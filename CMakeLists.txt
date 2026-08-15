@@ -18,6 +18,29 @@ option(VC_ENABLE_ROCKSDB "Promote RocksDB into the build" ON)
 set(VC_SOLUTIONS_DIR ${CMAKE_SOURCE_DIR}/external/solutions)
 set(VC_GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
 
+# A clean public clone needs only these promoted solutions, not the internal
+# research catalogue. Fail early with an actionable message when one is absent.
+set(VC_REQUIRED_SOLUTIONS entt recast-navigation)
+if(VC_ENABLE_ZSTD)
+    list(APPEND VC_REQUIRED_SOLUTIONS zstd)
+endif()
+if(VC_ENABLE_BLAKE3)
+    list(APPEND VC_REQUIRED_SOLUTIONS blake3)
+endif()
+if(VC_ENABLE_FLATBUFFERS)
+    list(APPEND VC_REQUIRED_SOLUTIONS flatbuffers)
+endif()
+if(VC_ENABLE_ROCKSDB)
+    list(APPEND VC_REQUIRED_SOLUTIONS rocksdb)
+endif()
+foreach(VC_SOLUTION IN LISTS VC_REQUIRED_SOLUTIONS)
+    if(NOT EXISTS "${VC_SOLUTIONS_DIR}/${VC_SOLUTION}")
+        message(FATAL_ERROR
+            "Missing dependency external/solutions/${VC_SOLUTION}. "
+            "Follow DEPENDENCIES.md; other internal solution clones are not required.")
+    endif()
+endforeach()
+
 if(VC_ENABLE_ZSTD)
     file(GLOB VC_ZSTD_COMMON ${VC_SOLUTIONS_DIR}/zstd/lib/common/*.c)
     file(GLOB VC_ZSTD_COMPRESS ${VC_SOLUTIONS_DIR}/zstd/lib/compress/*.c)
