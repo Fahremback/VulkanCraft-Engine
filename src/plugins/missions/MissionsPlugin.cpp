@@ -1,0 +1,2 @@
+#include "MissionsPlugin.hpp"
+namespace Engine::Plugins {void MissionsPlugin::register_types(TypeRegistry&r){register_plugin_type(r,"MissionComponent");register_plugin_type(r,"MissionTriggerComponent");}void MissionsPlugin::register_assets(AssetRegistry&r){(void)r;}void MissionsPlugin::register_editor_tools(Editor::EditorRegistry&r){register_asset_tool(r,"MissionAsset","Tools/Missions",get_name());register_asset_tool(r,"DialogueAsset","Tools/Missions",get_name());register_viewport_tool(r,"Mission Trigger Tool","Tools/Missions",get_name());}}

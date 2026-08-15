@@ -1,0 +1,46 @@
+#pragma once
+
+#include "ChunkConstants.hpp"
+#include "ChunkId.hpp"
+#include "Voxel.hpp"
+
+#include <array>
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+
+struct VoxelLayerSnapshot {
+    // Runtime block ids (builtin prefix + dynamic registry blocks).
+    std::array<RuntimeBlockId, CHUNK_SIZE_X * CHUNK_SIZE_Z> blocks{};
+    std::array<uint8_t, CHUNK_SIZE_X * CHUNK_SIZE_Z> water{};
+};
+
+struct NeighborVoxelHaloLayer {
+    static constexpr int Width = CHUNK_SIZE_X + 2;
+    static constexpr int Depth = CHUNK_SIZE_Z + 2;
+    std::array<RuntimeBlockId, Width * Depth> blocks{};
+    std::array<uint8_t, Width * Depth> water{};
+    std::array<uint8_t, Width * Depth> known{};
+};
+
+struct ChunkSnapshot {
+    ChunkId id{};
+    uint64_t revision{0};
+    int verticalExtent{0};
+    std::vector<int> layers;
+    std::unordered_map<int, VoxelLayerSnapshot> center;
+    std::unordered_map<int, NeighborVoxelHaloLayer> halo;
+    // Neighbor chunks read into the halo (with their revisions at read time).
+    // Streaming re-meshes a neighbor only when this snapshot is stale w.r.t. it.
+    std::vector<NeighborSeen> neighborSeen;
+    // Material/behavior snapshot for DYNAMIC (registry-defined) blocks, copied
+    // in at dispatch so worker threads never touch the registry. Builtin ids
+    // (< BlockType::Count) always resolve through the engine material table.
+    std::vector<std::pair<RuntimeBlockId, RuntimeBlockInfo>> runtimeBlocks;
+
+    [[nodiscard]] const RuntimeBlockInfo* find_runtime_block(RuntimeBlockId id) const;
+    [[nodiscard]] RuntimeBlockId block(int x, int y, int z) const;
+    [[nodiscard]] uint8_t water_level(int x, int y, int z) const;
+    [[nodiscard]] RuntimeBlockId halo_block(int x, int y, int z, bool& known) const;
+    [[nodiscard]] uint8_t halo_water(int x, int y, int z, bool& known) const;
+};

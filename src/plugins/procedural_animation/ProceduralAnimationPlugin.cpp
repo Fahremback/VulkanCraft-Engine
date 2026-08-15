@@ -1,0 +1,2 @@
+#include "ProceduralAnimationPlugin.hpp"
+namespace Engine::Plugins {void ProceduralAnimationPlugin::register_types(TypeRegistry&r){register_plugin_type(r,"ProceduralAnimationComponent");register_plugin_type(r,"IKTargetComponent");}void ProceduralAnimationPlugin::register_assets(AssetRegistry&r){(void)r;}void ProceduralAnimationPlugin::register_editor_tools(Editor::EditorRegistry&r){register_asset_tool(r,"ProceduralAnimationAsset","Tools/Animation",get_name());register_viewport_tool(r,"IK Target Tool","Tools/Animation",get_name());}}

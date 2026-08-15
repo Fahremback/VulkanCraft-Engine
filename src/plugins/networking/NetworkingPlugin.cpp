@@ -1,0 +1,2 @@
+#include "NetworkingPlugin.hpp"
+namespace Engine::Plugins {void NetworkingPlugin::register_types(TypeRegistry&r){register_plugin_type(r,"NetworkIdentityComponent");register_plugin_type(r,"ReplicatedComponent");}void NetworkingPlugin::register_assets(AssetRegistry&r){(void)r;}void NetworkingPlugin::register_editor_tools(Editor::EditorRegistry&r){register_asset_tool(r,"ReplicationProfileAsset","Tools/Networking",get_name());register_viewport_tool(r,"Network Relevancy Tool","Tools/Networking",get_name());}}

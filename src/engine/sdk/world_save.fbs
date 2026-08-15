@@ -1,0 +1,72 @@
+// world_save.fbs — v5 world save container (promoted solution, META §32).
+//
+// Replaces the hand-rolled binary body of v1-v4 (magic + append_u32/read_u16
+// by hand) with a typed, verifiable schema. The outer framing is unchanged:
+// "VCWLD" + u32 version(5) + <this buffer> + BLAKE3-256(32 bytes).
+//
+// The loader keeps the v1-v4 manual parser for legacy saves; v5 buffers are
+// validated with flatbuffers::Verifier before any accessor is used.
+
+namespace engine.voxel.save;
+
+// One dynamic runtime block id (>= BlockType::Count) and its persistent UUID.
+// Builtin ids are implied by the stable enum and are NOT in the palette.
+table PaletteEntry {
+  id: ushort;
+  uuid: string;
+}
+
+// One chunk column: cx/cz, vertical extent, then the block ids (u16 each) and
+// the fluid-level bytes (one per voxel), both in y,z,x order — the same layout
+// the v1-v4 binary format used.
+table ChunkEntry {
+  cx: int;
+  cz: int;
+  extent: uint;
+  blocks: [ushort];
+  fluid: [ubyte];
+}
+
+// One block entity (v3+): position, registered type id, the project's data
+// version and its opaque serialized blob.
+table BlockEntityEntry {
+  x: int;
+  y: int;
+  z: int;
+  type_id: string;
+  data_version: uint;
+  blob: [ubyte];
+}
+
+// One project component on a world entity: registered type id, the project's
+// data version and the opaque serialized blob.
+table EntityComponentEntry {
+  type: string;
+  version: uint;
+  blob: [ubyte];
+}
+
+// One world entity (added 2026-08-14, META section 15): registered entity
+// type, position, builtin health, tick policy and project components. The
+// field on WorldSave is optional, so v5 buffers written before this addition
+// still load (world_entities() == null means "none").
+table EntityEntry {
+  type: string;
+  x: float;
+  y: float;
+  z: float;
+  health: float;
+  max_health: float;
+  tick_interval: float;
+  components: [EntityComponentEntry];
+}
+
+table WorldSave {
+  palette: [PaletteEntry];
+  chunks: [ChunkEntry];
+  entities: [BlockEntityEntry];
+  world_entities: [EntityEntry];
+}
+
+root_type WorldSave;
+file_identifier "WLD5";

@@ -1,0 +1,14 @@
+{
+  "name": "vulkancraft-engine-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Dependency-free MCP server for safe AI access to the VulkanCraft engine",
+  "scripts": {
+    "start": "node server.mjs",
+    "smoke": "node protocol-smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

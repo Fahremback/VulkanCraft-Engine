@@ -1,0 +1,13 @@
+/build/
+/build-*/
+/.vs/
+/out/
+/Intermediate/
+/Projects/.runs/
+/vc_test_rocksdb*/
+*.user
+*.log
+ef*.txt
+pb_*.txt
+run_*.txt
+imgui.ini

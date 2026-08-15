@@ -1,0 +1,2 @@
+#include "WeaponsPlugin.hpp"
+namespace Engine::Plugins {void WeaponsPlugin::register_types(TypeRegistry&r){register_plugin_type(r,"WeaponComponent");register_plugin_type(r,"ProjectileComponent");}void WeaponsPlugin::register_assets(AssetRegistry&r){(void)r;}void WeaponsPlugin::register_editor_tools(Editor::EditorRegistry&r){register_asset_tool(r,"WeaponAsset","Tools/Weapons",get_name());register_viewport_tool(r,"Weapon Socket Tool","Tools/Weapons",get_name());}}
