@@ -16,6 +16,7 @@
 #include "../src/engine/physics/Physics.hpp"
 #include "../src/engine/scripting/VisualScriptGraph.hpp"
 #include "../src/engine/scripting/ScriptRuntime.hpp"
+#include <process.h>
 #include "../src/engine/core/plugin/Plugin.hpp"
 #include "../src/tools/AssetCooker.hpp"
 
@@ -1047,7 +1048,8 @@ int main() {
     std::cerr << "[CP] migration start\n";
     {
         const std::filesystem::path legacyRoot =
-            std::filesystem::temp_directory_path() / "legacy_assets_migration";
+            std::filesystem::temp_directory_path() /
+            ("legacy_assets_migration_" + std::to_string(_getpid()));
         std::error_code lec;
         std::filesystem::remove_all(legacyRoot, lec);
         std::filesystem::create_directories(legacyRoot);
@@ -1111,7 +1113,8 @@ int main() {
     {
         using namespace Engine::Assets;
         const std::filesystem::path thumbRoot =
-            std::filesystem::temp_directory_path() / "thumbnail_cache_tests";
+            std::filesystem::temp_directory_path() /
+            ("thumbnail_cache_tests_" + std::to_string(_getpid()));
         std::error_code tec;
         std::filesystem::remove_all(thumbRoot, tec);
 
@@ -1268,7 +1271,8 @@ int main() {
         if (cyclic.compute_load_order(cyclicOrder, &error)) { std::cerr << "Failure at line " << __LINE__ << " cycle not detected\n"; return EXIT_FAILURE; }
 
         // Manifest file roundtrip.
-        const std::filesystem::path pluginRoot = std::filesystem::temp_directory_path() / "plugin_runtime_tests";
+        const std::filesystem::path pluginRoot = std::filesystem::temp_directory_path() /
+            ("plugin_runtime_tests_" + std::to_string(_getpid()));
         std::error_code pec;
         std::filesystem::remove_all(pluginRoot, pec);
         PluginManifest fileManifest;

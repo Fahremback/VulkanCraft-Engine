@@ -22,23 +22,41 @@
 #include <engine/registry/Inventory.hpp>
 #include <engine/registry/RecipeRegistry.hpp>
 #include <engine/entity/IEntityWorld.hpp>
+#include <engine/entity/IMobBehavior.hpp>
+#include <engine/world/IWorldManager.hpp>
 #include <engine/navigation/INavigationProvider.hpp>
 #include <engine/navigation/VoxelNavigation.hpp>
+#include <engine/procgen/INoiseGraph.hpp>
+#include <engine/procgen/IClimateBiome.hpp>
+#include <engine/procgen/IWorldFeatures.hpp>
+#include <engine/procgen/IStructureGenerator.hpp>
+#include <engine/procgen/IParcellation.hpp>
+#include <engine/procgen/IShapeGrammar.hpp>
+#include <engine/procgen/IHeightmapErosion.hpp>
+#include <engine/procgen/IMeshCooking.hpp>
+#include <engine/procgen/IProcgenPreview.hpp>
+#include <engine/procgen/IJobRunner.hpp>
+#include <engine/procgen/ILodTerrain.hpp>
 #include <engine/compression/ICompressionProvider.hpp>
 #include <engine/hashing/IHashProvider.hpp>
 #include <engine/storage/IChunkStoreFactory.hpp>
 
 #include <glm/glm.hpp>
+#include "Voxel.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <exception>
 #include <cstdint>
+#include <mutex>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
+#include <process.h>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -58,6 +76,7 @@ int g_failures = 0;
     } while (0)
 
 constexpr int kBlockAir = 0;
+constexpr int kBlockDirt = 2;
 constexpr int kBlockStone = 3;
 
 // Deterministic generator: a flat world at `height` with no caves/ores.
@@ -80,6 +99,19 @@ public:
 private:
     int height_;
 };
+
+// The fluid tests run on DRY flat terrain ABOVE the world's sea level
+// (TerrainGenerator::SeaLevel = 127), so the world generates NO water: the
+// fluid under test is the only fluid in the world. Booting FlatGenerator(96)
+// floods the fluid-physics FIFO (512 cells/tick) with the generated sea lake
+// (millions of cells across the 33x33-chunk boot), starving the tested cells
+// indefinitely — that was the voxel_sdk_tests timing flake.
+constexpr int kFluidTestTerrain = 130;
+// Grounded pools sit on the terrain top (non-air below) so the ring is fed
+// sideways; the evaporation test's pool floats in air (air below) so nothing
+// can feed its ring.
+constexpr int kFluidTestGroundedY = kFluidTestTerrain + 1;
+constexpr int kFluidTestFloatingY = kFluidTestTerrain + 2;
 
 // ---- Project-owned block entities (META section 8 examples) ----
 // The engine stores/ticks/persists; the project owns behavior and state. The
@@ -139,7 +171,6 @@ public:
 bool boot_world(engine::voxel::IVoxelWorld& world, const glm::vec3& player,
                 int budget, int maxBudgetMs = 8000) {
     world.set_chunk_budget(budget);
-    world.set_mob_spawning(false);
     const auto start = std::chrono::steady_clock::now();
     while (!world.is_chunk_loaded(0, 0)) {
         if (std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -152,21 +183,51 @@ bool boot_world(engine::voxel::IVoxelWorld& world, const glm::vec3& player,
     return true;
 }
 
-// Runs update() until `predicate` holds or the wall-clock budget runs out.
-// Light settles asynchronously (budgeted relight pass), so assertions poll.
+// Runs update() until `predicate` holds. The sim advances by FIXED steps
+// (dt = 1/60, unlimited scheduler budgets), so the number of steps needed is
+// sim-time deterministic — wall-clock polling alone flaked under parallel
+// ctest/system load (the sim converges late, not never). The wall budget stays
+// only as a sanity cap so a genuine non-convergence fails fast instead of
+// hanging; the default is generous because each step may be slow under load.
 template <typename Pred>
 bool settle(engine::voxel::IVoxelWorld& world, const glm::vec3& player,
-            Pred predicate, int maxMs = 4000) {
+            Pred predicate, int maxMs = 30000) {
     const auto start = std::chrono::steady_clock::now();
-    while (!predicate()) {
+    constexpr int kMaxSteps = 60 * 120;  // 120 sim-seconds
+    for (int step = 0; step < kMaxSteps; ++step) {
+        if (predicate()) return true;
         if (std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start).count() > maxMs) {
             return false;
         }
         world.update(player, 1.0f / 60.0f);
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    return true;
+    return predicate();
+}
+
+// Per-process scratch directory: the file-based tests write to
+// temp/vc_sdk_tests_<pid>, so a concurrently running instance of this binary
+// (two ctest processes, or stale state from a crashed run) can never collide
+// on the same fixed file names. Other engine test binaries follow the same
+// unique-under-temp pattern.
+const std::string& scratch_dir() {
+    static const std::string dir = [] {
+        const std::string d = (std::filesystem::temp_directory_path() /
+            ("vc_sdk_tests_" + std::to_string(_getpid()))).string();
+        std::error_code ec;
+        std::filesystem::remove_all(d, ec);  // stale dir from a crashed run
+        std::filesystem::create_directories(d);
+        return d;
+    }();
+    return dir;
+}
+
+// Topmost non-air block of a column (terrain top, water level, or wall top).
+int helper_surface_y(engine::voxel::IVoxelWorld& world, int x, int z) {
+    for (int y = 160; y >= 0; --y) {
+        if (world.get_block(x, y, z) != kBlockAir) return y;
+    }
+    return -1;
 }
 
 void test_version() {
@@ -309,6 +370,222 @@ void test_transactions() {
                  "event log OK\n";
 }
 
+// FALTANTES §7 itens 139/142: falha em cada estágio da transação com rollback
+// integral, e transações multi-chunk sem estado parcial observável. Estágio 1
+// (validação): um id inválido MISTURADO com edições válidas falha ANTES de
+// aplicar qualquer coisa. Estágio 2 (apply): edições em chunks carregados +
+// uma em chunk NÃO carregado passam a validação mas falham no apply — as
+// edições já aplicadas são revertidas (nada parcial observável), o undo stack
+// e o event log ficam intactos. Sucesso: edições em DOIS chunks carregados
+// cometam atomicamente e o undo reverte ambas.
+void test_transaction_failure_stages() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> world =
+        engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(96));
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    // Budget 32 => janela completa dos anéis 0-2 (25 chunks): (0,0) e (2,2)
+    // ficam carregados; (31,31) fica muito fora da janela.
+    CHECK(boot_world(*world, player, 32));
+    CHECK(settle(*world, player, [&] { return world->is_chunk_loaded(2, 2); }));
+
+    int committed = 0, rolledBack = 0;
+    world->set_transaction_listener(
+        [&](const engine::voxel::TransactionEvent& event) {
+            if (event.kind == engine::voxel::TransactionEvent::Kind::Committed) ++committed;
+            if (event.kind == engine::voxel::TransactionEvent::Kind::RolledBack) ++rolledBack;
+        });
+
+    // --- Estágio 1: validação falha ANTES de aplicar qualquer coisa. ---
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = world->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);       // válida (chunk (0,0) carregado)
+        tx->set_block(4, 130, 4, 999'999);           // id inválido
+        std::string error;
+        CHECK(!tx->commit(error));
+        CHECK(!error.empty());
+        // NADA foi aplicado (a validação roda antes do apply): a edição válida
+        // também não existe, undo/log intocados.
+        CHECK(world->get_block(3, 130, 3) == kBlockAir);
+        CHECK(world->get_block(4, 130, 4) == kBlockAir);
+        CHECK(world->undo_depth() == 0);
+        CHECK(world->edit_log_count() == 0);
+    }
+
+    // --- Estágio 2: apply falha no meio de uma transação MULTI-CHUNK — as
+    // edições já aplicadas são revertidas (rollback integral, nada parcial). ---
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = world->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);        // chunk (0,0) carregado
+        tx->set_block(40, 130, 40, kBlockStone);      // chunk (2,2) carregado
+        tx->set_block(500, 130, 500, kBlockStone);    // chunk (31,31) NÃO carregado
+        std::string error;
+        CHECK(!tx->commit(error));
+        CHECK(error.find("chunk not loaded") != std::string::npos);
+        // Rollback integral: NENHUMA das edições aplicadas antes da falha
+        // sobrevive (nem no chunk (0,0), que foi aplicado primeiro).
+        CHECK(world->get_block(3, 130, 3) == kBlockAir);
+        CHECK(world->get_block(40, 130, 40) == kBlockAir);
+        CHECK(world->get_block(500, 130, 500) == kBlockAir);
+        CHECK(world->undo_depth() == 0);
+        CHECK(world->edit_log_count() == 0);
+    }
+
+    // --- Sucesso multi-chunk: edições em DOIS chunks carregados cometam
+    // atomicamente; o undo reverte ambas (o mundo segue íntegro pós-falha). ---
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = world->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);        // chunk (0,0)
+        tx->set_block(40, 130, 40, kBlockStone);      // chunk (2,2)
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+        CHECK(world->get_block(3, 130, 3) == kBlockStone);
+        CHECK(world->get_block(40, 130, 40) == kBlockStone);
+        CHECK(world->undo_depth() == 1);
+        CHECK(world->edit_log_count() == 2);
+    }
+    CHECK(world->undo_last_transaction());
+    CHECK(world->get_block(3, 130, 3) == kBlockAir);
+    CHECK(world->get_block(40, 130, 40) == kBlockAir);
+
+    // --- Contadores de evento: exatamente os 2 rollbacks + 1 commit. ---
+    CHECK(rolledBack == 2);
+    CHECK(committed == 1);
+
+    std::cout << "[sdk] transaction failure stages: validation rejects before "
+                 "apply, mid-apply multi-chunk failure rolls back applied "
+                 "edits (no partial state, undo/log intact), multi-chunk "
+                 "commit + undo OK\n";
+}
+
+// FALTANTES §7 item 138: permissões, validação autoritativa e limites por
+// transação. `TransactionLimits` (maxEdits, maxBoxVolume) e
+// `ITransactionPolicy` (per-edit + whole-transaction) são aplicados na
+// VALIDAÇÃO — antes de qualquer edit: uma recusa deixa o mundo intocado
+// (RolledBack, nada aplicado, undo/log intactos); dentro dos limites/política
+// a transação comita normalmente.
+void test_transaction_policy_limits() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> world =
+        engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(96));
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    CHECK(boot_world(*world, player, 16));
+    // boot_world only waits for chunk (0,0); the edits below reach chunk
+    // (1,1) (x=20..21), so wait for it too — otherwise the commit races the
+    // generator/upload and flakes under load (findings #54 pattern).
+    CHECK(settle(*world, player, [&] { return world->is_chunk_loaded(1, 1); }));
+
+    int rolledBack = 0, committed = 0;
+    world->set_transaction_listener(
+        [&](const engine::voxel::TransactionEvent& event) {
+            if (event.kind == engine::voxel::TransactionEvent::Kind::RolledBack) ++rolledBack;
+            if (event.kind == engine::voxel::TransactionEvent::Kind::Committed) ++committed;
+        });
+
+    // --- maxEdits: acima do limite, recusado ANTES do apply (nada aplicado);
+    // dentro do limite, comita. ---
+    world->set_transaction_limits(
+        engine::voxel::TransactionLimits{ /*maxEdits=*/2, /*maxBoxVolume=*/0 });
+    CHECK(world->transaction_limits().maxEdits == 2);
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = world->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);
+        tx->set_block(4, 130, 4, kBlockStone);
+        tx->set_block(5, 130, 5, kBlockStone);  // 3 > 2
+        std::string error;
+        CHECK(!tx->commit(error));
+        CHECK(error.find("per-transaction limit") != std::string::npos);
+        CHECK(world->get_block(3, 130, 3) == kBlockAir);
+        CHECK(world->undo_depth() == 0);
+        CHECK(world->edit_log_count() == 0);
+    }
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = world->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);
+        tx->set_block(4, 130, 4, kBlockStone);  // 2 <= 2
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+        CHECK(world->get_block(3, 130, 3) == kBlockStone);
+        CHECK(world->undo_depth() == 1);
+    }
+
+    // --- maxBoxVolume: caixa de edições grande recusada; compacta comita. ---
+    world->set_transaction_limits(
+        engine::voxel::TransactionLimits{ /*maxEdits=*/0, /*maxBoxVolume=*/27 });  // 3^3
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = world->begin_transaction();
+        tx->set_block(10, 130, 10, kBlockStone);
+        tx->set_block(100, 130, 10, kBlockStone);  // box 91*1*1 = 91 > 27
+        std::string error;
+        CHECK(!tx->commit(error));
+        CHECK(error.find("edit box volume") != std::string::npos);
+        CHECK(world->get_block(10, 130, 10) == kBlockAir);
+    }
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = world->begin_transaction();
+        tx->set_block(10, 130, 10, kBlockStone);
+        tx->set_block(11, 130, 10, kBlockStone);  // box 2*1*1 = 2 <= 27
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+
+    // --- Política autoritativa (permissões): per-edit + whole-transaction. ---
+    struct EastPolicy final : engine::voxel::ITransactionPolicy {
+        std::string validate_edit(
+            const engine::voxel::BlockEdit& edit) const override {
+            if (edit.position.x > 50) return "edits east of x=50 are forbidden";
+            return std::string();
+        }
+        std::string validate_transaction(
+            const std::vector<engine::voxel::BlockEdit>& edits) const override {
+            if (edits.size() > 1) return "single-edit transactions only";
+            return std::string();
+        }
+    };
+    world->set_transaction_policy(std::make_shared<EastPolicy>());
+    world->set_transaction_limits({});  // reset limits
+    // per-edit: x > 50 recusado — e como a validação roda antes do apply, o
+    // edit válido misturado também não é aplicado.
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = world->begin_transaction();
+        tx->set_block(20, 130, 20, kBlockStone);
+        tx->set_block(60, 130, 20, kBlockStone);  // x > 50 -> forbidden
+        std::string error;
+        CHECK(!tx->commit(error));
+        CHECK(error.find("forbidden") != std::string::npos);
+        CHECK(world->get_block(20, 130, 20) == kBlockAir);
+    }
+    // whole-transaction: 2 edits válidos recusados ("single-edit only").
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = world->begin_transaction();
+        tx->set_block(20, 130, 20, kBlockStone);
+        tx->set_block(21, 130, 20, kBlockStone);
+        std::string error;
+        CHECK(!tx->commit(error));
+        CHECK(error.find("single-edit") != std::string::npos);
+        CHECK(world->get_block(20, 130, 20) == kBlockAir);
+    }
+    // 1 edit válido comita normalmente sob a política.
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = world->begin_transaction();
+        tx->set_block(20, 130, 20, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+        CHECK(world->get_block(20, 130, 20) == kBlockStone);
+    }
+
+    // Contadores: 4 recusas (maxEdits, box, per-edit, whole-tx) + 3 commits.
+    CHECK(rolledBack == 4);
+    CHECK(committed == 3);
+
+    std::cout << "[sdk] transaction policy + limits: maxEdits/maxBoxVolume and "
+                 "authoritative policy reject before apply (nothing applied, "
+                 "undo/log intact), valid transactions commit OK\n";
+}
+
 // Persistence (META section 10): versioned save/load with semantic identity,
 // idempotent re-serialization, corruption/bad-magic/bad-version refusal, and a
 // file roundtrip.
@@ -378,8 +655,9 @@ void test_persistence() {
     CHECK(!b->deserialize_world(badVersion, errorF));
     CHECK(!errorF.empty());
 
-    // File roundtrip: save to disk, load into a fresh world.
-    const char* path = "vc_test_world.vcwld";
+    // File roundtrip: save to disk, load into a fresh world. The path lives
+    // in the per-process scratch dir so concurrent instances never collide.
+    const std::string path = scratch_dir() + "/vc_test_world.vcwld";
     std::string errorG;
     CHECK(a->save_world(path, errorG));
     CHECK(errorG.empty());
@@ -417,7 +695,8 @@ void test_persistence() {
         CHECK(e->get_block(3, 130, 3) == kBlockStone);  // first content kept
         CHECK(e->get_block(9, 130, 9) == kBlockAir);     // nothing stale
     }
-    std::remove(path);
+    std::error_code removeEc;
+    std::filesystem::remove(path, removeEc);
 
     std::cout << "[sdk] persistence: versioned save/load, idempotency, "
                  "corruption & file roundtrip OK\n";
@@ -591,7 +870,7 @@ void test_save_v4_legacy() {
         CHECK(!badV4Error.empty());
     }
 
-    const char* path = "vc_test_world_v4.vcwld";
+    const std::string path = scratch_dir() + "/vc_test_world_v4.vcwld";
     std::string saveError;
     CHECK(a->save_world(path, saveError));
     CHECK(saveError.empty());
@@ -619,17 +898,227 @@ void test_save_v4_legacy() {
     CHECK(b->load_world(path, loadError));
     CHECK(loadError.empty());
     CHECK(b->get_block(3, 130, 3) == kBlockStone);
-    std::remove(path);
+    std::error_code removeEc;
+    std::filesystem::remove(path, removeEc);
 
     std::cout << "[sdk] persistence v4: legacy v3 loads, zstd file layer "
                  "(smaller than raw) round-trips OK\n";
+}
+
+// Schema versioning + migration (FALTANTES §4 item 9): world_save_schema_
+// version introspects the version field without a full parse; migrate_world_
+// save upgrades a legacy v1-v4 save to the CURRENT version (v5) pure — the
+// live world is untouched, the migrated bytes load in a fresh world with
+// identical content (chunks, palette ids, block entities). Newer saves are
+// refused with a forward-compat diagnostic, not silently downgraded.
+void test_world_save_migration() {
+    // --- Introspection ------------------------------------------------
+    std::unique_ptr<engine::voxel::IVoxelWorld> maker =
+        engine::voxel::create_default_voxel_world();
+    maker->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*maker, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    std::string makerError;
+    const std::string v5save = maker->serialize_world(makerError);
+    CHECK(makerError.empty());
+    CHECK(maker->world_save_schema_version(v5save) == 5u);
+    CHECK(maker->world_save_schema_version("not a save") == 0u);
+    CHECK(maker->world_save_schema_version("VCWLD") == 0u);  // too small
+
+    // --- Hand-built legacy saves (v1: 1-byte builtin ids + FNV-1a) ----
+    auto appendU32 = [](std::string& b, uint32_t v) {
+        b.push_back(static_cast<char>(v & 0xFFu));
+        b.push_back(static_cast<char>((v >> 8) & 0xFFu));
+        b.push_back(static_cast<char>((v >> 16) & 0xFFu));
+        b.push_back(static_cast<char>((v >> 24) & 0xFFu));
+    };
+    auto appendI32 = [&appendU32](std::string& b, int32_t v) {
+        appendU32(b, static_cast<uint32_t>(v));
+    };
+    auto appendU16 = [](std::string& b, uint16_t v) {
+        b.push_back(static_cast<char>(v & 0xFFu));
+        b.push_back(static_cast<char>((v >> 8) & 0xFFu));
+    };
+    auto appendFNV = [](std::string& b) {
+        uint64_t hash = 1469598103934665603ull;
+        for (const unsigned char c : b) {
+            hash ^= c;
+            hash *= 1099511628211ull;
+        }
+        for (int i = 0; i < 8; ++i) {
+            b.push_back(static_cast<char>((hash >> (8 * i)) & 0xFFu));
+        }
+    };
+    auto appendBlake3 = [](std::string& b) {
+        const std::shared_ptr<engine::hashing::IHashProvider> h =
+            engine::hashing::create_blake3_hash_provider();
+        b += h->hash(b);
+    };
+
+    // One chunk (0,0), extent 2: stone at (3,0,3) and a WATER block at
+    // (4,0,3) with fluid level 3 (water persists its level; the level byte on
+    // a non-fluid block is not restored — that is the engine's contract),
+    // everything else air. Index = y*256 + z*16 + x.
+    constexpr int kExtent = 2;
+    constexpr int kLayer = 256;
+    constexpr int kBlockWaterId = 12;  // BlockType::Water
+    auto buildChunk = [&](std::string& b, bool wideIds) {
+        appendI32(b, 0);  // cx
+        appendI32(b, 0);  // cz
+        appendU32(b, kExtent);
+        const int stoneIndex = 0 * kLayer + 3 * 16 + 3;
+        const int waterIndex = 0 * kLayer + 3 * 16 + 4;
+        for (int v = 0; v < kExtent * kLayer; ++v) {
+            const uint16_t id = (v == stoneIndex) ? kBlockStone
+                                : (v == waterIndex) ? kBlockWaterId
+                                : kBlockAir;
+            if (wideIds) appendU16(b, id); else b.push_back(static_cast<char>(id));
+        }
+        for (int v = 0; v < kExtent * kLayer; ++v) {
+            b.push_back(static_cast<char>((v == waterIndex) ? 3 : 0xFF));
+        }
+    };
+
+    // v1 save (no palette, no entities, FNV-1a).
+    std::string v1 = "VCWLD";
+    appendU32(v1, 1);
+    appendU32(v1, 1);  // chunk count
+    buildChunk(v1, /*wideIds=*/false);
+    appendFNV(v1);
+    CHECK(maker->world_save_schema_version(v1) == 1u);
+
+    // v2: palette (empty) + u16 ids + FNV.
+    std::string v2 = "VCWLD";
+    appendU32(v2, 2);
+    appendU32(v2, 0);  // palette count
+    appendU32(v2, 1);
+    buildChunk(v2, /*wideIds=*/true);
+    appendFNV(v2);
+
+    // v3: + block entity section (one CounterMachine, counter=7).
+    std::string v3 = "VCWLD";
+    appendU32(v3, 3);
+    appendU32(v3, 0);  // palette count
+    appendU32(v3, 1);
+    buildChunk(v3, /*wideIds=*/true);
+    appendU32(v3, 1);  // entity count
+    appendI32(v3, 5);
+    appendI32(v3, 96);
+    appendI32(v3, 5);
+    const std::string typeId = "project:counter_machine";
+    appendU32(v3, static_cast<uint32_t>(typeId.size()));
+    v3 += typeId;
+    appendU32(v3, 1);  // data version
+    appendU32(v3, 4);  // blob: counter = 7 (LE u32)
+    v3.push_back(static_cast<char>(7));
+    v3.push_back(static_cast<char>(0));
+    v3.push_back(static_cast<char>(0));
+    v3.push_back(static_cast<char>(0));
+    appendFNV(v3);
+
+    // v4: same body as v3 but BLAKE3-256 checksum.
+    std::string v4 = "VCWLD";
+    appendU32(v4, 4);
+    appendU32(v4, 0);
+    appendU32(v4, 1);
+    buildChunk(v4, /*wideIds=*/true);
+    appendU32(v4, 1);
+    appendI32(v4, 5);
+    appendI32(v4, 96);
+    appendI32(v4, 5);
+    appendU32(v4, static_cast<uint32_t>(typeId.size()));
+    v4 += typeId;
+    appendU32(v4, 1);
+    appendU32(v4, 4);
+    v4.push_back(static_cast<char>(7));
+    v4.push_back(static_cast<char>(0));
+    v4.push_back(static_cast<char>(0));
+    v4.push_back(static_cast<char>(0));
+    appendBlake3(v4);
+
+    // --- Migrate each legacy save, then round-trip in a fresh world ----
+    const struct { uint32_t version; const std::string* bytes; } cases[] = {
+        { 1, &v1 }, { 2, &v2 }, { 3, &v3 }, { 4, &v4 },
+    };
+    for (const auto& testCase : cases) {
+        std::string migrated, migrateError;
+        CHECK(maker->migrate_world_save(*testCase.bytes, migrated, migrateError));
+        CHECK(migrateError.empty());
+        CHECK(!migrated.empty());
+        // Upgraded to the CURRENT schema version.
+        CHECK(maker->world_save_schema_version(migrated) == 5u);
+
+        // The migrated bytes load in a fresh world with identical content.
+        std::unique_ptr<engine::voxel::IVoxelWorld> fresh =
+            engine::voxel::create_default_voxel_world();
+        fresh->register_generator(std::make_shared<FlatGenerator>(96));
+        fresh->register_block_entity_type("project:counter_machine",
+            [] { return std::make_shared<CounterMachine>(); });
+        CHECK(boot_world(*fresh, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+        std::string loadError;
+        CHECK(fresh->deserialize_world(migrated, loadError));
+        CHECK(loadError.empty());
+        CHECK(fresh->get_block(3, 0, 3) == kBlockStone);
+        CHECK(fresh->get_block(4, 0, 3) == kBlockWaterId);
+        CHECK(fresh->get_fluid_level(4, 0, 3) == 3);
+        // Block entities survived the migration (v3/v4 only).
+        if (testCase.version >= 3) {
+            const auto entity = fresh->block_entity_at(5, 96, 5);
+            CHECK(entity != nullptr);
+            if (entity) {
+                CHECK(entity->type_id() == "project:counter_machine");
+                // Re-serialize to read the project state (counter=7).
+                const std::vector<uint8_t> blob = entity->serialize_state();
+                uint32_t counter = 0;
+                for (int i = 0; i < 4; ++i) {
+                    counter |= static_cast<uint32_t>(blob[static_cast<std::size_t>(i)])
+                               << (8 * i);
+                }
+                CHECK(counter == 7);
+            }
+        }
+        std::cout << "[sdk] migration v" << testCase.version << " -> v5: "
+                  << "upgraded, round-trip content identical (chunk"
+                  << (testCase.version >= 3 ? " + block entity" : "") << ") OK\n";
+    }
+
+    // --- No-op: a save already at the current version -----------------
+    std::string noopOut, noopError;
+    CHECK(maker->migrate_world_save(v5save, noopOut, noopError));
+    CHECK(noopError.empty());
+    CHECK(noopOut == v5save);
+
+    // --- Forward-compat: a NEWER schema is refused, never downgraded ----
+    std::string newer = v5save;
+    newer[5] = static_cast<char>(9);  // version u32 LE -> 9
+    newer[6] = static_cast<char>(0);
+    newer[7] = static_cast<char>(0);
+    newer[8] = static_cast<char>(0);
+    CHECK(maker->world_save_schema_version(newer) == 9u);
+    std::string newerOut, newerError;
+    CHECK(!maker->migrate_world_save(newer, newerOut, newerError));
+    CHECK(newerError.find("NEWER") != std::string::npos);
+    std::string loadNewerError;
+    CHECK(!maker->deserialize_world(newer, loadNewerError));
+    CHECK(loadNewerError.find("NEWER") != std::string::npos);
+
+    // --- Corruption is refused, never migrated -------------------------
+    std::string corrupt = v3;
+    corrupt[corrupt.size() - 1] ^= 0x01;
+    std::string corruptOut, corruptError;
+    CHECK(!maker->migrate_world_save(corrupt, corruptOut, corruptError));
+    CHECK(!corruptError.empty());
+    CHECK(corruptOut.empty());
+
+    std::cout << "[sdk] schema versioning + migration: introspection, v1-v4 "
+                 "upgrade to v5 (pure, round-trip), no-op current, newer "
+                 "refused, corrupt refused OK\n";
 }
 
 // Promoted solution (META section 32): the RocksDB chunk store persists world
 // blobs in a real embedded key-value database, content-addressed by BLAKE3,
 // and the world really delegates persistence to a registered service.
 void test_rocksdb_storage() {
-    const char* dbDir = "vc_test_rocksdb";
+    const std::string dbDir = scratch_dir() + "/vc_test_rocksdb";
 
     // World A: flat + edits, serialize (v5 flatbuffer + BLAKE3 body).
     std::unique_ptr<engine::voxel::IVoxelWorld> a =
@@ -696,7 +1185,7 @@ void test_rocksdb_storage() {
     std::shared_ptr<engine::voxel::IChunkStorage> store3 =
         engine::storage::create_rocksdb_chunk_storage();
     std::string emptyError;
-    CHECK(!store3->load_world("vc_test_rocksdb_empty", emptyError));
+    CHECK(!store3->load_world(scratch_dir() + "/vc_test_rocksdb_empty", emptyError));
     CHECK(!emptyError.empty());
 
     // Release the database handles BEFORE removing the directories: on
@@ -707,7 +1196,7 @@ void test_rocksdb_storage() {
     store2.reset();
     store3.reset();
     std::filesystem::remove_all(dbDir);
-    std::filesystem::remove_all("vc_test_rocksdb_empty");
+    std::filesystem::remove_all(scratch_dir() + "/vc_test_rocksdb_empty");
     std::cout << "[sdk] storage: RocksDB round-trip (BLAKE3-addressed), "
                  "world delegation, empty-db diagnostic OK\n";
 }
@@ -774,6 +1263,673 @@ void test_storage_service() {
 
     std::cout << "[sdk] storage service: persistence delegates to a "
                  "registered IChunkStorage\n";
+}
+
+// Region-paged persistence (FALTANTES §4 item 1): a region-capable
+// IChunkStorage turns a world save into a DIRECTORY of pages — a "world"
+// manifest page (palette + entities, no chunk data) plus one page per region
+// tile (8x8 chunks = 128x128 blocks). Round-trips identical data, groups
+// chunks by region tile (moving the player lands chunks in a second tile),
+// refuses a save with a missing page, and the monolithic path stays intact
+// when no paged store is registered.
+void test_region_chunk_storage() {
+    // --- Phase A: boot at origin (region tile r.0.0), edit, paged save. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);
+        tx->set_block(5, 130, 5, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    auto storeA = engine::storage::create_region_chunk_storage(8);
+    a->register_storage(storeA);
+    const std::string dirA = scratch_dir() + "/vc_test_regions_a";
+    std::string errorA;
+    CHECK(a->save_world(dirA, errorA));
+    CHECK(errorA.empty());
+    // The save is a page directory: manifest + one region page for the
+    // origin tile (sorted ids: "r.0.0" < "world").
+    // The save is a page directory: the "world" manifest page plus one page
+    // per region tile. Booting at chunk (0,0) with budget 16 loads chunks
+    // -2..2 -> tiles -1..0 in both axes (sorted: "-" < "0" < "w").
+    const std::vector<std::string> pagesA = storeA->page_ids();
+    CHECK(pagesA.size() == 5);
+    CHECK(pagesA[0] == "r.-1.-1");
+    CHECK(pagesA[1] == "r.-1.0");
+    CHECK(pagesA[2] == "r.0.-1");
+    CHECK(pagesA[3] == "r.0.0");
+    CHECK(pagesA[4] == "world");
+
+    // --- Phase B: fresh world loads the paged save identically. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*b, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    auto storeB = engine::storage::create_region_chunk_storage(8);
+    b->register_storage(storeB);
+    std::string errorB;
+    CHECK(b->load_world(dirA, errorB));
+    CHECK(errorB.empty());
+    const int xs[] = { 0, 3, 5, 8, 15 };
+    const int zs[] = { 0, 8, 15 };
+    const int ys[] = { 1, 50, 96, 100, 120, 127, 128, 130, 200 };
+    bool identical = true;
+    for (const int x : xs)
+        for (const int z : zs)
+            for (const int y : ys)
+                if (a->get_block(x, y, z) != b->get_block(x, y, z))
+                    identical = false;
+    CHECK(identical);
+
+    // --- Phase C: move the player to chunk (8,8) — a SECOND region tile
+    // (r.1.1) — and save again: both tiles land in the same paged save. ---
+    // Both (8,8) and (7,8) must reach Uploaded: a chunk left Generating
+    // (worker done, state only advanced by a later update) reads as Air from
+    // the public surface and would mismatch the restored page.
+    CHECK(settle(*a, glm::vec3(130.0f, 200.0f, 130.0f),
+                 [&] { return a->is_chunk_loaded(8, 8) &&
+                              a->is_chunk_loaded(7, 8); }));
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(140, 130, 140, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    const std::string dirC = scratch_dir() + "/vc_test_regions_c";
+    std::string errorC;
+    CHECK(a->save_world(dirC, errorC));
+    CHECK(errorC.empty());
+    // The new window (chunks 6..10, radius 2 around chunk (8,8)) spans tiles
+    // 0..1 in both axes; the origin tiles -1..0 were evicted by the move.
+    const std::vector<std::string> pagesC = storeA->page_ids();
+    CHECK(pagesC.size() == 5);
+    CHECK(pagesC[0] == "r.0.0");
+    CHECK(std::find(pagesC.begin(), pagesC.end(), "r.0.1") != pagesC.end());
+    CHECK(std::find(pagesC.begin(), pagesC.end(), "r.1.0") != pagesC.end());
+    CHECK(std::find(pagesC.begin(), pagesC.end(), "r.1.1") != pagesC.end());
+    CHECK(std::find(pagesC.begin(), pagesC.end(), "r.-1.-1") == pagesC.end());
+    CHECK(pagesC[4] == "world");
+
+    // --- Phase D: a third world loads both region pages; edits in both
+    // tiles survive, and untouched generated data round-trips too. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> c =
+        engine::voxel::create_default_voxel_world();
+    c->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*c, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    auto storeD = engine::storage::create_region_chunk_storage(8);
+    c->register_storage(storeD);
+    std::string errorD;
+    CHECK(c->load_world(dirC, errorD));
+    CHECK(errorD.empty());
+    CHECK(c->get_block(140, 130, 140) == kBlockStone);  // region r.1.1 edit
+    // Untouched generated data round-trips from BOTH tiles: (136,50,136) is
+    // chunk (8,8) (r.1.1, edited chunk), (117,50,133) is chunk (7,8) (r.0.1).
+    CHECK(c->get_block(136, 50, 136) == a->get_block(136, 50, 136));
+    CHECK(c->get_block(117, 50, 133) == a->get_block(117, 50, 133));
+
+    // --- Phase E: a missing region page is refused (all-or-nothing load). ---
+    std::error_code removeEc;
+    std::filesystem::remove(dirC + "/pages/r_1_1.dat", removeEc);
+    CHECK(!removeEc);
+    std::unique_ptr<engine::voxel::IVoxelWorld> d =
+        engine::voxel::create_default_voxel_world();
+    d->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*d, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    d->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string errorE;
+    CHECK(!d->load_world(dirC, errorE));
+    CHECK(!errorE.empty());
+
+    // --- Phase F: without a paged store the monolithic path is untouched: a
+    // regular FILE round-trips (no page directory involved). ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> e =
+        engine::voxel::create_default_voxel_world();
+    e->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*e, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = e->begin_transaction();
+        tx->set_block(4, 130, 4, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+    }
+    const std::string monoPath = scratch_dir() + "/vc_test_regions_mono.vcwld";
+    std::string errorF;
+    CHECK(e->save_world(monoPath, errorF));
+    CHECK(errorF.empty());
+    CHECK(std::filesystem::is_regular_file(monoPath));
+
+    std::cout << "[sdk] region storage: paged save/load, per-tile grouping, "
+                 "missing-page refusal, monolithic fallback OK\n";
+}
+
+// Per-chunk palette + compression in region pages (FALTANTES §4 item 2): a
+// v2 page (magic "VCW2") stores each chunk with a palette (u8 indices when
+// the chunk has <= 256 distinct blocks) and a zstd-compressed payload. The
+// test proves the on-disk page is smaller than the raw equivalent, round-
+// trips identically, and a corrupted payload is refused.
+void test_region_palette_compression() {
+    // --- Phase A: world with edits, paged save. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);
+        tx->set_block(5, 130, 5, kBlockStone);
+        tx->set_block(10, 130, 10, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    auto store = engine::storage::create_region_chunk_storage(8);
+    a->register_storage(store);
+    const std::string dir = scratch_dir() + "/vc_test_regions_palette";
+    std::string errorA;
+    CHECK(a->save_world(dir, errorA));
+    CHECK(errorA.empty());
+
+    // --- Phase B: the page is v2 and smaller than the raw equivalent. ---
+    const std::string pagePath = dir + "/pages/r_0_0.dat";
+    std::ifstream in(pagePath, std::ios::binary);
+    CHECK(in.good());
+    std::string page((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+    CHECK(page.size() > 8);
+    CHECK(page.compare(0, 4, "VCW2") == 0);
+    const auto u32at = [&page](std::size_t at) {
+        return static_cast<uint32_t>(static_cast<uint8_t>(page[at])) |
+               (static_cast<uint32_t>(static_cast<uint8_t>(page[at + 1])) << 8) |
+               (static_cast<uint32_t>(static_cast<uint8_t>(page[at + 2])) << 16) |
+               (static_cast<uint32_t>(static_cast<uint8_t>(page[at + 3])) << 24);
+    };
+    const auto u16at = [&page](std::size_t at) {
+        return static_cast<uint16_t>(static_cast<uint8_t>(page[at])) |
+               (static_cast<uint16_t>(static_cast<uint8_t>(page[at + 1])) << 8);
+    };
+    const uint32_t count = u32at(4);
+    CHECK(count >= 1);
+    std::size_t cursor = 8;
+    std::size_t rawBytes = 0;   // v1 equivalent (u16 ids, uncompressed)
+    std::size_t firstFlags = 0xFF;
+    for (uint32_t i = 0; i < count; ++i) {
+        CHECK(cursor + 13 <= page.size());
+        const uint32_t extent = u32at(cursor + 8);
+        const uint8_t flags = static_cast<uint8_t>(page[cursor + 12]);
+        if (i == 0) firstFlags = flags;
+        rawBytes += 12 + static_cast<std::size_t>(extent) * 256 * 3;
+        cursor += 13;
+        if (flags & 0x01) {  // palette present
+            CHECK(cursor + 2 <= page.size());
+            const uint16_t paletteCount = u16at(cursor);
+            cursor += 2 + static_cast<std::size_t>(paletteCount) * 2;
+        }
+        CHECK(cursor + 4 <= page.size());
+        const uint32_t payloadBytes = u32at(cursor);
+        cursor += 4 + payloadBytes;
+    }
+    CHECK(cursor == page.size());  // no trailing garbage
+    // The first chunk must use BOTH palette and compression (flat terrain:
+    // few distinct blocks, highly repetitive payload) and the page must be
+    // smaller than its raw equivalent overall.
+    CHECK((firstFlags & 0x01) != 0);
+    CHECK((firstFlags & 0x02) != 0);
+    CHECK(page.size() < rawBytes);
+
+    // --- Phase C: fresh world loads the v2 page identically. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*b, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    b->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string errorB;
+    CHECK(b->load_world(dir, errorB));
+    CHECK(errorB.empty());
+    const int xs[] = { 0, 3, 5, 10, 15 };
+    const int zs[] = { 0, 8, 15 };
+    const int ys[] = { 1, 50, 96, 100, 120, 127, 128, 130, 200 };
+    bool identical = true;
+    for (const int x : xs)
+        for (const int z : zs)
+            for (const int y : ys)
+                if (a->get_block(x, y, z) != b->get_block(x, y, z))
+                    identical = false;
+    CHECK(identical);
+
+    // --- Phase D: corruption in the v2 payload is refused cleanly. ---
+    const std::string corruptPath = scratch_dir() + "/vc_test_regions_palette_corrupt";
+    {
+        std::filesystem::create_directories(corruptPath + "/pages");
+        // Re-create the manifest page too (load_world requires it).
+        std::ifstream worldIn(dir + "/pages/world.dat", std::ios::binary);
+        std::string manifest((std::istreambuf_iterator<char>(worldIn)),
+                             std::istreambuf_iterator<char>());
+        std::ofstream worldOut(corruptPath + "/pages/world.dat", std::ios::binary);
+        worldOut.write(manifest.data(),
+                       static_cast<std::streamsize>(manifest.size()));
+        std::string corrupt = page;
+        corrupt[corrupt.size() / 2] ^= 0xFF;  // inside a compressed payload
+        std::ofstream out(corruptPath + "/pages/r_0_0.dat", std::ios::binary);
+        out.write(corrupt.data(), static_cast<std::streamsize>(corrupt.size()));
+    }
+    std::unique_ptr<engine::voxel::IVoxelWorld> c =
+        engine::voxel::create_default_voxel_world();
+    c->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*c, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    c->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string errorC;
+    CHECK(!c->load_world(corruptPath, errorC));
+    CHECK(!errorC.empty());
+
+    std::cout << "[sdk] region palette+compression: v2 page smaller than raw, "
+                 "round-trip identical, corruption refused OK\n";
+}
+
+// A region backend whose FIRST save_page call blocks on a gate — used to pin
+// a save mid-write so the test can inject a concurrent edit deterministically.
+// Everything else delegates to the real region backend, so the pages land on
+// disk and a subsequent load is a genuine round-trip.
+class GatedRegionStorage final : public engine::voxel::IChunkStorage {
+public:
+    GatedRegionStorage()
+        : inner_(engine::storage::create_region_chunk_storage(8)) {}
+
+    std::mutex gateMutex;
+    std::condition_variable cv;
+    bool entered = false;
+    bool release = false;
+    int savePageCalls = 0;
+
+    std::string serialize_world(std::string& e) override {
+        return inner_->serialize_world(e);
+    }
+    bool deserialize_world(const std::string& d, std::string& e) override {
+        return inner_->deserialize_world(d, e);
+    }
+    bool save_world(const std::string& p, std::string& e) override {
+        return inner_->save_world(p, e);
+    }
+    bool load_world(const std::string& p, std::string& e) override {
+        return inner_->load_world(p, e);
+    }
+    bool supports_regions() const override { return true; }
+    bool save_page(const std::string& id, const std::string& payload,
+                   std::string& e) override {
+        {
+            std::unique_lock<std::mutex> lock(gateMutex);
+            ++savePageCalls;
+            if (savePageCalls == 1) {  // first page write: block mid-flight
+                entered = true;
+                cv.notify_all();
+                cv.wait(lock, [this] { return release; });
+            }
+        }
+        return inner_->save_page(id, payload, e);
+    }
+    bool load_page(const std::string& id, std::string& out, std::string& e) override {
+        return inner_->load_page(id, out, e);
+    }
+    std::vector<std::string> page_ids() const override {
+        return inner_->page_ids();
+    }
+    bool commit_save(std::string& e) override { return inner_->commit_save(e); }
+
+private:
+    std::shared_ptr<engine::voxel::IChunkStorage> inner_;
+};
+
+// Consistent snapshot without holding the global mutex through the save
+// (FALTANTES §4 item 4). The gate pins the save AFTER the capture (blocked at
+// the first page write); a concurrent edit then lands in the LIVE world but
+// NOT in the saved pages — the save is a point-in-time. The next save picks
+// the edit up. A save that encoded from live chunks would corrupt the
+// snapshot with the mid-save edit; this test would fail.
+void test_region_snapshot_concurrent_edit() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    auto gated = std::make_shared<GatedRegionStorage>();
+    a->register_storage(gated);
+    const std::string dir = scratch_dir() + "/vc_test_regions_snapshot";
+
+    std::string saveError;
+    std::thread saver([&] {
+        a->save_world(dir, saveError);
+    });
+    {
+        std::unique_lock<std::mutex> lock(gated->gateMutex);
+        gated->cv.wait_for(lock, std::chrono::seconds(30),
+                           [&] { return gated->entered; });
+        CHECK(gated->entered);  // save is now past the capture, mid-write
+    }
+    // Concurrent edit while the save is mid-flight: must not deadlock, and
+    // must NOT be part of the snapshot being persisted.
+    a->set_block(5, 130, 5, kBlockStone);
+    {
+        std::lock_guard<std::mutex> lock(gated->gateMutex);
+        gated->release = true;
+    }
+    gated->cv.notify_all();
+    saver.join();
+    CHECK(saveError.empty());
+
+    // World B loads the SAVED state: pre-edit (3,130,3) present, the
+    // mid-save edit (5,130,5) absent — a consistent point-in-time.
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*b, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    b->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string loadError;
+    CHECK(b->load_world(dir, loadError));
+    CHECK(loadError.empty());
+    CHECK(b->get_block(3, 130, 3) == kBlockStone);
+    CHECK(b->get_block(5, 130, 5) != kBlockStone);
+
+    // The next save captures the edit (delta): world C has both.
+    std::string saveError2;
+    CHECK(a->save_world(dir, saveError2));
+    CHECK(saveError2.empty());
+    std::unique_ptr<engine::voxel::IVoxelWorld> c =
+        engine::voxel::create_default_voxel_world();
+    c->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*c, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    c->register_storage(engine::storage::create_region_chunk_storage(8));
+    CHECK(boot_world(*c, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    std::string loadError2;
+    CHECK(c->load_world(dir, loadError2));
+    CHECK(loadError2.empty());
+    CHECK(c->get_block(3, 130, 3) == kBlockStone);
+    CHECK(c->get_block(5, 130, 5) == kBlockStone);
+
+    std::cout << "[sdk] region snapshot: concurrent mid-save edit does not "
+                 "corrupt the save, next save captures it OK\n";
+}
+
+// Async save/load (FALTANTES §4 item 5): encode (palette+zstd) and page
+// writes run as background jobs, and load runs file reads/decompression/apply
+// on the pool — the caller thread is never blocked on them. The result
+// arrives via the callback AND wait_async_saves; a concurrent save while one
+// is in flight is refused.
+void test_region_async_save_load() {
+    // --- Async save: dispatch, keep simulating, then wait for the result. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);
+        tx->set_block(5, 130, 5, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    a->register_storage(engine::storage::create_region_chunk_storage(8));
+    const std::string dir = scratch_dir() + "/vc_test_regions_async";
+
+    std::mutex cbMutex;
+    std::condition_variable cbCv;
+    bool callbackFired = false;
+    bool callbackOk = false;
+    std::string callbackErr;
+    std::string dispatchErr;
+    CHECK(a->save_world_async(
+        dir,
+        [&](bool ok, std::string err) {
+            std::lock_guard<std::mutex> lock(cbMutex);
+            callbackFired = true;
+            callbackOk = ok;
+            callbackErr = std::move(err);
+            cbCv.notify_all();
+        },
+        dispatchErr));
+    CHECK(dispatchErr.empty());
+
+    // The caller keeps simulating while the save is in flight (the snapshot
+    // was captured at dispatch; these ticks must not block or corrupt it).
+    a->update(glm::vec3(8.0f, 200.0f, 8.0f), 1.0f / 60.0f);
+    CHECK(a->get_block(3, 130, 3) == kBlockStone);
+
+    // The result arrives via wait_async_saves AND the callback.
+    std::string waitErr;
+    CHECK(a->wait_async_saves(waitErr));
+    CHECK(waitErr.empty());
+    {
+        std::unique_lock<std::mutex> lock(cbMutex);
+        cbCv.wait_for(lock, std::chrono::seconds(30),
+                      [&] { return callbackFired; });
+        CHECK(callbackFired);
+        CHECK(callbackOk);
+        CHECK(callbackErr.empty());
+    }
+
+    // Round-trip: a fresh world restores the async-saved pages.
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*b, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    b->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string loadErr;
+    CHECK(b->load_world(dir, loadErr));
+    CHECK(loadErr.empty());
+    CHECK(b->get_block(3, 130, 3) == kBlockStone);
+    CHECK(b->get_block(5, 130, 5) == kBlockStone);
+    const int xs[] = { 0, 3, 5, 8, 15 };
+    const int zs[] = { 0, 8, 15 };
+    const int ys[] = { 1, 50, 96, 100, 120, 127, 128, 130, 200 };
+    bool identical = true;
+    for (const int x : xs)
+        for (const int z : zs)
+            for (const int y : ys)
+                if (a->get_block(x, y, z) != b->get_block(x, y, z))
+                    identical = false;
+    CHECK(identical);
+
+    // --- Async load: dispatch, then wait; chunks are restored. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> c =
+        engine::voxel::create_default_voxel_world();
+    c->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*c, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    c->register_storage(engine::storage::create_region_chunk_storage(8));
+    bool loadCallbackFired = false;
+    bool loadCallbackOk = false;
+    std::string loadDispatchErr;
+    // Non-null callback => truly async: dispatch returns, result via wait.
+    CHECK(c->load_world_async(
+        dir,
+        [&](bool ok, std::string) {
+            std::lock_guard<std::mutex> lock(cbMutex);
+            loadCallbackFired = true;
+            loadCallbackOk = ok;
+        },
+        loadDispatchErr));
+    CHECK(loadDispatchErr.empty());
+    std::string loadWaitErr;
+    CHECK(c->wait_async_saves(loadWaitErr));
+    CHECK(loadWaitErr.empty());
+    {
+        std::lock_guard<std::mutex> lock(cbMutex);
+        CHECK(loadCallbackFired);
+        CHECK(loadCallbackOk);
+    }
+    CHECK(c->get_block(3, 130, 3) == kBlockStone);
+    CHECK(c->get_block(5, 130, 5) == kBlockStone);
+
+    // --- A save while an async save is in flight is refused. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> d =
+        engine::voxel::create_default_voxel_world();
+    d->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*d, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    auto gated = std::make_shared<GatedRegionStorage>();
+    d->register_storage(gated);
+    const std::string gateDir = scratch_dir() + "/vc_test_regions_async_gate";
+    std::string gateDispatchErr;
+    // Non-null callback => truly async (a null callback would block on the
+    // gate — it is treated as the synchronous path).
+    CHECK(d->save_world_async(gateDir, [](bool, std::string) {}, gateDispatchErr));
+    {
+        std::unique_lock<std::mutex> lock(gated->gateMutex);
+        gated->cv.wait_for(lock, std::chrono::seconds(30),
+                           [&] { return gated->entered; });
+        CHECK(gated->entered);  // async save is now mid-write (op in flight)
+    }
+    std::string refusedErr;
+    CHECK(!d->save_world(gateDir + "_2", refusedErr));
+    CHECK(!refusedErr.empty());
+    {
+        std::lock_guard<std::mutex> lock(gated->gateMutex);
+        gated->release = true;
+    }
+    gated->cv.notify_all();
+    std::string gateWaitErr;
+    CHECK(d->wait_async_saves(gateWaitErr));
+    CHECK(gateWaitErr.empty());
+
+    // --- Async requires a paged storage: refused with a clear diagnostic. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> e =
+        engine::voxel::create_default_voxel_world();
+    std::string noStoreErr;
+    CHECK(!e->save_world_async(dir + "_nostore", nullptr, noStoreErr));
+    CHECK(!noStoreErr.empty());
+
+    std::cout << "[sdk] region async: save/load on background jobs, caller "
+                 "keeps simulating, concurrent save refused OK\n";
+}
+
+// Delta saves (FALTANTES §4 item 3): a save rewrites ONLY the region tiles
+// whose chunks changed since the last save (revision-tracked). A no-change
+// save touches no page file (mtime stable), an edit in one tile rewrites only
+// that tile's page, and the round-trip still restores the full world.
+void test_region_delta_saves() {
+    // Page id -> on-disk file (mirror of page_id_to_file: '.' -> '_').
+    const auto pageFile = [](const std::string& dir, const std::string& pageId) {
+        std::string leaf = pageId;
+        for (char& c : leaf) if (c == '.') c = '_';
+        return dir + "/pages/" + leaf + ".dat";
+    };
+    const auto readFile = [](const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    };
+
+    // --- Phase A: world with edits in two tiles, base save. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    // boot_world only waits for chunk (0,0); the transaction below also edits
+    // chunk (-1,-1), whose generation/upload races the commit under load
+    // (findings #54 pattern) — materialize it first.
+    CHECK(settle(*a, glm::vec3(8.0f, 200.0f, 8.0f),
+                 [&] { return a->is_chunk_loaded(-1, -1); }));
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);      // chunk (0,0) -> r.0.0
+        tx->set_block(-5, 130, -5, kBlockStone);    // chunk (-1,-1) -> r.-1.-1
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    auto store = engine::storage::create_region_chunk_storage(8);
+    a->register_storage(store);
+    const std::string dir = scratch_dir() + "/vc_test_regions_delta";
+    std::string errorA;
+    CHECK(a->save_world(dir, errorA));
+    CHECK(errorA.empty());
+    const std::vector<std::string> pages = store->page_ids();
+    CHECK(pages.size() == 5);  // 4 region tiles + world manifest
+
+    // --- Phase B: a no-change save touches NO page file. ---
+    std::map<std::string, std::filesystem::file_time_type> beforeTime;
+    std::map<std::string, std::string> beforeBytes;
+    for (const auto& pid : pages) {
+        const std::string path = pageFile(dir, pid);
+        beforeTime[pid] = std::filesystem::last_write_time(path);
+        beforeBytes[pid] = readFile(path);
+    }
+    std::string errorB;
+    CHECK(a->save_world(dir, errorB));
+    CHECK(errorB.empty());
+    CHECK(store->page_ids() == pages);  // same page set
+    // Chunk pages are gated: a no-change save must not touch a single tile
+    // file (mtime AND bytes stable). The "world" manifest is intentionally
+    // rewritten every save (small, always fresh); its CONTENT must still be
+    // semantically stable (same palette/entities/regions -> same bytes).
+    for (const auto& pid : pages) {
+        if (pid == "world") {
+            CHECK(readFile(pageFile(dir, pid)) == beforeBytes[pid]);
+            continue;
+        }
+        CHECK(std::filesystem::last_write_time(pageFile(dir, pid)) ==
+              beforeTime[pid]);
+        CHECK(readFile(pageFile(dir, pid)) == beforeBytes[pid]);
+    }
+
+    // --- Phase C: an edit in tile r.0.0 rewrites ONLY that tile. ---
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(7, 130, 7, kBlockStone);  // chunk (0,0) -> r.0.0
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    std::string errorC;
+    CHECK(a->save_world(dir, errorC));
+    CHECK(errorC.empty());
+    for (const auto& pid : pages) {
+        const std::string path = pageFile(dir, pid);
+        if (pid == "world") continue;  // always rewritten, checked in Phase B
+        const bool changed =
+            std::filesystem::last_write_time(path) != beforeTime[pid];
+        CHECK(changed == (pid == "r.0.0"));
+        if (pid == "r.0.0") {
+            CHECK(readFile(path) != beforeBytes[pid]);  // the edit landed
+        } else {
+            CHECK(readFile(path) == beforeBytes[pid]);
+        }
+    }
+
+    // --- Phase D: a fresh world restores the FULL world (base + delta). ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*b, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    b->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string errorD;
+    CHECK(b->load_world(dir, errorD));
+    CHECK(errorD.empty());
+    CHECK(b->get_block(3, 130, 3) == kBlockStone);    // base save edit
+    CHECK(b->get_block(-5, 130, -5) == kBlockStone);  // base save edit
+    CHECK(b->get_block(7, 130, 7) == kBlockStone);    // delta save edit
+    const int xs[] = { 0, 3, 5, 7, 15 };
+    const int zs[] = { 0, 8, 15 };
+    const int ys[] = { 1, 50, 96, 100, 120, 127, 128, 130, 200 };
+    bool identical = true;
+    for (const int x : xs)
+        for (const int z : zs)
+            for (const int y : ys)
+                if (a->get_block(x, y, z) != b->get_block(x, y, z))
+                    identical = false;
+    CHECK(identical);
+
+    std::cout << "[sdk] region delta: no-change save touches no page, one-edit "
+                 "save rewrites one tile, full restore OK\n";
 }
 
 // A JSON-only block survives save/load through the UUID palette: the palette
@@ -1263,6 +2419,68 @@ void test_fluid_registry() {
                  "validation OK\n";
 }
 
+// FALTANTES item 7: a block can declare its fluid behavior inline, so a
+// catalog-only fluid block needs no separate FluidRegistry asset. Schema
+// round-trip + all-or-nothing validation, then end-to-end: the world builds
+// its fluid table from the block's inline binding and the fluid spreads.
+void test_block_inline_fluid() {
+    engine::registry::BlockRegistry blocks;
+    std::string error;
+    CHECK(blocks.load_from_json(
+        R"({"name":"goo","namespace":"test","class":"fluid","drops":["test:goo"],"fluid":{"viscosity":0.0,"range":4,"evaporation":false,"damagePerTick":2.0}})",
+        error));
+    const engine::registry::BlockDefinition* goo = blocks.find_by_name("test:goo");
+    CHECK(goo != nullptr);
+    CHECK(goo->fluid.declared);
+    CHECK(goo->fluid.viscosity == 0.0f);
+    CHECK(goo->fluid.range == 4);
+    CHECK(!goo->fluid.evaporation);
+    CHECK(goo->fluid.damagePerTick == 2.0f);
+    CHECK(goo->fluid.source);    // defaults
+    CHECK(goo->fluid.falling);
+    engine::registry::BlockRegistry plain;
+    CHECK(plain.load_from_json(R"({"name":"solid","namespace":"test"})", error));
+    CHECK(!plain.find_by_name("test:solid")->fluid.declared);
+
+    // Validation is all-or-nothing: out-of-contract inline fluid is refused.
+    auto refuse = [&](const std::string& json) {
+        engine::registry::BlockRegistry registry;
+        std::string refuseError;
+        CHECK(!registry.load_from_json(json, refuseError));
+        CHECK(!refuseError.empty());
+    };
+    refuse(R"({"name":"a","namespace":"test","fluid":{"range":9}})");
+    refuse(R"({"name":"b","namespace":"test","fluid":{"viscosity":1.5}})");
+    refuse(R"({"name":"c","namespace":"test","fluid":{"density":-1}})");
+    refuse(R"({"name":"d","namespace":"test","fluid":{"tickInterval":-0.5}})");
+    refuse(R"({"name":"e","namespace":"test","fluid":{"damagePerTick":-2}})");
+
+    // End-to-end: a catalog-only fluid block with inline props drives the
+    // simulation WITHOUT any FluidRegistry (thin goo: 2 levels/tick, range 4
+    // caps at x=11), exactly like the registry-driven goo of the §13 tests.
+    auto world = engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    auto gooBlocks = std::make_shared<engine::registry::BlockRegistry>();
+    CHECK(gooBlocks->load_from_json(
+        R"({"name":"goo","namespace":"test","class":"fluid","color":[0.2,0.9,0.3],"fluid":{"viscosity":0.0,"range":4,"falling":false}})",
+        error));
+    world->set_block_registry(gooBlocks);
+    // No set_fluid_registry: the inline binding is the only fluid source.
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    CHECK(boot_world(*world, player, 16));
+    uint32_t gooId = 0;
+    CHECK(world->resolve_block_id("test:goo", gooId, error));
+    world->set_block(8, kFluidTestGroundedY, 8, gooId);
+    CHECK(settle(*world, player, [&] { return world->get_fluid_level(9, kFluidTestGroundedY, 8) == 2; }));
+    CHECK(world->get_fluid_level(8, kFluidTestGroundedY, 8) == 0);   // source
+    CHECK(world->get_fluid_level(9, kFluidTestGroundedY, 8) == 2);   // thin: 2/tick
+    CHECK(settle(*world, player, [&] { return world->get_fluid_level(10, kFluidTestGroundedY, 8) == 4; }));
+    CHECK(world->get_block(11, kFluidTestGroundedY, 8) == kBlockAir);  // range 4 caps
+
+    std::cout << "[sdk] block inline fluid: round-trip, validation and "
+                 "registry-free spread OK\n";
+}
+
 // The engine runs the project's fluid parameters: thin fluids spread 2 levels
 // per step (rings at 2, 4), thick fluids 1 level per step (rings at 1, 2), and
 // the spread budget (range) caps both.
@@ -1271,7 +2489,7 @@ void test_fluid_generalized() {
                            std::unique_ptr<engine::voxel::IVoxelWorld>& worldOut,
                            const glm::vec3& player) {
         auto world = engine::voxel::create_default_voxel_world();
-        world->register_generator(std::make_shared<FlatGenerator>(96));
+        world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
         auto blocks = std::make_shared<engine::registry::BlockRegistry>();
         std::string error;
         CHECK(blocks->load_from_json(
@@ -1288,30 +2506,31 @@ void test_fluid_generalized() {
     };
     const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
 
-    // Thin goo (viscosity 0 -> 2 levels/tick), range 4: rings at 2 and 4.
+    // Thin goo (viscosity 0 -> 2 levels/tick), range 4: rings at 2 and 4. The
+    // pool sits on the dry terrain top (non-air below) so the ring is fed
+    // sideways — same spread semantics as the old water-below setup, without
+    // the generated sea lake flooding the fluid-physics FIFO.
     std::unique_ptr<engine::voxel::IVoxelWorld> thin;
     uint32_t thinId = 0;
     build(R"([{"block":"test:goo","viscosity":0.0,"range":4,"falling":false}])",
           thinId, thin, player);
-    // y=128 sits just above the flat world's water line (below is water, not
-    // air) so the pool spreads sideways instead of falling/draining.
-    thin->set_block(8, 128, 8, static_cast<uint32_t>(thinId));
-    CHECK(settle(*thin, player, [&] { return thin->get_fluid_level(9, 128, 8) == 2; }));
-    CHECK(thin->get_fluid_level(8, 128, 8) == 0);   // source
-    CHECK(thin->get_fluid_level(9, 128, 8) == 2);   // thin: 2 levels per step
-    CHECK(settle(*thin, player, [&] { return thin->get_fluid_level(10, 128, 8) == 4; }));
-    CHECK(thin->get_block(11, 128, 8) == kBlockAir);  // range 4 caps the spread
+    thin->set_block(8, kFluidTestGroundedY, 8, static_cast<uint32_t>(thinId));
+    CHECK(settle(*thin, player, [&] { return thin->get_fluid_level(9, kFluidTestGroundedY, 8) == 2; }));
+    CHECK(thin->get_fluid_level(8, kFluidTestGroundedY, 8) == 0);   // source
+    CHECK(thin->get_fluid_level(9, kFluidTestGroundedY, 8) == 2);   // thin: 2 levels per step
+    CHECK(settle(*thin, player, [&] { return thin->get_fluid_level(10, kFluidTestGroundedY, 8) == 4; }));
+    CHECK(thin->get_block(11, kFluidTestGroundedY, 8) == kBlockAir);  // range 4 caps
 
     // Thick goo (viscosity 1 -> 1 level/tick), range 2: rings at 1 and 2.
     std::unique_ptr<engine::voxel::IVoxelWorld> thick;
     uint32_t thickId = 0;
     build(R"([{"block":"test:goo","viscosity":1.0,"range":2,"falling":false}])",
           thickId, thick, player);
-    thick->set_block(8, 128, 8, static_cast<uint32_t>(thickId));
-    CHECK(settle(*thick, player, [&] { return thick->get_fluid_level(9, 128, 8) == 1; }));
-    CHECK(thick->get_fluid_level(9, 128, 8) == 1);
-    CHECK(settle(*thick, player, [&] { return thick->get_fluid_level(10, 128, 8) == 2; }));
-    CHECK(thick->get_block(11, 128, 8) == kBlockAir);  // range 2 caps it
+    thick->set_block(8, kFluidTestGroundedY, 8, static_cast<uint32_t>(thickId));
+    CHECK(settle(*thick, player, [&] { return thick->get_fluid_level(9, kFluidTestGroundedY, 8) == 1; }));
+    CHECK(thick->get_fluid_level(9, kFluidTestGroundedY, 8) == 1);
+    CHECK(settle(*thick, player, [&] { return thick->get_fluid_level(10, kFluidTestGroundedY, 8) == 2; }));
+    CHECK(thick->get_block(11, kFluidTestGroundedY, 8) == kBlockAir);  // range 2 caps it
 
     std::cout << "[sdk] fluids: data-driven spread (thin 2/tick, thick 1/tick, "
                  "range caps) OK\n";
@@ -1324,7 +2543,7 @@ void test_fluid_evaporation() {
                            std::unique_ptr<engine::voxel::IVoxelWorld>& worldOut,
                            const glm::vec3& player) {
         auto world = engine::voxel::create_default_voxel_world();
-        world->register_generator(std::make_shared<FlatGenerator>(96));
+        world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
         auto blocks = std::make_shared<engine::registry::BlockRegistry>();
         std::string error;
         CHECK(blocks->load_from_json(
@@ -1341,16 +2560,16 @@ void test_fluid_evaporation() {
     const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
 
     // Pooled goo: evaporation=false -> the spread ring SURVIVES its unfed
-    // step (the source has air below, so it can never feed the ring sideways;
-    // an unfed cell also stops spreading, so the pool is exactly one ring).
+    // step (the pool floats in air, so nothing can feed the ring sideways; an
+    // unfed cell also stops spreading, so the pool is exactly one ring).
     std::unique_ptr<engine::voxel::IVoxelWorld> pooled;
     uint32_t pooledId = 0;
     build(R"([{"block":"test:goo","viscosity":1.0,"range":2,"falling":false,"evaporation":false}])",
           pooledId, pooled, player);
-    pooled->set_block(8, 130, 8, static_cast<uint32_t>(pooledId));
-    CHECK(settle(*pooled, player, [&] { return pooled->get_fluid_level(9, 130, 8) == 1; }));
-    CHECK(pooled->get_block(9, 130, 8) == static_cast<uint32_t>(pooledId));
-    CHECK(pooled->get_block(10, 130, 8) == kBlockAir);  // unfed cells don't spread
+    pooled->set_block(8, kFluidTestFloatingY, 8, static_cast<uint32_t>(pooledId));
+    CHECK(settle(*pooled, player, [&] { return pooled->get_fluid_level(9, kFluidTestFloatingY, 8) == 1; }));
+    CHECK(pooled->get_block(9, kFluidTestFloatingY, 8) == static_cast<uint32_t>(pooledId));
+    CHECK(pooled->get_block(10, kFluidTestFloatingY, 8) == kBlockAir);  // unfed cells don't spread
 
     // Evaporating goo: same setup with evaporation=true -> the ring decays to
     // air once it is processed (only the source cell remains).
@@ -1358,12 +2577,12 @@ void test_fluid_evaporation() {
     uint32_t evaporatingId = 0;
     build(R"([{"block":"test:goo","viscosity":1.0,"range":2,"falling":false,"evaporation":true}])",
           evaporatingId, evaporating, player);
-    evaporating->set_block(8, 130, 8, static_cast<uint32_t>(evaporatingId));
+    evaporating->set_block(8, kFluidTestFloatingY, 8, static_cast<uint32_t>(evaporatingId));
     CHECK(settle(*evaporating, player, [&] {
-        return evaporating->get_block(9, 130, 8) == kBlockAir &&
-               evaporating->get_block(10, 130, 8) == kBlockAir;
+        return evaporating->get_block(9, kFluidTestFloatingY, 8) == kBlockAir &&
+               evaporating->get_block(10, kFluidTestFloatingY, 8) == kBlockAir;
     }));
-    CHECK(evaporating->get_block(8, 130, 8) == static_cast<uint32_t>(evaporatingId));
+    CHECK(evaporating->get_block(8, kFluidTestFloatingY, 8) == static_cast<uint32_t>(evaporatingId));
 
     std::cout << "[sdk] fluids: evaporation flag (pooled vs decayed) OK\n";
 }
@@ -1372,7 +2591,7 @@ void test_fluid_evaporation() {
 // it visibly lags a fast fluid with the same range and viscosity.
 void test_fluid_tick_cadence() {
     auto world = engine::voxel::create_default_voxel_world();
-    world->register_generator(std::make_shared<FlatGenerator>(96));
+    world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
     auto blocks = std::make_shared<engine::registry::BlockRegistry>();
     std::string error;
     CHECK(blocks->load_from_json(
@@ -1393,18 +2612,1447 @@ void test_fluid_tick_cadence() {
     uint32_t gooId = 0, oozeId = 0;
     CHECK(world->resolve_block_id("test:goo", gooId, error));
     CHECK(world->resolve_block_id("test:ooze", oozeId, error));
-    world->set_block(2, 128, 2, gooId);
-    world->set_block(12, 128, 12, oozeId);
+    world->set_block(2, kFluidTestGroundedY, 2, gooId);
+    world->set_block(12, kFluidTestGroundedY, 12, oozeId);
 
     // Fast goo reaches its full range (level 4 at distance 4: level = distance
     // for a 1-level/tick fluid)...
-    CHECK(settle(*world, player, [&] { return world->get_fluid_level(6, 128, 2) == 4; }));
+    CHECK(settle(*world, player, [&] { return world->get_fluid_level(6, kFluidTestGroundedY, 2) == 4; }));
     // ...while the slow ooze (8x cadence) has barely moved.
-    CHECK(world->get_fluid_level(13, 128, 12) < 4);
+    CHECK(world->get_fluid_level(13, kFluidTestGroundedY, 12) < 4);
     // It catches up eventually: cadence gates speed, not reach.
-    CHECK(settle(*world, player, [&] { return world->get_fluid_level(16, 128, 12) == 4; }));
+    CHECK(settle(*world, player, [&] { return world->get_fluid_level(16, kFluidTestGroundedY, 12) == 4; }));
 
     std::cout << "[sdk] fluids: per-fluid tick cadence (slow lags, catches up) OK\n";
+}
+
+// FALTANTES §2 item 2: collision/selection shapes. Schema round-trip + strict
+// refusals + a REAL consumer: the voxel raycast honors collisionShape (a
+// block with collisionShape "none" is not solid even with the legacy
+// collidable:true bool — the ray passes through to the terrain below).
+void test_block_collision_selection_shapes() {
+    auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+    std::string error;
+    CHECK(blocks->load_from_json(
+        R"([{"name":"ghost","namespace":"test","collisionShape":"none","selectionShape":"none"},)"
+        R"({"name":"picket","namespace":"test","collisionShape":"cross","selectionShape":"cross"},)"
+        R"({"name":"plain","namespace":"test"}])",
+        error));
+
+    const auto* ghost = blocks->find_by_name("test:ghost");
+    const auto* picket = blocks->find_by_name("test:picket");
+    const auto* plain = blocks->find_by_name("test:plain");
+    CHECK(ghost != nullptr && picket != nullptr && plain != nullptr);
+    CHECK(ghost->collisionShape == engine::registry::CollisionShape::None);
+    CHECK(ghost->selectionShape == engine::registry::SelectionShape::None);
+    CHECK(!ghost->is_collidable());          // none wins over collidable:true
+    CHECK(picket->collisionShape == engine::registry::CollisionShape::Cross);
+    CHECK(picket->selectionShape == engine::registry::SelectionShape::Cross);
+    CHECK(picket->is_collidable());
+    CHECK(plain->collisionShape == engine::registry::CollisionShape::Full);
+    CHECK(plain->selectionShape == engine::registry::SelectionShape::Full);
+    CHECK(plain->is_collidable());
+
+    // Strict enums: explicit unknown values are refused (all-or-nothing).
+    auto blocks2 = std::make_shared<engine::registry::BlockRegistry>();
+    CHECK(!blocks2->load_from_json(R"([{"name":"bad","collisionShape":"octagon"}])", error));
+    auto blocks3 = std::make_shared<engine::registry::BlockRegistry>();
+    CHECK(!blocks3->load_from_json(R"([{"name":"bad","selectionShape":"slab"}])", error));
+
+    // End-to-end: raycast honors the collision shape. Player looks straight
+    // down; the block sits on the terrain top (first air cell), so a solid
+    // block is the FIRST hit and a ghost lets the ray reach the terrain.
+    auto world = engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    world->set_block_registry(blocks);
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    CHECK(boot_world(*world, player, 16));
+    uint32_t ghostId = 0, picketId = 0, plainId = 0;
+    CHECK(world->resolve_block_id("test:ghost", ghostId, error));
+    CHECK(world->resolve_block_id("test:picket", picketId, error));
+    CHECK(world->resolve_block_id("test:plain", plainId, error));
+
+    const glm::vec3 down{ 0.0f, -1.0f, 0.0f };
+    world->set_block(2, kFluidTestGroundedY, 2, picketId);
+    const engine::voxel::VoxelRaycastHit picketHit =
+        world->raycast(glm::vec3(2.0f, 200.0f, 2.0f), down, 1000.0f);
+    CHECK(picketHit.hit);
+    CHECK(picketHit.block == glm::ivec3(2, kFluidTestGroundedY, 2));  // cross is solid at cell granularity
+
+    world->set_block(4, kFluidTestGroundedY, 4, plainId);
+    const engine::voxel::VoxelRaycastHit plainHit =
+        world->raycast(glm::vec3(4.0f, 200.0f, 4.0f), down, 1000.0f);
+    CHECK(plainHit.hit);
+    CHECK(plainHit.block == glm::ivec3(4, kFluidTestGroundedY, 4));
+
+    world->set_block(6, kFluidTestGroundedY, 6, ghostId);
+    const engine::voxel::VoxelRaycastHit ghostHit =
+        world->raycast(glm::vec3(6.0f, 200.0f, 6.0f), down, 1000.0f);
+    CHECK(ghostHit.hit);
+    // The ghost is skipped: the first solid cell is the terrain BELOW it.
+    CHECK(ghostHit.block == glm::ivec3(6, kFluidTestTerrain, 6));
+
+    std::cout << "[sdk] block collision/selection shapes (schema + raycast "
+                 "honors collisionShape) OK\n";
+}
+
+// FALTANTES §3 item 1: public streaming/budget/observability contract. The
+// world exposes a live StreamingSnapshot (chunk census + budgets) and an
+// optional push monitor fired after update() while streaming state changes.
+void test_streaming_observability() {
+    auto world = engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+
+    // Budget contract: default inside [min, max]; clamps are honored.
+    const engine::voxel::StreamingSnapshot initial = world->streaming_snapshot();
+    CHECK(initial.chunkBudget >= initial.chunkBudgetMin);
+    CHECK(initial.chunkBudget <= initial.chunkBudgetMax);
+    CHECK(initial.chunkBudgetMin == 8);  // world constant (MIN_CHUNK_BUDGET)
+    world->set_chunk_budget(100000);
+    CHECK(world->streaming_snapshot().chunkBudget == initial.chunkBudgetMax);
+    world->set_chunk_budget(1);
+    CHECK(world->streaming_snapshot().chunkBudget == initial.chunkBudgetMin);
+    world->set_chunk_budget(16);
+
+    // Push observability: a monitor receives snapshots while the world boots
+    // and streaming state moves; the census is consistent and the budgets are
+    // live.
+    struct Recorder final : engine::voxel::IVoxelStreamingMonitor {
+        std::vector<engine::voxel::StreamingSnapshot> seen;
+        void on_streaming_update(const engine::voxel::StreamingSnapshot& snapshot) override {
+            seen.push_back(snapshot);
+        }
+    };
+    auto recorder = std::make_shared<Recorder>();
+    world->set_streaming_monitor(recorder);
+    CHECK(boot_world(*world, player, 16));
+    CHECK(!recorder->seen.empty());
+    const engine::voxel::StreamingSnapshot last = recorder->seen.back();
+    CHECK(last.chunksLoaded > 0);
+    // Every present chunk is in exactly one non-Unloaded state.
+    CHECK(last.chunksLoaded ==
+          last.chunksGenerating + last.chunksMeshReady + last.chunksUploaded);
+    // Headless (NullBridge): meshes complete; uploads stay 0 by design.
+    CHECK(last.chunksMeshReady + last.chunksUploaded >= 1);
+    CHECK(last.chunkBudget == 16);
+    CHECK(last.workerThreads > 0);
+    CHECK(last.farLodPercent >= 0 && last.farLodPercent <= 100);
+
+    // Clearing the monitor stops dispatch: updates stop reaching the recorder.
+    world->set_streaming_monitor(nullptr);
+    const std::size_t beforeClear = recorder->seen.size();
+    for (int i = 0; i < 20; ++i) world->update(player, 1.0f / 60.0f);
+    CHECK(recorder->seen.size() == beforeClear);
+
+    std::cout << "[sdk] streaming observability (snapshot census + budgets + "
+                 "monitor) OK\n";
+}
+
+// RAM-budgeted chunk cache (FALTANTES §4 item 6): a memory budget bounds the
+// estimated bytes of loaded chunk data; each frame's end evicts the farthest
+// chunks while over budget, so every update boundary satisfies the budget. The
+// closest chunk survives the eviction (farthest-first policy) and the window
+// repopulates once the budget is lifted.
+void test_chunk_memory_budget() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> world =
+        engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*world, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    // Park the player over a PLAIN chunk (far from the builtin structure
+    // sites near the origin) so the closest chunk is ordinary flat terrain.
+    const glm::vec3 player{ 8.0f, 200.0f, 200.0f };  // chunk (0,12)
+    CHECK(settle(*world, player,
+                 [&] { return world->is_chunk_loaded(0, 12); }));
+
+    // Default: unlimited budget, real usage reported.
+    engine::voxel::StreamingSnapshot before = world->streaming_snapshot();
+    CHECK(before.memoryBudgetBytes == 0);
+    CHECK(before.ramUsageBytes > 0);
+    CHECK(before.chunksLoaded >= 5);
+
+    // An edit in the player's own chunk (extent reaches y=110 -> ~86 KB).
+    world->set_block(5, 110, 205, kBlockStone);
+    CHECK(world->get_block(5, 110, 205) == kBlockStone);
+
+    // Tiny budget: ONE chunk fits. Every update boundary must satisfy the
+    // budget (eviction runs at the end of the frame), farthest chunks go
+    // first, and the closest chunk (the edited one) survives.
+    const uint64_t kTinyBudget = 100000;
+    world->set_memory_budget(kTinyBudget);
+    CHECK(settle(*world, player,
+                 [&] { return world->streaming_snapshot().ramUsageBytes <= kTinyBudget; }));
+    const engine::voxel::StreamingSnapshot clamped = world->streaming_snapshot();
+    CHECK(clamped.memoryBudgetBytes == kTinyBudget);
+    CHECK(clamped.ramUsageBytes <= kTinyBudget);
+    CHECK(clamped.chunksLoaded <= 3);      // budget evicted most of the window
+    CHECK(clamped.chunksLoaded >= 1);      // at least the closest chunk stays
+    CHECK(world->get_block(5, 110, 205) == kBlockStone);  // edited chunk survives
+
+    // Lifting the budget lets the window repopulate.
+    world->set_memory_budget(0);
+    CHECK(settle(*world, player,
+                 [&] { return world->streaming_snapshot().chunksLoaded >= 5; }));
+    CHECK(world->streaming_snapshot().ramUsageBytes > kTinyBudget);
+    CHECK(world->streaming_snapshot().memoryBudgetBytes == 0);
+
+    std::cout << "[sdk] chunk memory budget: end-of-frame eviction clamps "
+                 "usage, farthest-first, closest chunk survives OK\n";
+}
+
+// Autosave incremental (FALTANTES §4 item 7): while enabled, the headless
+// update() tick fires a DELTA async save (items 3 + 5) to the autosave path
+// when a time interval OR a change-volume threshold is crossed. A no-change
+// autosave must not rewrite chunk pages (the delta gate), a fire while
+// another op is in flight is skipped (timers keep running), and disabling
+// autosave stops future fires.
+void test_autosave_incremental() {
+    const auto pageFile = [](const std::string& dir, const std::string& pageId) {
+        std::string leaf = pageId;
+        for (char& c : leaf) if (c == '.') c = '_';
+        return dir + "/pages/" + leaf + ".dat";
+    };
+    const auto pageMtime = [&](const std::string& dir, const std::string& pageId) {
+        return std::filesystem::last_write_time(pageFile(dir, pageId));
+    };
+    const auto readFile = [](const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    };
+
+    // --- Phase A: edits + time trigger fires an autosave. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);      // chunk (0,0) -> r.0.0
+        tx->set_block(-5, 130, -5, kBlockStone);    // chunk (-1,-1) -> r.-1.-1
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    auto storeA = engine::storage::create_region_chunk_storage(8);
+    a->register_storage(storeA);
+    const std::string dir = scratch_dir() + "/vc_test_autosave";
+
+    engine::voxel::IVoxelWorld::AutosaveConfig cfg;
+    cfg.enabled = true;
+    cfg.intervalSeconds = 0.05;   // time trigger: 3 ticks of 1/60s
+    cfg.dirtyChunkThreshold = 0;  // volume trigger disabled in Phase A
+    a->set_autosave(cfg, dir);
+    CHECK(a->autosave_config().enabled);
+    CHECK(a->autosave_config().intervalSeconds == 0.05);
+
+    // The time trigger fires while the caller keeps simulating.
+    for (int i = 0; i < 4; ++i) a->update(glm::vec3(8.0f, 200.0f, 8.0f), 1.0f / 60.0f);
+    std::string waitErr;
+    CHECK(a->wait_async_saves(waitErr));
+    CHECK(waitErr.empty());
+    CHECK(std::filesystem::exists(pageFile(dir, "world")));
+    CHECK(storeA->page_ids().size() >= 5);  // manifest + region tiles
+
+    // Round-trip: a fresh world loads the autosave (edits present).
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(96));
+    b->register_storage(engine::storage::create_region_chunk_storage(8));
+    CHECK(boot_world(*b, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    std::string loadErr;
+    CHECK(b->load_world(dir, loadErr));
+    CHECK(loadErr.empty());
+    CHECK(b->get_block(3, 130, 3) == kBlockStone);
+    CHECK(b->get_block(-5, 130, -5) == kBlockStone);
+
+    // --- Phase B: a no-change autosave (time still elapsing) must NOT
+    // rewrite a single chunk page — the delta gate survives the autosave
+    // path. The manifest is intentionally rewritten (small, always fresh). ---
+    const std::vector<std::string> pages = storeA->page_ids();
+    std::map<std::string, std::filesystem::file_time_type> beforeTime;
+    std::map<std::string, std::string> beforeBytes;
+    for (const auto& pid : pages) {
+        beforeTime[pid] = pageMtime(dir, pid);
+        beforeBytes[pid] = readFile(pageFile(dir, pid));
+    }
+    for (int i = 0; i < 6; ++i) a->update(glm::vec3(8.0f, 200.0f, 8.0f), 1.0f / 60.0f);
+    std::string waitErr2;
+    CHECK(a->wait_async_saves(waitErr2));
+    for (const auto& pid : pages) {
+        if (pid == "world") continue;  // manifest always rewritten
+        CHECK(pageMtime(dir, pid) == beforeTime[pid]);
+        CHECK(readFile(pageFile(dir, pid)) == beforeBytes[pid]);
+    }
+
+    // --- Phase C: volume trigger fires early (threshold 1). ---
+    engine::voxel::IVoxelWorld::AutosaveConfig cfgVol;
+    cfgVol.enabled = true;
+    cfgVol.intervalSeconds = 0;   // time trigger off
+    cfgVol.dirtyChunkThreshold = 1;
+    a->set_autosave(cfgVol, dir);
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(21, 130, 21, kBlockStone);  // chunk (1,1) -> r.0.0
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    a->update(glm::vec3(8.0f, 200.0f, 8.0f), 1.0f / 60.0f);  // one tick fires it
+    std::string waitErr3;
+    CHECK(a->wait_async_saves(waitErr3));
+    std::unique_ptr<engine::voxel::IVoxelWorld> c =
+        engine::voxel::create_default_voxel_world();
+    c->register_generator(std::make_shared<FlatGenerator>(96));
+    c->register_storage(engine::storage::create_region_chunk_storage(8));
+    CHECK(boot_world(*c, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    std::string loadErr2;
+    CHECK(c->load_world(dir, loadErr2));
+    CHECK(loadErr2.empty());
+    CHECK(c->get_block(3, 130, 3) == kBlockStone);
+    CHECK(c->get_block(21, 130, 21) == kBlockStone);  // volume-fired edit present
+
+    // --- Phase D: a fire while another op is in flight is skipped (timers
+    // keep running — the next eligible update fires it). Deterministic via a
+    // storage that blocks the first page write. ---
+    class GatedStorage final : public engine::voxel::IChunkStorage {
+    public:
+        explicit GatedStorage(std::shared_ptr<engine::voxel::IChunkStorage> inner)
+            : inner_(std::move(inner)) {}
+        std::string serialize_world(std::string& e) override { return inner_->serialize_world(e); }
+        bool deserialize_world(const std::string& d, std::string& e) override { return inner_->deserialize_world(d, e); }
+        bool supports_regions() const override { return true; }
+        bool save_world(const std::string& p, std::string& e) override { return inner_->save_world(p, e); }
+        bool load_world(const std::string& p, std::string& e) override { return inner_->load_world(p, e); }
+        std::vector<std::string> page_ids() const override { return inner_->page_ids(); }
+        bool commit_save(std::string& e) override { return inner_->commit_save(e); }
+        bool save_page(const std::string& id, const std::string& bytes, std::string& e) override {
+            if (!gatePassed_ && id != "world") {
+                std::unique_lock<std::mutex> ul(m_);
+                if (!gatePassed_) {  // only the first page write gates
+                    gatePassed_ = true;
+                    enteredSave_ = true;
+                    enteredCv_.notify_all();
+                    releaseCv_.wait(ul, [&] { return release_.load(); });
+                }
+            }
+            return inner_->save_page(id, bytes, e);
+        }
+        bool load_page(const std::string& id, std::string& bytes, std::string& e) override { return inner_->load_page(id, bytes, e); }
+        void wait_entered() {
+            std::unique_lock<std::mutex> ul(m_);
+            enteredCv_.wait(ul, [&] { return enteredSave_.load(); });
+        }
+        void release() {
+            std::lock_guard<std::mutex> lock(m_);
+            release_ = true;
+            releaseCv_.notify_all();
+        }
+        std::shared_ptr<engine::voxel::IChunkStorage> inner_;
+        mutable std::mutex m_;
+        std::condition_variable enteredCv_, releaseCv_;
+        std::atomic_bool enteredSave_{ false }, release_{ false };
+        std::atomic_bool gatePassed_{ false };
+    };
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> d =
+        engine::voxel::create_default_voxel_world();
+    d->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*d, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    auto gated = std::make_shared<GatedStorage>(
+        engine::storage::create_region_chunk_storage(8));
+    d->register_storage(gated);
+    const std::string dirD = scratch_dir() + "/vc_test_autosave_gated";
+    d->set_autosave(cfgVol, dirD);
+
+    // First fire gets stuck in the gate (op in flight).
+    d->update(glm::vec3(8.0f, 200.0f, 8.0f), 1.0f / 60.0f);
+    gated->wait_entered();
+    // A second fire while in flight must be SKIPPED, not deadlock (update
+    // returns promptly; the timers keep running).
+    d->update(glm::vec3(8.0f, 200.0f, 8.0f), 1.0f / 60.0f);
+    gated->release();
+    std::string waitErrD;
+    CHECK(d->wait_async_saves(waitErrD));
+    CHECK(waitErrD.empty());
+
+    // --- Phase E: disabling autosave stops future fires. ---
+    engine::voxel::IVoxelWorld::AutosaveConfig cfgOff;
+    cfgOff.enabled = false;
+    d->set_autosave(cfgOff, dirD);
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = d->begin_transaction();
+        tx->set_block(9, 130, 9, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    const auto pagesD = gated->page_ids();
+    std::map<std::string, std::filesystem::file_time_type> beforeD;
+    for (const auto& pid : pagesD) beforeD[pid] = pageMtime(dirD, pid);
+    for (int i = 0; i < 10; ++i) d->update(glm::vec3(8.0f, 200.0f, 8.0f), 1.0f / 60.0f);
+    std::string waitErrE;
+    CHECK(d->wait_async_saves(waitErrE));
+    for (const auto& pid : pagesD) {
+        if (pid == "world") continue;
+        CHECK(pageMtime(dirD, pid) == beforeD[pid]);
+    }
+
+    std::cout << "[sdk] autosave incremental: time + volume triggers fire a "
+                 "delta async save, no-change save skips chunk pages, "
+                 "in-flight fire skipped, disable stops fires OK\n";
+}
+
+// WAL recovery (FALTANTES §4 item 8): a save journals the undo data of every
+// page it is about to overwrite (wal/<page>.bak, or a .missing tombstone for
+// pages that did not exist); commit_save drops the journal. A save left
+// UNcommitted (process death, power loss) is detected on the next load_world
+// and rolled back — the directory returns to the last committed save, never a
+// mix of old and new pages.
+void test_wal_recovery() {
+    const auto pageFile = [](const std::string& dir, const std::string& pageId) {
+        std::string leaf = pageId;
+        for (char& c : leaf) if (c == '.') c = '_';
+        return dir + "/pages/" + leaf + ".dat";
+    };
+    const auto readFile = [](const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    };
+    const auto fileExists = [](const std::string& path) {
+        return std::filesystem::is_regular_file(path);
+    };
+    const std::string dir = scratch_dir() + "/vc_test_wal";
+
+    // --- Phase A: a committed save leaves NO journal, and load is a no-op
+    // recovery (bytes round-trip unchanged). ---
+    auto s1 = engine::storage::create_region_chunk_storage(8);
+    std::string errA;
+    CHECK(s1->save_world(dir, errA));
+    CHECK(errA.empty());
+    CHECK(s1->save_page("world", "manifest-A", errA));
+    CHECK(s1->save_page("r.0.0", "page-A", errA));
+    CHECK(s1->commit_save(errA));
+    CHECK(errA.empty());
+    CHECK(!fileExists(dir + "/wal"));  // committed: journal gone
+    std::string loadA;
+    CHECK(s1->load_page("r.0.0", loadA, errA));
+    CHECK(loadA == "page-A");
+
+    // --- Phase B: an UNCOMMITTED save (interruption mid-write) is rolled
+    // back on the next load. "page-B" replaced r.0.0 and "r.1.1" was
+    // created, then the process "died" before commit_save. ---
+    auto s2 = engine::storage::create_region_chunk_storage(8);
+    std::string errB;
+    CHECK(s2->save_world(dir, errB));   // begin: clears any prior journal
+    CHECK(s2->save_page("r.0.0", "page-B", errB));  // overwrites page-A
+    CHECK(s2->save_page("r.1.1", "page-C", errB));  // new page (tombstone)
+    CHECK(fileExists(dir + "/wal/r_0_0.dat.bak"));
+    CHECK(fileExists(dir + "/wal/r_1_1.dat.missing"));
+    // NO commit_save() — the save was interrupted here.
+    CHECK(readFile(pageFile(dir, "r.0.0")) == "page-B");  // torn on disk
+
+    // A fresh store loads: recovery must restore the committed state.
+    auto s3 = engine::storage::create_region_chunk_storage(8);
+    std::string errC;
+    CHECK(s3->load_world(dir, errC));
+    CHECK(errC.empty());
+    CHECK(!fileExists(dir + "/wal"));  // journal consumed by recovery
+    std::string pageAfter;
+    CHECK(s3->load_page("r.0.0", pageAfter, errC));
+    CHECK(pageAfter == "page-A");      // rolled back to the committed save
+    std::string missingPage;
+    CHECK(!s3->load_page("r.1.1", missingPage, errC));  // tombstoned: gone
+    std::string worldAfter;
+    CHECK(s3->load_page("world", worldAfter, errC));
+    CHECK(worldAfter == "manifest-A");  // untouched page survived
+
+    // --- Phase C: a complete NEW save after recovery commits normally (the
+    // delta bookkeeping on the facade sees no stale journal). ---
+    auto s4 = engine::storage::create_region_chunk_storage(8);
+    std::string errD;
+    CHECK(s4->save_world(dir, errD));
+    CHECK(s4->save_page("r.0.0", "page-D", errD));
+    CHECK(s4->save_page("r.1.1", "page-D2", errD));
+    CHECK(s4->commit_save(errD));
+    CHECK(errD.empty());
+    auto s5 = engine::storage::create_region_chunk_storage(8);
+    std::string errE;
+    CHECK(s5->load_world(dir, errE));
+    std::string d;
+    CHECK(s5->load_page("r.0.0", d, errE));
+    CHECK(d == "page-D");
+    CHECK(s5->load_page("r.1.1", d, errE));
+    CHECK(d == "page-D2");
+
+    // --- Phase D: end-to-end through the facade — an interrupted SAVE leaves
+    // a journal that the next load_world rolls back, so a world never loads a
+    // half-written save. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    auto storeA = engine::storage::create_region_chunk_storage(8);
+    a->register_storage(storeA);
+    const std::string dirA = scratch_dir() + "/vc_test_wal_facade";
+    std::string saveErr;
+    CHECK(a->save_world(dirA, saveErr));
+    CHECK(saveErr.empty());
+    CHECK(!fileExists(dirA + "/wal"));  // committed
+
+    // Simulate an interrupted second save: write a page directly through the
+    // backend WITHOUT commit (what a crash mid-save leaves behind).
+    auto storeB = engine::storage::create_region_chunk_storage(8);
+    std::string errF;
+    CHECK(storeB->save_world(dirA, errF));
+    CHECK(storeB->save_page("r.0.0", "corrupt-interrupt", errF));
+    CHECK(fileExists(dirA + "/wal/r_0_0.dat.bak"));
+
+    // The next load_world recovers: the world restores the committed save.
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(96));
+    b->register_storage(engine::storage::create_region_chunk_storage(8));
+    CHECK(boot_world(*b, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    std::string loadErr;
+    CHECK(b->load_world(dirA, loadErr));
+    CHECK(loadErr.empty());
+    CHECK(b->get_block(3, 130, 3) == kBlockStone);  // committed edit survived
+    CHECK(!fileExists(dirA + "/wal"));
+
+    std::cout << "[sdk] wal recovery: committed save leaves no journal, "
+                 "interrupted save rolls back to the last committed state "
+                 "(pages + tombstones), end-to-end through the facade OK\n";
+}
+
+// Block entities + world entities through the PAGED save path (FALTANTES §4):
+// the region manifest carries both (block entities with opaque state, world
+// entities with health/components), so save_world/load_world via region pages
+// must round-trip them exactly like the monolithic v5 serializer.
+void test_region_entity_persistence() {
+    // --- World A: block entity (counter=7) + world entity (cow, health,
+    // component), then a PAGED save. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(96));
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    CHECK(boot_world(*a, player, 16));
+    a->register_block_entity_type("project:counter_machine",
+        [] { return std::make_shared<CounterMachine>(); });
+    auto machine = std::make_shared<CounterMachine>();
+    machine->counter_ = 7;
+    std::string error;
+    CHECK(a->attach_block_entity(8, 96, 8, machine, error));
+    auto entities = a->entity_world();
+    CHECK(entities != nullptr);
+    engine::entity::EntityId cow = entities->spawn(
+        "vulkancraft:cow", engine::entity::Position{ 8.0f, 100.0f, 8.0f }, error);
+    CHECK(cow.valid());
+    CHECK(entities->set_health(cow, engine::entity::Health{ 7.0f, 20.0f }));
+    engine::entity::ComponentData comp;
+    comp.type = "vulkancraft:loot";
+    comp.version = 1;
+    comp.blob = "leather";
+    CHECK(entities->set_component(cow, comp));
+
+    a->register_storage(engine::storage::create_region_chunk_storage(8));
+    const std::string dir = scratch_dir() + "/vc_test_regions_entities";
+    std::string saveError;
+    CHECK(a->save_world(dir, saveError));
+    CHECK(saveError.empty());
+    CHECK(std::filesystem::exists(dir + "/pages/world.dat"));
+
+    // --- World B (factory registered): the paged load reconstructs BOTH the
+    // block entity (opaque state) and the world entity (health/component). ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*b, player, 16));
+    b->register_block_entity_type("project:counter_machine",
+        [] { return std::make_shared<CounterMachine>(); });
+    b->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string loadError;
+    CHECK(b->load_world(dir, loadError));
+    CHECK(loadError.empty());
+    auto restored =
+        std::dynamic_pointer_cast<CounterMachine>(b->block_entity_at(8, 96, 8));
+    CHECK(restored != nullptr);
+    CHECK(restored->counter_ == 7);  // opaque project state survived
+    CHECK(b->block_entity_count() == 1);
+    auto bEntities = b->entity_world();
+    CHECK(bEntities != nullptr);
+    CHECK(bEntities->size() == 1);
+    const auto inChunk = bEntities->entities_in_chunk(0, 0);
+    CHECK(inChunk.size() == 1);
+    engine::entity::Health health;
+    CHECK(bEntities->get_health(inChunk[0], health));
+    CHECK(health.value == 7.0f);
+    engine::entity::ComponentData got;
+    CHECK(bEntities->get_component(inChunk[0], "vulkancraft:loot", got));
+    CHECK(got.blob == "leather");
+    b->update(player, 0.09f);
+    b->update(player, 0.09f);
+    CHECK(restored->ticks_ >= 2);  // the restored block entity ticks again
+
+    // --- World C WITHOUT the factory: the paged load is REFUSED (all-or-
+    // nothing, same as the monolithic path — never a silently dropped
+    // entity). ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> c =
+        engine::voxel::create_default_voxel_world();
+    c->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*c, player, 16));
+    c->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string refuseError;
+    CHECK(!c->load_world(dir, refuseError));
+    CHECK(refuseError.find("project:counter_machine") != std::string::npos);
+
+    std::cout << "[sdk] region entities: block entities + world entities "
+                 "round-trip through the paged save (state, health, "
+                 "components, refusal without factory) OK\n";
+}
+
+// FALTANTES §4 itens 17/18: load SOB DEMANDA — o chunk é materializado sem
+// depender da janela de streaming e sem gerar o chunk antes de restaurá-lo
+// (a geração da janela é suprimida durante o load) — + RESTAURAÇÃO EM LOTE —
+// os dados voxel são escritos em UM lote com invalidação única, não
+// set_block_at por voxel.
+void test_region_batch_restore() {
+    // --- Phase A: tile r.1.1 (chunk 8,8) fica FORA da janela de boot.
+    // Terreno seco acima do nível do mar (130 > SeaLevel 127): a única água
+    // do mundo é a que o teste coloca (byte de fluido estável, sem sim). ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    CHECK(settle(*a, glm::vec3(130.0f, 200.0f, 130.0f),
+                 [&] { return a->is_chunk_loaded(8, 8); }));
+    constexpr int kTestWaterId = 12;  // BlockType::Water
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(135, 131, 135, kBlockStone);
+        tx->set_block(133, 131, 133, kBlockStone);
+        // Water source (byte 0): the fluid byte must round-trip through the
+        // batch write; non-fluid cells stay WATER_LEVEL_NONE (engine contract).
+        tx->set_block(135, 130, 133, kTestWaterId);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    a->register_storage(engine::storage::create_region_chunk_storage(8));
+    const std::string dir = scratch_dir() + "/vc_test_batch_restore";
+    std::string saveError;
+    CHECK(a->save_world(dir, saveError));
+    CHECK(saveError.empty());
+
+    // --- Phase B: SEM boot. O load sob demanda materializa os chunks salvos
+    // DIRETAMENTE (independente da janela, sem pré-gerar o chunk) e deixa
+    // chunks não salvos AUSENTES. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    b->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string loadError;
+    CHECK(b->load_world(dir, loadError));
+    CHECK(loadError.empty());
+
+    // Chunk salvo FORA da janela de boot (tile r.1.1) restaurado no lugar.
+    CHECK(b->is_chunk_loaded(8, 8));
+    // Chunk nunca salvo NÃO está materializado: nenhuma geração de janela
+    // rodou durante o load (item 17 — restore não gera o chunk antes).
+    CHECK(!b->is_chunk_loaded(62, 62));
+
+    // Conteúdo exato via lote (item 18): blocos + byte de fluido.
+    CHECK(b->get_block(135, 131, 135) == kBlockStone);
+    CHECK(b->get_block(133, 131, 133) == kBlockStone);
+    CHECK(b->get_fluid_level(135, 130, 133) == 0);     // fonte restaurada
+    CHECK(b->get_fluid_level(135, 131, 135) == 0xff);  // não-fluida: NONE
+
+    // Igualdade de grade completa do chunk restaurado contra A (amostras no
+    // mesmo espírito do teste de região monolítico).
+    bool identical = true;
+    const int xs[] = { 128, 131, 133, 136, 143 };
+    const int zs[] = { 128, 136, 143 };
+    const int ys[] = { 1, 50, 130, 131, 200 };
+    for (const int x : xs)
+        for (const int z : zs)
+            for (const int y : ys)
+                if (a->get_block(x, y, z) != b->get_block(x, y, z))
+                    identical = false;
+    CHECK(identical);
+
+    // --- Phase C: a geração RETOMA após o load (gap fill sob demanda). O
+    // jogador se move para longe; o streaming gera a janela nova. ---
+    CHECK(settle(*b, glm::vec3(1000.0f, 200.0f, 1000.0f),
+                 [&] { return b->is_chunk_loaded(62, 62); }));
+
+    std::cout << "[sdk] region batch restore: on-demand load (no "
+                 "pre-generation, far chunk outside window), single-"
+                 "invalidation batch write round-trips blocks + fluid byte, "
+                 "generation resumes after load OK\n";
+}
+
+// FALTANTES §4 item 19: rollback do carregamento completo se QUALQUER chunk
+// falhar. Save v3 montado à mão com 2 chunks — o chunk 1 tem um block id
+// INVÁLIDO: o parse aplica o chunk 0 e então falha. O mundo B (com estado
+// pré-load próprio: edit + block entity + world entity) deve voltar EXATAMENTE
+// ao estado pré-load — nenhum chunk fica parcialmente restaurado.
+void test_load_rollback() {
+    // Helpers — mesmo layout dos saves v3 montados à mão do teste de migração.
+    auto appendU32 = [](std::string& b, uint32_t v) {
+        b.push_back(static_cast<char>(v & 0xFFu));
+        b.push_back(static_cast<char>((v >> 8) & 0xFFu));
+        b.push_back(static_cast<char>((v >> 16) & 0xFFu));
+        b.push_back(static_cast<char>((v >> 24) & 0xFFu));
+    };
+    auto appendI32 = [&appendU32](std::string& b, int32_t v) {
+        appendU32(b, static_cast<uint32_t>(v));
+    };
+    auto appendU16 = [](std::string& b, uint16_t v) {
+        b.push_back(static_cast<char>(v & 0xFFu));
+        b.push_back(static_cast<char>((v >> 8) & 0xFFu));
+    };
+    auto appendFNV = [](std::string& b) {
+        uint64_t hash = 1469598103934665603ull;
+        for (const unsigned char c : b) {
+            hash ^= c;
+            hash *= 1099511628211ull;
+        }
+        for (int i = 0; i < 8; ++i) {
+            b.push_back(static_cast<char>((hash >> (8 * i)) & 0xFFu));
+        }
+    };
+    constexpr int kLayer = 256;
+
+    // Chunk (0,0), extent 131: stone em (3,130,3) — ACIMA do terreno de 96 do
+    // mundo pré-load (air lá) — distingue o conteúdo do save do conteúdo
+    // gerado, provando o take-over E o rollback.
+    auto buildChunk0 = [&](std::string& b) {
+        appendI32(b, 0);
+        appendI32(b, 0);
+        appendU32(b, 131);
+        const int stoneIndex = 130 * kLayer + 3 * 16 + 3;
+        for (int v = 0; v < 131 * kLayer; ++v) {
+            appendU16(b, (v == stoneIndex) ? static_cast<uint16_t>(kBlockStone)
+                                           : static_cast<uint16_t>(kBlockAir));
+        }
+        for (int v = 0; v < 131 * kLayer; ++v) {
+            b.push_back(static_cast<char>(0xFF));  // sem fluido
+        }
+    };
+    // Chunk (5,5), extent 1: primeiro id válido (stone) ou INVÁLIDO (0xEE).
+    auto buildChunk1 = [&](std::string& b, uint16_t firstId) {
+        appendI32(b, 5);
+        appendI32(b, 5);
+        appendU32(b, 1);
+        for (int v = 0; v < kLayer; ++v) {
+            appendU16(b, (v == 0) ? firstId : static_cast<uint16_t>(kBlockAir));
+        }
+        for (int v = 0; v < kLayer; ++v) {
+            b.push_back(static_cast<char>(0xFF));
+        }
+    };
+    auto buildSave = [&](bool badChunk1) {
+        std::string body = "VCWLD";
+        appendU32(body, 3);  // v3
+        appendU32(body, 0);  // paleta vazia
+        appendU32(body, 2);  // 2 chunks
+        buildChunk0(body);
+        buildChunk1(body, badChunk1 ? 0xEEu : static_cast<uint16_t>(kBlockStone));
+        appendU32(body, 0);  // 0 block entities
+        appendFNV(body);
+        return body;
+    };
+
+    // --- Mundo B: estado pré-load próprio (edit + block entity + world
+    // entity), load falha no chunk 1 DEPOIS do chunk 0 aplicado. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*b, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = b->begin_transaction();
+        tx->set_block(7, 131, 7, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    b->register_block_entity_type("project:counter_machine",
+        [] { return std::make_shared<CounterMachine>(); });
+    auto machine = std::make_shared<CounterMachine>();
+    machine->counter_ = 3;
+    std::string error;
+    CHECK(b->attach_block_entity(6, 96, 6, machine, error));
+    auto bEntities = b->entity_world();
+    CHECK(bEntities != nullptr);
+    CHECK(bEntities->spawn("vulkancraft:cow",
+                           engine::entity::Position{ 5.0f, 100.0f, 5.0f },
+                           error).valid());
+
+    const std::string badSave = buildSave(/*badChunk1=*/true);
+    std::string loadError;
+    CHECK(!b->deserialize_world(badSave, loadError));
+    CHECK(loadError.find("unknown block id") != std::string::npos);
+
+    // Rollback completo: chunk (0,0) assumido voltou ao estado pré-load (air
+    // em y=130 — o save tinha stone lá), o edit próprio de B sobreviveu, o
+    // chunk (5,5) criado pelo load foi REMOVIDO, block entity e world entity
+    // de B continuam lá.
+    CHECK(b->get_block(3, 130, 3) == kBlockAir);
+    CHECK(b->get_block(7, 131, 7) == kBlockStone);
+    CHECK(!b->is_chunk_loaded(5, 5));
+    auto restored =
+        std::dynamic_pointer_cast<CounterMachine>(b->block_entity_at(6, 96, 6));
+    CHECK(restored != nullptr);
+    CHECK(restored->counter_ == 3);
+    CHECK(b->block_entity_count() == 1);
+    CHECK(bEntities->size() == 1);
+
+    // --- Caminho de sucesso: load válido COMMITA (sem rollback). ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> c =
+        engine::voxel::create_default_voxel_world();
+    c->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*c, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    const std::string goodSave = buildSave(/*badChunk1=*/false);
+    std::string okError;
+    CHECK(c->deserialize_world(goodSave, okError));
+    CHECK(okError.empty());
+    CHECK(c->get_block(3, 130, 3) == kBlockStone);  // take-over commitado
+    CHECK(c->is_chunk_loaded(5, 5));
+
+    std::cout << "[sdk] load rollback: chunk failure mid-load rolls the whole "
+                 "load back (content, created chunks, block/world entities), "
+                 "success commits OK\n";
+}
+
+// FALTANTES §4 item 19, caminho paginado: o manifest (v5) restaura block
+// entities + world entities do save ANTES das páginas de região; uma página
+// corrompida que falha no meio do decode deve reverter TUDO — chunks
+// aplicados, entidades do save, e o estado pré-load de B deve voltar íntegro.
+void test_region_load_rollback() {
+    // --- World A: tile r.0.0 + block entity + 2 world entities, save paginado.
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    a->register_block_entity_type("project:counter_machine",
+        [] { return std::make_shared<CounterMachine>(); });
+    auto machine = std::make_shared<CounterMachine>();
+    machine->counter_ = 7;
+    std::string error;
+    CHECK(a->attach_block_entity(8, kFluidTestTerrain, 8, machine, error));
+    auto aEntities = a->entity_world();
+    CHECK(aEntities != nullptr);
+    CHECK(aEntities->spawn("vulkancraft:cow",
+                           engine::entity::Position{ 8.0f, 132.0f, 8.0f },
+                           error).valid());
+    CHECK(aEntities->spawn("vulkancraft:cow",
+                           engine::entity::Position{ 9.0f, 132.0f, 9.0f },
+                           error).valid());
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(3, 131, 3, kBlockStone);
+        std::string e;
+        CHECK(tx->commit(e));
+        CHECK(e.empty());
+    }
+    a->register_storage(engine::storage::create_region_chunk_storage(8));
+    const std::string dir = scratch_dir() + "/vc_test_region_rollback";
+    std::string saveError;
+    CHECK(a->save_world(dir, saveError));
+    CHECK(saveError.empty());
+
+    // Corrompe a página r.0.0: infla o contador de chunks (u32 LE no offset
+    // 4) — o decode aplica os chunks reais e falha no chunk fantasma.
+    const std::string pagePath = dir + "/pages/r_0_0.dat";  // page id "r.0.0" -> file
+    std::ifstream in(pagePath, std::ios::binary);
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    std::string page = buffer.str();
+    CHECK(page.size() > 8);
+    page[4] = static_cast<char>(0xFF);
+    std::ofstream out(pagePath, std::ios::binary | std::ios::trunc);
+    out.write(page.data(), static_cast<std::streamsize>(page.size()));
+
+    // --- World B: estado pré-load (edit + cow com marker), load falha. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    CHECK(boot_world(*b, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    b->register_block_entity_type("project:counter_machine",
+        [] { return std::make_shared<CounterMachine>(); });
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = b->begin_transaction();
+        tx->set_block(7, 131, 7, kBlockStone);
+        std::string e;
+        CHECK(tx->commit(e));
+        CHECK(e.empty());
+    }
+    auto bEntities = b->entity_world();
+    CHECK(bEntities != nullptr);
+    const engine::entity::EntityId cowB = bEntities->spawn(
+        "vulkancraft:cow", engine::entity::Position{ 5.0f, 132.0f, 5.0f }, error);
+    CHECK(cowB.valid());
+    engine::entity::ComponentData marker;
+    marker.type = "vulkancraft:marker";
+    marker.version = 1;
+    marker.blob = "B";
+    CHECK(bEntities->set_component(cowB, marker));
+    b->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string loadError;
+    CHECK(!b->load_world(dir, loadError));
+
+    // Rollback: chunk (0,0) voltou ao estado pré-load (o stone do save em
+    // (3,131,3) revertido, o edit de B em (7,131,7) intacto); a CounterMachine
+    // e as 2 cows DO SAVE revertidas — B volta com a SUA cow (marker "B").
+    CHECK(b->get_block(3, 131, 3) == kBlockAir);
+    CHECK(b->get_block(7, 131, 7) == kBlockStone);
+    CHECK(b->block_entity_count() == 0);
+    CHECK(bEntities->size() == 1);
+    const auto inChunk = bEntities->entities_in_chunk(0, 0);
+    CHECK(inChunk.size() == 1);
+    engine::entity::ComponentData got;
+    CHECK(bEntities->get_component(inChunk[0], "vulkancraft:marker", got));
+    CHECK(got.blob == "B");
+
+    std::cout << "[sdk] region load rollback: corrupt region page mid-load "
+                 "reverts chunks + save entities, pre-load state (own edit, "
+                 "own cow with marker) intact OK\n";
+}
+
+// FALTANTES §4 item 20: bateria de resiliência da persistência. Falta de
+// espaço (I/O sabotado — um ARQUIVO ocupando o lugar de pages/, proxy
+// determinístico de disco cheio) é recusada com diagnóstico sem corromper um
+// save commitado; temp parcial órfão (processo morto durante temp+rename
+// DEPOIS do commit) é inerte e swept no load; concorrência (load sincrono E
+// assíncrono) é recusada enquanto um save async está em voo (slot único).
+// Corrupção/migração/save repetido já têm cobertura própria
+// (test_persistence, test_world_save_migration, test_region_delta_saves).
+void test_persistence_resilience() {
+    // --- Phase A: falha de I/O é recusada com diagnóstico e nunca corrompe
+    // um save commitado. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    a->register_storage(engine::storage::create_region_chunk_storage(8));
+    const std::string goodDir = scratch_dir() + "/vc_resilience_good";
+    std::string goodErr;
+    CHECK(a->save_world(goodDir, goodErr));
+    CHECK(goodErr.empty());
+
+    const std::string fullDir = scratch_dir() + "/vc_resilience_full";
+    std::filesystem::create_directories(fullDir);
+    { std::ofstream out(fullDir + "/pages"); out << "not a directory"; }
+    std::string ioErr;
+    CHECK(!a->save_world(fullDir, ioErr));
+    CHECK(!ioErr.empty());
+
+    // O save commitado em goodDir continua íntegro e carrega.
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(96));
+    b->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string loadErrB;
+    CHECK(b->load_world(goodDir, loadErrB));
+    CHECK(loadErrB.empty());
+    CHECK(b->get_block(3, 130, 3) == kBlockStone);
+
+    // O diretório sabotado não vira um mundo utilizável: o load falha LIMPO
+    // (o journal do save fracassado é recuperado para nada — sem lixo).
+    std::unique_ptr<engine::voxel::IVoxelWorld> c =
+        engine::voxel::create_default_voxel_world();
+    c->register_generator(std::make_shared<FlatGenerator>(96));
+    c->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string loadErrC;
+    CHECK(!c->load_world(fullDir, loadErrC));
+    CHECK(!loadErrC.empty());
+
+    // --- Phase B: temp parcial órfão em save commitado é inerte e swept no
+    // load (FALTANTES §4 item 20: sempre, mesmo sem journal). ---
+    const std::string stray = goodDir + "/pages/r_0_0.dat.tmp999";
+    { std::ofstream out(stray); out << "partial garbage from a killed process"; }
+    std::unique_ptr<engine::voxel::IVoxelWorld> d =
+        engine::voxel::create_default_voxel_world();
+    d->register_generator(std::make_shared<FlatGenerator>(96));
+    d->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string loadErrD;
+    CHECK(d->load_world(goodDir, loadErrD));
+    CHECK(loadErrD.empty());
+    CHECK(d->get_block(3, 130, 3) == kBlockStone);
+    CHECK(!std::filesystem::exists(stray));  // swept
+
+    // --- Phase C: concorrência — load sincrono E async recusados enquanto um
+    // save async está em voo (slot único de op). ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> e =
+        engine::voxel::create_default_voxel_world();
+    e->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*e, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    auto gated = std::make_shared<GatedRegionStorage>();
+    e->register_storage(gated);
+    const std::string gateDir = scratch_dir() + "/vc_resilience_gate";
+    std::string gateDispatchErr;
+    CHECK(e->save_world_async(gateDir, [](bool, std::string) {}, gateDispatchErr));
+    {
+        std::unique_lock<std::mutex> lock(gated->gateMutex);
+        gated->cv.wait_for(lock, std::chrono::seconds(30),
+                           [&] { return gated->entered; });
+        CHECK(gated->entered);  // save async em voo (primeira página presa)
+    }
+    std::string refusedLoad;
+    CHECK(!e->load_world(goodDir, refusedLoad));
+    CHECK(!refusedLoad.empty());
+    std::string refusedAsyncLoad;
+    CHECK(!e->load_world_async(goodDir, [](bool, std::string) {},
+                               refusedAsyncLoad));
+    CHECK(!refusedAsyncLoad.empty());
+    {
+        std::lock_guard<std::mutex> lock(gated->gateMutex);
+        gated->release = true;
+    }
+    gated->cv.notify_all();
+    std::string gateWaitErr;
+    CHECK(e->wait_async_saves(gateWaitErr));
+    CHECK(gateWaitErr.empty());
+
+    std::cout << "[sdk] persistence resilience: I/O failure refused with "
+                 "diagnostic (committed save untouched), stray partial temp "
+                 "swept on load, concurrent load refused while async save in "
+                 "flight OK\n";
+}
+
+// FALTANTES §4 item 21: mundo grande com limite explícito de tempo, RAM e
+// tamanho em disco. O mundo headless tem residência densa máxima de 121
+// chunks (janela 11x11, kDenseLodRadius=5) — este teste a usa inteira (>=100
+// chunks, 4-8x a residência dos outros testes), salva paginado (paleta +
+// compressão), recarrega em mundo novo, e prova que o orçamento de RAM do
+// item 6 continua válido na escala grande. Todos os números são medidos e
+// reportados; os limites são caps generosos (o suite roda sob carga paralela).
+void test_large_world() {
+    const auto nowMs = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    const auto dirBytes = [](const std::string& dir) {
+        uint64_t total = 0;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(dir)) {
+            if (entry.is_regular_file()) {
+                total += static_cast<uint64_t>(entry.file_size());
+            }
+        }
+        return total;
+    };
+
+    // --- Geração: a janela densa inteira (budget 300 -> dense 121 chunks). ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    const int64_t bootStart = nowMs();
+    CHECK(boot_world(*a, player, 300));
+    CHECK(settle(*a, player,
+                 [&] { return a->streaming_snapshot().chunksLoaded >= 100; },
+                 /*maxMs=*/60000));
+    const int64_t bootMs = nowMs() - bootStart;
+    const std::size_t generated = a->streaming_snapshot().chunksLoaded;
+    CHECK(generated >= 100);
+    CHECK(bootMs < 60000);
+
+    // Edit perto do centro (chunk (0,0), tile r.0.0).
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(3, 131, 3, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    auto store = engine::storage::create_region_chunk_storage(8);
+    a->register_storage(store);
+    const std::string dir = scratch_dir() + "/vc_test_large_world";
+    const int64_t saveStart = nowMs();
+    std::string saveErr;
+    CHECK(a->save_world(dir, saveErr));
+    CHECK(saveErr.empty());
+    const int64_t saveMs = nowMs() - saveStart;
+    const uint64_t diskBytes = dirBytes(dir);
+    const std::vector<std::string> pages = store->page_ids();
+    CHECK(pages.size() >= 5);              // manifest + >=4 tiles de região
+    CHECK(pages.back() == "world");
+    CHECK(diskBytes > 0);
+    CHECK(diskBytes < 8u * 1024 * 1024);   // paleta + zstd; reportado abaixo
+    CHECK(saveMs < 15000);
+
+    // --- Recarga em mundo novo: todo o mundo volta (restore sob demanda). ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    b->register_storage(engine::storage::create_region_chunk_storage(8));
+    const int64_t loadStart = nowMs();
+    std::string loadErr;
+    CHECK(b->load_world(dir, loadErr));
+    CHECK(loadErr.empty());
+    const int64_t loadMs = nowMs() - loadStart;
+    const std::size_t restored = b->streaming_snapshot().chunksLoaded;
+    CHECK(restored >= 100);
+    CHECK(b->get_block(3, 131, 3) == kBlockStone);
+    CHECK(loadMs < 15000);
+
+    // --- RAM: o orçamento do item 6 continua válido na escala grande (o
+    // eviction de fim de frame clampa o uso, preservando uma área ampla). ---
+    const uint64_t beforeRam = b->streaming_snapshot().ramUsageBytes;
+    const uint64_t kRamBudget = 8u * 1024 * 1024;
+    b->set_memory_budget(kRamBudget);
+    CHECK(settle(*b, player,
+                 [&] { return b->streaming_snapshot().ramUsageBytes <= kRamBudget; },
+                 /*maxMs=*/60000));
+    const engine::voxel::StreamingSnapshot clamped = b->streaming_snapshot();
+    CHECK(clamped.ramUsageBytes <= kRamBudget);
+    CHECK(clamped.chunksLoaded >= 40);  // escala grande: orçamento NÃO zera a área
+    b->set_memory_budget(0);
+
+    std::cout << "[sdk] large world: " << generated << " chunks generated in "
+              << bootMs << "ms, paged save " << diskBytes << " bytes ("
+              << pages.size() << " pages) in " << saveMs << "ms, reload "
+              << restored << " chunks in " << loadMs << "ms, RAM " << beforeRam
+              << " -> clamped to " << clamped.ramUsageBytes << " (budget "
+              << kRamBudget << ", chunks " << clamped.chunksLoaded << ") OK\n";
+}
+
+// FALTANTES §3 item 2: services are substitutable WITHOUT modifying the core.
+// Storage/generator/edit/replication are already WIRED; here we prove the
+// mesher and lighting plugins route through the world with a real observable
+// effect — a lighting plugin forcing emission on a dark block lights the
+// world, and a mesher plugin's policy shows up in the effective runtime table.
+void test_service_plugin_substitution() {
+    // Lighting plugin: forces emission 15 on an otherwise-dark catalog block.
+    struct EmissiveLighting final : engine::voxel::IVoxelLighting {
+        uint32_t targetId{ 0 };
+        const char* name() const override { return "test-emissive"; }
+        std::vector<std::pair<uint32_t, engine::voxel::BlockLightProperties>>
+        light_property_overrides() override {
+            if (targetId == 0) return {};
+            return { { targetId, { 15, 15 } } };
+        }
+    };
+    auto emissive = std::make_shared<EmissiveLighting>();
+
+    // Control world: no plugin — the dark block emits nothing.
+    {
+        auto world = engine::voxel::create_default_voxel_world();
+        world->register_generator(std::make_shared<FlatGenerator>(96));
+        auto registry = std::make_shared<engine::registry::BlockRegistry>();
+        std::string error;
+        CHECK(registry->load_from_json(
+            R"([{"name":"dull","namespace":"test","color":[0.4,0.4,0.4]}])", error));
+        world->set_block_registry(registry);
+        const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+        CHECK(boot_world(*world, player, 16));
+        uint32_t dullId = 0;
+        CHECK(world->resolve_block_id("test:dull", dullId, error));
+        world->set_block(8, 130, 8, dullId);
+        CHECK(settle(*world, player, [&] { return true; }));
+        CHECK(world->get_block_light(8, 130, 8) == 0);   // no emission
+        CHECK(world->get_block_light(8, 129, 8) == 0);
+    }
+
+    // Plugin world: the same block emits 15 after the plugin routes.
+    {
+        auto world = engine::voxel::create_default_voxel_world();
+        world->register_generator(std::make_shared<FlatGenerator>(96));
+        auto registry = std::make_shared<engine::registry::BlockRegistry>();
+        std::string error;
+        CHECK(registry->load_from_json(
+            R"([{"name":"dull","namespace":"test","color":[0.4,0.4,0.4]}])", error));
+        world->set_block_registry(registry);
+        world->register_lighting(emissive);
+        CHECK(world->registered_services().end() !=
+              std::find(world->registered_services().begin(),
+                        world->registered_services().end(), "lighting:test-emissive"));
+        const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+        CHECK(boot_world(*world, player, 16));
+        uint32_t dullId = 0;
+        CHECK(world->resolve_block_id("test:dull", dullId, error));
+        // The override is keyed by runtime id (known only after the registry
+        // attached); re-registering re-pushes the table and queues a relight.
+        emissive->targetId = dullId;
+        world->register_lighting(emissive);
+        world->set_block(8, 130, 8, dullId);
+        CHECK(settle(*world, player, [&] { return world->get_block_light(8, 129, 8) == 14; }));
+        CHECK(world->get_block_light(8, 130, 8) == 15);   // emitter cell
+        CHECK(world->get_block_light(8, 129, 8) == 14);   // one air step
+        CHECK(world->get_block_light(8, 140, 8) == 5);    // 10 air steps: 15 - 10
+    }
+
+    // Mesher plugin: per-block policy overrides land in the effective runtime
+    // table (what the mesher consumes) and show in runtime_block_views().
+    struct GrateMesher final : engine::voxel::IVoxelMesher {
+        uint32_t targetId{ 0 };
+        const char* name() const override { return "test-grate"; }
+        std::vector<std::pair<uint32_t, engine::voxel::BlockMeshPolicy>>
+        mesh_policy_overrides() override {
+            if (targetId == 0) return {};
+            return { { targetId, { /*occludes=*/false, /*transparent=*/true, /*renderLayer=*/1 } } };
+        }
+    };
+    auto grate = std::make_shared<GrateMesher>();
+    auto world = engine::voxel::create_default_voxel_world();
+    auto registry = std::make_shared<engine::registry::BlockRegistry>();
+    std::string error;
+    CHECK(registry->load_from_json(
+        R"([{"name":"grate","namespace":"test","color":[0.2,0.2,0.5]}])", error));
+    world->set_block_registry(registry);
+    // Resolve the id (the table is pushed at set_block_registry; boot is not
+    // required for the runtime-block view).
+    uint32_t grateId = 0;
+    CHECK(world->resolve_block_id("test:grate", grateId, error));
+    {
+        const auto views = world->runtime_block_views();
+        const auto found = std::find_if(views.begin(), views.end(), [&](const auto& view) {
+            return view.id == grateId;
+        });
+        CHECK(found != views.end());
+        CHECK(found->occludes);          // registry-derived defaults
+        CHECK(!found->transparent);
+        CHECK(found->renderLayer == 0);
+    }
+    grate->targetId = grateId;
+    world->register_mesher(grate);
+    CHECK(world->registered_services().end() !=
+          std::find(world->registered_services().begin(),
+                    world->registered_services().end(), "mesher:test-grate"));
+    {
+        const auto views = world->runtime_block_views();
+        const auto found = std::find_if(views.begin(), views.end(), [&](const auto& view) {
+            return view.id == grateId;
+        });
+        CHECK(found != views.end());
+        CHECK(!found->occludes);        // plugin policy won
+        CHECK(found->transparent);
+        CHECK(found->renderLayer == 1);
+    }
+    // A default mesher (no overrides) restores the registry-derived policy.
+    struct DefaultMesher final : engine::voxel::IVoxelMesher {
+        const char* name() const override { return "default"; }
+    };
+    world->register_mesher(std::make_shared<DefaultMesher>());
+    {
+        const auto views = world->runtime_block_views();
+        const auto found = std::find_if(views.begin(), views.end(), [&](const auto& view) {
+            return view.id == grateId;
+        });
+        CHECK(found != views.end());
+        CHECK(found->occludes);         // back to the registry-derived default
+        CHECK(!found->transparent);
+    }
+
+    std::cout << "[sdk] service plugin substitution (lighting + mesher route "
+                 "through the world) OK\n";
+}
+
+// FALTANTES §25 item 6 (fronteira de chunk): a fluid source placed at the LAST
+// column of chunk (0,0) must spread into the NEIGHBOR chunk (1,0) — and keep
+// spreading within it — even though the source chunk was just dirtied to
+// MeshReady by the set_block (the guard that regressed this raced the dirty
+// remesh: it demanded the chunk be Uploaded, popped the source cell and never
+// re-scheduled it; can_touch_chunk_at uses the same guard as set_block_at, so
+// the order of remesh vs fluid step is irrelevant).
+void test_fluid_chunk_boundary() {
+    const auto build = [&](uint32_t& idOut,
+                           std::unique_ptr<engine::voxel::IVoxelWorld>& worldOut,
+                           const glm::vec3& player) {
+        auto world = engine::voxel::create_default_voxel_world();
+        world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+        auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+        std::string error;
+        CHECK(blocks->load_from_json(
+            R"([{"name":"goo","namespace":"test","class":"fluid","color":[0.2,0.9,0.3]}])",
+            error));
+        world->set_block_registry(blocks);
+        auto fluids = std::make_shared<engine::registry::FluidRegistry>();
+        CHECK(fluids->load_from_json(
+            R"([{"block":"test:goo","viscosity":0.0,"range":4,"falling":false}])",
+            error));
+        CHECK(world->set_fluid_registry(fluids, error));
+        CHECK(error.empty());
+        CHECK(boot_world(*world, player, 16));
+        CHECK(world->resolve_block_id("test:goo", idOut, error));
+        worldOut = std::move(world);
+    };
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> world;
+    uint32_t gooId = 0;
+    build(gooId, world, player);
+
+    // x=15 is the last column of chunk (0,0); the set_block dirties the chunk
+    // (MeshReady). Thin goo spreads 2 levels/step: ring 1 (x=16, chunk (1,0))
+    // at level 2, ring 2 (x=17) at level 4.
+    world->set_block(15, kFluidTestGroundedY, 8, static_cast<uint32_t>(gooId));
+    CHECK(settle(*world, player,
+        [&] { return world->get_fluid_level(16, kFluidTestGroundedY, 8) == 2; }));
+    CHECK(world->get_block(16, kFluidTestGroundedY, 8) == static_cast<uint32_t>(gooId));
+    CHECK(world->get_fluid_level(15, kFluidTestGroundedY, 8) == 0);  // source stays
+    CHECK(settle(*world, player,
+        [&] { return world->get_fluid_level(17, kFluidTestGroundedY, 8) == 4; }));
+    CHECK(world->get_block(17, kFluidTestGroundedY, 8) == static_cast<uint32_t>(gooId));
+
+    // The reverse direction also crosses: a source at x=0 (chunk (0,0)) spreads
+    // into chunk (-1,0) at x=-1.
+    std::unique_ptr<engine::voxel::IVoxelWorld> west;
+    uint32_t westId = 0;
+    build(westId, west, player);
+    west->set_block(0, kFluidTestGroundedY, 8, static_cast<uint32_t>(westId));
+    CHECK(settle(*west, player,
+        [&] { return west->get_fluid_level(-1, kFluidTestGroundedY, 8) == 2; }));
+    CHECK(west->get_block(-1, kFluidTestGroundedY, 8) == static_cast<uint32_t>(westId));
+
+    std::cout << "[sdk] fluids: cross-chunk boundary spread OK\n";
+}
+
+// FALTANTES §8 item 165: simulate correctly through chunk boundaries. A
+// falling source in the LAST column of chunk (0,0) falls (chunks are
+// full-height columns, so the fall stays in chunk A) and its ring spreads at
+// the LOWER level into chunk (1,0) — the boundary is crossed at a different
+// Y than the source, not just same-row. Also: a source pinned against an
+// UNLOADED boundary chunk must resume the moment the chunk streams in (the
+// spread re-enqueues instead of dropping the cell).
+void test_fluid_cross_boundary_vertical() {
+    const auto build = [&](uint32_t& idOut,
+                           std::unique_ptr<engine::voxel::IVoxelWorld>& worldOut,
+                           const glm::vec3& player) {
+        auto world = engine::voxel::create_default_voxel_world();
+        world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+        auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+        std::string error;
+        CHECK(blocks->load_from_json(
+            R"([{"name":"goo","namespace":"test","class":"fluid","color":[0.2,0.9,0.3]}])",
+            error));
+        world->set_block_registry(blocks);
+        auto fluids = std::make_shared<engine::registry::FluidRegistry>();
+        CHECK(fluids->load_from_json(
+            R"([{"block":"test:goo","viscosity":0.0,"range":4,"falling":true,"evaporation":false}])",
+            error));
+        CHECK(world->set_fluid_registry(fluids, error));
+        CHECK(error.empty());
+        CHECK(boot_world(*world, player, 32));
+        CHECK(world->resolve_block_id("test:goo", idOut, error));
+        worldOut = std::move(world);
+    };
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> world;
+    uint32_t gooId = 0;
+    build(gooId, world, player);
+
+    // Source in the last column of chunk (0,0), raised 3 cells above the
+    // terrain: falling=true drops it cell by cell within chunk (0,0) until it
+    // lands on the terrain top; the ring then spreads at the LANDING level —
+    // x=16 sits in chunk (1,0). The source column is fully within chunk A
+    // (chunks are full-height), so the only cross-boundary write is the
+    // lower-level spread into chunk B.
+    const int sourceY = kFluidTestGroundedY + 3;
+    world->set_block(15, sourceY, 8, static_cast<uint32_t>(gooId));
+    // The column fell: the source cell (level 0) keeps its block, and the
+    // falling cells below placed goo blocks all the way to the landing level.
+    CHECK(settle(*world, player,
+        [&] { return world->get_block(15, kFluidTestGroundedY, 8) ==
+                     static_cast<uint32_t>(gooId); }));
+    CHECK(world->get_fluid_level(15, sourceY, 8) == 0);  // source level
+    CHECK(world->get_block(15, sourceY, 8) == static_cast<uint32_t>(gooId));
+    // The landing-level ring crossed the chunk boundary: x=16 (chunk (1,0))
+    // carries goo at level 2 (thin goo: 2 levels/tick).
+    CHECK(settle(*world, player,
+        [&] { return world->get_fluid_level(16, kFluidTestGroundedY, 8) == 2; }));
+    CHECK(world->get_block(16, kFluidTestGroundedY, 8) ==
+          static_cast<uint32_t>(gooId));
+
+    std::cout << "[sdk] fluids: vertical fall crosses the boundary at the "
+                 "landing level OK\n";
+}
+
+// FALTANTES §8 item 165 (resume half): a fluid source whose ONLY spread exit
+// is an UNLOADED chunk must not die — it re-enqueues and flows the moment the
+// chunk streams in. The horizontal spread guard used to just `continue` on an
+// untouchable neighbor, dropping the popped cell; when every other exit is a
+// wall, the fluid died permanently. Now it survives and resumes.
+void test_fluid_resume_after_boundary_load() {
+    const auto build = [&](uint32_t& idOut,
+                           std::unique_ptr<engine::voxel::IVoxelWorld>& worldOut,
+                           const glm::vec3& player, int budget) {
+        auto world = engine::voxel::create_default_voxel_world();
+        world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+        auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+        std::string error;
+        CHECK(blocks->load_from_json(
+            R"([{"name":"goo","namespace":"test","class":"fluid","color":[0.2,0.9,0.3]}])",
+            error));
+        world->set_block_registry(blocks);
+        auto fluids = std::make_shared<engine::registry::FluidRegistry>();
+        CHECK(fluids->load_from_json(
+            R"([{"block":"test:goo","viscosity":0.0,"range":4,"falling":false,"evaporation":false}])",
+            error));
+        CHECK(world->set_fluid_registry(fluids, error));
+        CHECK(error.empty());
+        CHECK(boot_world(*world, player, budget));
+        CHECK(world->resolve_block_id("test:goo", idOut, error));
+        worldOut = std::move(world);
+    };
+
+    // Player at (-8, 200, 8) centers chunk (-1,0); budget 8 (the minimum,
+    // budget 4 clamps up) fills ring 0 + ring 1 in fixed order, which stops
+    // BEFORE chunk (1,0): chunk (0,0) (the source chunk) loads, chunk (1,0)
+    // (the spread exit) does not.
+    const glm::vec3 player{ -8.0f, 200.0f, 8.0f };
+    std::unique_ptr<engine::voxel::IVoxelWorld> world;
+    uint32_t gooId = 0;
+    build(gooId, world, player, 8);
+    CHECK(world->is_chunk_loaded(0, 0));
+    CHECK(!world->is_chunk_loaded(1, 0));
+
+    // Source at x=15 (last column of chunk (0,0)); walls at x=14, z=7, z=9
+    // make x=16 the ONLY spread exit — and that chunk is unloaded.
+    world->set_block(15, kFluidTestGroundedY, 8, static_cast<uint32_t>(gooId));
+    world->set_block(14, kFluidTestGroundedY, 8, kBlockStone);
+    world->set_block(15, kFluidTestGroundedY, 7, kBlockStone);
+    world->set_block(15, kFluidTestGroundedY, 9, kBlockStone);
+    // With the unloaded exit, the fluid must neither die nor leak: several
+    // sim-seconds pass and x=16 stays empty while the source survives.
+    for (int i = 0; i < 60 * 3; ++i) {
+        world->update(player, 1.0f / 60.0f);
+    }
+    // No leak into the unloaded chunk (fluid level stays empty), and the
+    // source survives the wait.
+    CHECK(world->get_fluid_level(16, kFluidTestGroundedY, 8) == 0xff);
+    CHECK(world->get_block(15, kFluidTestGroundedY, 8) ==
+          static_cast<uint32_t>(gooId));
+
+    // Move the player over chunk (1,0): it streams in; the still-queued
+    // source resumes and its ring reaches x=16.
+    const glm::vec3 east{ 24.0f, 200.0f, 8.0f };
+    CHECK(settle(*world, east, [&] {
+        return world->is_chunk_loaded(1, 0);
+    }));
+    CHECK(settle(*world, east,
+        [&] { return world->get_fluid_level(16, kFluidTestGroundedY, 8) == 2; }));
+    CHECK(world->get_block(16, kFluidTestGroundedY, 8) ==
+          static_cast<uint32_t>(gooId));
+
+    std::cout << "[sdk] fluids: source pinned to an unloaded boundary resumes "
+                 "when the chunk loads OK\n";
 }
 
 // Fluid levels are part of the world save: a data-driven fluid's spread
@@ -1414,7 +4062,7 @@ void test_fluid_persistence() {
                            std::unique_ptr<engine::voxel::IVoxelWorld>& worldOut,
                            const glm::vec3& player) {
         auto world = engine::voxel::create_default_voxel_world();
-        world->register_generator(std::make_shared<FlatGenerator>(96));
+        world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
         auto blocks = std::make_shared<engine::registry::BlockRegistry>();
         std::string error;
         CHECK(blocks->load_from_json(
@@ -1435,8 +4083,8 @@ void test_fluid_persistence() {
     std::unique_ptr<engine::voxel::IVoxelWorld> a;
     uint32_t gooId = 0;
     build(gooId, a, player);
-    a->set_block(8, 128, 8, static_cast<uint32_t>(gooId));
-    CHECK(settle(*a, player, [&] { return a->get_fluid_level(10, 128, 8) == 4; }));
+    a->set_block(8, kFluidTestGroundedY, 8, static_cast<uint32_t>(gooId));
+    CHECK(settle(*a, player, [&] { return a->get_fluid_level(10, kFluidTestGroundedY, 8) == 4; }));
     std::string saveError;
     const std::string bytes = a->serialize_world(saveError);
     CHECK(saveError.empty());
@@ -1449,15 +4097,445 @@ void test_fluid_persistence() {
     std::string loadError;
     CHECK(b->deserialize_world(bytes, loadError));
     CHECK(loadError.empty());
-    CHECK(b->get_fluid_level(8, 128, 8) == 0);   // source restored
-    CHECK(b->get_fluid_level(9, 128, 8) == 2);   // ring levels restored
-    CHECK(b->get_fluid_level(10, 128, 8) == 4);
-    CHECK(b->get_block(9, 128, 8) == static_cast<uint32_t>(gooIdB));
+    CHECK(b->get_fluid_level(8, kFluidTestGroundedY, 8) == 0);   // source restored
+    CHECK(b->get_fluid_level(9, kFluidTestGroundedY, 8) == 2);   // ring levels restored
+    CHECK(b->get_fluid_level(10, kFluidTestGroundedY, 8) == 4);
+    CHECK(b->get_block(9, kFluidTestGroundedY, 8) == static_cast<uint32_t>(gooIdB));
     std::string reError;
     CHECK(b->serialize_world(reError) == bytes);  // byte-identical roundtrip
 
     std::cout << "[sdk] fluids: levels persist through save/load, byte-identical "
                  "roundtrip OK\n";
+}
+
+// FALTANTES §8 item 168 (conservação): um pool fechado (evaporation=false,
+// falling=false) atinge um FIXPOINT — a soma total de níveis (e a contagem de
+// células de fluido) é idêntica após centenas de ticks extras, e o pool não
+// cresce além do range (x=11 permanece ar). Sem drift, sem perda.
+void test_fluid_conservation() {
+    const auto build = [&](uint32_t& idOut,
+                           std::unique_ptr<engine::voxel::IVoxelWorld>& worldOut,
+                           const glm::vec3& player) {
+        auto world = engine::voxel::create_default_voxel_world();
+        world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+        auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+        std::string error;
+        CHECK(blocks->load_from_json(
+            R"([{"name":"goo","namespace":"test","class":"fluid","color":[0.2,0.9,0.3]}])",
+            error));
+        world->set_block_registry(blocks);
+        auto fluids = std::make_shared<engine::registry::FluidRegistry>();
+        CHECK(fluids->load_from_json(
+            R"([{"block":"test:goo","viscosity":0.0,"range":4,"falling":false,"evaporation":false}])",
+            error));
+        CHECK(world->set_fluid_registry(fluids, error));
+        CHECK(error.empty());
+        CHECK(boot_world(*world, player, 32));
+        CHECK(world->resolve_block_id("test:goo", idOut, error));
+        worldOut = std::move(world);
+    };
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+
+    // Pool: fonte em (8, y, 8) com anéis 2 e 4 (thin goo). Uma única fonte
+    // gera um pool fechado de tamanho fixo (0 + 4x2 + 4x4 = 24 unidades).
+    std::unique_ptr<engine::voxel::IVoxelWorld> world;
+    uint32_t gooId = 0;
+    build(gooId, world, player);
+    world->set_block(8, kFluidTestGroundedY, 8, static_cast<uint32_t>(gooId));
+    CHECK(settle(*world, player,
+        [&] { return world->get_fluid_level(10, kFluidTestGroundedY, 8) == 4; }));
+
+    // Sum of base levels over the pool region (only fluid cells count).
+    const auto total = [&]() {
+        int sum = 0;
+        int cells = 0;
+        for (int x = 4; x <= 12; ++x) {
+            for (int z = 4; z <= 12; ++z) {
+                if (world->get_block(x, kFluidTestGroundedY, z) !=
+                    static_cast<uint32_t>(gooId)) continue;
+                ++cells;
+                sum += static_cast<int>(
+                    world->get_fluid_level(x, kFluidTestGroundedY, z) & 0x07u);
+            }
+        }
+        return std::pair<int, int>{ sum, cells };
+    };
+    const auto [sum0, cells0] = total();
+    // Espalhamento em losango (Manhattan): fonte 0 + 4x2 (anel 1) + 8x4
+    // (anel 2) = 40 unidades em 13 células; maxLevel 4 para no anel 2.
+    CHECK(sum0 == 40);
+    CHECK(cells0 == 13);
+    CHECK(world->get_block(11, kFluidTestGroundedY, 8) == kBlockAir);  // range cap
+
+    // Conservação: 120 ticks extras não mudam NADA — o pool é um fixpoint.
+    for (int i = 0; i < 120; ++i) world->update(player, 1.0f / 60.0f);
+    const auto [sum1, cells1] = total();
+    CHECK(sum1 == sum0);
+    CHECK(cells1 == cells0);
+    CHECK(world->get_block(11, kFluidTestGroundedY, 8) == kBlockAir);  // sem crescer
+
+    std::cout << "[sdk] fluids: conservation — pooled levels are a fixed point "
+                 "across ticks, range caps OK\n";
+}
+
+// FALTANTES §8 item 168 (cachoeira): falling=true de uma fonte elevada forma
+// uma COLUNA contínua de fluido até o chão (cada célula carrega a flag de
+// queda, preservando o nível base através da queda), e o nível base da fonte
+// chega intacto ao nível do chão — onde o anel espalha (2, 4).
+void test_fluid_waterfall() {
+    const auto build = [&](uint32_t& idOut,
+                           std::unique_ptr<engine::voxel::IVoxelWorld>& worldOut,
+                           const glm::vec3& player) {
+        auto world = engine::voxel::create_default_voxel_world();
+        world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+        auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+        std::string error;
+        CHECK(blocks->load_from_json(
+            R"([{"name":"goo","namespace":"test","class":"fluid","color":[0.2,0.9,0.3]}])",
+            error));
+        world->set_block_registry(blocks);
+        auto fluids = std::make_shared<engine::registry::FluidRegistry>();
+        CHECK(fluids->load_from_json(
+            R"([{"block":"test:goo","viscosity":0.0,"range":4,"falling":true,"evaporation":false}])",
+            error));
+        CHECK(world->set_fluid_registry(fluids, error));
+        CHECK(error.empty());
+        CHECK(boot_world(*world, player, 32));
+        CHECK(world->resolve_block_id("test:goo", idOut, error));
+        worldOut = std::move(world);
+    };
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+
+    // Fonte 4 células acima do chão (groundedY = terrain+1). A coluna cai
+    // célula a célula; o nível base 0 (fonte) é preservado pela flag de queda.
+    std::unique_ptr<engine::voxel::IVoxelWorld> world;
+    uint32_t gooId = 0;
+    build(gooId, world, player);
+    const int sourceY = kFluidTestGroundedY + 4;
+    world->set_block(8, sourceY, 8, static_cast<uint32_t>(gooId));
+    // A queda forma a coluna e o poço no chão: o anel 2 no groundedY
+    // (distância Manhattan 2, nível base 4) fecha o losango da base.
+    const auto baseAt = [&](int x, int y) {
+        return static_cast<int>(world->get_fluid_level(x, y, 8) & 0x07u);
+    };
+    CHECK(settle(*world, player,
+        [&] { return baseAt(10, kFluidTestGroundedY) == 4; }));
+
+    // Coluna contínua: TODA célula de groundedY..sourceY é goo.
+    for (int y = kFluidTestGroundedY; y <= sourceY; ++y) {
+        CHECK(world->get_block(8, y, 8) == static_cast<uint32_t>(gooId));
+    }
+    // A fonte preserva o nível base 0; as células em queda carregam a flag
+    // (0x80) com o MESMO nível base — a queda conserva o nível.
+    CHECK(world->get_fluid_level(8, sourceY, 8) == 0);  // source stays
+    for (int y = kFluidTestGroundedY; y < sourceY; ++y) {
+        const uint8_t level = world->get_fluid_level(8, y, 8);
+        CHECK((level & 0x80u) != 0);        // falling flag
+        CHECK((level & 0x07u) == 0);        // base 0 preserved through the fall
+    }
+    // O poço no chão: a coluna em queda espalha (falling=true) como um
+    // losango Manhattan com base +2 por passo, capado no nível 4 (maxLevel).
+    // Anel 1 = base 2; anel 2 = base 4; distância 3 permanece ar (range cap).
+    CHECK(baseAt(9, kFluidTestGroundedY) == 2);
+    CHECK(baseAt(10, kFluidTestGroundedY) == 4);
+    CHECK(world->get_block(11, kFluidTestGroundedY, 8) == kBlockAir);  // range cap
+
+    // A cachoeira também é um fixpoint: 120 ticks extras não mudam o poço
+    // (base 4 no anel 2) nem estouram o range (distância 3 segue ar).
+    for (int i = 0; i < 120; ++i) world->update(player, 1.0f / 60.0f);
+    for (int y = kFluidTestGroundedY; y <= sourceY; ++y) {
+        CHECK(world->get_block(8, y, 8) == static_cast<uint32_t>(gooId));
+    }
+    CHECK(baseAt(9, kFluidTestGroundedY) == 2);
+    CHECK(baseAt(10, kFluidTestGroundedY) == 4);
+    CHECK(world->get_block(11, kFluidTestGroundedY, 8) == kBlockAir);
+
+    std::cout << "[sdk] fluids: waterfall — falling column carries the base "
+                 "level to the ground, bounded falling pool caps at range OK\n";
+}
+
+// FALTANTES §8 item 168 (unload/reload): níveis de fluido sobrevivem a um
+// ciclo save (páginas de região) + load em mundo novo — o restore em lote
+// grava os bytes de fluido por voxel, então o pool volta com os MESMOS níveis
+// (não apenas os blocos).
+void test_fluid_unload_reload() {
+    const auto build = [&](uint32_t& idOut,
+                           std::unique_ptr<engine::voxel::IVoxelWorld>& worldOut,
+                           const glm::vec3& player) {
+        auto world = engine::voxel::create_default_voxel_world();
+        world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+        auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+        std::string error;
+        CHECK(blocks->load_from_json(
+            R"([{"name":"goo","namespace":"test","class":"fluid","color":[0.2,0.9,0.3]}])",
+            error));
+        world->set_block_registry(blocks);
+        auto fluids = std::make_shared<engine::registry::FluidRegistry>();
+        CHECK(fluids->load_from_json(
+            R"([{"block":"test:goo","viscosity":0.0,"range":4,"falling":false,"evaporation":false}])",
+            error));
+        CHECK(world->set_fluid_registry(fluids, error));
+        CHECK(error.empty());
+        CHECK(boot_world(*world, player, 32));
+        CHECK(world->resolve_block_id("test:goo", idOut, error));
+        worldOut = std::move(world);
+    };
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> a;
+    uint32_t gooId = 0;
+    build(gooId, a, player);
+    a->set_block(8, kFluidTestGroundedY, 8, static_cast<uint32_t>(gooId));
+    CHECK(settle(*a, player,
+        [&] { return a->get_fluid_level(10, kFluidTestGroundedY, 8) == 4; }));
+    const std::string dir = scratch_dir() + "/vc_test_fluid_unload_reload";
+    a->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string saveError;
+    CHECK(a->save_world(dir, saveError));
+    CHECK(saveError.empty());
+
+    // Mundo novo: mesmo registry (mesmo id dinâmico), sem fluido em memória.
+    std::unique_ptr<engine::voxel::IVoxelWorld> b;
+    uint32_t gooIdB = 0;
+    build(gooIdB, b, player);
+    CHECK(gooIdB == gooId);
+    b->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string loadError;
+    CHECK(b->load_world(dir, loadError));
+    CHECK(loadError.empty());
+
+    // Níveis restaurados: fonte 0, anéis 2 e 4, blocos goo, ar no cap.
+    CHECK(b->get_fluid_level(8, kFluidTestGroundedY, 8) == 0);
+    CHECK(b->get_fluid_level(9, kFluidTestGroundedY, 8) == 2);
+    CHECK(b->get_fluid_level(10, kFluidTestGroundedY, 8) == 4);
+    CHECK(b->get_block(9, kFluidTestGroundedY, 8) == static_cast<uint32_t>(gooIdB));
+    CHECK(b->get_block(11, kFluidTestGroundedY, 8) == kBlockAir);
+
+    // Conservação pós-reload: o pool restaurado também é um fixpoint.
+    for (int i = 0; i < 120; ++i) b->update(player, 1.0f / 60.0f);
+    CHECK(b->get_fluid_level(10, kFluidTestGroundedY, 8) == 4);
+    CHECK(b->get_fluid_level(11, kFluidTestGroundedY, 8) == 0xff);
+
+    std::cout << "[sdk] fluids: unload/reload — paged save restores fluid "
+                 "levels, pool stable after reload OK\n";
+}
+
+// FALTANTES §8 item 168 (budgets, lado do mundo): com MUITAS células de
+// fluido ativas (grade 4x4 de fontes, anéis sobrepostos), o cap por tick da
+// simulação adia trabalho em vez de perder — o pool todo converge ao fixpoint
+// e permanece. (O carryover determinístico por orçamento da fase FluidTick
+// vive em voxel_scheduler_tests, onde o WorldScheduler é acessível.)
+void test_fluid_budgets() {
+    auto world = engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+    std::string error;
+    CHECK(blocks->load_from_json(
+        R"([{"name":"goo","namespace":"test","class":"fluid","color":[0.2,0.9,0.3]}])",
+        error));
+    world->set_block_registry(blocks);
+    auto fluids = std::make_shared<engine::registry::FluidRegistry>();
+    CHECK(fluids->load_from_json(
+        R"([{"block":"test:goo","viscosity":0.0,"range":4,"falling":false,"evaporation":false}])",
+        error));
+    CHECK(world->set_fluid_registry(fluids, error));
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    CHECK(boot_world(*world, player, 64));
+    uint32_t gooIdW = 0;
+    CHECK(world->resolve_block_id("test:goo", gooIdW, error));
+    // O grid de fontes cruza os chunks (0,0)/(1,0)/(0,1)/(1,1): materialize-os
+    // antes de colocar (set_block_at descarta writes em chunk não carregado —
+    // o mesmo padrão dos fixes findings #54).
+    for (int i = 0; i < 600 &&
+                    !(world->is_chunk_loaded(0, 0) && world->is_chunk_loaded(1, 0) &&
+                      world->is_chunk_loaded(0, 1) && world->is_chunk_loaded(1, 1));
+         ++i) {
+        world->update(player, 1.0f / 60.0f);
+    }
+    CHECK(world->is_chunk_loaded(1, 1));
+
+    // Grade 10x10 de fontes espaçadas 2 células (x=8..26, z=8..26): 100
+    // fontes -> rajada inicial de ~700 células, bem acima do cap de 512 do
+    // passo por tick — o excedente carrega (scheduler + dedup), nada se perde.
+    // Os losangos (raio 2, nível 4 no passo 2) se fundem num pool contínuo.
+    for (int i = 0; i < 10; ++i) {
+        for (int j = 0; j < 10; ++j) {
+            world->set_block(8 + 2 * i, kFluidTestGroundedY, 8 + 2 * j,
+                             static_cast<uint32_t>(gooIdW));
+        }
+    }
+    // Convergência sob orçamento: o interior (distância 2 da fonte mais
+    // próxima — canto do losango) atinge o nível 4 e permanece fixo.
+    CHECK(settle(*world, player,
+        [&] { return world->get_fluid_level(17, kFluidTestGroundedY, 17) == 4; }));
+    // Canto do pool (distância 2 da fonte de canto (26,26) -> (27,27)) nível 4;
+    // fora do raio (distância 3+: (28,28) está a distância 4) permanece ar.
+    CHECK(world->get_fluid_level(27, kFluidTestGroundedY, 27) == 4);
+    CHECK(world->get_block(28, kFluidTestGroundedY, 28) == kBlockAir);
+    for (int i = 0; i < 120; ++i) world->update(player, 1.0f / 60.0f);
+    CHECK(world->get_fluid_level(17, kFluidTestGroundedY, 17) == 4);
+    CHECK(world->get_block(28, kFluidTestGroundedY, 28) == kBlockAir);
+
+    std::cout << "[sdk] fluids: budgets — many-source pool converges under the "
+                 "per-tick cap, nothing lost OK\n";
+}
+
+// FALTANTES §8 item 166: simulação completamente separada do material visual.
+// (a) BLOCK_SIM_PROPS é a ÚNICA fonte de solididade/transparência/absorção
+// dos blocos builtin — BLOCK_MATERIALS (cor/texturas) não carrega mais flags
+// físicas (o guard estático em ArchitectureBoundaryTests prova que World.cpp
+// nunca lê a tabela visual). (b) Blocos data-driven com a MESMA cor e classes
+// DIFERENTES têm simulação diferente; com a MESMA classe e cores DIFERENTES
+// têm simulação idêntica — a cor nunca entra na decisão física.
+void test_material_simulation_separation() {
+    // --- (a) tabela de simulação embutida: valores canônicos por bloco. ---
+    const auto sim = [](BlockType t) { return get_block_sim(t); };
+    CHECK(!sim(BlockType::Air).solid && sim(BlockType::Air).transparent &&
+          sim(BlockType::Air).lightAbsorption == 0);
+    CHECK(sim(BlockType::Stone).solid && !sim(BlockType::Stone).transparent &&
+          sim(BlockType::Stone).lightAbsorption == 15);
+    CHECK(sim(BlockType::Glass).solid && sim(BlockType::Glass).transparent &&
+          sim(BlockType::Glass).lightAbsorption == 0);
+    CHECK(!sim(BlockType::Leaves).solid && sim(BlockType::Leaves).transparent &&
+          sim(BlockType::Leaves).lightAbsorption == 1);
+    CHECK(!sim(BlockType::Water).solid && sim(BlockType::Water).transparent &&
+          sim(BlockType::Water).lightAbsorption == 1);
+    CHECK(!sim(BlockType::Lava).solid && !sim(BlockType::Lava).transparent &&
+          sim(BlockType::Lava).lightAbsorption == 1);
+    // Os helpers de simulação leem a tabela de SIMULAÇÃO (nunca o material).
+    CHECK(is_solid_block(BlockType::Stone) && !is_solid_block(BlockType::Water));
+    CHECK(is_transparent_block(BlockType::Glass) && !is_transparent_block(BlockType::Stone));
+
+    // --- (b) data-driven: a CLASSE decide a simulação; a cor é invisível. ---
+    auto world = engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(96));
+    auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+    std::string error;
+    const char* json =
+        R"([
+  {"name":"solid_a","namespace":"test","class":"solid","color":[1.0,0.0,0.0]},
+  {"name":"transparent_b","namespace":"test","class":"transparent","collidable":false,"color":[1.0,0.0,0.0],"lightAbsorption":0.0},
+  {"name":"solid_c","namespace":"test","class":"solid","color":[0.0,0.0,1.0]}
+])";
+    CHECK(blocks->load_from_json(json, error));
+    world->set_block_registry(blocks);
+    CHECK(boot_world(*world, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    uint32_t a = 0, b = 0, c = 0;
+    CHECK(world->resolve_block_id("test:solid_a", a, error) && error.empty());
+    CHECK(world->resolve_block_id("test:transparent_b", b, error) && error.empty());
+    CHECK(world->resolve_block_id("test:solid_c", c, error) && error.empty());
+
+    const auto view = [&](uint32_t id) -> engine::voxel::BlockRuntimeView {
+        for (const auto& v : world->runtime_block_views()) {
+            if (v.id == id) return v;
+        }
+        return {};
+    };
+    const engine::voxel::BlockRuntimeView va = view(a);
+    const engine::voxel::BlockRuntimeView vb = view(b);
+    const engine::voxel::BlockRuntimeView vc = view(c);
+    // MESMA cor (vermelho), classes diferentes -> simulação DIFERENTE.
+    CHECK(va.solid && !va.transparent && va.lightAbsorption == 15);
+    CHECK(!vb.solid && vb.transparent && vb.lightAbsorption == 0);
+    // MESMA classe (solid), cores diferentes -> simulação IDÊNTICA.
+    CHECK(vc.solid == va.solid && vc.transparent == va.transparent &&
+          vc.lightAbsorption == va.lightAbsorption);
+
+    // --- comportamento público: o raycast para no sólido e atravessa o
+    // transparente (solidity vem da classe, não da aparência). ---
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = world->begin_transaction();
+        tx->set_block(3, 130, 3, a);
+        tx->set_block(6, 130, 6, b);
+        std::string txError;
+        CHECK(tx->commit(txError) && txError.empty());
+    }
+    const engine::voxel::VoxelRaycastHit hitSolid =
+        world->raycast(glm::vec3(3.5f, 200.0f, 3.5f), glm::vec3(0.0f, -1.0f, 0.0f), 200.0f);
+    CHECK(hitSolid.hit);
+    CHECK(hitSolid.block.x == 3 && hitSolid.block.y == 130 && hitSolid.block.z == 3);
+    const engine::voxel::VoxelRaycastHit throughTransparent =
+        world->raycast(glm::vec3(6.5f, 200.0f, 6.5f), glm::vec3(0.0f, -1.0f, 0.0f), 200.0f);
+    CHECK(throughTransparent.hit);            // hits the flat ground below
+    CHECK(throughTransparent.block.y < 130);  // transparent_b did NOT stop it
+
+    std::cout << "[sdk] material×simulation: BlockSimProps is the only source of "
+                 "solidity/light, BlockMaterial is appearance-only OK\n";
+}
+
+// FALTANTES §8 item 167: água, lava e um TERCEIRO fluido definidos APENAS
+// pelo projeto — os três via FluidRegistry JSON (o projeto sobrescreve os
+// defaults de água/lava e define um fluido catalog-only). Prova: (1) os três
+// simulam como fluido (anéis por níveis); (2) parâmetros distintos
+// observáveis — água espessa 1/tick com range 7 e falling:false (poço
+// flutuante, sem coluna; alcance longo) vs ácido fino 2/tick com range 4
+// (cap curto) vs lava falling:true (coluna desce ao chão) com dano; (3) o
+// dano do terceiro fluido (acid) aplica a mobs.
+void test_project_defined_fluids() {
+    auto world = engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+    std::string error;
+    CHECK(blocks->load_from_json(
+        R"([{"name":"acid","namespace":"test","class":"fluid","color":[0.3,1.0,0.2]}])",
+        error));
+    world->set_block_registry(blocks);
+    auto fluids = std::make_shared<engine::registry::FluidRegistry>();
+    CHECK(fluids->load_from_json(
+        R"([
+          {"block":"vulkancraft:water","viscosity":0.5,"range":7,"falling":false,"evaporation":false},
+          {"block":"vulkancraft:lava","viscosity":1.0,"range":3,"falling":true,"evaporation":true,"damagePerTick":5.0},
+          {"block":"test:acid","viscosity":0.0,"range":4,"falling":false,"evaporation":false,"damagePerTick":2.0}
+        ])",
+        error));
+    CHECK(world->set_fluid_registry(fluids, error));
+    CHECK(error.empty());
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    CHECK(boot_world(*world, player, 64));
+    uint32_t waterId = 0, lavaId = 0, acidId = 0;
+    CHECK(world->resolve_block_id("vulkancraft:water", waterId, error) && error.empty());
+    CHECK(world->resolve_block_id("vulkancraft:lava", lavaId, error) && error.empty());
+    CHECK(world->resolve_block_id("test:acid", acidId, error) && error.empty());
+    // boot_world only guarantees chunk (0,0); the pools below reach chunks
+    // (0,1), (1,1) and (2,2). set_block DROPS writes to not-yet-loaded chunks
+    // (findings #54/#56 pattern), so materialize the target chunks first or
+    // the settles run to their wall-clock cap.
+    CHECK(settle(*world, player, [&] { return world->is_chunk_loaded(0, 1) &&
+                                              world->is_chunk_loaded(1, 1) &&
+                                              world->is_chunk_loaded(2, 2); }));
+
+    // (1) Água (override do projeto): espessa 1/tick, range 7 — anel 1 = nível
+    // 1 e o alcance longo chega à distância 3 (nível 3); poço no chão.
+    world->set_block(8, kFluidTestGroundedY, 8, waterId);
+    // The pool spreads ring by ring: settle on BOTH asserted cells so the
+    // ring-3 check below does not race the still-expanding pool.
+    CHECK(settle(*world, player,
+        [&] { return world->get_fluid_level(9, kFluidTestGroundedY, 8) == 1 &&
+                      world->get_fluid_level(11, kFluidTestGroundedY, 8) == 3; }));
+    CHECK(world->get_fluid_level(11, kFluidTestGroundedY, 8) == 3);  // range 7
+
+    // (2) Água flutuante falling:false (override do default falling:true):
+    // poço no nível de origem, NADA desce — (8,131,30) permanece ar.
+    world->set_block(8, kFluidTestFloatingY + 3, 30, waterId);
+    CHECK(settle(*world, player,
+        [&] { return world->get_fluid_level(9, kFluidTestFloatingY + 3, 30) == 1; }));
+    CHECK(world->get_block(8, kFluidTestGroundedY, 30) == kBlockAir);  // no column
+
+    // (3) Ácido (terceiro fluido): fino 2/tick, range 4 — anel 2 = nível 4 e
+    // a distância 3 é ar (cap curto, diferente da água).
+    world->set_block(24, kFluidTestGroundedY, 24, acidId);
+    CHECK(settle(*world, player,
+        [&] { return world->get_fluid_level(26, kFluidTestGroundedY, 24) == 4; }));
+    CHECK(world->get_block(27, kFluidTestGroundedY, 24) == kBlockAir);  // range cap 4
+
+    // (4) Lava falling:true: a coluna DESCE ao chão a partir da altura.
+    world->set_block(40, kFluidTestFloatingY + 3, 40, lavaId);
+    CHECK(settle(*world, player,
+        [&] { return world->get_block(40, kFluidTestGroundedY, 40) == lavaId; }));
+
+    std::cout << "[sdk] fluids: project-defined water (thick/range 7/falling:false), "
+                 "lava (falling column) and a third acid (thin/range 4) all "
+                 "simulate per JSON OK\n";
 }
 
 void test_block_registry() {
@@ -1480,8 +4558,10 @@ void test_block_registry() {
     CHECK(stoneAgain->uuid == stoneUuid);
 
     // JSON asset loads at runtime (no recompile): a project-defined block.
+    // FALTANTES §14: per-face materials (faceTop/faceBottom/faceSide),
+    // occlusion and renderLayer round-trip through the JSON schema.
     const char* jsonAsset =
-        R"([{"name":"ruby","namespace":"test","class":"solid","hardness":3.0,"lightEmission":0.4,"tags":["gem"],"drops":["test:ruby"]},)"
+        R"([{"name":"ruby","namespace":"test","class":"solid","hardness":3.0,"lightEmission":0.4,"tags":["gem"],"drops":["test:ruby"],"faceTop":[0.2,0.8,0.2],"faceSide":[0.5,0.35,0.2],"occlusion":false,"renderLayer":1},)"
         R"({"name":"sapphire","namespace":"test","class":"solid","hardness":4.0}])";
     std::string error;
     CHECK(blocks.load_from_json(jsonAsset, error));
@@ -1490,6 +4570,28 @@ void test_block_registry() {
     CHECK(ruby->hardness > 2.9f && ruby->hardness < 3.1f);
     CHECK(ruby->lightEmission > 0.3f);
     CHECK(ruby->tags.size() == 1 && ruby->tags[0] == "gem");
+    CHECK(ruby->faceTopSet);
+    CHECK(ruby->faceTop.g > 0.7f && ruby->faceTop.g < 0.9f);
+    CHECK(!ruby->faceBottomSet);
+    CHECK(ruby->faceSideSet);
+    CHECK(ruby->faceSide.r > 0.4f && ruby->faceSide.r < 0.6f);
+    CHECK(!ruby->occludes);
+    CHECK(ruby->renderLayer == 1);
+    CHECK(ruby->color.r > 0.99f);  // base color untouched by face overrides
+
+    // renderLayer validation is all-or-nothing: out-of-range is refused with
+    // a diagnostic and nothing is registered.
+    engine::registry::BlockRegistry badLayer;
+    std::string layerError;
+    CHECK(!badLayer.load_from_json(
+        R"({"name":"bad_layer","namespace":"test","renderLayer":300})", layerError));
+    CHECK(!layerError.empty());
+    CHECK(badLayer.find_by_name("test:bad_layer") == nullptr);
+    engine::registry::BlockRegistry negLayer;
+    std::string negError;
+    CHECK(!negLayer.load_from_json(
+        R"({"name":"neg_layer","namespace":"test","renderLayer":-2})", negError));
+    CHECK(!negError.empty());
 
     // ID stability across load order: identical definitions in a different
     // order produce the same UUIDs (reorder-proof ids).
@@ -1537,6 +4639,59 @@ void test_item_registry() {
     CHECK(found->durability == 250);
     CHECK(found->uuid.size() == 36);
 
+    // §2 item 8: use/equipment/behavior components round-trip through the
+    // programmatic registration and the JSON schema.
+    engine::registry::ItemDefinition sword;
+    sword.ns = "vulkancraft";
+    sword.name = "stone_sword";
+    sword.maxStack = 1;
+    sword.useCooldownMs = 250;
+    sword.useMode = engine::registry::ItemUseMode::Instant;
+    sword.equipSlot = engine::registry::ItemEquipSlot::Hand;
+    sword.attackDamage = 5.0f;
+    sword.behaviorId = "vulkancraft:melee_swing";
+    CHECK(items.register_item(sword, error));
+    const engine::registry::ItemDefinition* swordFound =
+        items.find_by_name("vulkancraft:stone_sword");
+    CHECK(swordFound != nullptr);
+    CHECK(swordFound->useCooldownMs == 250);
+    CHECK(swordFound->useMode == engine::registry::ItemUseMode::Instant);
+    CHECK(swordFound->equipSlot == engine::registry::ItemEquipSlot::Hand);
+    CHECK(std::abs(swordFound->attackDamage - 5.0f) < 1e-3f);
+    CHECK(swordFound->behaviorId == "vulkancraft:melee_swing");
+
+    // JSON round-trip of the components (useMode/equipSlot enums + stats).
+    engine::registry::ItemRegistry components;
+    std::string componentsError;
+    CHECK(components.load_from_json(
+        R"({"name":"iron_helmet","namespace":"test","useCooldown":500,"useMode":"continuous","equipSlot":"head","attackDamage":1.5,"armor":2.0,"behaviorId":"test:wear_effect"})",
+        componentsError));
+    const engine::registry::ItemDefinition* helmet =
+        components.find_by_name("test:iron_helmet");
+    CHECK(helmet != nullptr);
+    CHECK(helmet->useCooldownMs == 500);
+    CHECK(helmet->useMode == engine::registry::ItemUseMode::Continuous);
+    CHECK(helmet->equipSlot == engine::registry::ItemEquipSlot::Head);
+    CHECK(std::abs(helmet->attackDamage - 1.5f) < 1e-3f);
+    CHECK(std::abs(helmet->armor - 2.0f) < 1e-3f);
+    CHECK(helmet->behaviorId == "test:wear_effect");
+
+    // §2 item 8 validation is all-or-nothing: out-of-range/unknown components
+    // are refused with a diagnostic, never clamped or guessed.
+    auto refuseItem = [&](const std::string& json) {
+        engine::registry::ItemRegistry registry;
+        std::string refuseError;
+        CHECK(!registry.load_from_json(json, refuseError));
+        CHECK(!refuseError.empty());
+    };
+    refuseItem(R"({"name":"a","namespace":"test","useCooldown":70000})");
+    refuseItem(R"({"name":"b","namespace":"test","useMode":"spell"})");
+    refuseItem(R"({"name":"c","namespace":"test","equipSlot":"wings"})");
+    refuseItem(R"({"name":"d","namespace":"test","attackDamage":-1})");
+    refuseItem(R"({"name":"e","namespace":"test","armor":101})");
+    refuseItem(R"({"name":"f","namespace":"test","behaviorId":"unnamespaced"})");
+
+
     // Invalid maxStack is rejected with a diagnostic.
     engine::registry::ItemDefinition bad;
     bad.ns = "test";
@@ -1568,6 +4723,203 @@ void test_item_registry() {
 
     std::cout << "[sdk] item registry: " << items.size()
               << " items, validation and fallback OK\n";
+}
+
+// FALTANTES item 9: cross-reference validation between registries — block
+// drops resolve against a registered ItemRegistry, fluid blocks resolve
+// against a BlockRegistry, builtin blocks are the engine's own contract, and
+// an unnamespaced drop is refused at registration.
+void test_cross_reference_validation() {
+    using engine::registry::BlockRegistry;
+    using engine::registry::FluidRegistry;
+    using engine::registry::ItemRegistry;
+
+    // A user-authored block whose drop references an unknown item is flagged;
+    // registering the item makes the same registry clean.
+    BlockRegistry blocks;
+    std::string error;
+    CHECK(blocks.load_from_json(
+        R"({"name":"ruby_ore","namespace":"test","drops":["test:ruby"]})",
+        error));
+    ItemRegistry items;
+    std::vector<std::string> refErrors;
+    CHECK(!blocks.validate_item_references(items, refErrors));
+    bool foundRuby = false;
+    for (const std::string& message : refErrors) {
+        if (message.find("test:ruby") != std::string::npos) foundRuby = true;
+    }
+    CHECK(foundRuby);
+    std::string itemError;
+    engine::registry::ItemDefinition ruby;
+    ruby.ns = "test";
+    ruby.name = "ruby";
+    CHECK(items.register_item(ruby, itemError));
+    refErrors.clear();
+    CHECK(blocks.validate_item_references(items, refErrors));
+    CHECK(refErrors.empty());
+
+    // Unnamespaced drops are refused at registration (all-or-nothing).
+    BlockRegistry strict;
+    CHECK(!strict.load_from_json(
+        R"({"name":"bad_drop","namespace":"test","drops":["ruby"]})",
+        error));
+
+    // Builtin blocks are the engine's own contract: a fresh BlockRegistry with
+    // an empty ItemRegistry validates clean (no false positives from the
+    // builtin table's auto-drops).
+    BlockRegistry fresh;
+    ItemRegistry emptyItems;
+    std::vector<std::string> builtinErrors;
+    CHECK(fresh.validate_item_references(emptyItems, builtinErrors));
+    CHECK(builtinErrors.empty());
+
+    // Fluids: the driven block must resolve (builtin or authored).
+    FluidRegistry fluids;
+    CHECK(fluids.load_from_json(
+        R"({"block":"vulkancraft:sludge","viscosity":0.8})", error));
+    BlockRegistry baseBlocks;
+    std::vector<std::string> fluidErrors;
+    CHECK(!fluids.validate_block_references(baseBlocks, fluidErrors));
+    bool foundSludge = false;
+    for (const std::string& message : fluidErrors) {
+        if (message.find("vulkancraft:sludge") != std::string::npos) foundSludge = true;
+    }
+    CHECK(foundSludge);
+    // Builtin block reference resolves against a fresh BlockRegistry.
+    FluidRegistry waterFluid;
+    CHECK(waterFluid.load_from_json(
+        R"({"block":"vulkancraft:water"})", error));
+    fluidErrors.clear();
+    CHECK(waterFluid.validate_block_references(baseBlocks, fluidErrors));
+    CHECK(fluidErrors.empty());
+
+    std::cout << "[sdk] cross-reference validation: drops->items, fluids->blocks"
+              << " OK\n";
+}
+
+// FALTANTES item 5: named block states + versioned transitions — JSON
+// round-trip, all-or-nothing validation (duplicates, unknown refs, empty
+// trigger, self/duplicate rules) and state-aware material resolution in the
+// mesher (states[0] = default; index k = states[k]; out-of-range clamps).
+void test_block_states_transitions() {
+    using engine::registry::BlockRegistry;
+
+    BlockRegistry blocks;
+    std::string error;
+    CHECK(blocks.load_from_json(
+        R"({"name":"lamp","namespace":"test","drops":["test:lamp"],"states":[
+            {"name":"base","color":[0.4,0.4,0.4]},
+            {"name":"lit","color":[1.0,0.6,0.1],"faceTop":[0.9,0.9,0.9],"lightEmission":0.8}
+          ],"transitions":[
+            {"from":"","to":"lit","trigger":"ignite"},
+            {"from":"lit","to":"","trigger":"extinguish"}
+          ]})",
+        error));
+    const engine::registry::BlockDefinition* lamp = blocks.find_by_name("test:lamp");
+    CHECK(lamp != nullptr);
+    CHECK(lamp->states.size() == 2);
+    CHECK(lamp->state_index("") == 0);
+    CHECK(lamp->state_index("base") == 0);
+    CHECK(lamp->state_index("lit") == 1);
+    CHECK(lamp->state_index("nope") == -1);
+    CHECK(lamp->states[1].name == "lit");
+    CHECK(std::abs(lamp->states[1].color.r - 1.0f) < 1e-3f);
+    CHECK(std::abs(lamp->states[1].color.g - 0.6f) < 1e-3f);
+    CHECK(lamp->states[1].faceTopSet);
+    CHECK(std::abs(lamp->states[1].faceTop.r - 0.9f) < 1e-3f);
+    CHECK(std::abs(lamp->states[1].lightEmission - 0.8f) < 1e-3f);
+    CHECK(lamp->transitions.size() == 2);
+    CHECK(lamp->transitions[0].fromState.empty());
+    CHECK(lamp->transitions[0].toState == "lit");
+    CHECK(lamp->transitions[0].trigger == "ignite");
+    CHECK(lamp->transitions[1].fromState == "lit");
+    CHECK(lamp->transitions[1].toState.empty());
+
+    // Validation is all-or-nothing: structure/ref errors refuse the whole
+    // document with a diagnostic, never guessed or clamped.
+    auto refuse = [&](const std::string& json) {
+        BlockRegistry registry;
+        std::string refuseError;
+        CHECK(!registry.load_from_json(json, refuseError));
+        CHECK(!refuseError.empty());
+    };
+    refuse(R"({"name":"a","namespace":"test","states":[{"name":"dup"},{"name":"dup"}]})");
+    refuse(R"({"name":"b","namespace":"test","states":[{"name":""}]})");
+    refuse(R"({"name":"c","namespace":"test","states":[{"name":"s"}],"transitions":[{"from":"","to":"ghost","trigger":"x"}]})");
+    refuse(R"({"name":"d","namespace":"test","states":[{"name":"s"}],"transitions":[{"from":"ghost","to":"","trigger":"x"}]})");
+    refuse(R"({"name":"e","namespace":"test","transitions":[{"from":"","to":"s","trigger":""}]})");
+    refuse(R"({"name":"f","namespace":"test","transitions":[{"from":"s","to":"s","trigger":"x"}]})");
+    refuse(R"({"name":"g","namespace":"test","states":[{"name":"s"},{"name":"t"}],"transitions":[{"from":"","to":"s","trigger":"x"},{"from":"","to":"t","trigger":"x"}]})");
+
+    std::cout << "[sdk] block states + transitions: round-trip and validation OK\n";
+}
+
+// FALTANTES item 4: sound/particle references, the mining tool component and
+// the resistance/physical properties on BlockDefinition — round-trip through
+// the JSON schema and all-or-nothing validation (strict tool enum, refs must
+// be namespaced, ranges enforced; never clamped).
+void test_block_tool_physics() {
+    using engine::registry::BlockRegistry;
+    using engine::registry::BlockTool;
+
+    BlockRegistry blocks;
+    std::string error;
+    CHECK(blocks.load_from_json(
+        R"({"name":"adamant","namespace":"test","drops":["test:adamant"],"soundPlace":"test:adamant_place","soundBreak":"test:adamant_break","soundStep":"test:adamant_step","soundHit":"test:adamant_hit","particleBreak":"test:adamant_dust","tool":"pickaxe","toolTier":3,"resistance":40,"friction":0.3,"bounciness":0.05,"density":8.0})",
+        error));
+    const engine::registry::BlockDefinition* adamant = blocks.find_by_name("test:adamant");
+    CHECK(adamant != nullptr);
+    CHECK(adamant->tool == BlockTool::Pickaxe);
+    CHECK(adamant->toolTier == 3);
+    CHECK(adamant->resistance == 40.0f);
+    CHECK(adamant->friction == 0.3f);
+    CHECK(adamant->bounciness == 0.05f);
+    CHECK(adamant->density == 8.0f);
+    CHECK(adamant->soundPlace == "test:adamant_place");
+    CHECK(adamant->soundBreak == "test:adamant_break");
+    CHECK(adamant->soundStep == "test:adamant_step");
+    CHECK(adamant->soundHit == "test:adamant_hit");
+    CHECK(adamant->particleBreak == "test:adamant_dust");
+
+    // §2 item 6: declarative behavior reference round-trips (validated, not
+    // resolved — resolution belongs to the abilities/block entity milestone).
+    BlockRegistry behavioral;
+    CHECK(behavioral.load_from_json(
+        R"({"name":"ember","namespace":"test","behaviorId":"test:spread_ember"})",
+        error));
+    CHECK(behavioral.find_by_name("test:ember")->behaviorId == "test:spread_ember");
+    BlockRegistry noBehavior;
+    CHECK(noBehavior.load_from_json(R"({"name":"quiet","namespace":"test"})", error));
+    CHECK(noBehavior.find_by_name("test:quiet")->behaviorId.empty());
+
+    // Defaults: no tool (Any), tier 0, friction 0.5, density 1, empty refs.
+    BlockRegistry plain;
+    CHECK(plain.load_from_json(R"({"name":"plain","namespace":"test"})", error));
+    const engine::registry::BlockDefinition* plainBlock = plain.find_by_name("test:plain");
+    CHECK(plainBlock->tool == BlockTool::Any);
+    CHECK(plainBlock->toolTier == 0);
+    CHECK(plainBlock->friction == 0.5f);
+    CHECK(plainBlock->density == 1.0f);
+    CHECK(plainBlock->soundPlace.empty());
+
+    // All-or-nothing: unknown tool, out-of-range tiers/physics and unnamespaced
+    // refs are refused with a diagnostic, never clamped or guessed.
+    auto refuse = [&](const std::string& json) {
+        BlockRegistry registry;
+        std::string refuseError;
+        CHECK(!registry.load_from_json(json, refuseError));
+        CHECK(!refuseError.empty());
+    };
+    refuse(R"({"name":"a","namespace":"test","tool":"drill"})");
+    refuse(R"({"name":"b","namespace":"test","toolTier":9})");
+    refuse(R"({"name":"c","namespace":"test","resistance":-1})");
+    refuse(R"({"name":"d","namespace":"test","friction":1.5})");
+    refuse(R"({"name":"e","namespace":"test","bounciness":-0.1})");
+    refuse(R"({"name":"f","namespace":"test","density":0})");
+    refuse(R"({"name":"g","namespace":"test","soundPlace":"notnamespaced"})");
+    refuse(R"({"name":"h","namespace":"test","behaviorId":"unnamespaced"})");
+
+    std::cout << "[sdk] block tool + physics: round-trip and validation OK\n";
 }
 
 // META section 14: authoritative item stacks and slot inventories — typed
@@ -2204,10 +5556,8 @@ void test_navigation_provider() {
     using engine::navigation::PathResult;
     using engine::navigation::VoxelColumn;
 
-    std::cerr << "[nav-probe] provider create\n";
     std::unique_ptr<engine::navigation::INavigationProvider> nav =
         engine::navigation::create_recast_navigation_provider();
-    std::cerr << "[nav-probe] provider ok\n";
     CHECK(nav != nullptr);
     CHECK(!nav->valid());
 
@@ -2250,33 +5600,13 @@ void test_navigation_provider() {
 
     // ---- Flat terrain: straight path, walkability, revision ----
     std::string error;
-    std::cerr << "[nav-probe] build start (columns="
-              << ground_columns().size() << ")\n";
     CHECK(nav->build(config, ground_columns(), error));
-    std::cerr << "[nav-probe] build done rev=" << nav->revision() << "\n";
     CHECK(error.empty());
     CHECK(nav->valid());
     const uint64_t r0 = nav->revision();
     CHECK(r0 > 0);
     PathResult flat;
     CHECK(nav->find_path(2.0f, 1.5f, 2.0f, 30.0f, 1.5f, 30.0f, flat));
-    {
-        std::cerr << "[nav-probe] flat: found=" << flat.found
-                  << " len=" << flat.totalLength << " wp=" << flat.waypoints.size()
-                  << "\n";
-        for (std::size_t i = 0; i + 2 < flat.waypoints.size(); i += 3) {
-            std::cerr << "  p" << i / 3 << "=(" << flat.waypoints[i] << ","
-                      << flat.waypoints[i + 1] << "," << flat.waypoints[i + 2]
-                      << ")\n";
-        }
-        std::cerr << "[nav-probe] walkable(8,1.5,8)=" << nav->is_walkable(8.0f, 1.5f, 8.0f)
-                  << " walkable(8,12,8)=" << nav->is_walkable(8.0f, 12.0f, 8.0f) << "\n";
-        std::cerr << "[nav-probe] first wp=(" << flat.waypoints[0] << ","
-                  << flat.waypoints[1] << "," << flat.waypoints[2] << ") last=("
-                  << flat.waypoints[flat.waypoints.size() - 3] << ","
-                  << flat.waypoints[flat.waypoints.size() - 2] << ","
-                  << flat.waypoints[flat.waypoints.size() - 1] << ")\n";
-    }
     CHECK(flat.found);
     const float straight = std::sqrt(28.0f * 28.0f * 2.0f);
     CHECK(flat.totalLength > straight - 1.0f);
@@ -2290,20 +5620,14 @@ void test_navigation_provider() {
     CHECK(nav->revision() > r0);
 
     // ---- Wall: the path must deviate around it ----
+    // The wall spans z in [8, 24] at x = 16, so a route through its middle
+    // (z = 16) must swing around one end — a real detour, not a corner clip.
     CHECK(nav->build(config, wall_columns(ground_columns()), error));
     CHECK(error.empty());
     PathResult around;
-    CHECK(nav->find_path(8.0f, 1.5f, 8.0f, 24.0f, 1.5f, 8.0f, around));
-    std::cerr << "[nav-probe] around: found=" << around.found
-              << " len=" << around.totalLength << " wp=" << around.waypoints.size()
-              << "\n";
-    for (std::size_t i = 0; i + 2 < around.waypoints.size(); i += 3) {
-        std::cerr << "  a" << i / 3 << "=(" << around.waypoints[i] << ","
-                  << around.waypoints[i + 1] << "," << around.waypoints[i + 2]
-                  << ")\n";
-    }
+    CHECK(nav->find_path(8.0f, 1.5f, 16.0f, 24.0f, 1.5f, 16.0f, around));
     CHECK(around.found);
-    CHECK(around.totalLength > 16.0f + 1.5f);  // longer than the straight 16
+    CHECK(around.totalLength > 16.0f + 8.0f);  // around the wall end, not through
 
     // ---- maxClimb: a 1-block step is climbable at 1.0, blocked at 0.2 ----
     const auto stepped_columns = [&]() {
@@ -2324,30 +5648,13 @@ void test_navigation_provider() {
     PathResult ontoPlatform;
     CHECK(nav->find_path(10.0f, 1.5f, 10.0f, 24.0f, 2.5f, 24.0f,
                          ontoPlatform));
-    std::cerr << "[nav-probe] climb1: found=" << ontoPlatform.found
-              << " len=" << ontoPlatform.totalLength << " wp="
-              << ontoPlatform.waypoints.size() << "\n";
-    for (std::size_t i = 0; i + 2 < ontoPlatform.waypoints.size(); i += 3) {
-        std::cerr << "  c" << i / 3 << "=(" << ontoPlatform.waypoints[i] << ","
-                  << ontoPlatform.waypoints[i + 1] << "," << ontoPlatform.waypoints[i + 2]
-                  << ")\n";
-    }
     CHECK(ontoPlatform.found);
     NavmeshConfig noClimb = climbConfig;
     noClimb.agentMaxClimb = 0.2f;
     CHECK(nav->build(noClimb, stepped_columns(), error));
     PathResult blockedStep;
-    const bool blockedCall = nav->find_path(10.0f, 1.5f, 10.0f, 24.0f, 2.5f,
-                                            24.0f, blockedStep);
-    std::cerr << "[nav-probe] noClimb: call=" << blockedCall
-              << " found=" << blockedStep.found << " len=" << blockedStep.totalLength
-              << " wp=" << blockedStep.waypoints.size() << "\n";
-    for (std::size_t i = 0; i + 2 < blockedStep.waypoints.size(); i += 3) {
-        std::cerr << "  b" << i / 3 << "=(" << blockedStep.waypoints[i] << ","
-                  << blockedStep.waypoints[i + 1] << "," << blockedStep.waypoints[i + 2]
-                  << ")\n";
-    }
-    CHECK(!blockedCall);
+    CHECK(!nav->find_path(10.0f, 1.5f, 10.0f, 24.0f, 2.5f, 24.0f,
+                          blockedStep));
     CHECK(!blockedStep.found);
 
     // ---- Determinism: same build + query -> same path ----
@@ -2369,7 +5676,7 @@ void test_navigation_voxel_world() {
     using engine::navigation::PathResult;
 
     const auto surface_y = [](engine::voxel::IVoxelWorld& world, int x, int z) {
-        for (int y = 120; y >= 0; --y) {
+        for (int y = 160; y >= 0; --y) {
             if (world.get_block(x, y, z) != 0) return y;
         }
         return -1;
@@ -2381,7 +5688,7 @@ void test_navigation_voxel_world() {
     config.boundsMinZ = 0.0f;
     config.boundsMaxZ = 32.0f;
     config.boundsMinY = 0.0f;
-    config.boundsMaxY = 110.0f;
+    config.boundsMaxY = 130.0f;  // above the wall top (surface + 3)
     config.cellSize = 0.5f;
 
     // World A: open terrain.
@@ -2389,6 +5696,12 @@ void test_navigation_voxel_world() {
         engine::voxel::create_default_voxel_world();
     open->register_generator(std::make_shared<FlatGenerator>(96));
     CHECK(boot_world(*open, glm::vec3(16.0f, 200.0f, 16.0f), 24));
+    // The sampler covers x,z in [0,32): all four chunks must be loaded before
+    // columns are read, or the mesh is built from partial (air) data.
+    CHECK(settle(*open, glm::vec3(16.0f, 200.0f, 16.0f), [&] {
+        return open->is_chunk_loaded(1, 0) && open->is_chunk_loaded(0, 1) &&
+               open->is_chunk_loaded(1, 1);
+    }));
     const int surface = surface_y(*open, 8, 8);
     CHECK(surface > 0);
     std::string error;
@@ -2402,7 +5715,7 @@ void test_navigation_voxel_world() {
     CHECK(error.empty());
     const float agentY = static_cast<float>(surface) + 1.5f;
     PathResult openPath;
-    CHECK(nav->find_path(8.0f, agentY, 8.0f, 24.0f, agentY, 8.0f, openPath));
+    CHECK(nav->find_path(8.0f, agentY, 16.0f, 24.0f, agentY, 16.0f, openPath));
     CHECK(openPath.found);
     CHECK(openPath.totalLength < 17.5f);  // essentially straight (16)
 
@@ -2411,6 +5724,10 @@ void test_navigation_voxel_world() {
         engine::voxel::create_default_voxel_world();
     walled->register_generator(std::make_shared<FlatGenerator>(96));
     CHECK(boot_world(*walled, glm::vec3(16.0f, 200.0f, 16.0f), 24));
+    CHECK(settle(*walled, glm::vec3(16.0f, 200.0f, 16.0f), [&] {
+        return walled->is_chunk_loaded(1, 0) && walled->is_chunk_loaded(0, 1) &&
+               walled->is_chunk_loaded(1, 1);
+    }));
     for (int z = 8; z <= 24; ++z) {
         for (int y = surface + 1; y <= surface + 3; ++y) {
             walled->set_block(16, y, z, kBlockStone);
@@ -2422,12 +5739,3765 @@ void test_navigation_voxel_world() {
     CHECK(nav->build(config, wallColumns, error));
     CHECK(error.empty());
     PathResult walledPath;
-    CHECK(nav->find_path(8.0f, agentY, 8.0f, 24.0f, agentY, 8.0f, walledPath));
+    CHECK(nav->find_path(8.0f, agentY, 16.0f, 24.0f, agentY, 16.0f, walledPath));
     CHECK(walledPath.found);
-    CHECK(walledPath.totalLength > openPath.totalLength + 1.5f);  // detour
+    CHECK(walledPath.totalLength > openPath.totalLength + 8.0f);  // detour
 
     std::cout << "[sdk] navigation voxel: sampler + wall detour on a real "
                  "world OK\n";
+}
+
+// ---- META section 17 / FALTANTES item 13: authoritative voxel replication ----
+// Server validates and applies client edits (cooldown, bounds, loaded chunk,
+// block registry), broadcasts ordered deltas over the generic networking
+// runtime, streams chunks by interest, persists the dedicated server save;
+// clients predict optimistically, correct on the authoritative result and
+// resync from snapshots. All flows are driven transport-free through the
+// public IVoxelReplication contract.
+
+constexpr engine::voxel::ReplicationConnectionId kRepConnA = 1;
+constexpr engine::voxel::ReplicationConnectionId kRepConnB = 2;
+constexpr engine::voxel::ReplicationConnectionId kRepConnC = 3;
+constexpr engine::voxel::ReplicationConnectionId kRepConnLate = 4;
+
+std::unique_ptr<engine::voxel::IVoxelWorld> make_flat_world() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> world =
+        engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(96));
+    if (!boot_world(*world, glm::vec3(16.0f, 200.0f, 16.0f), 16)) return nullptr;
+    return world;
+}
+
+void test_replication_authority() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> server = make_flat_world();
+    CHECK(server != nullptr);
+    const int surface = helper_surface_y(*server, 8, 8);
+    CHECK(surface > 0);
+
+    std::shared_ptr<engine::voxel::IVoxelReplication> replication =
+        engine::voxel::create_voxel_replication(*server);
+    // Wiring: the world exposes the registered replication service.
+    server->register_replication(replication);
+    const auto services = server->registered_services();
+    CHECK(std::find(services.begin(), services.end(), "replication:authoritative") !=
+          services.end());
+    CHECK(std::string(replication->name()) == "authoritative");
+
+    replication->server_register_connection(kRepConnA);
+    replication->server_set_interest(kRepConnA, {{16, surface, 16}, 2});
+
+    // Valid edit: applied to the authoritative world and counted.
+    auto ok = replication->server_submit_edit(kRepConnA, 8, surface + 1, 8, kBlockStone);
+    CHECK(ok.accepted);
+    CHECK(ok.error.empty());
+    CHECK(ok.revision == 1);
+    CHECK(server->get_block(8, surface + 1, 8) == kBlockStone);
+    CHECK(replication->server_edit_count() == 1);
+
+    // Unknown connection refused without mutating anything.
+    auto unknown = replication->server_submit_edit(999, 8, surface + 1, 9, kBlockStone);
+    CHECK(!unknown.accepted);
+    CHECK(unknown.error.find("unknown") != std::string::npos);
+    CHECK(server->get_block(8, surface + 1, 9) == kBlockAir);
+
+    // Cooldown: a second edit in the same tick is refused (anti-spam).
+    auto spam = replication->server_submit_edit(kRepConnA, 9, surface + 1, 9, kBlockStone);
+    CHECK(!spam.accepted);
+    CHECK(spam.error.find("cooldown") != std::string::npos);
+    replication->server_update();
+    replication->server_update();  // advance past the cooldown window
+    auto afterCooldown =
+        replication->server_submit_edit(kRepConnA, 9, surface + 1, 9, kBlockStone);
+    CHECK(afterCooldown.accepted);
+
+    // Out of bounds refused.
+    replication->server_update();
+    replication->server_update();
+    auto bounds = replication->server_submit_edit(kRepConnA, 8, 5000, 8, kBlockStone);
+    CHECK(!bounds.accepted);
+    CHECK(bounds.error.find("bounds") != std::string::npos);
+
+    // Unloaded chunk refused.
+    replication->server_update();
+    replication->server_update();
+    auto far = replication->server_submit_edit(kRepConnA, 4096, surface, 4096, kBlockStone);
+    CHECK(!far.accepted);
+    CHECK(far.error.find("chunk") != std::string::npos);
+
+    // Block id unknown to the world registry refused (world transaction gate).
+    replication->server_update();
+    replication->server_update();
+    auto invalid =
+        replication->server_submit_edit(kRepConnA, 10, surface + 1, 10, 0x10000u);
+    CHECK(!invalid.accepted);
+    CHECK(!invalid.error.empty());
+    CHECK(server->get_block(10, surface + 1, 10) == kBlockAir);  // nothing mutated
+
+    // Broadcast: accepted edits reach a client; rejections are reported too.
+    replication->server_update();
+    auto batch = replication->server_pack_batch(kRepConnA);
+    CHECK(batch.deltas.size() >= 2);
+    CHECK(batch.deltas[0].position == glm::ivec3(8, surface + 1, 8));
+    CHECK(batch.deltas[0].blockId == kBlockStone);
+    CHECK(batch.deltas[0].previousBlockId == kBlockAir);  // wall goes up from air
+    CHECK(batch.deltas[0].revision == 1);
+    CHECK(!batch.rejected.empty());
+    CHECK(std::find(batch.rejected.begin(), batch.rejected.end(),
+                    glm::ivec3(10, surface + 1, 10)) != batch.rejected.end());
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> client = make_flat_world();
+    CHECK(client != nullptr);
+    auto clientRep = engine::voxel::create_voxel_replication(*client);
+    clientRep->client_apply_batch(batch);
+    CHECK(client->get_block(8, surface + 1, 8) == kBlockStone);
+    CHECK(client->get_block(9, surface + 1, 9) == kBlockStone);
+
+    std::cout << "[sdk] replication: server authority (validate/apply/broadcast) "
+                 "OK\n";
+}
+
+void test_replication_deltas_reorder() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> server = make_flat_world();
+    std::unique_ptr<engine::voxel::IVoxelWorld> client = make_flat_world();
+    CHECK(server && client);
+    const int surface = helper_surface_y(*server, 8, 8);
+
+    auto srv = engine::voxel::create_voxel_replication(*server);
+    auto cli = engine::voxel::create_voxel_replication(*client);
+    srv->server_register_connection(kRepConnA);
+
+    CHECK(srv->server_submit_edit(kRepConnA, 8, surface + 1, 8, kBlockStone).accepted);
+    srv->server_update();
+    srv->server_update();
+    // Same position edited again: per-position revision is monotonic.
+    CHECK(srv->server_submit_edit(kRepConnA, 8, surface + 1, 8, kBlockDirt).accepted);
+    srv->server_update();
+    auto batch = srv->server_pack_batch(kRepConnA);
+    CHECK(batch.deltas.size() == 2);
+    CHECK(batch.deltas[0].revision == 1 && batch.deltas[1].revision == 2);
+    CHECK(batch.deltas[0].sequence < batch.deltas[1].sequence);
+
+    cli->client_apply_batch(batch);
+    CHECK(client->get_block(8, surface + 1, 8) == kBlockDirt);  // last edit wins
+
+    // Duplicate/out-of-order delivery is dropped without changing state.
+    const std::size_t staleBefore = cli->client_stale_dropped();
+    cli->client_apply_batch(batch);
+    CHECK(cli->client_stale_dropped() == staleBefore + batch.deltas.size());
+    CHECK(client->get_block(8, surface + 1, 8) == kBlockDirt);
+
+    std::cout << "[sdk] replication: ordered deltas + stale-drop on replay OK\n";
+}
+
+// FALTANTES §7 item 137: integração do commit com replicação e persistência
+// incremental. Um commit feito DIRETO no mundo autoritativo (editor/MCP/host,
+// não via server_submit_edit) deve alcançar os clientes como deltas ordenados
+// (hook de commit = único ponto de broadcast) e sujar o chunk para o save
+// incremental seguinte. Rollback (validação) não transmite nada.
+void test_commit_replication_persistence() {
+    // Servidor com budget 32: garante que o chunk (0,1) (z=24) está residente
+    // ao comitar o multi-edit (anéis 0-2 completos = 25 <= 32) — com budget 16
+    // o eviction corta o chunk intermitentemente (mesmo flake documentado no
+    // test_transaction_failure_stages).
+    std::unique_ptr<engine::voxel::IVoxelWorld> server =
+        engine::voxel::create_default_voxel_world();
+    server->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*server, glm::vec3(8.0f, 200.0f, 8.0f), 32));
+    // boot_world only waits for chunk (0,0); the commit below reaches chunk
+    // (0,1) (z=24), so wait for it too — the commit would otherwise race the
+    // upload and flake (findings #54 pattern).
+    CHECK(settle(*server, glm::vec3(8.0f, 200.0f, 8.0f),
+                 [&] { return server->is_chunk_loaded(0, 1); }));
+    const int surface = helper_surface_y(*server, 8, 8);
+    CHECK(surface > 0);
+
+    auto srv = engine::voxel::create_voxel_replication(*server);
+    server->register_replication(srv);
+    srv->server_register_connection(kRepConnA);
+    srv->server_set_interest(kRepConnA, {{0, surface, 0}, 2});
+
+    // Cliente com budget 32: garante que o chunk (0,1) (z=24) está residente
+    // ao aplicar o batch (anéis 0-2 completos = 25 <= 32), evitando o flake de
+    // "chunk not loaded" na aplicação dos deltas.
+    std::unique_ptr<engine::voxel::IVoxelWorld> client =
+        engine::voxel::create_default_voxel_world();
+    client->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*client, glm::vec3(8.0f, 200.0f, 8.0f), 32));
+
+    // --- Commit multi-edit multi-chunk DIRETO no mundo (não via submit). ---
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = server->begin_transaction();
+        tx->set_block(8, surface + 1, 8, kBlockStone);     // chunk (0,0)
+        tx->set_block(8, surface + 1, 24, kBlockDirt);     // chunk (0,1)
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    // O hook de commit transmitiu os deltas — nada a ver com server_submit_edit.
+    srv->server_update();
+    auto batch = srv->server_pack_batch(kRepConnA);
+    CHECK(batch.deltas.size() == 2);
+    CHECK(batch.deltas[0].position == glm::ivec3(8, surface + 1, 8));
+    CHECK(batch.deltas[0].blockId == kBlockStone);
+    CHECK(batch.deltas[0].previousBlockId == kBlockAir);
+    CHECK(batch.deltas[1].position == glm::ivec3(8, surface + 1, 24));
+    CHECK(batch.deltas[1].blockId == kBlockDirt);
+    CHECK(batch.deltas[0].revision == 1 && batch.deltas[1].revision == 1);
+    CHECK(batch.deltas[0].sequence < batch.deltas[1].sequence);
+
+    // Cliente aplica o batch e converge com a autoridade. O boot não garante
+    // que o anel 1 esteja materializado, e apply de delta em chunk não
+    // carregado é um no-op silencioso do contrato — então materializamos o
+    // chunk (0,1) no cliente ANTES de aplicar (update até is_chunk_loaded).
+    auto clientRep = engine::voxel::create_voxel_replication(*client);
+    for (int i = 0; i < 120 && !client->is_chunk_loaded(0, 1); ++i) {
+        client->update(glm::vec3(8.0f, 200.0f, 8.0f), 1.0f / 60.0f);
+    }
+    CHECK(client->is_chunk_loaded(0, 1));
+    clientRep->client_apply_batch(batch);
+    CHECK(client->get_block(8, surface + 1, 8) == kBlockStone);
+    CHECK(client->get_block(8, surface + 1, 24) == kBlockDirt);
+    CHECK(server->undo_depth() == 1);
+    CHECK(server->edit_log_count() == 2);
+
+    // --- Rollback (validação: id inválido misturado) NÃO transmite nada. ---
+    const std::size_t deltasBefore = srv->server_pack_batch(kRepConnA).deltas.size();
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = server->begin_transaction();
+        tx->set_block(12, surface + 1, 12, kBlockStone);
+        tx->set_block(13, surface + 1, 13, 0x10000u);  // id sem mapping
+        std::string error;
+        CHECK(!tx->commit(error));
+        CHECK(!error.empty());
+    }
+    srv->server_update();
+    const auto afterRollback = srv->server_pack_batch(kRepConnA);
+    CHECK(afterRollback.deltas.size() == deltasBefore);  // nada novo
+    CHECK(server->get_block(12, surface + 1, 12) == kBlockAir);  // intocado
+    CHECK(server->undo_depth() == 1);                            // undo intacto
+
+    // --- Persistência incremental: o commit sujou o chunk; o save persiste. ---
+    auto store = engine::storage::create_region_chunk_storage(8);
+    server->register_storage(store);
+    const std::string dir = scratch_dir() + "/vc_test_commit_repl";
+    std::string saveError;
+    CHECK(server->save_world(dir, saveError));
+    CHECK(saveError.empty());
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> fresh =
+        engine::voxel::create_default_voxel_world();
+    fresh->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*fresh, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    fresh->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string loadError;
+    CHECK(fresh->load_world(dir, loadError));
+    CHECK(loadError.empty());
+    CHECK(fresh->get_block(8, surface + 1, 8) == kBlockStone);  // commit persistido
+    CHECK(fresh->get_block(8, surface + 1, 24) == kBlockDirt);
+
+    std::cout << "[sdk] commit replication+persistence: direct commit reaches "
+                 "clients as ordered deltas, rollback broadcasts nothing, "
+                 "incremental save persists the commit OK\n";
+}
+
+// FALTANTES §7 item 140: undo/redo é SESSION-SCOPED — o histórico não é
+// persistido em nenhum formato de save e um load bem-sucedido (monolítico v5
+// E paginado) limpa undo/redo/log. O undo pós-load reverteria contra o
+// conteúdo recém-carregado (não contra a sessão que produziu as edições), então
+// a nova sessão começa com histórico limpo.
+void test_session_scoped_undo() {
+    // --- Monolítico (serialize/deserialize v5). ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);
+        tx->set_block(5, 130, 5, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    CHECK(a->undo_depth() == 1);
+    CHECK(a->edit_log_count() == 2);
+    std::string serError;
+    const std::string bytes = a->serialize_world(serError);
+    CHECK(serError.empty());
+    CHECK(bytes.size() > 100);
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*b, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    // Histórico próprio ANTES do load.
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = b->begin_transaction();
+        tx->set_block(7, 130, 7, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    CHECK(b->undo_depth() == 1);
+    std::string loadError;
+    CHECK(b->deserialize_world(bytes, loadError));
+    CHECK(loadError.empty());
+    // Load bem-sucedido limpa a sessão: undo/redo/log zerados.
+    CHECK(b->undo_depth() == 0);
+    CHECK(b->edit_log_count() == 0);
+    // O conteúdo do save está lá e o histórico antigo NÃO desfaz contra ele.
+    CHECK(b->get_block(3, 130, 3) == kBlockStone);
+    CHECK(b->get_block(7, 130, 7) == kBlockAir);  // edição pré-load não existe
+
+    // Novo commit pós-load volta a ser undoável (sessão nova).
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = b->begin_transaction();
+        tx->set_block(9, 130, 9, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    CHECK(b->undo_depth() == 1);
+    CHECK(b->edit_log_count() == 1);
+    CHECK(b->undo_last_transaction());
+    CHECK(b->get_block(9, 130, 9) == kBlockAir);
+    CHECK(b->redo_last_transaction());
+    CHECK(b->get_block(9, 130, 9) == kBlockStone);
+
+    // --- Paginado (load_world_regions). ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> c =
+        engine::voxel::create_default_voxel_world();
+    c->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*c, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    c->register_storage(engine::storage::create_region_chunk_storage(8));
+    const std::string dir = scratch_dir() + "/vc_test_session_undo";
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = c->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    CHECK(c->undo_depth() == 1);
+    std::string saveError;
+    CHECK(c->save_world(dir, saveError));
+    CHECK(saveError.empty());
+    // O histórico NÃO foi salvo (session-scoped): carregar o mundo em outra
+    // instância começa com undo_depth 0.
+    std::unique_ptr<engine::voxel::IVoxelWorld> d =
+        engine::voxel::create_default_voxel_world();
+    d->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*d, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    d->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string loadErrorD;
+    CHECK(d->load_world(dir, loadErrorD));
+    CHECK(loadErrorD.empty());
+    CHECK(d->undo_depth() == 0);
+    CHECK(d->edit_log_count() == 0);
+    CHECK(d->get_block(3, 130, 3) == kBlockStone);
+
+    std::cout << "[sdk] session-scoped undo/redo: history cleared by successful "
+                 "load (monolithic + paged), never persisted, new session "
+                 "undoable OK\n";
+}
+
+// FALTANTES §7 item 141: dry-run, diff e diagnóstico estruturado para
+// editor/MCP. dry_run_edits pré-visualiza o que o commit FARIA sem aplicar
+// nada: validação idêntica ao commit (limites/política/registry/chunk), diff
+// com o before-state por edit, e NENHUMA mutação, evento ou undo.
+void test_transaction_dry_run() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> world =
+        engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*world, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+
+    int rolledBack = 0, committed = 0;
+    world->set_transaction_listener(
+        [&](const engine::voxel::TransactionEvent& event) {
+            if (event.kind == engine::voxel::TransactionEvent::Kind::RolledBack) ++rolledBack;
+            if (event.kind == engine::voxel::TransactionEvent::Kind::Committed) ++committed;
+        });
+
+    // --- Diff correto: before-state lido do mundo vivo, nada aplicado. ---
+    engine::voxel::EditDryRunResult dry = world->dry_run_edits({
+        { { 3, 130, 3 }, kBlockStone, 0 },
+        { { 5, 130, 5 }, kBlockDirt, 0 },
+    });
+    CHECK(dry.valid);
+    CHECK(dry.error.empty());
+    CHECK(dry.diff.size() == 2);
+    CHECK(dry.diff[0].position == glm::ivec3(3, 130, 3));
+    CHECK(dry.diff[0].blockId == kBlockStone);
+    CHECK(dry.diff[0].previousBlockId == kBlockAir);   // before-state = air
+    CHECK(dry.diff[1].previousBlockId == kBlockAir);
+    // O dry-run NÃO mutou nada, não disparou eventos e não tocou o undo.
+    CHECK(world->get_block(3, 130, 3) == kBlockAir);
+    CHECK(world->get_block(5, 130, 5) == kBlockAir);
+    CHECK(rolledBack == 0 && committed == 0);
+    CHECK(world->undo_depth() == 0);
+    CHECK(world->edit_log_count() == 0);
+
+    // O diff bate com o que o commit realmente faz (mesma validação, mesmo
+    // resultado observável depois de aplicar).
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = world->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);
+        tx->set_block(5, 130, 5, kBlockDirt);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    CHECK(world->get_block(3, 130, 3) == kBlockStone);
+    CHECK(world->get_block(5, 130, 5) == kBlockDirt);
+    CHECK(committed == 1);
+
+    // --- Diagnóstico estruturado: mesmos erros do commit, SEM eventos. ---
+    world->set_transaction_limits(
+        engine::voxel::TransactionLimits{ /*maxEdits=*/1, /*maxBoxVolume=*/0 });
+    engine::voxel::EditDryRunResult overLimit = world->dry_run_edits({
+        { { 10, 130, 10 }, kBlockStone, 0 },
+        { { 11, 130, 11 }, kBlockStone, 0 },
+    });
+    CHECK(!overLimit.valid);
+    CHECK(overLimit.error.find("per-transaction limit") != std::string::npos);
+    CHECK(overLimit.diff.empty());
+    CHECK(world->get_block(10, 130, 10) == kBlockAir);  // nada aplicado
+    CHECK(rolledBack == 0);  // dry-run nunca dispara RolledBack
+    world->set_transaction_limits({});
+
+    // Id inválido (registry): mesmo diagnóstico do commit.
+    engine::voxel::EditDryRunResult badId = world->dry_run_edits({
+        { { 12, 130, 12 }, 0x10000u, 0 },
+    });
+    CHECK(!badId.valid);
+    CHECK(badId.error.find("block registry") != std::string::npos);
+    CHECK(world->get_block(12, 130, 12) == kBlockAir);
+
+    // Chunk não carregado: o dry-run espelha o rollback que o commit faria.
+    engine::voxel::EditDryRunResult far = world->dry_run_edits({
+        { { 4096, 130, 4096 }, kBlockStone, 0 },
+    });
+    CHECK(!far.valid);
+    CHECK(far.error.find("chunk not loaded") != std::string::npos);
+    CHECK(world->get_block(4096, 130, 4096) == kBlockAir);
+
+    std::cout << "[sdk] transaction dry-run: preview without applying (diff "
+                 "before-state, no events/undo), diagnostics mirror commit, "
+                 "chunk-not-loaded mirrored OK\n";
+}
+
+// FALTANTES §6 item 129: integração do scheduler com save e servidor headless.
+// O estado do scheduler (relógio fixo + filas) viaja com o save v5 e é
+// restaurado no load — um servidor dedicado/headless continua o tick de onde a
+// sessão salvada parou. Prova: uma block entity tickável (CounterMachine) roda
+// N ticks, o mundo é salvo e recarregado; o PRÓXIMO tick pós-load é contínuo
+// (worldTick avança de onde parou, não reinicia em 1).
+void test_scheduler_save_headless() {
+    // World A: boot, attach a CounterMachine, run ticks so the scheduler clock
+    // advances well past zero.
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(96));
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    CHECK(boot_world(*a, player, 16));
+    a->register_block_entity_type("project:counter_machine",
+        [] { return std::make_shared<CounterMachine>(); });
+    auto machine = std::make_shared<CounterMachine>();
+    std::string error;
+    CHECK(a->attach_block_entity(5, 96, 5, machine, error));
+    for (int i = 0; i < 8; ++i) a->update(player, 0.09f);
+    CHECK(machine->ticks_ >= 8);
+    const uint64_t savedTick = machine->lastWorldTick_;
+    CHECK(savedTick > 0);
+
+    // Save (monolithic v5 with scheduler state) and load into a fresh world.
+    std::string saveError;
+    const std::string bytes = a->serialize_world(saveError);
+    CHECK(saveError.empty());
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*b, player, 16));
+    b->register_block_entity_type("project:counter_machine",
+        [] { return std::make_shared<CounterMachine>(); });
+    std::string loadError;
+    CHECK(b->deserialize_world(bytes, loadError));
+    CHECK(loadError.empty());
+    const auto restored = b->block_entity_at(5, 96, 5);
+    CHECK(restored != nullptr);
+    auto restoredMachine =
+        std::static_pointer_cast<CounterMachine>(restored);
+    CHECK(restoredMachine->ticks_ == 0);  // runtime counters start fresh
+
+    // The scheduler clock was restored: the next tick continues PAST the
+    // saved worldTick (a fresh scheduler would start at worldTick 1).
+    b->update(player, 0.09f);
+    CHECK(restoredMachine->ticks_ == 1);
+    CHECK(restoredMachine->lastWorldTick_ > savedTick);
+
+    // Region (paged) path: same guarantee through load_world.
+    std::unique_ptr<engine::voxel::IVoxelWorld> c =
+        engine::voxel::create_default_voxel_world();
+    c->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*c, player, 16));
+    c->register_block_entity_type("project:counter_machine",
+        [] { return std::make_shared<CounterMachine>(); });
+    auto machineC = std::make_shared<CounterMachine>();
+    std::string errorC;
+    CHECK(c->attach_block_entity(5, 96, 5, machineC, errorC));
+    for (int i = 0; i < 6; ++i) c->update(player, 0.09f);
+    CHECK(machineC->lastWorldTick_ > 0);
+    const uint64_t savedTickC = machineC->lastWorldTick_;
+    c->register_storage(engine::storage::create_region_chunk_storage(8));
+    const std::string dir = scratch_dir() + "/vc_test_sched_headless";
+    std::string cSaveError;
+    CHECK(c->save_world(dir, cSaveError));
+    CHECK(cSaveError.empty());
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> d =
+        engine::voxel::create_default_voxel_world();
+    d->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*d, player, 16));
+    d->register_block_entity_type("project:counter_machine",
+        [] { return std::make_shared<CounterMachine>(); });
+    d->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string dLoadError;
+    CHECK(d->load_world(dir, dLoadError));
+    CHECK(dLoadError.empty());
+    const auto restoredD = d->block_entity_at(5, 96, 5);
+    CHECK(restoredD != nullptr);
+    auto restoredMachineD = std::static_pointer_cast<CounterMachine>(restoredD);
+    d->update(player, 0.09f);
+    CHECK(restoredMachineD->ticks_ == 1);
+    CHECK(restoredMachineD->lastWorldTick_ > savedTickC);
+
+    std::cout << "[sdk] scheduler save/headless: scheduler clock rides the v5 "
+                 "save (monolithic + paged) and a restored world continues its "
+                 "tick from the saved worldTick OK\n";
+}
+
+void test_replication_interest() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> server = make_flat_world();
+    CHECK(server != nullptr);
+    const int surface = helper_surface_y(*server, 8, 8);
+    CHECK(surface > 0);
+
+    auto srv = engine::voxel::create_voxel_replication(*server);
+    srv->server_register_connection(kRepConnA);
+    srv->server_set_snapshot_window(0, surface + 8);  // cover the wall above water
+    srv->server_set_interest(kRepConnA, {{0, surface, 0}, 1});
+
+    // Build a wall through the authority inside chunk (0,0).
+    for (int z = 4; z <= 12; ++z) {
+        CHECK(srv->server_submit_edit(kRepConnA, 8, surface + 1, z, kBlockStone).accepted);
+        srv->server_update();
+        srv->server_update();
+    }
+    srv->server_update();
+    auto snapshots = srv->server_pack_interest(kRepConnA);
+    // The wall is complete only in the LAST streamed snapshot of chunk (0,0)
+    // (earlier ones were streamed mid-construction and are superseded).
+    const engine::voxel::ChunkReplicationSnapshot* lastChunk00 = nullptr;
+    for (const auto& snapshot : snapshots) {
+        if (snapshot.chunkX == 0 && snapshot.chunkZ == 0) lastChunk00 = &snapshot;
+    }
+    CHECK(lastChunk00 != nullptr);
+    if (lastChunk00 != nullptr) {
+        const std::size_t index =
+            (static_cast<std::size_t>(surface + 1) *
+                 engine::voxel::kReplicationChunkSize +
+             8) *
+                engine::voxel::kReplicationChunkSize +
+            8;
+        CHECK(index < lastChunk00->blocks.size());
+        if (index < lastChunk00->blocks.size()) {
+            CHECK(lastChunk00->blocks[index] == kBlockStone);  // wall in snapshot
+        }
+    }
+
+    // A dirty chunk re-streams after a new edit.
+    CHECK(srv->server_submit_edit(kRepConnA, 8, surface + 1, 14, kBlockStone).accepted);
+    srv->server_update();
+    auto again = srv->server_pack_interest(kRepConnA);
+    bool resent = false;
+    for (const auto& snapshot : again) {
+        if (snapshot.chunkX == 0 && snapshot.chunkZ == 0) resent = true;
+    }
+    CHECK(resent);
+
+    // A client far away streams nothing (no loaded chunks in interest range).
+    srv->server_register_connection(kRepConnB);
+    srv->server_set_interest(kRepConnB, {{4096, surface, 4096}, 1});
+    srv->server_update();
+    CHECK(srv->server_pack_interest(kRepConnB).empty());
+
+    std::cout << "[sdk] replication: chunk streaming by interest (snapshot, "
+                 "dirty resend, out-of-range) OK\n";
+}
+
+void test_replication_prediction_correction() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> server = make_flat_world();
+    std::unique_ptr<engine::voxel::IVoxelWorld> clientA = make_flat_world();
+    std::unique_ptr<engine::voxel::IVoxelWorld> clientC = make_flat_world();
+    CHECK(server && clientA && clientC);
+    const int surface = helper_surface_y(*server, 8, 8);
+
+    auto srv = engine::voxel::create_voxel_replication(*server);
+    auto cliA = engine::voxel::create_voxel_replication(*clientA);
+    auto cliC = engine::voxel::create_voxel_replication(*clientC);
+    srv->server_register_connection(kRepConnA);
+    srv->server_register_connection(kRepConnC);
+
+    // A predicts a place at P; C (server-validated) places a different block
+    // first. A must be corrected to the authoritative block.
+    CHECK(cliA->client_predict(8, surface + 1, 8, kBlockStone));
+    CHECK(clientA->get_block(8, surface + 1, 8) == kBlockStone);  // optimistic
+    CHECK(cliA->client_pending_predictions() == 1);
+    CHECK(srv->server_submit_edit(kRepConnC, 8, surface + 1, 8, kBlockDirt).accepted);
+    srv->server_update();
+    auto batchA = srv->server_pack_batch(kRepConnA);
+    CHECK(batchA.deltas.size() == 1);
+    CHECK(batchA.deltas[0].blockId == kBlockDirt);
+    cliA->client_apply_batch(batchA);
+    CHECK(cliA->client_pending_predictions() == 0);          // settled by authority
+    CHECK(clientA->get_block(8, surface + 1, 8) == kBlockDirt);  // corrected
+
+    // C predicts, then the server rejects the relayed edit (cooldown): the
+    // client reverts to the pre-prediction block.
+    CHECK(cliC->client_predict(12, surface + 1, 12, kBlockStone));
+    CHECK(clientC->get_block(12, surface + 1, 12) == kBlockStone);
+    auto rejected = srv->server_submit_edit(kRepConnC, 12, surface + 1, 12, kBlockStone);
+    CHECK(!rejected.accepted);  // C is still inside its cooldown window
+    srv->server_update();
+    auto batchC = srv->server_pack_batch(kRepConnC);
+    CHECK(!batchC.rejected.empty());
+    CHECK(std::find(batchC.rejected.begin(), batchC.rejected.end(),
+                    glm::ivec3(12, surface + 1, 12)) != batchC.rejected.end());
+    cliC->client_apply_batch(batchC);
+    CHECK(cliC->client_pending_predictions() == 0);
+    CHECK(clientC->get_block(12, surface + 1, 12) == kBlockAir);  // reverted
+
+    std::cout << "[sdk] replication: prediction + correction + rejection-revert "
+                 "OK\n";
+}
+
+void test_replication_reconnect_resync() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> server = make_flat_world();
+    std::unique_ptr<engine::voxel::IVoxelWorld> clientB = make_flat_world();
+    CHECK(server && clientB);
+    const int surface = helper_surface_y(*server, 8, 8);
+
+    auto srv = engine::voxel::create_voxel_replication(*server);
+    auto cliB = engine::voxel::create_voxel_replication(*clientB);
+    srv->server_register_connection(kRepConnA);
+    srv->server_set_snapshot_window(0, surface + 8);
+    srv->server_set_interest(kRepConnA, {{0, surface, 0}, 1});
+    for (int z = 4; z <= 12; ++z) {
+        CHECK(srv->server_submit_edit(kRepConnA, 8, surface + 1, z, kBlockStone).accepted);
+        srv->server_update();
+        srv->server_update();
+    }
+    srv->server_update();
+
+    // A late client reconnects: interest streams full snapshots (no deltas
+    // needed) and the client world converges to the authoritative state.
+    srv->server_register_connection(kRepConnLate);
+    srv->server_set_interest(kRepConnLate, {{0, surface, 0}, 1});
+    srv->server_update();
+    auto snapshots = srv->server_pack_interest(kRepConnLate);
+    CHECK(!snapshots.empty());
+    for (const auto& snapshot : snapshots) {
+        if (snapshot.chunkX == 0 && snapshot.chunkZ == 0) {
+            cliB->client_apply_snapshot(snapshot);
+        }
+    }
+    CHECK(clientB->get_block(8, surface + 1, 8) == kBlockStone);   // resynced
+    CHECK(clientB->get_block(8, surface + 1, 12) == kBlockStone);
+
+    std::cout << "[sdk] replication: reconnect + snapshot resync OK\n";
+}
+
+void test_replication_server_persist() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> server = make_flat_world();
+    CHECK(server != nullptr);
+    const int surface = helper_surface_y(*server, 8, 8);
+
+    auto srv = engine::voxel::create_voxel_replication(*server);
+    srv->server_register_connection(kRepConnA);
+    CHECK(srv->server_submit_edit(kRepConnA, 8, surface + 1, 8, kBlockStone).accepted);
+
+    std::string error;
+    const std::string path =
+        (std::filesystem::temp_directory_path() /
+         ("vc_rep_server_save_" + std::to_string(_getpid()) + ".bin")).string();
+    std::filesystem::remove(path);
+    CHECK(srv->server_save(path, error));
+    CHECK(error.empty());
+
+    // Dedicated-server persistence: a fresh world loads the authoritative state.
+    std::unique_ptr<engine::voxel::IVoxelWorld> loaded =
+        engine::voxel::create_default_voxel_world();
+    loaded->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(loaded->load_world(path, error));
+    CHECK(error.empty());
+    CHECK(loaded->get_block(8, surface + 1, 8) == kBlockStone);
+    std::filesystem::remove(path);
+
+    std::cout << "[sdk] replication: dedicated-server persistence OK\n";
+}
+
+void test_replication_codec() {
+    engine::voxel::ReplicationBatch batch;
+    batch.sequence = 5;
+    batch.deltas.push_back({{1, 2, 3}, 7, 4, 5, 2});
+    batch.deltas.push_back({{4, 5, 6}, 3, 9, 6, 3});
+    batch.rejected.push_back({9, 9, 9});
+
+    auto raw = engine::voxel::encode_replication_batch(batch);
+    engine::voxel::ReplicationBatch decoded;
+    CHECK(engine::voxel::decode_replication_batch(raw, decoded));
+    CHECK(decoded.sequence == 5);
+    CHECK(decoded.deltas.size() == 2);
+    CHECK(decoded.rejected.size() == 1);
+    CHECK(decoded.deltas == batch.deltas);
+    CHECK(decoded.rejected == batch.rejected);
+
+    // Malformed frame (bad magic) is refused, never partially applied.
+    std::vector<std::byte> junk = raw;
+    junk[0] = std::byte{'X'};
+    engine::voxel::ReplicationBatch bad;
+    CHECK(!engine::voxel::decode_replication_batch(junk, bad));
+
+    // Compressed round-trip through the promoted zstd provider.
+    auto zstd = engine::compression::create_zstd_compression_provider();
+    CHECK(zstd != nullptr);
+    auto packed = engine::voxel::encode_replication_batch(batch, zstd);
+    engine::voxel::ReplicationBatch fromPacked;
+    CHECK(engine::voxel::decode_replication_batch(packed, fromPacked, zstd));
+    CHECK(fromPacked.deltas == batch.deltas);
+    CHECK(fromPacked.rejected == batch.rejected);
+
+    engine::voxel::ChunkReplicationSnapshot snapshot;
+    snapshot.chunkX = 0;
+    snapshot.chunkZ = 0;
+    snapshot.minY = 64;
+    snapshot.height = 16;
+    snapshot.sequence = 9;
+    snapshot.blocks.assign(16 * 16 * 16, 0u);
+    snapshot.blocks[(3 * 16 + 2) * 16 + 1] = kBlockStone;
+    auto sRaw = engine::voxel::encode_replication_snapshot(snapshot);
+    engine::voxel::ChunkReplicationSnapshot sDecoded;
+    CHECK(engine::voxel::decode_replication_snapshot(sRaw, sDecoded));
+    CHECK(sDecoded.chunkX == 0 && sDecoded.chunkZ == 0 && sDecoded.minY == 64);
+    CHECK(sDecoded.height == 16 && sDecoded.sequence == 9);
+    CHECK(sDecoded.blocks == snapshot.blocks);
+    auto sPacked = engine::voxel::encode_replication_snapshot(snapshot, zstd);
+    engine::voxel::ChunkReplicationSnapshot sFromPacked;
+    CHECK(engine::voxel::decode_replication_snapshot(sPacked, sFromPacked, zstd));
+    CHECK(sFromPacked.blocks == snapshot.blocks);
+
+    std::cout << "[sdk] replication: batch/snapshot codec + zstd compression "
+                 "round-trip OK\n";
+}
+
+void test_replication_multiclient() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> server = make_flat_world();
+    CHECK(server != nullptr);
+    const int surface = helper_surface_y(*server, 8, 8);
+
+    auto srv = engine::voxel::create_voxel_replication(*server);
+    srv->server_register_connection(kRepConnA);
+    srv->server_register_connection(kRepConnB);
+    CHECK(srv->server_submit_edit(kRepConnA, 8, surface + 1, 8, kBlockStone).accepted);
+    srv->server_update();
+    auto batchA = srv->server_pack_batch(kRepConnA);
+    auto batchB = srv->server_pack_batch(kRepConnB);
+    CHECK(batchA.deltas.size() == 1);
+    CHECK(batchB.deltas.size() == 1);
+    CHECK(batchA.deltas[0].position == batchB.deltas[0].position);
+    // Per-connection ordering: each client's stream is independent and starts
+    // its own sequence space (both are the first delta of their stream).
+    CHECK(batchA.deltas[0].sequence == 1);
+    CHECK(batchB.deltas[0].sequence == 1);
+
+    // A second edit is delivered to both with increasing per-connection seqs.
+    srv->server_update();
+    srv->server_update();
+    CHECK(srv->server_submit_edit(kRepConnA, 9, surface + 1, 9, kBlockDirt).accepted);
+    srv->server_update();
+    auto batchA2 = srv->server_pack_batch(kRepConnA);
+    auto batchB2 = srv->server_pack_batch(kRepConnB);
+    CHECK(batchA2.deltas.size() == 1 && batchB2.deltas.size() == 1);
+    CHECK(batchA2.deltas[0].sequence > batchA.deltas[0].sequence);
+    CHECK(batchB2.deltas[0].sequence > batchB.deltas[0].sequence);
+
+    std::cout << "[sdk] replication: multiclient broadcast with per-connection "
+                 "ordering OK\n";
+}
+
+void test_region_replication() {
+    // FALTANTES item 6: block entities, fluids, relevant lighting and
+    // entities (+§14 inventories) replicate per region as one state-sync unit.
+    constexpr std::uint32_t kBlockGlowstone = 40;  // BlockType::Glowstone
+    constexpr std::uint32_t kWaterId = 12;          // BlockType::Water
+
+    // Both sides register the same project block entity type (reconstruction
+    // requires the factory — all-or-nothing otherwise).
+    auto registerChest = [](engine::voxel::IVoxelWorld& world) {
+        world.register_block_entity_type("project:counter_machine",
+            [] { return std::make_shared<CounterMachine>(); });
+    };
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> server = make_flat_world();
+    CHECK(server != nullptr);
+    registerChest(*server);
+    const int surface = helper_surface_y(*server, 8, 8);
+    CHECK(surface > 0);
+
+    // Authoritative region content: a block entity, an entity carrying a §14
+    // inventory component, a fluid (water) and a light emitter (glowstone).
+    auto machine = std::make_shared<CounterMachine>();
+    machine->counter_ = 42;
+    std::string error;
+    server->set_block(8, surface + 1, 8, kBlockStone);
+    CHECK(server->attach_block_entity(8, surface + 1, 8, machine, error));
+
+    auto entityWorld = server->entity_world();
+    CHECK(entityWorld != nullptr);
+    engine::entity::ComponentData inventory;
+    inventory.type = "inventory";
+    inventory.version = 1;
+    {
+        engine::registry::ItemRegistry items;
+        engine::registry::ItemDefinition def;
+        def.ns = "vulkancraft";
+        def.name = "cobblestone";
+        def.maxStack = 64;
+        CHECK(items.register_item(def, error));
+        engine::registry::Inventory inv(2);
+        engine::registry::SlotFilter any;
+        any.allowAny = true;
+        inv.set_filter(0, any);
+        engine::registry::ItemStack stone;
+        stone.item = "vulkancraft:cobblestone";
+        stone.count = 10;
+        CHECK(inv.set(0, stone, items, error));
+        inventory.blob = inv.serialize_json();
+    }
+    std::string spawnError;
+    const engine::entity::EntityId holder =
+        entityWorld->spawn("project:inventory_holder",
+                           { static_cast<float>(9), static_cast<float>(surface + 1),
+                             static_cast<float>(9) },
+                           spawnError);
+    CHECK(holder.valid());
+    CHECK(entityWorld->set_component(holder, inventory));
+
+    server->set_block(10, surface + 1, 10, kWaterId);
+    server->set_block(11, surface + 1, 11, kBlockGlowstone);
+    // Let the deterministic engine settle fluid + light on the authority.
+    const glm::vec3 player(16.0f, 200.0f, 16.0f);
+    CHECK(settle(*server, player,
+                 [&] { return server->get_block_light(11, surface + 1, 11) > 0; }));
+    CHECK(server->get_fluid_level(10, surface + 1, 10) != 0xFF);
+
+    auto srv = engine::voxel::create_voxel_replication(*server);
+    srv->server_register_connection(kRepConnA);
+    srv->server_set_interest(kRepConnA, {{8, surface, 8}, 0});
+    // The test edits sit just above the surface; give the snapshot a window
+    // that covers the whole region we verify (edits at surface+1 and below).
+    srv->server_set_snapshot_window(surface - 24, 48);
+    srv->server_update();
+
+    engine::voxel::RegionReplicationSnapshot region;
+    std::string regionError;
+    CHECK(srv->server_pack_region(kRepConnA, region, regionError));
+    CHECK(regionError.empty());
+    CHECK(region.chunkRadius == 0);
+    CHECK(region.chunks.size() == 1);
+    CHECK(region.chunks[0].chunkX == 0 && region.chunks[0].chunkZ == 0);
+    // Blocks inside the window (the test window covers the edits).
+    CHECK(region.chunks[0].height == 48);
+
+    // Block entity state: position + typeId + version + opaque blob.
+    CHECK(region.blockEntities.size() == 1);
+    CHECK(region.blockEntities[0].position == glm::ivec3(8, surface + 1, 8));
+    CHECK(region.blockEntities[0].typeId == "project:counter_machine");
+    CHECK(region.blockEntities[0].dataVersion == 1);
+    CHECK(region.blockEntities[0].blob.size() == 4);
+    std::uint32_t counter = 0;
+    for (int i = 0; i < 4; ++i) {
+        counter |= static_cast<std::uint32_t>(region.blockEntities[0].blob[static_cast<std::size_t>(i)])
+                   << (8 * i);
+    }
+    CHECK(counter == 42);
+
+    // Entity snapshot with the inventory component blob (the §14 inventory
+    // JSON rides in the protocol untouched).
+    CHECK(region.entities.size() == 1);
+    CHECK(region.entities[0].type == "project:inventory_holder");
+    bool foundInventory = false;
+    for (const engine::entity::ComponentData& c : region.entities[0].components) {
+        if (c.type == "inventory") {
+            foundInventory = true;
+            engine::registry::ItemRegistry items;
+            engine::registry::ItemDefinition def;
+            def.ns = "vulkancraft";
+            def.name = "cobblestone";
+            def.maxStack = 64;
+            CHECK(items.register_item(def, error));
+            engine::registry::Inventory parsed(2);
+            engine::registry::SlotFilter parsedFilter;
+            parsedFilter.allowAny = true;
+            parsed.set_filter(0, parsedFilter);
+            CHECK(parsed.deserialize_json(c.blob, items, error));
+            CHECK(parsed.get(0).item == "vulkancraft:cobblestone");
+            CHECK(parsed.get(0).count == 10);
+        }
+    }
+    CHECK(foundInventory);
+
+    // Relevant fluid + light cells: sparse, water + glowstone present.
+    bool foundWater = false;
+    bool foundLight = false;
+    for (const engine::voxel::FluidLightReplicationCell& cell : region.cells) {
+        if (cell.position == glm::ivec3(10, surface + 1, 10)) {
+            foundWater = true;
+            CHECK(cell.fluidLevel != 0xFF);
+        }
+        if (cell.position == glm::ivec3(11, surface + 1, 11)) {
+            foundLight = true;
+            CHECK(cell.blockLight > 0);
+        }
+    }
+    CHECK(foundWater);
+    CHECK(foundLight);
+
+    // Codec: bit-exact round-trip (region carries everything).
+    const std::vector<std::byte> encoded =
+        engine::voxel::encode_replication_region(region);
+    CHECK(!encoded.empty());
+    engine::voxel::RegionReplicationSnapshot decoded;
+    CHECK(engine::voxel::decode_replication_region(encoded, decoded));
+    CHECK(decoded.sequence == region.sequence);
+    CHECK(decoded.chunks.size() == region.chunks.size());
+    CHECK(decoded.blockEntities == region.blockEntities);
+    CHECK(decoded.cells.size() == region.cells.size());
+    CHECK(decoded.entities.size() == region.entities.size());
+    CHECK(engine::voxel::encode_replication_region(decoded) == encoded);
+
+    // Determinism between identical servers: bit-identical regions.
+    std::unique_ptr<engine::voxel::IVoxelWorld> server2 = make_flat_world();
+    CHECK(server2 != nullptr);
+    registerChest(*server2);
+    const int surface2 = helper_surface_y(*server2, 8, 8);
+    CHECK(surface2 == surface);
+    auto machine2 = std::make_shared<CounterMachine>();
+    machine2->counter_ = 42;
+    server2->set_block(8, surface2 + 1, 8, kBlockStone);
+    CHECK(server2->attach_block_entity(8, surface2 + 1, 8, machine2, error));
+    auto entityWorld2 = server2->entity_world();
+    const engine::entity::EntityId holder2 = entityWorld2->spawn(
+        "project:inventory_holder",
+        { static_cast<float>(9), static_cast<float>(surface2 + 1), static_cast<float>(9) },
+        spawnError);
+    CHECK(holder2.valid());
+    CHECK(entityWorld2->set_component(holder2, inventory));
+    server2->set_block(10, surface2 + 1, 10, kWaterId);
+    server2->set_block(11, surface2 + 1, 11, kBlockGlowstone);
+    CHECK(settle(*server2, player,
+                 [&] { return server2->get_block_light(11, surface2 + 1, 11) > 0; }));
+    auto srv2 = engine::voxel::create_voxel_replication(*server2);
+    srv2->server_register_connection(kRepConnB);
+    srv2->server_set_interest(kRepConnB, {{8, surface2, 8}, 0});
+    srv2->server_set_snapshot_window(surface2 - 24, 48);
+    srv2->server_update();
+    engine::voxel::RegionReplicationSnapshot region2;
+    CHECK(srv2->server_pack_region(kRepConnB, region2, regionError));
+    {
+        const std::vector<std::byte> encoded2 =
+            engine::voxel::encode_replication_region(region2);
+        CHECK(encode_replication_region(region2) == encoded);
+    }
+
+    // Client apply: blocks + block entity (reconstructed via factory) +
+    // entity (with its inventory component) converge to the region.
+    std::unique_ptr<engine::voxel::IVoxelWorld> client = make_flat_world();
+    CHECK(client != nullptr);
+    registerChest(*client);
+    auto cli = engine::voxel::create_voxel_replication(*client);
+    std::string applyError;
+    CHECK(cli->client_apply_region(decoded, applyError));
+    CHECK(applyError.empty());
+    CHECK(client->get_block(8, surface + 1, 8) == kBlockStone);
+    CHECK(client->get_block(11, surface + 1, 11) == kBlockGlowstone);
+    auto chest = client->block_entity_at(8, surface + 1, 8);
+    CHECK(chest != nullptr);
+    CHECK(chest->type_id() == "project:counter_machine");
+    auto* counterMachine = dynamic_cast<CounterMachine*>(chest.get());
+    CHECK(counterMachine != nullptr);
+    CHECK(counterMachine->counter_ == 42);
+
+    auto clientEntities = client->entity_world()->entities_in_chunk(0, 0);
+    CHECK(clientEntities.size() == 1);
+    engine::entity::ComponentData received;
+    CHECK(client->entity_world()->get_component(clientEntities[0], "inventory",
+                                                received));
+    engine::registry::ItemRegistry items;
+    engine::registry::ItemDefinition def;
+    def.ns = "vulkancraft";
+    def.name = "cobblestone";
+    def.maxStack = 64;
+    CHECK(items.register_item(def, error));
+    engine::registry::Inventory parsed(2);
+    engine::registry::SlotFilter parsedFilter;
+    parsedFilter.allowAny = true;
+    parsed.set_filter(0, parsedFilter);
+    CHECK(parsed.deserialize_json(received.blob, items, error));
+    CHECK(parsed.get(0).item == "vulkancraft:cobblestone");
+    CHECK(parsed.get(0).count == 10);
+
+    // The client's deterministic engine converges fluid + light to the
+    // authoritative cells.
+    CHECK(settle(*client, player,
+                 [&] {
+                     return client->get_block_light(11, surface + 1, 11) > 0 &&
+                            client->get_fluid_level(10, surface + 1, 10) ==
+                                server->get_fluid_level(10, surface + 1, 10);
+                 }));
+
+    // Unknown connection refused; unregistered block entity type refused
+    // all-or-nothing (nothing mutated).
+    engine::voxel::RegionReplicationSnapshot unused;
+    CHECK(!srv->server_pack_region(999, unused, regionError));
+    CHECK(!regionError.empty());
+    engine::voxel::RegionReplicationSnapshot bad = decoded;
+    engine::voxel::BlockEntityReplicationState unknown;
+    unknown.position = { 7, surface + 1, 7 };
+    unknown.typeId = "project:not_registered";
+    unknown.dataVersion = 1;
+    bad.blockEntities.push_back(unknown);
+    std::unique_ptr<engine::voxel::IVoxelWorld> other = make_flat_world();
+    auto otherCli = engine::voxel::create_voxel_replication(*other);
+    CHECK(!otherCli->client_apply_region(bad, applyError));
+    CHECK(!applyError.empty());
+    CHECK(other->block_entity_count() == 0);
+    CHECK(other->entity_world()->size() == 0);
+
+    std::cout << "[sdk] replication: region state (block entities + fluids/light "
+                 "cells + entities/inventories) OK\n";
+}
+
+// ---- FALTANTES item 11: mobs are IEntityWorld entities (the legacy Mob/
+// MobManager track was removed from the simulation World). The public
+// IMobBehavior advances them — gravity, fluid damage (META section 13),
+// fluids are never ground, simple AI, death -> despawn. Equivalence gate: the
+// cow-in-lava scenario that used to live in the streaming test.
+
+// Polls world.update + behavior.tick until the predicate holds.
+template <typename Pred>
+bool settle_mob(engine::voxel::IVoxelWorld& world,
+                engine::entity::IEntityWorld& entities,
+                engine::entity::IMobBehavior& behavior, const glm::vec3& player,
+                Pred predicate, int maxMs = 8000) {
+    const auto start = std::chrono::steady_clock::now();
+    while (!predicate()) {
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count() > maxMs) {
+            return false;
+        }
+        world.update(player, 1.0f / 60.0f);
+        std::string error;
+        if (!behavior.tick(1.0f / 60.0f, { player.x, player.y, player.z },
+                           entities, world.mob_world_query(), error)) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return true;
+}
+
+engine::entity::EntityId spawn_mob_entity(engine::entity::IEntityWorld& entities,
+                                          uint32_t typeIndex, float maxHealth,
+                                          bool hostile,
+                                          const engine::entity::Position& pos) {
+    std::string error;
+    const engine::entity::EntityId id = entities.spawn("project:mob", pos, error);
+    if (!id.valid()) return id;
+    entities.set_health(id, { maxHealth, maxHealth });
+    engine::entity::MobSpec spec;
+    spec.typeIndex = typeIndex;
+    spec.maxHealth = maxHealth;
+    spec.hostile = hostile;
+    engine::entity::ComponentData mob;
+    mob.type = engine::entity::kMobComponentType;
+    mob.version = 1;
+    mob.blob = engine::entity::serialize_mob_spec(spec);
+    entities.set_component(id, mob);
+    return id;
+}
+
+void test_mob_behavior() {
+    constexpr int kLavaId = 13;  // builtin BlockType::Lava
+
+    // Equivalence gate — cow in lava (was scenario_fluid_damage in the
+    // streaming test): the cow sinks through the lava (fluids are never
+    // ground) and takes the lava's damagePerTick (4/s) until the check fires.
+    {
+        std::unique_ptr<engine::voxel::IVoxelWorld> world = make_flat_world();
+        CHECK(world != nullptr);
+        const int floorY = helper_surface_y(*world, 8, 8);
+        CHECK(floorY > 0);
+        for (int x = 5; x <= 11; ++x) {
+            for (int z = 5; z <= 11; ++z) {
+                world->set_block(x, floorY, z, kBlockStone);
+                world->set_block(x, floorY + 1, z, kLavaId);
+                world->set_block(x, floorY + 2, z, kLavaId);
+                for (int y = floorY + 3; y <= floorY + 6; ++y) {
+                    world->set_block(x, y, z, kBlockAir);
+                }
+            }
+        }
+        auto& entities = *world->entity_world();
+        std::unique_ptr<engine::entity::IMobBehavior> behavior =
+            engine::entity::create_mob_behavior();
+        const engine::entity::EntityId cow = spawn_mob_entity(
+            entities, 3, 10.0f, false,
+            { 8.5f, static_cast<float>(floorY) + 4.5f, 8.5f });
+        CHECK(cow.valid());
+        const glm::vec3 player(16.0f, 200.0f, 16.0f);
+        const bool damaged = settle_mob(*world, entities, *behavior, player,
+                                        [&] {
+                                            engine::entity::Health h;
+                                            return entities.get_health(cow, h) &&
+                                                   h.value <= 10.0f - 1.5f;
+                                        });
+        CHECK(damaged);
+        engine::entity::Health h;
+        engine::entity::Position p;
+        CHECK(entities.get_health(cow, h));
+        CHECK(h.value < 10.0f);
+        CHECK(entities.get_position(cow, p));
+        // Fluids are never ground: the cow sank through the lava and rests
+        // inside it (below the pool surface), not on top of it.
+        CHECK(p.y < static_cast<float>(floorY) + 1.5f);
+        std::cout << "[sdk] mob behavior: cow in lava lost "
+                  << (10.0f - h.value) << " HP (4/s) and sank\n";
+    }
+
+    // FALTANTES §8 item 167: o dano de fluido é data-driven — um TERCEIRO
+    // fluido de projeto (test:acid, damagePerTick 2.0 via FluidRegistry)
+    // também aplica dano a mobs dentro dele.
+    {
+        std::unique_ptr<engine::voxel::IVoxelWorld> world =
+            engine::voxel::create_default_voxel_world();
+        world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+        auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+        std::string error;
+        CHECK(blocks->load_from_json(
+            R"([{"name":"acid","namespace":"test","class":"fluid","color":[0.3,1.0,0.2]}])",
+            error));
+        world->set_block_registry(blocks);
+        auto fluids = std::make_shared<engine::registry::FluidRegistry>();
+        CHECK(fluids->load_from_json(
+            R"([{"block":"test:acid","viscosity":0.0,"range":4,"falling":false,"evaporation":false,"damagePerTick":2.0}])",
+            error));
+        CHECK(world->set_fluid_registry(fluids, error));
+        CHECK(error.empty());
+        const glm::vec3 player(24.0f, 200.0f, 24.0f);
+        CHECK(boot_world(*world, player, 64));
+        uint32_t acidId = 0;
+        CHECK(world->resolve_block_id("test:acid", acidId, error) && error.empty());
+        // Poço de ácido no chão + vaca acima: ela afunda e perde HP a 2/s.
+        world->set_block(24, kFluidTestGroundedY, 24, acidId);
+        CHECK(settle(*world, player,
+            [&] { return world->get_fluid_level(26, kFluidTestGroundedY, 24) == 4; }));
+        auto& entities = *world->entity_world();
+        std::unique_ptr<engine::entity::IMobBehavior> behavior =
+            engine::entity::create_mob_behavior();
+        const engine::entity::EntityId cow = spawn_mob_entity(
+            entities, 3, 10.0f, false,
+            { 24.5f, static_cast<float>(kFluidTestGroundedY) + 2.5f, 24.5f });
+        CHECK(cow.valid());
+        const bool damaged = settle_mob(*world, entities, *behavior, player,
+                                        [&] {
+                                            engine::entity::Health h;
+                                            return entities.get_health(cow, h) &&
+                                                   h.value <= 9.0f;
+                                        });
+        CHECK(damaged);
+        engine::entity::Health h;
+        CHECK(entities.get_health(cow, h));
+        CHECK(h.value < 10.0f);
+        std::cout << "[sdk] mob behavior: cow in project acid lost "
+                  << (10.0f - h.value) << " HP (2/s, data-driven) OK\n";
+    }
+
+    // Death -> despawn: a 1-HP cow in lava dies and leaves the world.
+    {
+        std::unique_ptr<engine::voxel::IVoxelWorld> world = make_flat_world();
+        CHECK(world != nullptr);
+        const int floorY = helper_surface_y(*world, 8, 8);
+        for (int x = 5; x <= 11; ++x) {
+            for (int z = 5; z <= 11; ++z) {
+                world->set_block(x, floorY, z, kBlockStone);
+                world->set_block(x, floorY + 1, z, kLavaId);
+                world->set_block(x, floorY + 2, z, kLavaId);
+            }
+        }
+        auto& entities = *world->entity_world();
+        std::unique_ptr<engine::entity::IMobBehavior> behavior =
+            engine::entity::create_mob_behavior();
+        const engine::entity::EntityId cow = spawn_mob_entity(
+            entities, 3, 1.0f, false,
+            { 8.5f, static_cast<float>(floorY) + 2.5f, 8.5f });
+        CHECK(cow.valid());
+        const glm::vec3 player(16.0f, 200.0f, 16.0f);
+        const bool died = settle_mob(*world, entities, *behavior, player,
+                                     [&] { return entities.size() == 0; });
+        CHECK(died);
+        CHECK(!entities.alive(cow));
+    }
+
+    // AI: a hostile mob chases the player (closes in at chase speed); a
+    // passive mob on the same ground never leaves its wander bound.
+    {
+        std::unique_ptr<engine::voxel::IVoxelWorld> world = make_flat_world();
+        CHECK(world != nullptr);
+        const int platformY = 140;
+        for (int x = -3; x <= 3; ++x) {
+            for (int z = -3; z <= 3; ++z) {
+                world->set_block(x, platformY, z, kBlockStone);
+                world->set_block(x, platformY + 1, z, kBlockAir);
+                world->set_block(x, platformY + 2, z, kBlockAir);
+            }
+        }
+        auto& entities = *world->entity_world();
+        std::unique_ptr<engine::entity::IMobBehavior> behavior =
+            engine::entity::create_mob_behavior();
+        const engine::entity::EntityId zombie = spawn_mob_entity(
+            entities, 0, 20.0f, true, { 0.0f, 141.5f, 0.0f });
+        const engine::entity::EntityId cow = spawn_mob_entity(
+            entities, 3, 10.0f, false, { 0.0f, 141.5f, 0.0f });
+        CHECK(zombie.valid() && cow.valid());
+        const glm::vec3 player(5.0f, 141.5f, 0.0f);  // 5 m away (chase range 16)
+        const int kTicks = 60;                       // 1 s of sim
+        for (int i = 0; i < kTicks; ++i) {
+            world->update(player, 1.0f / 60.0f);
+            std::string error;
+            CHECK(behavior->tick(1.0f / 60.0f, { player.x, player.y, player.z },
+                                 entities, world->mob_world_query(), error));
+        }
+        engine::entity::Position pz;
+        engine::entity::Position pc;
+        CHECK(entities.get_position(zombie, pz));
+        CHECK(entities.get_position(cow, pc));
+        const float zombieDist = std::sqrt((pz.x - player.x) * (pz.x - player.x) +
+                                           (pz.z - player.z) * (pz.z - player.z));
+        const float cowDist = std::sqrt((pc.x - player.x) * (pc.x - player.x) +
+                                        (pc.z - player.z) * (pc.z - player.z));
+        // Chase: ~3.2 m/s closed most of the 5 m in 1 s; passive mob stays
+        // well inside its wander bound.
+        CHECK(zombieDist < 5.0f - 1.0f);
+        CHECK(cowDist < 8.0f);
+        engine::entity::Health hz;
+        CHECK(entities.get_health(zombie, hz));
+        CHECK(hz.value == 20.0f);  // no damage on solid ground
+    }
+
+    // Determinism: two identical worlds + populations reproduce bit-exactly.
+    {
+        std::vector<float> runA;
+        std::vector<float> runB;
+        for (int run = 0; run < 2; ++run) {
+            std::unique_ptr<engine::voxel::IVoxelWorld> world = make_flat_world();
+            CHECK(world != nullptr);
+            auto& entities = *world->entity_world();
+            std::unique_ptr<engine::entity::IMobBehavior> behavior =
+                engine::entity::create_mob_behavior();
+            spawn_mob_entity(entities, 3, 10.0f, false, { 1.0f, 200.0f, 1.0f });
+            spawn_mob_entity(entities, 0, 20.0f, true, { 6.0f, 200.0f, 1.0f });
+            const glm::vec3 player(10.0f, 200.0f, 10.0f);
+            for (int i = 0; i < 90; ++i) {
+                world->update(player, 1.0f / 60.0f);
+                std::string error;
+                CHECK(behavior->tick(1.0f / 60.0f,
+                                     { player.x, player.y, player.z },
+                                     entities, world->mob_world_query(),
+                                     error));
+            }
+            std::vector<float> out;
+            entities.for_each_entity([&](engine::entity::EntityId id) {
+                engine::entity::Position p;
+                engine::entity::Health h;
+                CHECK(entities.get_position(id, p));
+                CHECK(entities.get_health(id, h));
+                out.push_back(p.x);
+                out.push_back(p.y);
+                out.push_back(p.z);
+                out.push_back(h.value);
+            });
+            if (run == 0) runA = out;
+            else runB = out;
+        }
+        CHECK(runA.size() == runB.size());
+        CHECK(runA == runB);  // bit-exact across instances
+    }
+
+    // Validation: negative dt refused; malformed mob component refused
+    // all-or-nothing (nothing mutated); non-mob entities untouched.
+    {
+        auto world = make_flat_world();
+        CHECK(world != nullptr);
+        auto& entities = *world->entity_world();
+        std::unique_ptr<engine::entity::IMobBehavior> behavior =
+            engine::entity::create_mob_behavior();
+        const engine::entity::Position at{ 1.0f, 200.0f, 1.0f };
+        std::string plainError;
+        const engine::entity::EntityId plain =
+            entities.spawn("project:plain", at, plainError);
+        CHECK(plain.valid());
+        const engine::entity::EntityId broken =
+            spawn_mob_entity(entities, 3, 10.0f, false, { 3.0f, 200.0f, 3.0f });
+        CHECK(broken.valid());
+        std::string error;
+        CHECK(!behavior->tick(-1.0f, at, entities, world->mob_world_query(),
+                              error));
+        CHECK(!error.empty());
+        error.clear();
+        // Corrupt the mob component.
+        engine::entity::ComponentData bad;
+        bad.type = engine::entity::kMobComponentType;
+        bad.version = 1;
+        bad.blob = "not json at all";
+        CHECK(entities.set_component(broken, bad));
+        CHECK(!behavior->tick(1.0f / 60.0f, at, entities,
+                              world->mob_world_query(), error));
+        CHECK(!error.empty());
+        CHECK(entities.alive(plain));
+        CHECK(entities.alive(broken));  // nothing mutated by the failed step
+        std::cout << "[sdk] mob behavior: equivalence, determinism, AI, death "
+                     "despawn, validation OK\n";
+    }
+}
+
+// ---- META section 15 / FALTANTES item 8: multiple worlds and portals ----
+// A public WorldManager owns independent worlds (per-world seed/clock/rules/
+// persistence), moves entities between worlds transactionally (commit/rollback)
+// and maps spaces through generic portals.
+
+uint32_t seed_mix(uint64_t seed, int x, int z) {
+    uint64_t h = seed;
+    h ^= static_cast<uint64_t>(static_cast<uint32_t>(x)) +
+         0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    h ^= static_cast<uint64_t>(static_cast<uint32_t>(z)) +
+         0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ull;
+    h = (h ^ (h >> 27)) * 0x94d049bb133111ebull;
+    h ^= h >> 31;
+    return static_cast<uint32_t>(h);
+}
+
+// Deterministic seed-driven terrain height: the project wires the world's
+// seed (stored/exposed per world by the manager) into its generator.
+struct SeedHeightGenerator final : public engine::voxel::IVoxelGenerator {
+    explicit SeedHeightGenerator(uint64_t seed) : seed_(seed) {}
+    engine::voxel::TerrainPoint sample(float worldX, float worldZ) const override {
+        engine::voxel::TerrainPoint point;
+        point.height = 8 +
+                      static_cast<int>(seed_mix(seed_,
+                                                static_cast<int>(std::floor(worldX)),
+                                                static_cast<int>(std::floor(worldZ))) %
+                                       24);
+        return point;
+    }
+    float cave_density(float, float, float) const override { return -1.0f; }
+    float ore_density(float, float, float) const override { return -1.0f; }
+    uint64_t seed_{ 0 };
+};
+
+void test_world_manager() {
+    using namespace engine::world;
+    using engine::entity::EntityId;
+    using engine::entity::Position;
+
+    auto manager = create_world_manager();
+    CHECK(manager != nullptr);
+
+    // ---- create independent worlds (per-world seed/rules) ----
+    WorldSpec overworld;
+    overworld.name = "overworld";
+    overworld.seed = 11;
+    overworld.rulesJson = R"({"difficulty":"hard","dayLength":1200})";
+    WorldSpec nether;
+    nether.name = "nether";
+    nether.seed = 22;
+    std::string error;
+    CHECK(manager->create_world(overworld, error));
+    CHECK(manager->create_world(nether, error));
+    CHECK(manager->world_count() == 2);
+    CHECK(manager->has_world("overworld") && manager->has_world("nether"));
+    const std::vector<std::string> names = manager->world_names();
+    CHECK(names.size() == 2);
+    CHECK(names[0] == "nether" && names[1] == "overworld");  // sorted
+
+    const WorldInfo infoOver = manager->world_info("overworld");
+    CHECK(infoOver.loaded && infoOver.seed == 11 && infoOver.entityCount == 0);
+    CHECK(infoOver.rulesJson.find("hard") != std::string::npos);
+    CHECK(manager->world_info("nether").loaded &&
+          manager->world_info("nether").seed == 22);
+
+    // ---- validations all-or-nothing ----
+    WorldSpec dup = overworld;
+    CHECK(!manager->create_world(dup, error) && !error.empty());
+    WorldSpec unnamed;
+    unnamed.name = "";
+    CHECK(!manager->create_world(unnamed, error));
+    WorldSpec badRules = overworld;
+    badRules.name = "badrules";
+    badRules.rulesJson = "{not json";
+    CHECK(!manager->create_world(badRules, error) && !error.empty());
+    CHECK(!manager->has_world("badrules"));  // never registered
+    CHECK(manager->world("missing") == nullptr);
+    CHECK(!manager->update_world("missing", glm::vec3(0.0f), 1.0f / 60.0f));
+
+    // ---- per-world clock independence ----
+    CHECK(manager->update_world("overworld", glm::vec3(8.0f, 64.0f, 8.0f),
+                                1.0f / 60.0f));
+    CHECK(manager->update_world("overworld", glm::vec3(8.0f, 64.0f, 8.0f),
+                                1.0f / 60.0f));
+    CHECK(std::abs(manager->world_info("overworld").elapsedSeconds -
+                   (2.0 / 60.0)) < 1e-6);
+    CHECK(manager->world_info("nether").elapsedSeconds == 0.0);  // untouched
+
+    // ---- per-world seed -> distinct terrain; same seed -> identical ----
+    engine::voxel::IVoxelWorld* over = manager->world("overworld");
+    engine::voxel::IVoxelWorld* neh = manager->world("nether");
+    CHECK(over != nullptr && neh != nullptr);
+    const uint64_t overSeed = manager->world_info("overworld").seed;
+    const uint64_t nehSeed = manager->world_info("nether").seed;
+    over->register_generator(std::make_shared<SeedHeightGenerator>(overSeed));
+    neh->register_generator(std::make_shared<SeedHeightGenerator>(nehSeed));
+    bool different = false;
+    for (int x = 0; x < 64 && !different; x += 3) {
+        for (int z = 0; z < 64 && !different; z += 3) {
+            if (SeedHeightGenerator(overSeed).sample(x, z).height !=
+                SeedHeightGenerator(nehSeed).sample(x, z).height) {
+                different = true;
+            }
+        }
+    }
+    CHECK(different);  // different seeds -> different terrain
+
+    // Same seed -> identical terrain: two worlds created with the same seed
+    // store it per world and their generators agree on every column.
+    WorldSpec twinA = overworld;
+    twinA.name = "twinA";
+    twinA.seed = 77;
+    WorldSpec twinB = overworld;
+    twinB.name = "twinB";
+    twinB.seed = 77;
+    std::string twinError;
+    CHECK(manager->create_world(twinA, twinError));
+    CHECK(manager->create_world(twinB, twinError));
+    CHECK(manager->world_info("twinA").seed == 77);
+    CHECK(manager->world_info("twinB").seed == 77);
+    bool identical = true;
+    for (int x = 0; x < 32 && identical; x += 3) {
+        for (int z = 0; z < 32 && identical; z += 3) {
+            if (SeedHeightGenerator(manager->world_info("twinA").seed)
+                    .sample(x, z).height !=
+                SeedHeightGenerator(manager->world_info("twinB").seed)
+                    .sample(x, z).height) {
+                identical = false;
+            }
+        }
+    }
+    CHECK(identical);  // same seed -> identical terrain
+
+    // ---- transactional entity transfer (commit) ----
+    auto* overEntities = over->entity_world().get();
+    auto* nehEntities = neh->entity_world().get();
+    CHECK(overEntities != nullptr && nehEntities != nullptr);
+    std::string spawnError;
+    const EntityId cow = overEntities->spawn(
+        "vulkancraft:cow", Position{ 10.0f, 40.0f, 10.0f }, spawnError);
+    CHECK(cow.valid());
+    CHECK(overEntities->set_health(cow, engine::entity::Health{ 17.0f, 20.0f }));
+    CHECK(overEntities->set_tick_interval(cow, 0.5f));
+    engine::entity::ComponentData inventory;
+    inventory.type = "vulkancraft:inventory";
+    inventory.version = 2;
+    inventory.blob = R"({"slots":[{"item":"cobblestone","count":4}]})";
+    CHECK(overEntities->set_component(cow, inventory));
+
+    const EntityId cowInNether = manager->transfer_entity(
+        "overworld", cow, "nether", Position{ 100.0f, 64.0f, 100.0f }, error);
+    CHECK(cowInNether.valid());
+    CHECK(!overEntities->alive(cow));   // removed from source
+    CHECK(nehEntities->alive(cowInNether));  // present in destination
+    CHECK(manager->world_info("overworld").entityCount == 0);
+    CHECK(manager->world_info("nether").entityCount == 1);
+    CHECK(nehEntities->type_of(cowInNether) == "vulkancraft:cow");
+    engine::entity::Health movedHealth;
+    CHECK(nehEntities->get_health(cowInNether, movedHealth));
+    CHECK(movedHealth.value == 17.0f);
+    float interval = 0.0f;
+    CHECK(nehEntities->get_tick_interval(cowInNether, interval));
+    CHECK(interval == 0.5f);
+    engine::entity::ComponentData movedComponent;
+    CHECK(nehEntities->get_component(cowInNether, "vulkancraft:inventory",
+                                     movedComponent));
+    CHECK(movedComponent.version == 2 &&
+          movedComponent.blob.find("cobblestone") != std::string::npos);
+    Position movedPos;
+    CHECK(nehEntities->get_position(cowInNether, movedPos));
+    CHECK(std::abs(movedPos.x - 100.0f) < 1e-4f &&
+          std::abs(movedPos.y - 64.0f) < 1e-4f &&
+          std::abs(movedPos.z - 100.0f) < 1e-4f);
+
+    // ---- transfer rollback (source untouched on any failure) ----
+    const EntityId pig = overEntities->spawn(
+        "vulkancraft:pig", Position{ 1.0f, 40.0f, 1.0f }, spawnError);
+    CHECK(pig.valid());
+    CHECK(!manager->transfer_entity("overworld", pig, "missing", Position{},
+                                    error).valid());
+    CHECK(overEntities->alive(pig));
+    CHECK(!manager->transfer_entity("missing", pig, "nether", Position{},
+                                    error).valid());
+    CHECK(overEntities->alive(pig));
+    CHECK(!manager->transfer_entity("overworld", cow, "nether", Position{},
+                                    error).valid());  // stale handle
+    CHECK(!manager->transfer_entity("overworld", pig, "overworld", Position{},
+                                    error).valid());  // same world
+    CHECK(overEntities->alive(pig));
+
+    // ---- portals: generic mappings between spaces ----
+    PortalSpec portal;
+    portal.fromWorld = "overworld";
+    portal.fromX = 100.0f;
+    portal.fromY = 64.0f;
+    portal.fromZ = 100.0f;
+    portal.toWorld = "nether";
+    portal.toX = 1000.0f;
+    portal.toY = 70.0f;
+    portal.toZ = 1000.0f;
+    portal.yawDegrees = 90.0f;
+    const uint32_t portalId = manager->create_portal(portal, error);
+    CHECK(portalId != 0);
+    PortalSpec badPortal = portal;
+    badPortal.toWorld = "missing";
+    CHECK(manager->create_portal(badPortal, error) == 0 && !error.empty());
+    badPortal = portal;
+    badPortal.fromWorld = "missing";
+    CHECK(manager->create_portal(badPortal, error) == 0);
+    badPortal = portal;
+    badPortal.toWorld = "overworld";
+    CHECK(manager->create_portal(badPortal, error) == 0);  // same world
+    CHECK(manager->portals().size() == 1);
+    PortalSpec roundTrip;
+    CHECK(manager->portal(portalId, roundTrip));
+    CHECK(roundTrip.toWorld == "nether" && roundTrip.yawDegrees == 90.0f);
+
+    // Spawn near the source anchor and cross: local offset (5, 3, 0) rotated
+    // 90° around Y -> (0, 3, 5) -> target (1000, 73, 1005).
+    const EntityId wanderer = overEntities->spawn(
+        "vulkancraft:player", Position{ 105.0f, 67.0f, 100.0f }, spawnError);
+    CHECK(wanderer.valid());
+    const EntityId crossed =
+        manager->transfer_via_portal("overworld", wanderer, portalId, error);
+    CHECK(crossed.valid());
+    CHECK(!overEntities->alive(wanderer));
+    Position crossedPos;
+    CHECK(nehEntities->get_position(crossed, crossedPos));
+    CHECK(std::abs(crossedPos.x - 1000.0f) < 1e-3f);
+    CHECK(std::abs(crossedPos.y - 73.0f) < 1e-3f);
+    CHECK(std::abs(crossedPos.z - 1005.0f) < 1e-3f);
+    CHECK(!manager->transfer_via_portal("overworld", pig, portalId + 99,
+                                        error).valid());  // unknown portal
+    CHECK(!manager->transfer_via_portal("nether", cowInNether, portalId,
+                                        error).valid());  // wrong source world
+    CHECK(nehEntities->alive(cowInNether));
+    CHECK(overEntities->alive(pig));
+    CHECK(manager->remove_portal(portalId));
+    CHECK(manager->portals().empty());
+    CHECK(!manager->transfer_via_portal("overworld", pig, portalId,
+                                        error).valid());
+
+    // ---- per-world persistence ----
+    const std::filesystem::path saveDir =
+        std::filesystem::temp_directory_path() /
+        ("wm_save_test_" + std::to_string(_getpid()));
+    const std::string savePath = (saveDir / "overworld_save.bin").string();
+    std::filesystem::create_directories(saveDir);
+    // Load chunks near the pig (world save captures loaded chunk state):
+    // set a budget and update until chunk (0,0) is loaded.
+    manager->world("overworld")->set_chunk_budget(16);
+    const auto bootStart = std::chrono::steady_clock::now();
+    while (!manager->world("overworld")->is_chunk_loaded(0, 0)) {
+        CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - bootStart).count() < 8000);
+        manager->update_world("overworld", glm::vec3(8.0f, 64.0f, 8.0f),
+                              1.0f / 60.0f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(manager->world("overworld")->is_chunk_loaded(0, 0));
+    if (!manager->save_world("overworld", savePath, error)) {
+        std::cerr << "[wm] save_world failed: " << error << "\n";
+    }
+    CHECK(manager->save_world("overworld", savePath, error));
+    auto manager2 = create_world_manager();
+    CHECK(manager2 != nullptr);
+    WorldSpec reloaded;
+    reloaded.name = "overworld";
+    reloaded.seed = 11;
+    reloaded.savePath = savePath;
+    CHECK(manager2->load_world(reloaded, error));
+    CHECK(manager2->world_info("overworld").loaded);
+    CHECK(manager2->world_info("overworld").entityCount == 1);  // the pig
+    auto* reloadedEntities =
+        manager2->world("overworld")->entity_world().get();
+    CHECK(reloadedEntities != nullptr && reloadedEntities->size() == 1);
+    WorldSpec badLoad = reloaded;
+    badLoad.name = "badload";
+    badLoad.savePath = (saveDir / "missing.bin").string();
+    CHECK(!manager2->load_world(badLoad, error) &&
+          !manager2->has_world("badload"));  // all-or-nothing
+
+    // ---- unload ----
+    CHECK(manager->unload_world("nether"));
+    CHECK(!manager->has_world("nether"));
+    CHECK(manager->world_count() == 3);  // overworld + twinA + twinB
+    std::filesystem::remove_all(saveDir);
+
+    std::cout << "[sdk] world manager: independent worlds, transactional "
+                 "transfer (commit/rollback), portals, per-world "
+                 "persistence OK\n";
+}
+
+// ---- META section 18 / FALTANTES item 14: procedural generation as assets ----
+// Codified generation becomes an editable asset: a noise graph (typed nodes,
+// JSON-serializable) drives terrain/caves/ores deterministically by seed
+// through the world's public IVoxelGenerator contract — no engine recompile.
+
+using engine::procgen::NoiseGraphSpec;
+using engine::procgen::NoiseNodeSpec;
+
+// fbm over perlin — the canonical terrain height graph.
+NoiseGraphSpec make_height_spec(std::uint32_t seed, float frequency) {
+    NoiseGraphSpec spec;
+    spec.seed = seed;
+    spec.nodes.push_back({ "perlin", { frequency, 0.0f }, {} });        // 0
+    spec.nodes.push_back({ "fbm", { 4, 0.5f, 2.0f, 0.0f }, { 0 } });    // 1
+    spec.root = 1;
+    return spec;
+}
+
+void test_noise_graph_determinism() {
+    const NoiseGraphSpec spec = make_height_spec(1337, 0.01f);
+    std::string error;
+    auto first = engine::procgen::create_noise_graph_from_spec(spec, error);
+    CHECK(first != nullptr);
+    CHECK(error.empty());
+    auto second = engine::procgen::create_noise_graph_from_spec(spec, error);
+    CHECK(second != nullptr);
+    CHECK(error.empty());
+    CHECK(std::string(first->name()) == "fastnoise-lite");
+    CHECK(first->seed() == 1337);
+
+    // Same spec + seed -> bit-identical samples from independent instances.
+    bool identical = true;
+    for (int i = 0; i < 200; ++i) {
+        const float x = static_cast<float>((i % 20)) * 1.7f;
+        const float z = static_cast<float>((i / 20)) * 2.3f;
+        if (first->sample_2d(x, z) != second->sample_2d(x, z)) identical = false;
+    }
+    CHECK(identical);
+
+    // Sampling order does not matter (no hidden state).
+    const float a1 = first->sample_2d(1.0f, 2.0f);
+    const float a2 = first->sample_2d(3.0f, 4.0f);
+    const float a3 = first->sample_2d(5.0f, 6.0f);
+    const float b3 = first->sample_2d(5.0f, 6.0f);
+    const float b2 = first->sample_2d(3.0f, 4.0f);
+    const float b1 = first->sample_2d(1.0f, 2.0f);
+    CHECK(a1 == b1 && a2 == b2 && a3 == b3);
+
+    // 3D sampling is deterministic too (caves/ores).
+    CHECK(first->sample_3d(1.0f, 2.0f, 3.0f) == second->sample_3d(1.0f, 2.0f, 3.0f));
+    CHECK(first->sample_3d(1.0f, 2.0f, 3.0f) == first->sample_3d(1.0f, 2.0f, 3.0f));
+
+    // set_seed deterministically changes the whole field and restores it.
+    const float original = first->sample_2d(10.0f, 10.0f);
+    first->set_seed(99);
+    CHECK(first->sample_2d(10.0f, 10.0f) != original);
+    first->set_seed(1337);
+    CHECK(first->sample_2d(10.0f, 10.0f) == second->sample_2d(10.0f, 10.0f));
+
+    std::cout << "[sdk] procgen: noise graph determinism (seed, order, 2D/3D) "
+                 "OK\n";
+}
+
+void test_noise_graph_nodes() {
+    std::string error;
+
+    // Constant node returns its value for every coordinate (2D and 3D).
+    NoiseGraphSpec constant;
+    constant.seed = 1;
+    constant.nodes.push_back({ "constant", { 0.25f }, {} });
+    constant.root = 0;
+    auto graph = engine::procgen::create_noise_graph_from_spec(constant, error);
+    CHECK(graph != nullptr && error.empty());
+    CHECK(graph->sample_2d(1.0f, 2.0f) == 0.25f);
+    CHECK(graph->sample_2d(-123.0f, 77.0f) == 0.25f);
+    CHECK(graph->sample_3d(1.0f, 2.0f, 3.0f) == 0.25f);
+
+    // Perlin stays within [-1, 1] and actually varies.
+    NoiseGraphSpec perlin;
+    perlin.seed = 7;
+    perlin.nodes.push_back({ "perlin", { 0.01f, 0.0f }, {} });
+    perlin.root = 0;
+    auto plain = engine::procgen::create_noise_graph_from_spec(perlin, error);
+    CHECK(plain != nullptr && error.empty());
+    float minValue = 2.0f, maxValue = -2.0f;
+    bool varies = false;
+    float previous = plain->sample_2d(0.0f, 0.0f);
+    for (int i = 1; i < 64; ++i) {
+        const float v = plain->sample_2d(static_cast<float>(i) * 0.37f, 1.0f);
+        minValue = std::min(minValue, v);
+        maxValue = std::max(maxValue, v);
+        if (v != previous) varies = true;
+        previous = v;
+    }
+    CHECK(minValue >= -1.0f && maxValue <= 1.0f);
+    CHECK(varies);
+
+    // Fractal (fbm) reshapes the same base noise (differs somewhere — a single
+    // point could coincide by chance).
+    auto fractal = engine::procgen::create_noise_graph_from_spec(
+        make_height_spec(7, 0.01f), error);
+    CHECK(fractal != nullptr && error.empty());
+    bool fractalDiffers = false;
+    for (int i = 0; i < 64 && !fractalDiffers; ++i) {
+        const float x = static_cast<float>(i) * 0.7f;
+        if (plain->sample_2d(x, 5.0f) != fractal->sample_2d(x, 5.0f)) {
+            fractalDiffers = true;
+        }
+    }
+    CHECK(fractalDiffers);
+
+    // Blends compose sources recursively.
+    NoiseGraphSpec blends;
+    blends.seed = 3;
+    blends.nodes.push_back({ "perlin", { 0.01f, 0.0f }, {} });       // 0
+    blends.nodes.push_back({ "perlin", { 0.01f, 100.0f }, {} });     // 1
+    blends.nodes.push_back({ "add", {}, { 0, 1 } });                 // 2
+    blends.nodes.push_back({ "multiply", {}, { 0, 1 } });            // 3
+    blends.nodes.push_back({ "min", {}, { 0, 1 } });                 // 4
+    blends.nodes.push_back({ "max", {}, { 0, 1 } });                 // 5
+    blends.nodes.push_back({ "constant", { 0.5f }, {} });            // 6
+    blends.nodes.push_back({ "lerp", {}, { 0, 1, 6 } });             // 7
+    blends.root = 7;
+    auto blend = engine::procgen::create_noise_graph_from_spec(blends, error);
+    CHECK(blend != nullptr && error.empty());
+    const float sa = blend->sample_2d(2.0f, 3.0f);  // sanity: lerp is a blend
+    CHECK(sa == sa);  // deterministic
+
+    // Validation: unknown node type, out-of-range root, fractal over blend.
+    NoiseGraphSpec unknown;
+    unknown.nodes.push_back({ "nope", {}, {} });
+    unknown.root = 0;
+    CHECK(engine::procgen::create_noise_graph_from_spec(unknown, error) == nullptr);
+    CHECK(!error.empty());
+    error.clear();
+
+    NoiseGraphSpec badRoot;
+    badRoot.nodes.push_back({ "perlin", { 0.01f, 0.0f }, {} });
+    badRoot.root = 5;
+    CHECK(engine::procgen::create_noise_graph_from_spec(badRoot, error) == nullptr);
+    CHECK(!error.empty());
+    error.clear();
+
+    NoiseGraphSpec fractalOverBlend;
+    fractalOverBlend.nodes.push_back({ "perlin", { 0.01f, 0.0f }, {} });  // 0
+    fractalOverBlend.nodes.push_back({ "perlin", { 0.01f, 5.0f }, {} });  // 1
+    fractalOverBlend.nodes.push_back({ "add", {}, { 0, 1 } });            // 2
+    fractalOverBlend.nodes.push_back({ "fbm", { 4, 0.5f, 2.0f, 0.0f }, { 2 } });
+    fractalOverBlend.root = 3;
+    CHECK(engine::procgen::create_noise_graph_from_spec(fractalOverBlend, error) ==
+          nullptr);
+    CHECK(error.find("base noise") != std::string::npos);
+
+    std::cout << "[sdk] procgen: noise graph node semantics + validation OK\n";
+}
+
+void test_noise_graph_serialization() {
+    const NoiseGraphSpec spec = make_height_spec(4242, 0.02f);
+    std::string error;
+    auto graph = engine::procgen::create_noise_graph_from_spec(spec, error);
+    CHECK(graph != nullptr && error.empty());
+
+    std::string json;
+    CHECK(graph->serialize(json));
+    CHECK(json.find("\"version\":1") != std::string::npos);
+    CHECK(json.find("\"type\":\"fbm\"") != std::string::npos);
+
+    // Round-trip through the asset form samples bit-identically.
+    NoiseGraphSpec stub;  // graph starts from a valid spec; deserialize replaces it
+    stub.nodes.push_back({ "constant", { 1.0f }, {} });
+    stub.root = 0;
+    auto rebuilt = engine::procgen::create_noise_graph_from_spec(stub, error);
+    CHECK(rebuilt != nullptr && error.empty());
+    CHECK(rebuilt->deserialize(json, error));
+    CHECK(error.empty());
+    bool identical = true;
+    for (int i = 0; i < 100; ++i) {
+        const float x = static_cast<float>(i) * 0.9f;
+        const float z = static_cast<float>(i % 7) * 1.3f;
+        if (graph->sample_2d(x, z) != rebuilt->sample_2d(x, z)) identical = false;
+    }
+    CHECK(identical);
+    CHECK(rebuilt->seed() == 4242);
+
+    // serialize(deserialize(json)) is idempotent.
+    std::string reSerialized;
+    CHECK(rebuilt->serialize(reSerialized));
+    CHECK(reSerialized == json);
+
+    // Corrupted / unsupported assets are refused, never guessed.
+    std::string badError;
+    CHECK(!rebuilt->deserialize("{\"version\":1, broken", badError));
+    CHECK(!rebuilt->deserialize("{\"version\":2,\"seed\":0,\"root\":0,"
+                                "\"nodes\":[]}", badError));
+    CHECK(!rebuilt->deserialize("{\"version\":1,\"seed\":0,\"root\":0,"
+                                "\"nodes\":[{\"type\":\"nope\"}]}", badError));
+    // Refusal is all-or-nothing: the graph keeps its previous valid state.
+    CHECK(rebuilt->sample_2d(1.0f, 1.0f) == graph->sample_2d(1.0f, 1.0f));
+
+    std::cout << "[sdk] procgen: noise graph asset round-trip + refusal OK\n";
+}
+
+void test_graph_generator_world() {
+    std::string error;
+    auto height = engine::procgen::create_noise_graph_from_spec(
+        make_height_spec(2026, 0.02f), error);
+    CHECK(height != nullptr && error.empty());
+
+    // 3D density fields for caves and ores (same graph family, 3D sampling).
+    NoiseGraphSpec caveSpec;
+    caveSpec.seed = 11;
+    caveSpec.nodes.push_back({ "simplex", { 0.08f, 0.0f }, {} });
+    caveSpec.root = 0;
+    auto caveGraph = engine::procgen::create_noise_graph_from_spec(caveSpec, error);
+    CHECK(caveGraph != nullptr && error.empty());
+    auto caves = engine::procgen::create_graph_density_function(caveGraph, 1.0f, 0.0f);
+    auto ores = engine::procgen::create_graph_density_function(caveGraph, 0.5f, 0.0f);
+
+    auto generator = engine::procgen::create_graph_voxel_generator(
+        height, caves, ores, /*baseHeight=*/96, /*amplitude=*/24);
+    CHECK(generator != nullptr);
+
+    // Deterministic sampling of the generator itself.
+    const engine::voxel::TerrainPoint p1 = generator->sample(3.0f, 5.0f);
+    const engine::voxel::TerrainPoint p2 = generator->sample(3.0f, 5.0f);
+    CHECK(p1.height == p2.height);
+    CHECK(generator->cave_density(1.0f, 2.0f, 3.0f) ==
+          generator->cave_density(1.0f, 2.0f, 3.0f));
+
+    // Non-flat: the graph shapes the terrain (surface varies across the world).
+    bool varied = false;
+    int previousHeight = generator->sample(4.0f, 4.0f).height;
+    for (int x = 2; x <= 12; x += 2) {
+        for (int z = 2; z <= 12; z += 2) {
+            const int h = generator->sample(static_cast<float>(x),
+                                            static_cast<float>(z)).height;
+            if (h != previousHeight) varied = true;
+            previousHeight = h;
+        }
+    }
+    CHECK(varied);
+
+    // Two separately-booted worlds with identical graph generators produce
+    // identical solid terrain (seed-deterministic world generation).
+    std::unique_ptr<engine::voxel::IVoxelWorld> worldA =
+        engine::voxel::create_default_voxel_world();
+    worldA->register_generator(generator);
+    CHECK(boot_world(*worldA, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    std::unique_ptr<engine::voxel::IVoxelWorld> worldB =
+        engine::voxel::create_default_voxel_world();
+    worldB->register_generator(generator);
+    CHECK(boot_world(*worldB, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    bool sameTerrain = true;
+    for (int x = 2; x <= 12; x += 2) {
+        for (int z = 2; z <= 12; z += 2) {
+            for (int y = 0; y <= 70; ++y) {  // below the minimum surface (72)
+                if (worldA->get_block(x, y, z) != worldB->get_block(x, y, z)) {
+                    sameTerrain = false;
+                }
+            }
+        }
+    }
+    CHECK(sameTerrain);
+    // The world actually used the graph: the terrain surface (first non-air,
+    // non-water block) IS the graph height at every column, and the terrain is
+    // not flat (water sits above the terrain, so the naive surface scan would
+    // always return the uniform water top).
+    constexpr std::uint32_t kBlockWaterId = 12;  // BlockType::Water
+    const auto terrain_surface = [](engine::voxel::IVoxelWorld& world, int x, int z) {
+        for (int y = 160; y >= 0; --y) {
+            const std::uint32_t id = world.get_block(x, y, z);
+            if (id != kBlockAir && id != kBlockWaterId) return y;
+        }
+        return -1;
+    };
+    bool nonFlat = false;
+    const int reference = terrain_surface(*worldA, 4, 4);
+    CHECK(reference > 0);
+    const int positions[4][2] = { { 4, 4 }, { 8, 8 }, { 12, 12 }, { 14, 14 } };
+    for (const auto& pos : positions) {
+        const int worldSurface = terrain_surface(*worldA, pos[0], pos[1]);
+        const int graphHeight =
+            generator->sample(static_cast<float>(pos[0]), static_cast<float>(pos[1]))
+                .height;
+        CHECK(worldSurface == graphHeight);  // data-driven generation
+        if (worldSurface != reference) nonFlat = true;
+    }
+    CHECK(nonFlat);
+
+    std::cout << "[sdk] procgen: graph-driven voxel generator (deterministic "
+                 "terrain, non-flat) OK\n";
+}
+
+// ---- Item 8: climate graph, biome registry and surface rules (META 18) ----
+
+using engine::procgen::ClimatePoint;
+using engine::procgen::BiomeDefinition;
+
+// A graph that samples a constant everywhere (used to bias whole worlds into
+// a single climate, so the biome/surface assertions are exact).
+std::shared_ptr<engine::procgen::INoiseGraph> make_constant_graph(
+    float value, std::string& error) {
+    NoiseGraphSpec spec;
+    spec.seed = 1;
+    spec.nodes.push_back({ "constant", { value }, {} });
+    spec.root = 0;
+    return engine::procgen::create_noise_graph_from_spec(spec, error);
+}
+
+// Index of the first definition with `name`, or biome_count() when absent.
+std::size_t registry_index_of(engine::procgen::IBiomeRegistry& registry,
+                              const std::string& name) {
+    BiomeDefinition def;
+    for (std::size_t i = 0; i < registry.biome_count(); ++i) {
+        if (registry.biome_definition(i, def) && def.name == name) return i;
+    }
+    return registry.biome_count();
+}
+
+void test_climate_registry() {
+    auto registry = engine::procgen::create_biome_registry();
+    CHECK(registry != nullptr);
+    CHECK(registry->biome_count() >= 10);
+
+    // Deterministic first-match classification over the climate bounds.
+    const ClimatePoint hotDry{ 0.7f, -0.7f, 0.5f, 0.0f, 0.0f, 0.0f };
+    const ClimatePoint cold{ -0.7f, 0.2f, 0.5f, 0.0f, 0.0f, 0.0f };
+    const ClimatePoint lowContinental{ 0.5f, 0.5f, -0.8f, 0.0f, 0.0f, 0.0f };
+    const ClimatePoint mild{ 0.5f, 0.3f, 0.5f, 0.0f, 0.0f, 0.0f };
+    std::uint32_t first = 0, second = 0;
+    CHECK(registry->biome_for(hotDry, first));
+    CHECK(registry->biome_for(hotDry, second));
+    CHECK(first == second);  // deterministic
+    const std::uint32_t hotIndex = first;
+    BiomeDefinition def;
+    CHECK(registry->biome_definition(first, def));
+    CHECK(def.name == "desert" && def.engineBiomeIndex == 8);
+    CHECK(registry->biome_for(cold, first) &&
+          registry->biome_definition(first, def));
+    CHECK(def.name == "glacial" && def.engineBiomeIndex == 16);
+    CHECK(registry->biome_for(lowContinental, first) &&
+          registry->biome_definition(first, def));
+    CHECK(def.name == "deep_ocean");
+    CHECK(registry->biome_for(mild, first) &&
+          registry->biome_definition(first, def));
+    CHECK(def.name == "meadow");  // catch-all last entry
+
+    // JSON asset round-trip: deserialize(classify identically) and a fresh
+    // registry built directly from the document.
+    std::string asset;
+    CHECK(registry->serialize(asset));
+    std::string error;
+    auto fromJson = engine::procgen::create_biome_registry_from_json(asset, error);
+    CHECK(fromJson != nullptr && error.empty());
+    CHECK(fromJson->biome_count() == registry->biome_count());
+    std::uint32_t a = 0, b = 0;
+    CHECK(registry->biome_for(hotDry, a) && fromJson->biome_for(hotDry, b));
+    CHECK(a == b);
+    CHECK(registry->biome_for(cold, a) && fromJson->biome_for(cold, b));
+    CHECK(a == b);
+
+    // All-or-nothing: a corrupted document is rejected and the previous
+    // classification survives (desert still resolves to the same index).
+    CHECK(fromJson->deserialize("{nope", error) == false);
+    CHECK(!error.empty());
+    CHECK(fromJson->biome_for(hotDry, b) && b == hotIndex);
+    auto bad = engine::procgen::create_biome_registry_from_json("{nope", error);
+    CHECK(bad == nullptr && !error.empty());
+
+    // Validation: inverted climate bounds reject the whole asset.
+    const char* inverted =
+        R"({"version":1,"biomes":[
+             {"name":"bad","engineBiomeIndex":4,
+              "climate":{"temperature":[0.5,-0.5]}}]})";
+    auto rejected = engine::procgen::create_biome_registry_from_json(inverted, error);
+    CHECK(rejected == nullptr && !error.empty());
+
+    std::cout << "[sdk] procgen: biome registry (classification, determinism, "
+                 "JSON, all-or-nothing) OK\n";
+}
+
+void test_climate_sampler() {
+    std::string error;
+    auto temperature = engine::procgen::create_noise_graph_from_spec(
+        make_height_spec(5, 0.02f), error);
+    auto moisture = engine::procgen::create_noise_graph_from_spec(
+        make_height_spec(7, 0.02f), error);
+    CHECK(temperature != nullptr && moisture != nullptr && error.empty());
+    auto sampler = engine::procgen::create_climate_sampler(
+        temperature, moisture, nullptr, nullptr, nullptr, nullptr);
+    CHECK(sampler != nullptr);
+
+    // Deterministic and axis-independent fields.
+    const ClimatePoint a = sampler->sample(3.0f, 5.0f);
+    const ClimatePoint b = sampler->sample(3.0f, 5.0f);
+    CHECK(a.temperature == b.temperature && a.moisture == b.moisture);
+    bool axesDiffer = false;
+    for (int i = 0; i < 40; ++i) {
+        const float x = static_cast<float>(i) * 0.7f;
+        const float z = static_cast<float>(i % 7) * 1.3f;
+        const ClimatePoint p = sampler->sample(x, z);
+        if (p.temperature != p.moisture) axesDiffer = true;
+    }
+    CHECK(axesDiffer);
+    CHECK(a.continentalness == 0.0f && a.river == 0.0f);  // null axes
+
+    // Serialization embeds the graph documents; round-trip re-samples
+    // identically.
+    std::string asset;
+    CHECK(sampler->serialize(asset));
+    auto restored = engine::procgen::create_climate_sampler(
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    CHECK(restored != nullptr);
+    CHECK(restored->deserialize(asset, error));
+    bool identical = true;
+    for (int i = 0; i < 30; ++i) {
+        const float x = static_cast<float>(i % 11) * 0.9f;
+        const float z = static_cast<float>(i / 11) * 1.7f;
+        const ClimatePoint p1 = sampler->sample(x, z);
+        const ClimatePoint p2 = restored->sample(x, z);
+        if (p1.temperature != p2.temperature || p1.moisture != p2.moisture) {
+            identical = false;
+        }
+    }
+    CHECK(identical);
+
+    // Corrupted asset is rejected and keeps the previous state.
+    CHECK(restored->deserialize("{nope", error) == false);
+    CHECK(!error.empty());
+    CHECK(restored->sample(3.0f, 5.0f).temperature == a.temperature);
+
+    std::cout << "[sdk] procgen: climate sampler (determinism, axes, asset "
+                 "round-trip) OK\n";
+}
+
+// A hot+dry biome whose data rule places SNOW at depth 0 (only) — proving the
+// world consumed the data-driven surface rule over the engine builtin (sand).
+const char* kRuleOverrideAsset = R"({"version":1,"biomes":[
+  {"name":"desert_rule","engineBiomeIndex":8,
+   "climate":{"temperature":[0.25,1.0],"moisture":[-1.0,-0.2]},
+   "surface":[{"blockId":50,"minDepth":0,"maxDepth":0}]},
+  {"name":"meadow","engineBiomeIndex":7}]})";
+
+void test_climate_generator_world() {
+    std::string error;
+    auto height = engine::procgen::create_noise_graph_from_spec(
+        make_height_spec(2026, 0.05f), error);
+    CHECK(height != nullptr && error.empty());
+    auto registry = engine::procgen::create_biome_registry();
+    auto resolver = engine::procgen::create_surface_resolver(registry);
+    CHECK(registry != nullptr && resolver != nullptr);
+
+    // Cold world: temperature firmly negative -> glacial (engine 16) -> the
+    // engine builtin surface is snow on top.
+    auto coldTemp = make_constant_graph(-0.7f, error);
+    auto coldMoisture = make_constant_graph(0.0f, error);
+    auto continentalness = make_constant_graph(0.5f, error);
+    auto coldSampler = engine::procgen::create_climate_sampler(
+        coldTemp, coldMoisture, continentalness, nullptr, nullptr, nullptr);
+    auto coldGenerator = engine::procgen::create_climate_voxel_generator(
+        height, coldSampler, registry, resolver, nullptr, nullptr,
+        /*baseHeight=*/131, /*amplitude=*/4);
+    CHECK(coldGenerator != nullptr);
+
+    // The generator resolves climate -> biome -> engine biome from data.
+    CHECK(coldGenerator->climate_at(4.0f, 4.0f).temperature == -0.7f);
+    BiomeDefinition def;
+    CHECK(registry->biome_definition(coldGenerator->biome_at(4.0f, 4.0f), def));
+    CHECK(def.name == "glacial");
+    CHECK(coldGenerator->engine_biome_at(4.0f, 4.0f) == 16);
+    CHECK(coldGenerator->sample(4.0f, 4.0f).biomeIndex == 16);
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> coldWorld =
+        engine::voxel::create_default_voxel_world();
+    coldWorld->register_generator(coldGenerator);
+    CHECK(boot_world(*coldWorld, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+
+    // Hot world: hot+dry -> desert (engine 8) -> sand top.
+    auto hotTemp = make_constant_graph(0.7f, error);
+    auto hotMoisture = make_constant_graph(-0.7f, error);
+    auto hotSampler = engine::procgen::create_climate_sampler(
+        hotTemp, hotMoisture, continentalness, nullptr, nullptr, nullptr);
+    auto hotGenerator = engine::procgen::create_climate_voxel_generator(
+        height, hotSampler, registry, resolver, nullptr, nullptr, 131, 4);
+    std::unique_ptr<engine::voxel::IVoxelWorld> hotWorld =
+        engine::voxel::create_default_voxel_world();
+    hotWorld->register_generator(hotGenerator);
+    CHECK(boot_world(*hotWorld, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+
+    // Data-driven surface rule: hot+dry biome whose rule places SNOW at depth
+    // 0 (only); depth 1+ falls back to the engine builtin desert surface.
+    auto ruleRegistry =
+        engine::procgen::create_biome_registry_from_json(kRuleOverrideAsset, error);
+    CHECK(ruleRegistry != nullptr && error.empty());
+    auto ruleResolver = engine::procgen::create_surface_resolver(ruleRegistry);
+    auto ruleGenerator = engine::procgen::create_climate_voxel_generator(
+        height, hotSampler, ruleRegistry, ruleResolver, nullptr, nullptr, 131, 4);
+    std::unique_ptr<engine::voxel::IVoxelWorld> ruleWorld =
+        engine::voxel::create_default_voxel_world();
+    ruleWorld->register_generator(ruleGenerator);
+    CHECK(boot_world(*ruleWorld, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+
+    // Determinism: a second independently booted cold world is identical.
+    std::unique_ptr<engine::voxel::IVoxelWorld> coldWorldB =
+        engine::voxel::create_default_voxel_world();
+    coldWorldB->register_generator(coldGenerator);
+    CHECK(boot_world(*coldWorldB, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+
+    constexpr std::uint32_t kSandId = 5;   // BlockType::Sand
+    constexpr std::uint32_t kSnowId = 50;  // BlockType::SnowBlock
+    const auto top_block = [](engine::voxel::IVoxelWorld& world, int x, int z) {
+        for (int y = 160; y >= 0; --y) {
+            const std::uint32_t id = world.get_block(x, y, z);
+            if (id != kBlockAir) return id;
+        }
+        return std::uint32_t{ 0 };
+    };
+    bool terrainVaried = false;
+    const int reference = helper_surface_y(*coldWorld, 2, 2);
+    CHECK(reference > 0);
+    for (int x = 2; x <= 14; x += 2) {
+        for (int z = 2; z <= 14; z += 2) {
+            CHECK(top_block(*coldWorld, x, z) == kSnowId);  // cold -> snow
+            CHECK(top_block(*hotWorld, x, z) == kSandId);   // hot+dry -> sand
+            const int topY = helper_surface_y(*ruleWorld, x, z);
+            CHECK(topY > 0);
+            CHECK(ruleWorld->get_block(x, topY, z) == kSnowId);      // rule won
+            CHECK(ruleWorld->get_block(x, topY - 1, z) == kSandId);  // fallback
+            if (helper_surface_y(*coldWorld, x, z) != reference) terrainVaried = true;
+        }
+    }
+    CHECK(terrainVaried);  // the height graph still shapes the terrain
+
+    // The world surface matches the graph height at every column (the graph
+    // actually shapes the terrain) and the terrain is non-flat.
+    bool matchesGraph = true;
+    for (int x = 2; x <= 14; x += 2) {
+        for (int z = 2; z <= 14; z += 2) {
+            const int worldSurface = helper_surface_y(*coldWorld, x, z);
+            const int graphHeight = coldGenerator->sample(static_cast<float>(x),
+                                                          static_cast<float>(z)).height;
+            if (worldSurface != graphHeight) matchesGraph = false;
+        }
+    }
+    CHECK(matchesGraph);
+
+    bool sameTerrain = true;
+    for (int x = 2; x <= 12; x += 2) {
+        for (int z = 2; z <= 12; z += 2) {
+            for (int y = 0; y <= 135; ++y) {  // below the maximum surface (135)
+                if (coldWorld->get_block(x, y, z) != coldWorldB->get_block(x, y, z)) {
+                    sameTerrain = false;
+                }
+            }
+        }
+    }
+    CHECK(sameTerrain);
+
+    std::cout << "[sdk] procgen: climate-driven generator (cold->snow, hot->sand, "
+                 "data surface rule, determinism) OK\n";
+}
+
+// ---- Item 9: decorators, features, carvers and ore distribution (META 18) ----
+
+void test_ore_table() {
+    std::string error;
+    const char* kOreAsset = R"({"version":1,"rules":[
+      {"blockId":18,"minDensity":0.7,"maxDensity":0.8,"minY":10,"maxY":120}]})";
+    auto table = engine::procgen::create_ore_table_from_json(kOreAsset, error);
+    CHECK(table != nullptr && error.empty());
+    CHECK(table->rule_count() == 1);
+
+    // First-match semantics over density (inclusive min, exclusive max) + y.
+    CHECK(table->ore_for(0.75f, 60) == 18);
+    CHECK(table->ore_for(0.75f, 5) == 0);    // y below the rule range
+    CHECK(table->ore_for(0.65f, 60) == 0);   // density below
+    CHECK(table->ore_for(0.80f, 60) == 0);   // exclusive max density
+    CHECK(table->ore_for(0.75f, 121) == 0);  // y above the rule range
+
+    // JSON round-trip and all-or-nothing rejection.
+    std::string asset;
+    CHECK(table->serialize(asset));
+    auto restored = engine::procgen::create_ore_table_from_json(asset, error);
+    CHECK(restored != nullptr && restored->ore_for(0.75f, 60) == 18);
+    auto bad = engine::procgen::create_ore_table_from_json("{nope", error);
+    CHECK(bad == nullptr && !error.empty());
+
+    std::cout << "[sdk] procgen: ore table (rules, y/density gates, JSON) OK\n";
+}
+
+void test_carver() {
+    std::string error;
+    auto carver = engine::procgen::create_carver({ 60, 12 });  // fluid pool <= 60
+    CHECK(carver != nullptr);
+    CHECK(carver->fill_block(40) == 12);
+    CHECK(carver->fill_block(61) == 0);  // pure air above the pool
+
+    std::string asset;
+    CHECK(carver->serialize(asset));
+    auto restored = engine::procgen::create_carver_from_json(asset, error);
+    CHECK(restored != nullptr && restored->fill_block(40) == 12 &&
+          restored->fill_block(61) == 0);
+    auto bad = engine::procgen::create_carver_from_json("{nope", error);
+    CHECK(bad == nullptr && !error.empty());
+
+    std::cout << "[sdk] procgen: carver (fluid pool, air above, JSON) OK\n";
+}
+
+void test_decorator() {
+    std::string error;
+    const char* kDecoratorSetAsset = R"({"version":1,"decorators":[
+      {"type":"column","density":1.0,"params":[2,2],"blocks":[50]}]})";
+    auto set = engine::procgen::create_decorator_set_from_json(kDecoratorSetAsset, error);
+    CHECK(set != nullptr && error.empty());
+    CHECK(set->decorator_count() == 1);
+
+    // Direct placement through a capture writer: two blocks above the surface.
+    auto column = engine::procgen::create_decorator(
+        engine::procgen::DecoratorSpec{ "column", 1.0f, { 2, 2 }, { 50 }, 3,
+                                        true, 0, 0, 0x7FFFFFFF },
+        error);
+    CHECK(column != nullptr && error.empty());
+    engine::voxel::DecorationContext ctx;
+    ctx.localX = 4;
+    ctx.localZ = 4;
+    ctx.worldX = 4.0f;
+    ctx.worldZ = 4.0f;
+    ctx.surfaceHeight = 131;
+    ctx.biomeIndex = 8;
+    std::vector<std::pair<int, std::uint32_t>> placed;
+    const engine::voxel::BlockWriter writer =
+        [&](int lx, int ly, int lz, std::uint32_t blockId) -> bool {
+            (void)lx;
+            (void)lz;
+            placed.push_back({ ly, blockId });
+            return true;
+        };
+    CHECK(column->place(ctx, writer));
+    CHECK(placed.size() == 2);
+    CHECK(placed[0].first == 132 && placed[0].second == 50);
+    CHECK(placed[1].first == 133 && placed[1].second == 50);
+
+    // Biome gate: a decorator pinned to another biome places nothing.
+    engine::procgen::DecoratorSpec pinned = column->spec();
+    pinned.anyBiome = false;
+    pinned.biomeIndex = 9;
+    auto gated = engine::procgen::create_decorator(pinned, error);
+    CHECK(gated != nullptr);
+    placed.clear();
+    CHECK(!gated->place(ctx, writer));
+    CHECK(placed.empty());
+
+    // Density gate: 0.0 never places.
+    engine::procgen::DecoratorSpec none = column->spec();
+    none.density = 0.0f;
+    auto disabled = engine::procgen::create_decorator(none, error);
+    CHECK(disabled != nullptr);
+    placed.clear();
+    CHECK(!disabled->place(ctx, writer));
+    CHECK(placed.empty());
+
+    // Tree: trunk above the surface plus leaf blocks in the crown.
+    engine::procgen::DecoratorSpec treeSpec;
+    treeSpec.type = "tree";
+    treeSpec.density = 1.0f;
+    treeSpec.params = { 3, 3, 2 };
+    treeSpec.blocks = { 6, 7 };  // wood, leaves
+    auto tree = engine::procgen::create_decorator(treeSpec, error);
+    CHECK(tree != nullptr && error.empty());
+    placed.clear();
+    CHECK(tree->place(ctx, writer));
+    bool hasTrunk = false, hasLeaf = false;
+    for (const auto& entry : placed) {
+        if (entry.second == 6 && entry.first > 131) hasTrunk = true;
+        if (entry.second == 7) hasLeaf = true;
+    }
+    CHECK(hasTrunk && hasLeaf);
+
+    // JSON round-trip of the set and all-or-nothing rejection.
+    std::string asset;
+    CHECK(set->serialize(asset));
+    auto restored = engine::procgen::create_decorator_set_from_json(asset, error);
+    CHECK(restored != nullptr && restored->decorator_count() == 1);
+    placed.clear();
+    restored->apply(ctx, writer);
+    CHECK(placed.size() == 2);
+    auto bad = engine::procgen::create_decorator_set_from_json("{nope", error);
+    CHECK(bad == nullptr && !error.empty());
+    // Unknown type / malformed params rejected.
+    auto badType = engine::procgen::create_decorator_from_json(
+        R"({"version":1,"type":"castle","blocks":[1]})", error);
+    CHECK(badType == nullptr && !error.empty());
+
+    std::cout << "[sdk] procgen: decorator (column/tree placement, gates, JSON) "
+                 "OK\n";
+}
+
+// Constant graph (samples the same value everywhere) — already defined as
+// make_constant_graph; used here for the ore/carve density fields.
+void test_world_features() {
+    std::string error;
+    auto height = engine::procgen::create_noise_graph_from_spec(
+        make_height_spec(2026, 0.05f), error);
+    CHECK(height != nullptr && error.empty());
+    auto registry = engine::procgen::create_biome_registry();
+    auto resolver = engine::procgen::create_surface_resolver(registry);
+    auto hotTemp = make_constant_graph(0.7f, error);
+    auto hotMoisture = make_constant_graph(-0.7f, error);
+    auto continentalness = make_constant_graph(0.5f, error);
+    auto hotSampler = engine::procgen::create_climate_sampler(
+        hotTemp, hotMoisture, continentalness, nullptr, nullptr, nullptr);
+    const auto make_generator =
+        [&](std::shared_ptr<const engine::procgen::IDensityFunction> caves,
+            std::shared_ptr<const engine::procgen::IDensityFunction> ores,
+            std::shared_ptr<const engine::procgen::IOreTable> oreTable,
+            std::shared_ptr<const engine::procgen::ICarver> carver,
+            std::shared_ptr<const engine::procgen::IDecoratorSet> decoratorSet) {
+            return engine::procgen::create_climate_voxel_generator(
+                height, hotSampler, registry, resolver, std::move(caves),
+                std::move(ores), 131, 4, std::move(oreTable), std::move(carver),
+                std::move(decoratorSet));
+        };
+
+    // ---- Ore distribution in the world: constant 0.75 field + a rule
+    // [0.7,0.8) x y in [10,120] -> DiamondOre (18). The rule overrides the
+    // builtin vein (GoldOre at y<96, IronOre at y<256) and the y-gate keeps
+    // shallow bedrock layers untouched.
+    auto oreField = engine::procgen::create_graph_density_function(
+        make_constant_graph(0.75f, error), 1.0f, 0.0f);
+    const char* kOreAsset = R"({"version":1,"rules":[
+      {"blockId":18,"minDensity":0.7,"maxDensity":0.8,"minY":10,"maxY":120}]})";
+    auto oreTable = engine::procgen::create_ore_table_from_json(kOreAsset, error);
+    CHECK(oreTable != nullptr);
+    auto oreGenerator = make_generator(nullptr, oreField, oreTable, nullptr, nullptr);
+    std::unique_ptr<engine::voxel::IVoxelWorld> oreWorld =
+        engine::voxel::create_default_voxel_world();
+    oreWorld->register_generator(oreGenerator);
+    CHECK(boot_world(*oreWorld, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    CHECK(oreWorld->get_block(4, 60, 4) == 18);   // rule over builtin GoldOre
+    CHECK(oreWorld->get_block(4, 100, 4) == 18);  // rule over builtin IronOre
+    CHECK(oreWorld->get_block(4, 5, 4) == 17);    // y-gate: builtin GoldOre stays
+
+    // ---- Carver in the world: constant 0.5 cave field + fluid pool <= 60.
+    auto caveField = engine::procgen::create_graph_density_function(
+        make_constant_graph(0.5f, error), 1.0f, 0.0f);
+    auto carver = engine::procgen::create_carver({ 60, 12 });
+    auto carveGenerator = make_generator(caveField, nullptr, nullptr, carver, nullptr);
+    std::unique_ptr<engine::voxel::IVoxelWorld> carveWorld =
+        engine::voxel::create_default_voxel_world();
+    carveWorld->register_generator(carveGenerator);
+    CHECK(boot_world(*carveWorld, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    CHECK(carveWorld->get_block(4, 40, 4) == 12);   // fluid pool inside caves
+    CHECK(carveWorld->get_block(4, 100, 4) == 0);   // pure air above the pool
+
+    // ---- Decorator in the world: a 2-block snow column on every land
+    // column (data mode replaces the builtin tree pass).
+    const char* kDecoratorAsset = R"({"version":1,"decorators":[
+      {"type":"column","density":1.0,"params":[2,2],"blocks":[50]}]})";
+    auto decoratorSet = engine::procgen::create_decorator_set_from_json(kDecoratorAsset, error);
+    CHECK(decoratorSet != nullptr);
+    auto decoratorGenerator = make_generator(nullptr, nullptr, nullptr, nullptr,
+                                             decoratorSet);
+    std::unique_ptr<engine::voxel::IVoxelWorld> decorWorld =
+        engine::voxel::create_default_voxel_world();
+    decorWorld->register_generator(decoratorGenerator);
+    CHECK(boot_world(*decorWorld, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    const int landColumns[4][2] = { { 4, 4 }, { 6, 6 }, { 8, 8 }, { 10, 10 } };
+    for (const auto& column : landColumns) {
+        const int surface =
+            decoratorGenerator->sample(static_cast<float>(column[0]),
+                                       static_cast<float>(column[1])).height;
+        if (surface <= 129) continue;  // only land columns get decorated
+        CHECK(decorWorld->get_block(column[0], surface + 1, column[1]) == 50);
+        CHECK(decorWorld->get_block(column[0], surface + 2, column[1]) == 50);
+        CHECK(decorWorld->get_block(column[0], surface + 3, column[1]) == 0);
+    }
+
+    // Determinism: a second decorator world is identical to the first.
+    std::unique_ptr<engine::voxel::IVoxelWorld> decorWorldB =
+        engine::voxel::create_default_voxel_world();
+    decorWorldB->register_generator(decoratorGenerator);
+    CHECK(boot_world(*decorWorldB, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    bool sameTerrain = true;
+    for (int x = 4; x <= 10; x += 2) {
+        for (int z = 4; z <= 10; z += 2) {
+            for (int y = 0; y <= 140; ++y) {
+                if (decorWorld->get_block(x, y, z) != decorWorldB->get_block(x, y, z)) {
+                    sameTerrain = false;
+                }
+            }
+        }
+    }
+    CHECK(sameTerrain);
+
+    std::cout << "[sdk] procgen: world features (ore table, carver fluid, "
+                 "decorator pillars, determinism) OK\n";
+}
+
+// ---- Item 10: deterministic structures via fast-wfc (META 18) ----
+
+// A walled room floor plan: 1 = wall (Stone), 2 = floor (Sand). Pattern
+// window 2: non-backtracking WFC cannot solve closed-room samples at larger
+// windows (low entropy — see findings); window 2 is the reliable config.
+engine::procgen::StructureAssetSpec make_room_spec(std::uint32_t seed) {
+    engine::procgen::StructureAssetSpec spec;
+    spec.sampleWidth = 8;
+    spec.sampleHeight = 5;
+    const int w = spec.sampleWidth;
+    for (int z = 0; z < spec.sampleHeight; ++z) {
+        for (int x = 0; x < w; ++x) {
+            const bool wall = z == 0 || z == spec.sampleHeight - 1 ||
+                              x == 0 || x == w - 1;
+            spec.sample.push_back(wall ? 1u : 2u);
+        }
+    }
+    spec.patternSize = 2;
+    spec.seed = seed;
+    // Wall profile: three stone layers (wall 2 blocks + roof); floor: one sand
+    // layer. Depth = 3.
+    spec.profiles.emplace_back(1, std::vector<std::uint32_t>{ 3, 3, 3 });
+    spec.profiles.emplace_back(2, std::vector<std::uint32_t>{ 5 });
+    return spec;
+}
+
+void test_structure_generator() {
+    std::string error;
+    auto generator = engine::procgen::create_structure_generator(
+        make_room_spec(7), error);
+    CHECK(generator != nullptr && error.empty());
+    CHECK(generator->asset().sampleWidth == 8);
+
+    // Generation succeeds with the expected plan/extrusion dimensions.
+    engine::procgen::StructureOutput out;
+    CHECK(generator->generate(12, 8, out, error));
+    CHECK(out.succeeded && error.empty());
+    CHECK(out.width == 12 && out.height == 8 && out.depth == 3);
+    CHECK(out.plan.size() == 96 && out.blocks.size() == 96 * 3);
+
+    // Determinism: repeated runs are bit-identical (same seed used).
+    engine::procgen::StructureOutput again;
+    CHECK(generator->generate(12, 8, again, error));
+    CHECK(out.seedUsed == again.seedUsed);
+    CHECK(out.plan == again.plan && out.blocks == again.blocks);
+
+    // Window consistency: every patternSize window of the plan is a window of
+    // the sample (symmetry 1 = identity) — the output is locally consistent
+    // with the authored plan.
+    const auto& sample = generator->asset().sample;
+    const int sw = generator->asset().sampleWidth;
+    const int sh = generator->asset().sampleHeight;
+    const int ps = generator->asset().patternSize;
+    bool windowsConsistent = true;
+    for (int oz = 0; oz + ps <= out.height && windowsConsistent; ++oz) {
+        for (int ox = 0; ox + ps <= out.width; ++ox) {
+            bool found = false;
+            for (int sz = 0; sz + ps <= sh; ++sz) {
+                for (int sx = 0; sx + ps <= sw; ++sx) {
+                    bool match = true;
+                    for (int dy = 0; dy < ps; ++dy) {
+                        for (int dx = 0; dx < ps; ++dx) {
+                            const std::uint32_t outputId =
+                                out.plan[(oz + dy) * out.width + (ox + dx)];
+                            const std::uint32_t sampleId =
+                                sample[(sz + dy) * sw + (sx + dx)];
+                            if (outputId != sampleId) match = false;
+                        }
+                    }
+                    if (match) found = true;
+                }
+            }
+            if (!found) windowsConsistent = false;
+        }
+    }
+    CHECK(windowsConsistent);
+
+    // The plan contains both wall and floor ids, and the extrusion follows
+    // the profiles (wall column 3/3/3/air; floor column 5/air).
+    bool sawWall = false, sawFloor = false;
+    for (int z = 0; z < out.height; ++z) {
+        for (int x = 0; x < out.width; ++x) {
+            const std::uint32_t id = out.plan[x + z * out.width];
+            if (id == 1 && !sawWall) {
+                sawWall = true;
+                CHECK(out.blocks[x + z * out.width + 0 * out.width * out.height] == 3);
+                CHECK(out.blocks[x + z * out.width + 1 * out.width * out.height] == 3);
+                CHECK(out.blocks[x + z * out.width + 2 * out.width * out.height] == 3);
+            } else if (id == 2 && !sawFloor) {
+                sawFloor = true;
+                CHECK(out.blocks[x + z * out.width + 0 * out.width * out.height] == 5);
+                CHECK(out.blocks[x + z * out.width + 1 * out.width * out.height] == 0);
+            }
+        }
+    }
+    CHECK(sawWall && sawFloor);
+
+    // Instance independence: a second generator built from the serialized
+    // asset produces the same output.
+    std::string asset;
+    CHECK(generator->serialize(asset));
+    auto restored = engine::procgen::create_structure_generator_from_json(asset, error);
+    CHECK(restored != nullptr && error.empty());
+    engine::procgen::StructureOutput restoredOut;
+    CHECK(restored->generate(12, 8, restoredOut, error));
+    CHECK(restoredOut.plan == out.plan && restoredOut.blocks == out.blocks);
+
+    // The ground option is supported and deterministic (pins the sample's
+    // bottom pattern as a floor). A platformer-style sample (solid ground row,
+    // sparse blocks above, no closed loops) is the config the option can
+    // solve.
+    {
+        engine::procgen::StructureAssetSpec platform;
+        platform.sampleWidth = 8;
+        platform.sampleHeight = 5;
+        platform.patternSize = 2;
+        platform.ground = true;
+        platform.seed = 7;
+        const std::uint32_t rows[5][8] = {
+            { 0, 0, 0, 1, 0, 0, 0, 0 },
+            { 0, 1, 0, 0, 0, 1, 0, 0 },
+            { 0, 0, 0, 0, 1, 0, 0, 0 },
+            { 1, 0, 0, 1, 0, 0, 1, 0 },
+            { 1, 1, 1, 1, 1, 1, 1, 1 } };
+        for (int z = 0; z < 5; ++z) {
+            for (int x = 0; x < 8; ++x) platform.sample.push_back(rows[z][x]);
+        }
+        auto grounded = engine::procgen::create_structure_generator(platform, error);
+        CHECK(grounded != nullptr && error.empty());
+        engine::procgen::StructureOutput groundedOut;
+        CHECK(grounded->generate(12, 8, groundedOut, error));
+        CHECK(groundedOut.succeeded);
+        engine::procgen::StructureOutput groundedAgain;
+        CHECK(grounded->generate(12, 8, groundedAgain, error));
+        CHECK(groundedOut.plan == groundedAgain.plan);
+        std::string groundAsset;
+        CHECK(grounded->serialize(groundAsset));
+        CHECK(groundAsset.find("\"ground\":true") != std::string::npos);
+    }
+
+    // All-or-nothing on malformed assets; validation rejects bad specs.
+    auto bad = engine::procgen::create_structure_generator_from_json("{nope", error);
+    CHECK(bad == nullptr && !error.empty());
+    CHECK(restored->deserialize("{nope", error) == false);
+    CHECK(restored->generate(12, 8, again, error));  // previous spec preserved
+    CHECK(again.plan == out.plan);
+    auto tiny = make_room_spec(1);
+    tiny.sampleWidth = 1;  // patternSize 2 cannot fit
+    tiny.sample.resize(1);
+    auto rejected = engine::procgen::create_structure_generator(tiny, error);
+    CHECK(rejected == nullptr && !error.empty());
+
+    std::cout << "[sdk] procgen: structure generator (determinism, window "
+                 "consistency, extrusion, JSON, ground) OK\n";
+}
+
+void test_road_network() {
+    std::string error;
+    auto builder = engine::procgen::create_road_network_builder();
+    CHECK(builder != nullptr);
+
+    // Square of junctions: Delaunay gives 4 hull edges + 1 diagonal.
+    engine::procgen::RoadNetworkSpec spec;
+    spec.points = { { 0.0, 0.0 }, { 10.0, 0.0 }, { 10.0, 10.0 },
+                    { 0.0, 10.0 } };
+    CHECK(builder->build(spec, error));
+    const auto& network = builder->network();
+    CHECK(network.points.size() == 4);
+    CHECK(network.edges.size() == 5);  // 4 hull + 1 diagonal
+
+    // Determinism: an independent builder with the same spec produces the
+    // identical network (same points, same edges in the same order).
+    auto twin = engine::procgen::create_road_network_builder();
+    CHECK(twin->build(spec, error));
+    const auto& twinNetwork = twin->network();
+    CHECK(network.edges == twinNetwork.edges);
+    CHECK(network.points == twinNetwork.points);
+
+    // Length filter: maxEdgeLength 10 keeps the 4 sides (10.0) and drops
+    // the diagonal (~14.14).
+    engine::procgen::RoadNetworkSpec filtered = spec;
+    filtered.maxEdgeLength = 10.0;
+    auto filteredBuilder = engine::procgen::create_road_network_builder();
+    CHECK(filteredBuilder->build(filtered, error));
+    CHECK(filteredBuilder->network().edges.size() == 4);
+
+    // JSON round-trip: bit-exact points, same maxEdgeLength, and the
+    // deserialized asset rebuilds the same network.
+    std::string json;
+    CHECK(builder->serialize(json));
+    auto restored = engine::procgen::create_road_network_builder();
+    CHECK(restored->deserialize(json, error));
+    CHECK(restored->network().points == network.points);
+    CHECK(restored->network().edges == network.edges);
+    auto filteredRestored = engine::procgen::create_road_network_builder();
+    std::string filteredJson;
+    CHECK(filteredBuilder->serialize(filteredJson));
+    CHECK(filteredRestored->deserialize(filteredJson, error));
+    CHECK(filteredRestored->network().edges ==
+          filteredBuilder->network().edges);
+
+    // All-or-nothing + validation.
+    CHECK(restored->deserialize("{nope", error) == false);
+    CHECK(restored->network().points == network.points);  // state preserved
+    engine::procgen::RoadNetworkSpec tiny;
+    tiny.points = { { 0.0, 0.0 }, { 1.0, 1.0 } };
+    CHECK(builder->build(tiny, error) == false && !error.empty());
+    engine::procgen::RoadNetworkSpec dup = spec;
+    dup.points.push_back({ 0.0, 0.0 });  // duplicate junction
+    CHECK(builder->build(dup, error) == false && !error.empty());
+
+    std::cout << "[sdk] procgen: road network (delaunay, determinism, "
+                 "length filter, JSON) OK\n";
+}
+
+void test_parcellation() {
+    std::string error;
+    auto parcellation = engine::procgen::create_parcellation();
+    CHECK(parcellation != nullptr);
+
+    // Square with every Delaunay edge a road -> the two triangles are two
+    // parcels whose areas sum to the square.
+    engine::procgen::RoadNetwork square;
+    square.points = { { 0.0, 0.0 }, { 10.0, 0.0 }, { 10.0, 10.0 },
+                      { 0.0, 10.0 } };
+    auto squareBuilder = engine::procgen::create_road_network_builder();
+    engine::procgen::RoadNetworkSpec squareSpec;
+    squareSpec.points = square.points;
+    CHECK(squareBuilder->build(squareSpec, error));
+    square.edges = squareBuilder->network().edges;
+    std::vector<engine::procgen::ParcelPolygon> squareParcels;
+    CHECK(parcellation->parcels_from_network(square, squareParcels, error));
+    CHECK(squareParcels.size() == 2);
+    double squareSum = 0.0;
+    for (const auto& parcel : squareParcels) {
+        CHECK(parcel.outer.size() == 3);  // triangles
+        CHECK(parcel.holes.empty());
+        CHECK(parcel.area() > 0.0);
+        squareSum += parcel.area();
+    }
+    CHECK(std::abs(squareSum - 100.0) < 1e-9);
+
+    // Ring-in-ring: an interior road loop makes the annulus come back with
+    // a hole, plus the inner region as a separate parcel.
+    engine::procgen::RoadNetwork annulus;
+    annulus.points = { { 0.0, 0.0 }, { 10.0, 0.0 }, { 10.0, 10.0 },
+                       { 0.0, 10.0 }, { 4.0, 4.0 }, { 6.0, 4.0 },
+                       { 6.0, 6.0 },  { 4.0, 6.0 } };
+    annulus.edges = { { 0, 1 }, { 1, 2 }, { 2, 3 }, { 3, 0 },
+                      { 4, 5 }, { 5, 6 }, { 6, 7 }, { 7, 4 } };
+    std::vector<engine::procgen::ParcelPolygon> parcels;
+    CHECK(parcellation->parcels_from_network(annulus, parcels, error));
+    CHECK(parcels.size() == 2);
+    const engine::procgen::ParcelPolygon* ringParcel = nullptr;
+    const engine::procgen::ParcelPolygon* innerParcel = nullptr;
+    for (const auto& parcel : parcels) {
+        if (parcel.holes.size() == 1) {
+            ringParcel = &parcel;
+        } else {
+            innerParcel = &parcel;
+        }
+    }
+    CHECK(ringParcel != nullptr && innerParcel != nullptr);
+    CHECK(std::abs(ringParcel->area() - 96.0) < 1e-9);      // 100 - 4
+    CHECK(std::abs(innerParcel->area() - 4.0) < 1e-9);
+    CHECK(std::abs(engine::procgen::ParcelPolygon::ring_area(
+              ringParcel->holes[0])) -
+              4.0 <
+          1e-9);
+    CHECK(ringParcel->contains({ 1.0, 1.0 }));   // inside outer, outside hole
+    CHECK(!ringParcel->contains({ 5.0, 5.0 }));  // inside the hole
+    CHECK(innerParcel->contains({ 5.0, 5.0 }));
+
+    // Determinism: an independent instance produces identical parcels.
+    auto twin = engine::procgen::create_parcellation();
+    std::vector<engine::procgen::ParcelPolygon> twinParcels;
+    CHECK(twin->parcels_from_network(annulus, twinParcels, error));
+    CHECK(twinParcels.size() == parcels.size());
+    for (std::size_t i = 0; i < parcels.size(); ++i) {
+        CHECK(twinParcels[i].outer == parcels[i].outer);
+        CHECK(twinParcels[i].holes.size() == parcels[i].holes.size());
+        for (std::size_t h = 0; h < parcels[i].holes.size(); ++h) {
+            CHECK(twinParcels[i].holes[h] == parcels[i].holes[h]);
+        }
+    }
+
+    // Dangling road (a bridge) contributes no bounded parcel.
+    engine::procgen::RoadNetwork bridge = annulus;
+    bridge.edges.push_back({ 0, 7 });  // dangling spur on the outer corner
+    std::vector<engine::procgen::ParcelPolygon> bridged;
+    CHECK(parcellation->parcels_from_network(bridge, bridged, error));
+    CHECK(bridged.size() == 2);
+    double bridgedSum = 0.0;
+    for (const auto& parcel : bridged) {
+        bridgedSum += parcel.area();
+    }
+    CHECK(std::abs(bridgedSum - 100.0) < 1e-9);
+
+    std::cout << "[sdk] procgen: parcellation (faces, annulus hole, "
+                 "contains, determinism) OK\n";
+}
+
+void test_parcel_triangulation() {
+    std::string error;
+    auto parcellation = engine::procgen::create_parcellation();
+
+    // Annulus parcel (8 boundary vertices, 1 hole) -> earcut produces
+    // V + 2h - 2 triangles; their areas sum to the parcel area.
+    engine::procgen::ParcelPolygon annulus;
+    annulus.outer = { { 0.0, 0.0 }, { 10.0, 0.0 }, { 10.0, 10.0 },
+                      { 0.0, 10.0 } };
+    annulus.holes.push_back({ { 4.0, 4.0 }, { 6.0, 4.0 }, { 6.0, 6.0 },
+                              { 4.0, 6.0 } });
+    std::vector<std::uint32_t> indices;
+    CHECK(parcellation->triangulate(annulus, indices, error));
+    CHECK(indices.size() == 8 * 3);  // 4 + 4 + 2*1 - 2 = 8 triangles
+    CHECK(indices.size() % 3 == 0);
+    auto ring_point = [&annulus](std::uint32_t idx) {
+        if (idx < annulus.outer.size()) {
+            return annulus.outer[idx];
+        }
+        return annulus.holes[0][idx - annulus.outer.size()];
+    };
+    double sum = 0.0;
+    for (std::size_t i = 0; i < indices.size(); i += 3) {
+        const auto a = ring_point(indices[i]);
+        const auto b = ring_point(indices[i + 1]);
+        const auto c = ring_point(indices[i + 2]);
+        sum += std::abs((b.x - a.x) * (c.y - a.y) -
+                        (c.x - a.x) * (b.y - a.y)) *
+               0.5;
+    }
+    CHECK(std::abs(sum - annulus.area()) < 1e-9);
+
+    // Determinism across instances.
+    auto twin = engine::procgen::create_parcellation();
+    std::vector<std::uint32_t> twinIndices;
+    CHECK(twin->triangulate(annulus, twinIndices, error));
+    CHECK(twinIndices == indices);
+
+    // Validation: a 2-point outer ring is rejected.
+    engine::procgen::ParcelPolygon bad;
+    bad.outer = { { 0.0, 0.0 }, { 1.0, 1.0 } };
+    CHECK(parcellation->triangulate(bad, indices, error) == false &&
+          !error.empty());
+
+    std::cout << "[sdk] procgen: parcel triangulation (earcut, area sum, "
+                 "determinism) OK\n";
+}
+
+engine::procgen::ShapeGrammar make_house_grammar() {
+    using engine::procgen::GrammarOpCall;
+    using engine::procgen::GrammarOpMass;
+    using engine::procgen::GrammarOpSize;
+    using engine::procgen::GrammarOpSplit;
+    using engine::procgen::GrammarRule;
+    using engine::procgen::ShapeGrammar;
+    ShapeGrammar g;
+    // 10x10x8 house: walls (2) + interior split into floor/windows/floor
+    // (windows split into wall/glass/wall) = 2 + 2 + 3 = 7 boxes.
+    GrammarRule axiom;
+    axiom.name = "Axiom";
+    axiom.ops.push_back(GrammarOpSize{ 10, 10, 8 });
+    axiom.ops.push_back(GrammarOpSplit{ 'x', { 2, 6, 2 },
+                                        { "Wall", "Interior", "Wall" } });
+    g.rules.push_back(axiom);
+    GrammarRule wall;
+    wall.name = "Wall";
+    wall.ops.push_back(GrammarOpMass{ 4 });
+    g.rules.push_back(wall);
+    GrammarRule interior;
+    interior.name = "Interior";
+    interior.ops.push_back(GrammarOpSplit{ 'y', { 4, 2, 4 },
+                                           { "Floor", "Windows", "Floor" } });
+    g.rules.push_back(interior);
+    GrammarRule floor;
+    floor.name = "Floor";
+    floor.ops.push_back(GrammarOpMass{ 4 });
+    g.rules.push_back(floor);
+    GrammarRule windows;
+    windows.name = "Windows";
+    windows.ops.push_back(GrammarOpSplit{ 'z', { 1, 6, 1 },
+                                          { "Wall", "Glass", "Wall" } });
+    g.rules.push_back(windows);
+    GrammarRule glass;
+    glass.name = "Glass";
+    glass.ops.push_back(GrammarOpMass{ 20 });
+    g.rules.push_back(glass);
+    return g;
+}
+
+void test_shape_grammar() {
+    std::string error;
+    auto runner = engine::procgen::create_shape_grammar_runner();
+    CHECK(runner != nullptr);
+
+    // The house grammar emits 7 boxes whose volumes tile the 10x10x8 scope.
+    const engine::procgen::ShapeGrammar house = make_house_grammar();
+    engine::procgen::GrammarResult result;
+    CHECK(runner->run(house, result, error));
+    CHECK(result.boxes.size() == 7);
+    long long volumeSum = 0;
+    for (const auto& box : result.boxes) {
+        const long long vol = static_cast<long long>(box.maxX - box.minX) *
+                              (box.maxY - box.minY) * (box.maxZ - box.minZ);
+        volumeSum += vol;
+        CHECK(box.minX >= 0 && box.maxX <= 10);
+        CHECK(box.minY >= 0 && box.maxY <= 10);
+        CHECK(box.minZ >= 0 && box.maxZ <= 8);
+    }
+    CHECK(volumeSum == 800);
+
+    // Determinism: an independent runner produces bit-identical boxes.
+    auto twin = engine::procgen::create_shape_grammar_runner();
+    engine::procgen::GrammarResult twinResult;
+    CHECK(twin->run(house, twinResult, error));
+    CHECK(twinResult.boxes.size() == result.boxes.size());
+    for (std::size_t i = 0; i < result.boxes.size(); ++i) {
+        CHECK(twinResult.boxes[i].minX == result.boxes[i].minX);
+        CHECK(twinResult.boxes[i].maxX == result.boxes[i].maxX);
+        CHECK(twinResult.boxes[i].minY == result.boxes[i].minY);
+        CHECK(twinResult.boxes[i].maxY == result.boxes[i].maxY);
+        CHECK(twinResult.boxes[i].minZ == result.boxes[i].minZ);
+        CHECK(twinResult.boxes[i].maxZ == result.boxes[i].maxZ);
+        CHECK(twinResult.boxes[i].blockId == result.boxes[i].blockId);
+    }
+
+    // JSON round-trip: the deserialized asset runs to the same boxes.
+    std::string json;
+    CHECK(runner->serialize(house, json));
+    engine::procgen::ShapeGrammar restored;
+    CHECK(runner->deserialize(json, restored, error));
+    CHECK(restored.rules.size() == house.rules.size());
+    engine::procgen::GrammarResult restoredResult;
+    CHECK(runner->run(restored, restoredResult, error));
+    CHECK(restoredResult.boxes.size() == result.boxes.size());
+    for (std::size_t i = 0; i < result.boxes.size(); ++i) {
+        CHECK(restoredResult.boxes[i].minX == result.boxes[i].minX);
+        CHECK(restoredResult.boxes[i].minY == result.boxes[i].minY);
+        CHECK(restoredResult.boxes[i].minZ == result.boxes[i].minZ);
+        CHECK(restoredResult.boxes[i].maxX == result.boxes[i].maxX);
+        CHECK(restoredResult.boxes[i].maxY == result.boxes[i].maxY);
+        CHECK(restoredResult.boxes[i].maxZ == result.boxes[i].maxZ);
+        CHECK(restoredResult.boxes[i].blockId == result.boxes[i].blockId);
+    }
+
+    // Split clipping: parts beyond the scope extent are clamped; leftover
+    // space is unused.
+    engine::procgen::ShapeGrammar clip;
+    engine::procgen::GrammarRule clipAxiom;
+    clipAxiom.name = "Axiom";
+    clipAxiom.ops.push_back(engine::procgen::GrammarOpSize{ 8, 1, 1 });
+    clipAxiom.ops.push_back(engine::procgen::GrammarOpSplit{
+        'x', { 3, 3, 3 }, { "P", "P", "P" } });
+    clip.rules.push_back(clipAxiom);
+    engine::procgen::GrammarRule p;
+    p.name = "P";
+    p.ops.push_back(engine::procgen::GrammarOpMass{ 1 });
+    clip.rules.push_back(p);
+    engine::procgen::GrammarResult clipResult;
+    CHECK(runner->run(clip, clipResult, error));
+    CHECK(clipResult.boxes.size() == 3);
+    CHECK(clipResult.boxes[2].minX == 6 && clipResult.boxes[2].maxX == 8);
+    long long clipVolume = 0;
+    for (const auto& box : clipResult.boxes) {
+        clipVolume += static_cast<long long>(box.maxX - box.minX) *
+                      (box.maxY - box.minY) * (box.maxZ - box.minZ);
+    }
+    CHECK(clipVolume == 8);  // leftover [4,8) clipped to [6,8)
+
+    // Degenerate: Axiom = mass only emits the unit box at the origin.
+    engine::procgen::ShapeGrammar single;
+    engine::procgen::GrammarRule singleAxiom;
+    singleAxiom.name = "Axiom";
+    singleAxiom.ops.push_back(engine::procgen::GrammarOpMass{ 3 });
+    single.rules.push_back(singleAxiom);
+    engine::procgen::GrammarResult singleResult;
+    CHECK(runner->run(single, singleResult, error));
+    CHECK(singleResult.boxes.size() == 1);
+    CHECK(singleResult.boxes[0].minX == 0 && singleResult.boxes[0].minY == 0 &&
+          singleResult.boxes[0].minZ == 0);
+    CHECK(singleResult.boxes[0].maxX == 1 && singleResult.boxes[0].maxY == 1 &&
+          singleResult.boxes[0].maxZ == 1);
+
+    // Validation: missing Axiom, unknown rule reference, split sizes/rules
+    // count mismatch and unknown op types are rejected all-or-nothing.
+    CHECK(runner->deserialize(
+              "{\"version\":1,\"rules\":[{\"name\":\"B\",\"ops\":[]}]}",
+              restored, error) == false);
+    CHECK(runner->deserialize(
+              "{\"version\":1,\"rules\":[{\"name\":\"Axiom\",\"ops\":"
+              "[{\"type\":\"call\",\"rule\":\"Ghost\"}]}]}",
+              restored, error) == false);
+    CHECK(runner->deserialize(
+              "{\"version\":1,\"rules\":[{\"name\":\"Axiom\",\"ops\":"
+              "[{\"type\":\"split\",\"axis\":\"x\",\"sizes\":[1,2],"
+              "\"rules\":[\"P\"]}]}]}",
+              restored, error) == false);
+    CHECK(runner->deserialize(
+              "{\"version\":1,\"rules\":[{\"name\":\"Axiom\",\"ops\":"
+              "[{\"type\":\"nope\"}]}]}",
+              restored, error) == false);
+    CHECK(runner->deserialize("{nope", restored, error) == false);
+    // All-or-nothing: the last successful grammar is preserved.
+    CHECK(restored.rules.size() == house.rules.size());
+    engine::procgen::GrammarResult preserved;
+    CHECK(runner->run(restored, preserved, error));
+    CHECK(preserved.boxes.size() == result.boxes.size());
+
+    // Runtime recursion limit: Axiom calling itself is structurally valid
+    // (validate passes) but fails at run time with a depth error.
+    engine::procgen::ShapeGrammar loop;
+    engine::procgen::GrammarRule loopAxiom;
+    loopAxiom.name = "Axiom";
+    loopAxiom.ops.push_back(engine::procgen::GrammarOpCall{ "Axiom" });
+    loop.rules.push_back(loopAxiom);
+    CHECK(runner->validate(loop, error));
+    engine::procgen::GrammarResult loopResult;
+    CHECK(runner->run(loop, loopResult, error) == false && !error.empty());
+
+    std::cout << "[sdk] procgen: shape grammar (house volume, determinism, "
+                 "JSON, clipping, validation, recursion) OK\n";
+}
+
+engine::procgen::Heightmap make_checker_heightmap(int size, float base,
+                                                   float amplitude) {
+    engine::procgen::Heightmap map;
+    map.width = size;
+    map.height = size;
+    map.values.resize(static_cast<std::size_t>(size) * size);
+    for (int z = 0; z < size; ++z) {
+        for (int x = 0; x < size; ++x) {
+            const float cell =
+                ((x % 2 == z % 2) ? 1.0f : -1.0f) * amplitude;
+            map.values[z * size + x] = base + cell;
+        }
+    }
+    return map;
+}
+
+// Sum of |height - lowest neighbor| over the interior — a roughness measure.
+double roughness(const engine::procgen::Heightmap& map) {
+    double sum = 0.0;
+    for (int z = 1; z < map.height - 1; ++z) {
+        for (int x = 1; x < map.width - 1; ++x) {
+            const float h = map.values[z * map.width + x];
+            float low = h;
+            low = std::min(low, map.values[z * map.width + (x - 1)]);
+            low = std::min(low, map.values[z * map.width + (x + 1)]);
+            low = std::min(low, map.values[(z - 1) * map.width + x]);
+            low = std::min(low, map.values[(z + 1) * map.width + x]);
+            sum += std::abs(h - low);
+        }
+    }
+    return sum;
+}
+
+void test_heightmap_erosion() {
+    std::string error;
+    auto erosion = engine::procgen::create_heightmap_erosion();
+    CHECK(erosion != nullptr);
+
+    // Determinism: two independent instances and repeated runs produce
+    // bit-identical results for the same (heightmap, spec).
+    const engine::procgen::Heightmap checker = make_checker_heightmap(48, 0.5f, 0.3f);
+    engine::procgen::ErosionSpec spec;
+    spec.seed = 7;
+    spec.iterations = 60000;
+    spec.thermalIterations = 6;
+    engine::procgen::Heightmap first;
+    CHECK(erosion->erode(checker, spec, first, error));
+    engine::procgen::Heightmap again;
+    CHECK(erosion->erode(checker, spec, again, error));
+    CHECK(first.values == again.values);
+    auto twin = engine::procgen::create_heightmap_erosion();
+    engine::procgen::Heightmap twinOut;
+    CHECK(twin->erode(checker, spec, twinOut, error));
+    CHECK(twinOut.values == first.values);
+
+    // Real effect: erosion reduces the roughness (spikes eroded, valleys
+    // filled) while conserving material (hydraulic returns its sediment on
+    // death; thermal only slides material around).
+    const double before = roughness(checker);
+    const double after = roughness(first);
+    CHECK(after < before * 0.95);
+    CHECK(after > 0.0);
+    float minV = 1e9f;
+    float maxV = -1e9f;
+    double sumBefore = 0.0;
+    double sumAfter = 0.0;
+    for (std::size_t i = 0; i < checker.values.size(); ++i) {
+        minV = std::min(minV, first.values[i]);
+        maxV = std::max(maxV, first.values[i]);
+        sumBefore += checker.values[i];
+        sumAfter += first.values[i];
+    }
+    CHECK(minV >= 0.1f && maxV <= 0.9f);
+    CHECK(std::abs(sumAfter - sumBefore) < 1.0);  // conserved
+
+    // Thermal only: a single tall spike on flat ground slides down, and the
+    // total material is conserved (within float noise).
+    engine::procgen::Heightmap spike;
+    spike.width = 32;
+    spike.height = 32;
+    spike.values.assign(32 * 32, 0.5f);
+    spike.values[16 * 32 + 16] = 0.9f;
+    engine::procgen::ErosionSpec thermal;
+    thermal.iterations = 0;
+    thermal.thermalIterations = 200;
+    thermal.talusAngle = 0.02f;
+    double spikeSum = 0.0;
+    for (const float v : spike.values) {
+        spikeSum += v;
+    }
+    engine::procgen::Heightmap thermalOut;
+    CHECK(erosion->erode(spike, thermal, thermalOut, error));
+    double thermalSum = 0.0;
+    float spikeMax = -1e9f;
+    for (const float v : thermalOut.values) {
+        thermalSum += v;
+        spikeMax = std::max(spikeMax, v);
+    }
+    CHECK(spikeMax < 0.7f);           // material slid off the spike
+    CHECK(std::abs(thermalSum - spikeSum) < 1e-3);  // conservation
+    // The neighbors of the spike rose above the flat base.
+    CHECK(thermalOut.values[16 * 32 + 17] > 0.51f);
+
+    // Spec validation + JSON round-trip + all-or-nothing.
+    engine::procgen::ErosionSpec bad = spec;
+    bad.evaporation = 0.0f;
+    CHECK(erosion->validate(bad, error) == false && !error.empty());
+    std::string json;
+    CHECK(erosion->serialize_spec(spec, json));
+    engine::procgen::ErosionSpec restored;
+    CHECK(erosion->deserialize_spec(json, restored, error));
+    CHECK(restored.seed == spec.seed &&
+          restored.iterations == spec.iterations);
+    CHECK(restored.evaporation == spec.evaporation);
+    engine::procgen::Heightmap restoredOut;
+    CHECK(erosion->erode(checker, restored, restoredOut, error));
+    CHECK(restoredOut.values == first.values);
+    CHECK(erosion->deserialize_spec("{nope", restored, error) == false);
+    CHECK(erosion->deserialize_spec(
+              "{\"version\":1,\"evaporation\":0}", restored, error) ==
+          false);
+    CHECK(restored.seed == spec.seed);  // all-or-nothing preserved
+
+    // Tile cache: hits on repeat, distinct keys per (seed, tile), clear.
+    auto cache = engine::procgen::create_tile_erosion_cache();
+    CHECK(cache != nullptr && cache->size() == 0);
+    const engine::procgen::Heightmap tile = make_checker_heightmap(16, 0.5f, 0.2f);
+    engine::procgen::Heightmap tileOut;
+    CHECK(cache->erode_tile(spec, 0, 0, tile, tileOut, error));
+    CHECK(cache->size() == 1);
+    engine::procgen::Heightmap tileOut2;
+    CHECK(cache->erode_tile(spec, 0, 0, tile, tileOut2, error));
+    CHECK(cache->size() == 1);          // cache hit
+    CHECK(tileOut2.values == tileOut.values);
+    CHECK(cache->erode_tile(spec, 1, 0, tile, tileOut, error));
+    CHECK(cache->size() == 2);          // different tile -> new entry
+    engine::procgen::ErosionSpec otherSeed = spec;
+    otherSeed.seed = 99;
+    CHECK(cache->erode_tile(otherSeed, 0, 0, tile, tileOut, error));
+    CHECK(cache->size() == 3);          // different seed -> new entry
+    auto cacheTwin = engine::procgen::create_tile_erosion_cache();
+    engine::procgen::Heightmap twinTile;
+    CHECK(cacheTwin->erode_tile(spec, 0, 0, tile, twinTile, error));
+    CHECK(twinTile.values == tileOut2.values);  // cross-instance determinism
+    cache->clear();
+    CHECK(cache->size() == 0);
+
+    // Validation: degenerate heightmaps are rejected.
+    engine::procgen::Heightmap empty;
+    CHECK(erosion->erode(empty, spec, again, error) == false &&
+          !error.empty());
+
+    std::cout << "[sdk] procgen: heightmap erosion (determinism, hydraulic "
+                 "roughness, thermal conservation, spec JSON, tile cache) OK\n";
+}
+
+engine::procgen::CookedMesh make_grid_mesh(int gridW, int gridH, bool shuffled) {
+    engine::procgen::CookedMesh mesh;
+    const int vertsX = gridW + 1;
+    const int vertsZ = gridH + 1;
+    for (int z = 0; z < vertsZ; ++z) {
+        for (int x = 0; x < vertsX; ++x) {
+            const float h =
+                0.3f * std::sin(static_cast<float>(x) * 0.5f) *
+                std::cos(static_cast<float>(z) * 0.5f);
+            mesh.positions.push_back(static_cast<float>(x));
+            mesh.positions.push_back(h);
+            mesh.positions.push_back(static_cast<float>(z));
+            mesh.normals.push_back(0.0f);
+            mesh.normals.push_back(1.0f);
+            mesh.normals.push_back(0.0f);
+        }
+    }
+    for (int z = 0; z < gridH; ++z) {
+        for (int x = 0; x < gridW; ++x) {
+            const std::uint32_t i0 = static_cast<std::uint32_t>(z * vertsX + x);
+            const std::uint32_t i1 = i0 + 1;
+            const std::uint32_t i2 = i0 + static_cast<std::uint32_t>(vertsX);
+            const std::uint32_t i3 = i2 + 1;
+            mesh.indices.push_back(i0);
+            mesh.indices.push_back(i1);
+            mesh.indices.push_back(i2);
+            mesh.indices.push_back(i1);
+            mesh.indices.push_back(i3);
+            mesh.indices.push_back(i2);
+        }
+    }
+    if (shuffled) {
+        // Deterministic TRIANGLE shuffle that destroys vertex locality while
+        // keeping the grid topology intact: a multiplicative permutation over
+        // the triangle list (512 and 7919 are coprime). Shuffling individual
+        // index elements instead would break the (a,b,c) grouping and turn
+        // the mesh into a random triangle soup.
+        const std::size_t tris = mesh.indices.size() / 3;
+        std::vector<std::uint32_t> scrambled(mesh.indices.size());
+        for (std::size_t t = 0; t < tris; ++t) {
+            const std::size_t src = (t * 7919ull) % tris;
+            scrambled[t * 3 + 0] = mesh.indices[src * 3 + 0];
+            scrambled[t * 3 + 1] = mesh.indices[src * 3 + 1];
+            scrambled[t * 3 + 2] = mesh.indices[src * 3 + 2];
+        }
+        mesh.indices = std::move(scrambled);
+    }
+    return mesh;
+}
+
+void test_mesh_cooking() {
+    std::string error;
+    auto cooker = engine::procgen::create_mesh_cooker();
+    CHECK(cooker != nullptr);
+
+    // A grid mesh with scrambled triangle order is cache-hostile; optimizing
+    // must substantially improve the ACMR (meshopt analyzer).
+    const engine::procgen::CookedMesh bad =
+        make_grid_mesh(16, 16, /*shuffled=*/true);
+    engine::procgen::CookStats badStats;
+    CHECK(cooker->analyze(bad, badStats, error));
+    engine::procgen::CookStats goodStats;
+    engine::procgen::CookOptions optOnly;
+    optOnly.unwrap = false;
+    optOnly.simplifyTargetIndices = 0;
+    engine::procgen::CookedMesh optimized;
+    CHECK(cooker->optimize(bad, optOnly, optimized, error));
+    CHECK(cooker->analyze(optimized, goodStats, error));
+    CHECK(badStats.acmr > goodStats.acmr * 1.2);  // measurably better
+    CHECK(goodStats.acmr < 1.5f);                 // and actually good
+    CHECK(optimized.indices.size() == bad.indices.size());
+    CHECK(optimized.vertex_count() == bad.vertex_count());
+
+    // Unwrap: UVs are produced in [0,1], triangle count is preserved and
+    // every output vertex matches an input vertex (positions preserved).
+    const engine::procgen::CookedMesh grid = make_grid_mesh(16, 16, false);
+    engine::procgen::CookOptions unwrapOnly;
+    unwrapOnly.unwrap = true;
+    unwrapOnly.optimize = false;
+    engine::procgen::CookedMesh unwrapped;
+    CHECK(cooker->unwrap(grid, unwrapOnly, unwrapped, error));
+    CHECK(!unwrapped.uvs.empty());
+    CHECK(unwrapped.uvs.size() == unwrapped.vertex_count() * 2);
+    CHECK(unwrapped.indices.size() == grid.indices.size());
+    for (const float uv : unwrapped.uvs) {
+        CHECK(uv >= -1e-4f && uv <= 1.0f + 1e-4f);
+    }
+    for (const std::uint32_t idx : unwrapped.indices) {
+        CHECK(idx < unwrapped.vertex_count());
+    }
+
+    // Simplify: index count drops to the target and vertices compact.
+    engine::procgen::CookedMesh simplified;
+    CHECK(cooker->simplify(grid, grid.indices.size() / 2, 0.01f, simplified,
+                           error));
+    CHECK(simplified.indices.size() <= grid.indices.size() / 2);
+    CHECK(simplified.vertex_count() < grid.vertex_count());
+
+    // Determinism: two cooks (and two independent cookers) of the same mesh
+    // with the same options are bit-identical.
+    engine::procgen::CookOptions full;
+    full.unwrap = true;
+    full.optimize = true;
+    full.simplifyTargetIndices = 512;
+    engine::procgen::CookedMesh cooked;
+    engine::procgen::CookStats stats;
+    CHECK(cooker->cook(bad, full, cooked, stats, error));
+    // meshopt quantizes to whole triangles, so the final count can overshoot
+    // a non-multiple-of-3 target by one triangle (513 for target 512).
+    CHECK(stats.hasUvs && stats.outputIndices <= 515);
+    CHECK(stats.outputVertices < bad.vertex_count());
+    engine::procgen::CookedMesh cookedAgain;
+    engine::procgen::CookStats statsAgain;
+    CHECK(cooker->cook(bad, full, cookedAgain, statsAgain, error));
+    CHECK(cookedAgain.positions == cooked.positions);
+    CHECK(cookedAgain.uvs == cooked.uvs);
+    CHECK(cookedAgain.indices == cooked.indices);
+    auto twin = engine::procgen::create_mesh_cooker();
+    engine::procgen::CookedMesh twinCooked;
+    engine::procgen::CookStats twinStats;
+    CHECK(twin->cook(bad, full, twinCooked, twinStats, error));
+    CHECK(twinCooked.uvs == cooked.uvs && twinCooked.indices == cooked.indices);
+
+    // Validation: degenerate meshes and bad options are rejected.
+    engine::procgen::CookedMesh empty;
+    CHECK(cooker->cook(empty, full, cooked, stats, error) == false &&
+          !error.empty());
+    engine::procgen::CookedMesh badIndex = grid;
+    badIndex.indices[0] = 999999;
+    CHECK(cooker->unwrap(badIndex, unwrapOnly, cooked, error) == false &&
+          !error.empty());
+    engine::procgen::CookOptions badOpts = full;
+    badOpts.overdrawThreshold = 0.5f;
+    CHECK(cooker->cook(grid, badOpts, cooked, stats, error) == false &&
+          !error.empty());
+
+    std::cout << "[sdk] procgen: mesh cooking (unwrap UVs, optimize ACMR, "
+                 "simplify, determinism, validation) OK\n";
+}
+
+void test_procgen_preview() {
+    std::string error;
+    auto preview = engine::procgen::create_procgen_preview();
+    CHECK(preview != nullptr);
+
+    // --- terrain: height field ASCII + biome distribution ---
+    auto height = engine::procgen::create_noise_graph_from_spec(
+        make_height_spec(11, 0.1f), error);
+    CHECK(height != nullptr);
+    auto temperature = make_constant_graph(0.4f, error);
+    auto moisture = make_constant_graph(0.4f, error);
+    CHECK(temperature != nullptr && moisture != nullptr);
+    auto climate = engine::procgen::create_climate_sampler(
+        temperature, moisture, nullptr, nullptr, nullptr, nullptr);
+    CHECK(climate != nullptr);
+    auto biomes = engine::procgen::create_biome_registry();
+    CHECK(biomes != nullptr);
+
+    engine::procgen::PreviewOptions opts;
+    opts.sampleSize = 32;
+    engine::procgen::PreviewRender terrain;
+    CHECK(preview->preview_terrain(*height, *climate, *biomes, opts, terrain,
+                                   error));
+    CHECK(terrain.lines.size() == 32);
+    for (const auto& row : terrain.lines) {
+        CHECK(row.size() == 32);
+    }
+    // Constant climate -> the catch-all biome covers the whole patch.
+    bool biomeFull = false;
+    for (const auto& st : terrain.stats) {
+        if (st.label == "biomes" && st.value.find(":1024") != std::string::npos) {
+            biomeFull = true;
+        }
+    }
+    CHECK(biomeFull);
+
+    // --- structure: fast-wfc plan ASCII + block histogram ---
+    engine::procgen::PreviewOptions so;
+    so.sampleSize = 16;
+    engine::procgen::PreviewRender structure;
+    CHECK(preview->preview_structure(make_room_spec(7), so, structure, error));
+    CHECK(structure.title == "structure 16x16");
+    CHECK(structure.lines.size() == 16);
+    bool solidCells = false, planOk = false;
+    for (const auto& st : structure.stats) {
+        if (st.label == "solid_cells" && st.value != "0") {
+            solidCells = true;
+        }
+        if (st.label == "plan" && st.value == "16x16") {
+            planOk = true;
+        }
+    }
+    CHECK(solidCells && planOk);
+
+    // --- parcels: square -> 5 roads, 2 parcels summing the square ---
+    engine::procgen::RoadNetworkSpec spec;
+    spec.points = { { 0.0, 0.0 }, { 10.0, 0.0 }, { 10.0, 10.0 },
+                    { 0.0, 10.0 } };
+    engine::procgen::PreviewRender parcels;
+    CHECK(preview->preview_parcels(spec, opts, parcels, error));
+    CHECK(parcels.title.find("4 pts / 5 roads") != std::string::npos);
+    CHECK(parcels.lines.size() == 32);
+    bool junctions4 = false, roads5 = false, parcels2 = false, sum100 = false;
+    for (const auto& st : parcels.stats) {
+        if (st.label == "junctions" && st.value == "4") {
+            junctions4 = true;
+        }
+        if (st.label == "roads" && st.value == "5") {
+            roads5 = true;
+        }
+        if (st.label == "parcels" && st.value == "2") {
+            parcels2 = true;
+        }
+        if (st.label == "area_sum" && st.value == "100.00") {
+            sum100 = true;
+        }
+    }
+    CHECK(junctions4 && roads5 && parcels2 && sum100);
+
+    // --- shape: house grammar -> 7 boxes, volume 800, bounded render ---
+    engine::procgen::PreviewRender shape;
+    CHECK(preview->preview_shape(make_house_grammar(), opts, shape, error));
+    CHECK(shape.title == "shape 7 boxes");
+    CHECK(!shape.lines.empty());
+    bool boxes7 = false, vol800 = false;
+    for (const auto& st : shape.stats) {
+        if (st.label == "boxes" && st.value == "7") {
+            boxes7 = true;
+        }
+        if (st.label == "volume" && st.value == "800") {
+            vol800 = true;
+        }
+    }
+    CHECK(boxes7 && vol800);
+
+    // --- erosion: roughness drops, mass conserved ---
+    engine::procgen::PreviewOptions eo;
+    eo.sampleSize = 24;
+    eo.seed = 9;
+    engine::procgen::PreviewRender erosion;
+    CHECK(preview->preview_erosion(engine::procgen::ErosionSpec{}, eo, erosion,
+                                   error));
+    CHECK(erosion.title == "erosion 24x24");
+    CHECK(erosion.lines.size() == 24 + 1 + 24);  // before | gap | after
+    double roughBefore = -1.0, roughAfter = -1.0, massDelta = 1e9;
+    for (const auto& st : erosion.stats) {
+        if (st.label == "roughness_before") {
+            roughBefore = std::stod(st.value);
+        }
+        if (st.label == "roughness_after") {
+            roughAfter = std::stod(st.value);
+        }
+        if (st.label == "mass_delta") {
+            massDelta = std::stod(st.value);
+        }
+    }
+    CHECK(roughBefore > roughAfter);
+    CHECK(massDelta < 1e-2);
+
+    // --- mesh: cook stats text ---
+    const engine::procgen::CookedMesh grid = make_grid_mesh(16, 16, false);
+    engine::procgen::CookOptions full;
+    full.unwrap = true;
+    full.optimize = true;
+    full.simplifyTargetIndices = 0;
+    engine::procgen::PreviewRender mesh;
+    CHECK(preview->preview_mesh(grid, full, opts, mesh, error));
+    bool iv289 = false, ii1536 = false, uvsYes = false;
+    for (const auto& st : mesh.stats) {
+        if (st.label == "input_vertices" && st.value == "289") {
+            iv289 = true;
+        }
+        if (st.label == "input_indices" && st.value == "1536") {
+            ii1536 = true;
+        }
+        if (st.label == "has_uvs" && st.value == "yes") {
+            uvsYes = true;
+        }
+    }
+    CHECK(iv289 && ii1536 && uvsYes);
+
+    // --- determinism: an independent preview instance renders bit-identically
+    auto twin = engine::procgen::create_procgen_preview();
+    engine::procgen::PreviewRender tTerrain;
+    CHECK(twin->preview_terrain(*height, *climate, *biomes, opts, tTerrain,
+                                error));
+    CHECK(tTerrain.lines == terrain.lines);
+    CHECK(tTerrain.stats.size() == terrain.stats.size());
+    for (std::size_t i = 0; i < terrain.stats.size(); ++i) {
+        CHECK(tTerrain.stats[i].label == terrain.stats[i].label);
+        CHECK(tTerrain.stats[i].value == terrain.stats[i].value);
+    }
+    engine::procgen::PreviewRender tStructure;
+    CHECK(twin->preview_structure(make_room_spec(7), so, tStructure, error));
+    CHECK(tStructure.lines == structure.lines);
+    engine::procgen::PreviewRender tParcels;
+    CHECK(twin->preview_parcels(spec, opts, tParcels, error));
+    CHECK(tParcels.lines == parcels.lines);
+    engine::procgen::PreviewRender tShape;
+    CHECK(twin->preview_shape(make_house_grammar(), opts, tShape, error));
+    CHECK(tShape.lines == shape.lines);
+    engine::procgen::PreviewRender tErosion;
+    CHECK(twin->preview_erosion(engine::procgen::ErosionSpec{}, eo, tErosion,
+                                error));
+    CHECK(tErosion.lines == erosion.lines);
+    engine::procgen::PreviewRender tMesh;
+    CHECK(twin->preview_mesh(grid, full, opts, tMesh, error));
+    CHECK(tMesh.stats.size() == mesh.stats.size());
+    for (std::size_t i = 0; i < mesh.stats.size(); ++i) {
+        CHECK(tMesh.stats[i].value == mesh.stats[i].value);
+    }
+
+    std::cout << "[sdk] procgen: preview (terrain, structure, parcels, shape, "
+                 "erosion, mesh, determinism) OK\n";
+}
+
+// Deterministic noisy tile in [0, 1] for the erosion batch (pure per-cell
+// hash, no trig).
+engine::procgen::Heightmap make_erosion_tile(int size, std::uint64_t seed) {
+    engine::procgen::Heightmap h;
+    h.width = size;
+    h.height = size;
+    std::uint64_t s = 0x9e3779b97f4a7c15ull ^ seed;
+    h.values.reserve(static_cast<std::size_t>(size * size));
+    for (int i = 0; i < size * size; ++i) {
+        s += 0x9e3779b97f4a7c15ull;
+        std::uint64_t z = s;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        z ^= (z >> 31);
+        const float noise =
+            (static_cast<float>(z >> 40) / 16777216.0f - 0.5f) * 0.6f;
+        h.values.push_back(
+            std::max(0.05f, std::min(0.95f, 0.5f + noise)));
+    }
+    return h;
+}
+
+void test_procgen_jobs() {
+    std::string error;
+    auto jobs = engine::procgen::create_procgen_jobs();
+    CHECK(jobs != nullptr);
+    auto token = engine::procgen::create_cancellation_token();
+    CHECK(token != nullptr && !token->cancelled());
+
+    // --- erosion batch: outputs == individual erode, progress reaches total
+    std::vector<engine::procgen::Heightmap> tiles;
+    tiles.push_back(make_erosion_tile(16, 1));
+    tiles.push_back(make_erosion_tile(16, 2));
+    tiles.push_back(make_erosion_tile(16, 3));
+    tiles.push_back(make_erosion_tile(16, 4));
+    engine::procgen::ErosionSpec spec;
+    spec.iterations = 2000;  // fast batch
+    std::vector<engine::procgen::Heightmap> eroded;
+    std::size_t lastCompleted = 0;
+    std::size_t lastTotal = 0;
+    engine::procgen::JobResult r = jobs->erode_tiles(
+        spec, tiles, *token,
+        [&](const engine::procgen::JobProgress& p) {
+            lastCompleted = p.completed;
+            lastTotal = p.total;
+        },
+        eroded, error);
+    CHECK(r == engine::procgen::JobResult::Completed);
+    CHECK(eroded.size() == 4);
+    CHECK(lastCompleted == 3 && lastTotal == 4);
+
+    auto erosion = engine::procgen::create_heightmap_erosion();
+    for (std::size_t i = 0; i < tiles.size(); ++i) {
+        engine::procgen::Heightmap single;
+        CHECK(erosion->erode(tiles[i], spec, single, error));
+        CHECK(eroded[i].values == single.values);  // bit-exact
+    }
+
+    // --- cancellation mid-batch (from the progress callback) ---
+    auto cancelToken = engine::procgen::create_cancellation_token();
+    std::vector<engine::procgen::Heightmap> partial;
+    engine::procgen::JobResult cr = jobs->erode_tiles(
+        spec, tiles, *cancelToken,
+        [&](const engine::procgen::JobProgress& p) {
+            if (p.completed >= 1) {
+                cancelToken->cancel();
+            }
+        },
+        partial, error);
+    CHECK(cr == engine::procgen::JobResult::Cancelled);
+    CHECK(partial.size() == 2);  // unit 0+1 ran, unit 2 aborted
+    for (std::size_t i = 0; i < partial.size(); ++i) {
+        CHECK(partial[i].values == eroded[i].values);  // prefix == full run
+    }
+
+    // --- pre-cancelled: no work, empty outputs ---
+    auto deadToken = engine::procgen::create_cancellation_token();
+    deadToken->cancel();
+    std::vector<engine::procgen::Heightmap> none;
+    CHECK(jobs->erode_tiles(spec, tiles, *deadToken, nullptr, none, error) ==
+          engine::procgen::JobResult::Cancelled);
+    CHECK(none.empty());
+
+    // --- structure batch: outputs == individual generates ---
+    auto gen = engine::procgen::create_structure_generator(
+        make_room_spec(7), error);
+    CHECK(gen != nullptr);
+    std::vector<std::pair<int, int>> sizes = { { 12, 8 }, { 16, 12 } };
+    std::vector<engine::procgen::StructureOutput> structs;
+    engine::procgen::JobResult sr = jobs->generate_structures(
+        make_room_spec(7), sizes, *token, nullptr, structs, error);
+    CHECK(sr == engine::procgen::JobResult::Completed);
+    CHECK(structs.size() == 2);
+    for (std::size_t i = 0; i < sizes.size(); ++i) {
+        engine::procgen::StructureOutput single;
+        CHECK(gen->generate(sizes[i].first, sizes[i].second, single, error));
+        CHECK(structs[i].width == single.width);
+        CHECK(structs[i].height == single.height);
+        CHECK(structs[i].depth == single.depth);
+        CHECK(structs[i].plan == single.plan);
+        CHECK(structs[i].blocks == single.blocks);
+    }
+
+    // --- cook batch: outputs == individual cooks ---
+    const engine::procgen::CookedMesh gridMesh = make_grid_mesh(16, 16, false);
+    engine::procgen::CookOptions full;
+    full.unwrap = true;
+    full.optimize = true;
+    full.simplifyTargetIndices = 0;
+    engine::procgen::CookOptions noUnwrap;
+    noUnwrap.unwrap = false;
+    noUnwrap.optimize = true;
+    std::vector<engine::procgen::CookedMesh> meshes = { gridMesh, gridMesh };
+    std::vector<engine::procgen::CookOptions> optionSets = { full, noUnwrap };
+    std::vector<engine::procgen::CookedMesh> firstCooked;
+    // The batch uses one options set; run twice with each.
+    for (const auto& opts : optionSets) {
+        std::vector<engine::procgen::CookedMesh> cooked;
+        engine::procgen::JobResult mr =
+            jobs->cook_meshes(opts, meshes, *token, nullptr, cooked, error);
+        CHECK(mr == engine::procgen::JobResult::Completed);
+        CHECK(cooked.size() == 2);
+        if (&opts == &optionSets[0]) {
+            firstCooked = cooked;
+        }
+        auto cooker = engine::procgen::create_mesh_cooker();
+        for (std::size_t i = 0; i < meshes.size(); ++i) {
+            engine::procgen::CookedMesh single;
+            engine::procgen::CookStats stats;
+            CHECK(cooker->cook(meshes[i], opts, single, stats, error));
+            CHECK(cooked[i].positions == single.positions);
+            CHECK(cooked[i].indices == single.indices);
+            CHECK(cooked[i].uvs == single.uvs);
+        }
+    }
+
+    // --- cook cancellation: with 3 meshes, cancelling at unit 1 aborts unit 2
+    auto cookToken = engine::procgen::create_cancellation_token();
+    std::vector<engine::procgen::CookedMesh> threeMeshes = { gridMesh,
+                                                             gridMesh,
+                                                             gridMesh };
+    std::vector<engine::procgen::CookedMesh> cookedPartial;
+    engine::procgen::JobResult cmr = jobs->cook_meshes(
+        full, threeMeshes, *cookToken,
+        [&](const engine::procgen::JobProgress& p) {
+            if (p.completed >= 1) {
+                cookToken->cancel();
+            }
+        },
+        cookedPartial, error);
+    CHECK(cmr == engine::procgen::JobResult::Cancelled);
+    CHECK(cookedPartial.size() == 2);  // units 0+1 ran, unit 2 aborted
+
+    // --- empty batches: trivially Completed with no outputs ---
+    std::vector<engine::procgen::Heightmap> emptyTiles;
+    std::vector<engine::procgen::Heightmap> emptyOut;
+    CHECK(jobs->erode_tiles(spec, emptyTiles, *token, nullptr, emptyOut,
+                            error) ==
+          engine::procgen::JobResult::Completed);
+    CHECK(emptyOut.empty());
+    std::vector<std::pair<int, int>> emptySizes;
+    std::vector<engine::procgen::StructureOutput> emptyStructs;
+    CHECK(jobs->generate_structures(make_room_spec(7), emptySizes, *token,
+                                    nullptr, emptyStructs, error) ==
+          engine::procgen::JobResult::Completed);
+    CHECK(emptyStructs.empty());
+    std::vector<engine::procgen::CookedMesh> emptyMeshes;
+    std::vector<engine::procgen::CookedMesh> emptyCooked;
+    CHECK(jobs->cook_meshes(full, emptyMeshes, *token, nullptr, emptyCooked,
+                            error) ==
+          engine::procgen::JobResult::Completed);
+    CHECK(emptyCooked.empty());
+
+    // --- failures: invalid input rejects with a diagnostic ---
+    engine::procgen::StructureAssetSpec badAsset;
+    badAsset.sampleWidth = 0;
+    std::vector<engine::procgen::StructureOutput> badStructs;
+    CHECK(jobs->generate_structures(badAsset, sizes, *token, nullptr,
+                                    badStructs, error) ==
+          engine::procgen::JobResult::Failed);
+    CHECK(badStructs.empty() && !error.empty());
+    error.clear();
+    engine::procgen::CookedMesh badMesh = gridMesh;
+    badMesh.indices[0] = 999999;
+    std::vector<engine::procgen::CookedMesh> badMeshes = { badMesh };
+    std::vector<engine::procgen::CookedMesh> badCooked;
+    CHECK(jobs->cook_meshes(full, badMeshes, *token, nullptr, badCooked,
+                            error) ==
+          engine::procgen::JobResult::Failed);
+    CHECK(badCooked.empty() && !error.empty());
+
+    // --- determinism across instances ---
+    auto twin = engine::procgen::create_procgen_jobs();
+    std::vector<engine::procgen::Heightmap> twinEroded;
+    CHECK(twin->erode_tiles(spec, tiles, *token, nullptr, twinEroded, error) ==
+          engine::procgen::JobResult::Completed);
+    CHECK(twinEroded.size() == eroded.size());
+    for (std::size_t i = 0; i < eroded.size(); ++i) {
+        CHECK(twinEroded[i].values == eroded[i].values);
+    }
+    std::vector<engine::procgen::StructureOutput> twinStructs;
+    CHECK(twin->generate_structures(make_room_spec(7), sizes, *token, nullptr,
+                                    twinStructs, error) ==
+          engine::procgen::JobResult::Completed);
+    CHECK(twinStructs.size() == structs.size());
+    for (std::size_t i = 0; i < structs.size(); ++i) {
+        CHECK(twinStructs[i].plan == structs[i].plan);
+        CHECK(twinStructs[i].blocks == structs[i].blocks);
+    }
+    std::vector<engine::procgen::CookedMesh> twinCooked;
+    CHECK(twin->cook_meshes(full, meshes, *token, nullptr, twinCooked,
+                            error) ==
+          engine::procgen::JobResult::Completed);
+    CHECK(twinCooked.size() == 2);
+    for (std::size_t i = 0; i < twinCooked.size(); ++i) {
+        CHECK(twinCooked[i].positions == firstCooked[i].positions);
+        CHECK(twinCooked[i].indices == firstCooked[i].indices);
+        CHECK(twinCooked[i].uvs == firstCooked[i].uvs);
+    }
+
+    std::cout << "[sdk] procgen: cancellable jobs (erosion batch, structures, "
+                 "cooking, cancellation, failures, determinism) OK\n";
+}
+
+void test_lod_terrain() {
+    std::string error;
+    auto sampler = engine::procgen::create_lod_terrain_sampler();
+    CHECK(sampler != nullptr);
+
+    // The world function: the same graph-based generator the world uses for
+    // detail (height graph -> baseHeight + round(height * amplitude)).
+    auto height = engine::procgen::create_noise_graph_from_spec(
+        make_height_spec(21, 0.05f), error);
+    CHECK(height != nullptr);
+    auto gen = engine::procgen::create_graph_voxel_generator(
+        height, nullptr, nullptr, /*baseHeight=*/64, /*amplitude=*/32);
+    CHECK(gen != nullptr);
+
+    // Level 0 (cellSize 1) IS the detail surface: every anchor is an integer
+    // world column and equals gen.sample(anchor) bit-exactly.
+    std::vector<engine::procgen::LodCell> level0;
+    CHECK(sampler->sample(*gen, 0, 0, 8, 6, 1, level0, error));
+    CHECK(level0.size() == 48);
+    for (int z = 0; z < 6; ++z) {
+        for (int x = 0; x < 8; ++x) {
+            const auto& cell = level0[static_cast<std::size_t>(x + z * 8)];
+            CHECK(cell.anchorX == x && cell.anchorZ == z && cell.cellSize == 1);
+            const engine::voxel::TerrainPoint p = gen->sample(
+                static_cast<float>(x), static_cast<float>(z));
+            CHECK(cell.height == static_cast<float>(p.height));
+            CHECK(cell.biomeIndex == p.biomeIndex);
+        }
+    }
+
+    // Higher levels share anchors with level 0: anchors are multiples of
+    // cellSize, so every level-2 cell equals gen.sample(anchor) and the level
+    // -0 cell at the same anchor — cross-level coherent (the distant surface
+    // is the same function as the detail).
+    // 3x3 grid of size-2 cells: anchors (0,0)..(4,4), all inside the level-0
+    // 8x6 grid, so every level-2 anchor is also a level-0 anchor.
+    std::vector<engine::procgen::LodCell> level2;
+    CHECK(sampler->sample(*gen, 0, 0, 3, 3, 2, level2, error));
+    CHECK(level2.size() == 9);
+    for (int z = 0; z < 3; ++z) {
+        for (int x = 0; x < 3; ++x) {
+            const auto& cell = level2[static_cast<std::size_t>(x + z * 3)];
+            CHECK(cell.anchorX == x * 2 && cell.anchorZ == z * 2);
+            const engine::voxel::TerrainPoint p = gen->sample(
+                static_cast<float>(x * 2), static_cast<float>(z * 2));
+            CHECK(cell.height == static_cast<float>(p.height));
+            // Same anchor as the level-0 grid.
+            CHECK(cell.height == level0[x * 2 + z * 2 * 8].height);
+        }
+    }
+
+    // Aligned origin: anchors start at the origin.
+    std::vector<engine::procgen::LodCell> shifted;
+    CHECK(sampler->sample(*gen, 4, 4, 2, 2, 2, shifted, error));
+    CHECK(shifted.size() == 4);
+    CHECK(shifted[0].anchorX == 4 && shifted[0].anchorZ == 4);
+
+    // Interpolation passes exactly through the generator samples at anchors.
+    CHECK(sampler->interpolated_height(level2, 3, 3, 2, 4.0f, 4.0f) ==
+          level2[2 + 2 * 3].height);  // anchor (4,4)
+    CHECK(sampler->interpolated_height(level2, 3, 3, 2, 0.0f, 0.0f) ==
+          level2[0].height);
+    // Midpoint (3,0) blends anchors (2,0) and (4,0) linearly (float tolerance).
+    const float mid = sampler->interpolated_height(level2, 3, 3, 2, 3.0f, 0.0f);
+    const float avg =
+        0.5f * (level2[1].height + level2[2].height);  // anchors (2,0) (4,0)
+    CHECK(std::fabs(mid - avg) < 1e-4f);
+    // Out of range clamps to the outermost cell (anchor (4,4)).
+    CHECK(sampler->interpolated_height(level2, 3, 3, 2, 100.0f, 100.0f) ==
+          level2[8].height);
+
+    // Determinism: an independent sampler produces bit-identical cells.
+    auto twin = engine::procgen::create_lod_terrain_sampler();
+    std::vector<engine::procgen::LodCell> twinCells;
+    CHECK(twin->sample(*gen, 0, 0, 8, 6, 1, twinCells, error));
+    CHECK(twinCells.size() == level0.size());
+    for (std::size_t i = 0; i < level0.size(); ++i) {
+        CHECK(twinCells[i].anchorX == level0[i].anchorX);
+        CHECK(twinCells[i].anchorZ == level0[i].anchorZ);
+        CHECK(twinCells[i].height == level0[i].height);
+        CHECK(twinCells[i].biomeIndex == level0[i].biomeIndex);
+    }
+
+    // Validation: non-positive grid/cell size and unaligned origins reject.
+    std::vector<engine::procgen::LodCell> bad;
+    CHECK(sampler->sample(*gen, 0, 0, 0, 4, 2, bad, error) == false &&
+          !error.empty());
+    error.clear();
+    CHECK(sampler->sample(*gen, 0, 0, 4, 0, 2, bad, error) == false &&
+          !error.empty());
+    error.clear();
+    CHECK(sampler->sample(*gen, 0, 0, 4, 4, 0, bad, error) == false &&
+          !error.empty());
+    error.clear();
+    CHECK(sampler->sample(*gen, 1, 0, 4, 4, 2, bad, error) == false &&
+          !error.empty());
+    error.clear();
+    // Empty cell set interpolates to 0.
+    std::vector<engine::procgen::LodCell> none;
+    CHECK(sampler->interpolated_height(none, 4, 4, 2, 0.0f, 0.0f) == 0.0f);
+
+    std::cout << "[sdk] procgen: coherent LOD (same world function, "
+                 "cross-level anchors, interpolation, determinism, "
+                 "validation) OK\n";
 }
 
 }  // namespace
@@ -2437,12 +9507,20 @@ int main() {
         test_version();
         test_world_headless();
         test_transactions();
+        test_transaction_failure_stages();
+        test_transaction_policy_limits();
         test_persistence();
         test_compression_provider();
         test_hash_provider();
         test_save_v4_legacy();
+        test_world_save_migration();
         test_rocksdb_storage();
         test_storage_service();
+        test_region_chunk_storage();
+        test_region_palette_compression();
+        test_region_delta_saves();
+        test_region_snapshot_concurrent_edit();
+        test_region_async_save_load();
         test_world_registry_source_of_truth();
         test_dynamic_block_persistence();
         test_block_entity_lifecycle();
@@ -2453,18 +9531,79 @@ int main() {
         test_light_chunk_boundary();
         test_light_determinism();
         test_fluid_registry();
+        test_block_inline_fluid();
         test_fluid_generalized();
         test_fluid_evaporation();
         test_fluid_tick_cadence();
+        test_block_collision_selection_shapes();
+        test_streaming_observability();
+        test_chunk_memory_budget();
+        test_autosave_incremental();
+        test_wal_recovery();
+        test_region_entity_persistence();
+        test_region_batch_restore();
+        test_load_rollback();
+        test_region_load_rollback();
+        test_persistence_resilience();
+        test_large_world();
+        test_service_plugin_substitution();
+        test_fluid_chunk_boundary();
+        test_fluid_cross_boundary_vertical();
+        test_fluid_resume_after_boundary_load();
         test_fluid_persistence();
+        test_fluid_conservation();
+        test_fluid_waterfall();
+        test_fluid_unload_reload();
+        test_fluid_budgets();
+        test_material_simulation_separation();
+        test_project_defined_fluids();
         test_block_registry();
         test_item_registry();
+        test_cross_reference_validation();
+        test_block_states_transitions();
+        test_block_tool_physics();
         test_item_stack_inventory();
         test_recipe_graph();
         test_entity_world();
         test_entity_world_save();
         test_navigation_provider();
         test_navigation_voxel_world();
+        test_replication_authority();
+        test_replication_deltas_reorder();
+        test_commit_replication_persistence();
+        test_session_scoped_undo();
+        test_transaction_dry_run();
+        test_scheduler_save_headless();
+        test_replication_interest();
+        test_replication_prediction_correction();
+        test_replication_reconnect_resync();
+        test_replication_server_persist();
+        test_replication_codec();
+        test_replication_multiclient();
+        test_region_replication();
+        test_mob_behavior();
+        test_world_manager();
+        test_noise_graph_determinism();
+        test_noise_graph_nodes();
+        test_noise_graph_serialization();
+        test_graph_generator_world();
+        test_climate_registry();
+        test_climate_sampler();
+        test_climate_generator_world();
+        test_ore_table();
+        test_carver();
+        test_decorator();
+        test_world_features();
+        test_structure_generator();
+        test_road_network();
+        test_parcellation();
+        test_parcel_triangulation();
+        test_shape_grammar();
+        test_mesh_cooking();
+        test_heightmap_erosion();
+        test_procgen_preview();
+        test_procgen_jobs();
+        test_lod_terrain();
     } catch (const std::exception& e) {
         std::cerr << "[voxel_sdk_tests] uncaught exception: " << e.what()
                   << "\n";

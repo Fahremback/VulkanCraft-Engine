@@ -1,0 +1,99 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/registry/item.json",
+  "title": "item registry asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "\"name\" registry field",
+      "type": "string"
+    },
+    "namespace": {
+      "description": "\"namespace\" registry field",
+      "default": "vulkancraft",
+      "type": "string"
+    },
+    "id": {
+      "description": "persistent UUID; derived from ns:name when omitted",
+      "type": "string"
+    },
+    "maxStack": {
+      "description": "\"max_stack\" registry field",
+      "default": 64,
+      "type": "integer"
+    },
+    "durability": {
+      "description": "\"durability\" registry field",
+      "default": 0,
+      "type": "integer"
+    },
+    "icon": {
+      "description": "\"icon\" registry field",
+      "default": "",
+      "type": "string"
+    },
+    "model": {
+      "description": "\"model\" registry field",
+      "default": "",
+      "type": "string"
+    },
+    "useCooldown": {
+      "description": "use cooldown in ms [0, 60000] (item 8)",
+      "default": 0,
+      "type": "integer"
+    },
+    "useMode": {
+      "description": "use mode (item 8)",
+      "default": "none",
+      "enum": [
+        "none",
+        "instant",
+        "continuous"
+      ]
+    },
+    "equipSlot": {
+      "description": "equipment slot (item 8)",
+      "default": "none",
+      "enum": [
+        "none",
+        "hand",
+        "offhand",
+        "head",
+        "chest",
+        "legs",
+        "feet"
+      ]
+    },
+    "attackDamage": {
+      "description": "melee attack damage [0, 100] (item 8)",
+      "default": 0,
+      "type": "number"
+    },
+    "armor": {
+      "description": "armor value [0, 100] (item 8)",
+      "default": 0,
+      "type": "number"
+    },
+    "behaviorId": {
+      "description": "declarative behavior reference (item 8): namespaced id (ns:name) or empty",
+      "type": "string"
+    },
+    "tags": {
+      "description": "\"tags\" registry field",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "version": {
+      "description": "\"version\" registry field",
+      "default": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "name"
+  ]
+}

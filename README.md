@@ -40,15 +40,16 @@ Requisitos básicos:
 - compilador C++20 (Visual Studio 2022 recomendado);
 - Vulkan SDK.
 
-O clone público ainda requer seis bibliotecas em `external/solutions`: Zstandard,
-BLAKE3, FlatBuffers, RocksDB, EnTT e Recast/Detour. Elas não são os 97 projetos do
-catálogo interno; somente essas seis participam do build atual. Versões, URLs,
-caminhos e comandos reproduzíveis estão em [DEPENDENCIES.md](DEPENDENCIES.md).
+O clone público requer 11 bibliotecas fixadas em `external/solutions`: Zstandard,
+BLAKE3, FlatBuffers, RocksDB, EnTT, Recast/Detour, Fast-WFC, Delaunator, Earcut,
+meshoptimizer e xatlas. Elas não são os 97 projetos do catálogo interno; somente
+essas 11 participam do build atual. Versões, URLs, caminhos e comandos
+reproduzíveis estão em [DEPENDENCIES.md](DEPENDENCIES.md).
 
 O CMake baixa GLFW, GLM, vk-bootstrap, Vulkan Memory Allocator, miniaudio e ImGui
 automaticamente. Bullet e Jolt já estão vendorizados em `third_party`.
 
-Enquanto as seis integrações restantes não forem migradas para `FetchContent` ou
+Enquanto essas integrações não forem migradas para `FetchContent` ou
 um gerenciador de pacotes, esta revisão deve ser tratada como **source preview**,
 não como uma distribuição autossuficiente. Se alguma delas estiver ausente, o
 CMake encerra imediatamente e aponta para a documentação.

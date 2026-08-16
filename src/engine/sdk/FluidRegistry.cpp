@@ -1,5 +1,7 @@
 #include "engine/registry/FluidRegistry.hpp"
 
+#include "engine/registry/BlockRegistry.hpp"
+
 #include "RegistryJson.hpp"
 
 #include <algorithm>
@@ -102,6 +104,20 @@ std::vector<FluidDefinition> FluidRegistry::all_definitions() const {
                   return a.uuid < b.uuid;
               });
     return definitions;
+}
+
+bool FluidRegistry::validate_block_references(const BlockRegistry& blocks,
+                                              std::vector<std::string>& errorsOut) const {
+    bool clean = true;
+    for (const auto& [block, definition] : byBlock_) {
+        (void)definition;
+        if (blocks.find_by_name(block) == nullptr) {
+            errorsOut.push_back("fluid for block '" + block +
+                                "' references an unknown block");
+            clean = false;
+        }
+    }
+    return clean;
 }
 
 bool FluidRegistry::add(FluidDefinition definition, std::string& errorOut) {

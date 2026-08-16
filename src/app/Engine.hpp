@@ -4,12 +4,40 @@
 #include "Player.hpp"
 #include "World.hpp"
 #include "WorldRenderer.hpp"
-#include "Mob.hpp"
 #include "TextureManager.hpp"
 #include "MobRenderer.hpp"
 #include "SoundEngine.hpp"
 #include "RadianceCache.hpp"
+#include "engine/entity/IEntityWorld.hpp"
+#include "engine/entity/IMobBehavior.hpp"
+#include <memory>
 #include <vector>
+
+// Minimal world view the public mob behavior needs, adapted from the app's
+// internal simulation World (FALTANTES item 11 — the entity layer never
+// couples to the simulation World). Mobs are IEntityWorld entities advanced
+// by IMobBehavior; the legacy Mob/MobManager track is gone.
+class AppWorldMobQuery final : public engine::entity::IMobWorldQuery {
+public:
+    explicit AppWorldMobQuery(const World& world) : world_(world) {}
+    uint32_t block_at(int x, int y, int z) const override {
+        return static_cast<uint32_t>(world_.get_block_at(glm::vec3(
+            static_cast<float>(x), static_cast<float>(y),
+            static_cast<float>(z))));
+    }
+    bool is_fluid_block_at(int x, int y, int z) const override {
+        return world_.is_fluid_block_at(glm::vec3(
+            static_cast<float>(x), static_cast<float>(y),
+            static_cast<float>(z)));
+    }
+    float fluid_damage_per_second_at(int x, int y, int z) const override {
+        const FluidParams* params = world_.fluid_params_at(glm::ivec3(x, y, z));
+        return params != nullptr ? params->damagePerTick : 0.0f;
+    }
+
+private:
+    const World& world_;
+};
 
 struct FrameData {
     VkCommandPool commandPool;
@@ -126,10 +154,12 @@ public:
     uint32_t characterVertexCount{ 0 };
 
     SoundEngine soundEngine;
-    MobManager mobManager{soundEngine};
     MobRenderer mobRenderer;
-    World world{mobManager};
+    World world;
     WorldRenderer worldRenderer{world};
+    AppWorldMobQuery mobQuery{world};
+    std::unique_ptr<engine::entity::IEntityWorld> mobEntities;
+    std::unique_ptr<engine::entity::IMobBehavior> mobBehavior;
     Player player;
     TextureManager textureManager;
     RadianceCache radianceCache;

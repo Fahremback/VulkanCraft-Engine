@@ -1,7 +1,6 @@
 #define VMA_IMPLEMENTATION
 #include "Engine.hpp"
 #include "TextureManager.hpp"
-#include "Mob.hpp"
 
 #include <GLFW/glfw3native.h>
 #include <glm/gtc/matrix_transform.hpp>
@@ -9,6 +8,29 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <string>
+
+// Spawns one mob as an IEntityWorld entity with the public mob component
+// (FALTANTES item 11). typeIndex is the renderer limb set (0..5, legacy
+// MobType order); maxHealth/hostile mirror the legacy per-type values.
+void spawn_mob(engine::entity::IEntityWorld& entities, uint32_t typeIndex,
+               const glm::vec3& position, float maxHealth, bool hostile) {
+    std::string error;
+    const engine::entity::EntityId id = entities.spawn(
+        "project:mob",
+        { position.x, position.y, position.z }, error);
+    if (!id.valid()) return;
+    entities.set_health(id, { maxHealth, maxHealth });
+    engine::entity::MobSpec spec;
+    spec.typeIndex = typeIndex;
+    spec.maxHealth = maxHealth;
+    spec.hostile = hostile;
+    engine::entity::ComponentData mob;
+    mob.type = engine::entity::kMobComponentType;
+    mob.version = 1;
+    mob.blob = engine::entity::serialize_mob_spec(spec);
+    entities.set_component(id, mob);
+}
 
 struct PushData {
     glm::mat4 mvp;
@@ -62,12 +84,16 @@ void Engine::init() {
     worldRenderer.configure(device, allocator);
 
     mobRenderer.init(device, allocator);
-    mobManager.spawn_mob(MobType::Zombie, glm::vec3(player.position.x + 5.0f, 27.0f, player.position.z + 5.0f));
-    mobManager.spawn_mob(MobType::Creeper, glm::vec3(player.position.x - 5.0f, 27.0f, player.position.z + 6.0f));
-    mobManager.spawn_mob(MobType::Skeleton, glm::vec3(player.position.x + 7.0f, 27.0f, player.position.z - 5.0f));
-    mobManager.spawn_mob(MobType::Cow, glm::vec3(player.position.x - 6.0f, 27.0f, player.position.z - 4.0f));
-    mobManager.spawn_mob(MobType::Pig, glm::vec3(player.position.x + 3.0f, 27.0f, player.position.z - 8.0f));
-    mobManager.spawn_mob(MobType::Sheep, glm::vec3(player.position.x - 4.0f, 27.0f, player.position.z - 7.0f));
+    // Mobs are IEntityWorld entities (FALTANTES item 11): the legacy Mob/
+    // MobManager track was removed; the public IMobBehavior advances them.
+    mobEntities = engine::entity::create_entity_world();
+    mobBehavior = engine::entity::create_mob_behavior();
+    spawn_mob(*mobEntities, 0, glm::vec3(player.position.x + 5.0f, 27.0f, player.position.z + 5.0f), 20.0f, true);   // Zombie
+    spawn_mob(*mobEntities, 2, glm::vec3(player.position.x - 5.0f, 27.0f, player.position.z + 6.0f), 20.0f, true);   // Creeper
+    spawn_mob(*mobEntities, 1, glm::vec3(player.position.x + 7.0f, 27.0f, player.position.z - 5.0f), 20.0f, true);   // Skeleton
+    spawn_mob(*mobEntities, 3, glm::vec3(player.position.x - 6.0f, 27.0f, player.position.z - 4.0f), 10.0f, false);  // Cow
+    spawn_mob(*mobEntities, 4, glm::vec3(player.position.x + 3.0f, 27.0f, player.position.z - 8.0f), 10.0f, false);  // Pig
+    spawn_mob(*mobEntities, 5, glm::vec3(player.position.x - 4.0f, 27.0f, player.position.z - 7.0f), 8.0f, false);   // Sheep
 
     init_pipeline();
     init_arm_mesh();
@@ -1096,6 +1122,13 @@ void Engine::draw() {
             player.selectedBlock = selectedBlockBeforeLodInput;
         }
         world.update(player.position, worldRenderer, deltaTime);
+        if (mobEntities && mobBehavior) {
+            std::string mobError;
+            mobBehavior->tick(deltaTime,
+                              { player.position.x, player.position.y,
+                                player.position.z },
+                              *mobEntities, mobQuery, mobError);
+        }
         soundEngine.update_ambience(player.position, world, currentDaylight, player.isSubmerged, deltaTime);
     }
 
@@ -1348,7 +1381,7 @@ void Engine::draw() {
 
     beginWorldPass(voxelPipeline);
     worldRenderer.draw(cmd, frustum);
-    mobRenderer.draw(mobManager, cmd, voxelPipelineLayout, mvp, frustum,
+    mobRenderer.draw(*mobEntities, cmd, voxelPipelineLayout, mvp, frustum,
                                      player.camera.position, currentSunDirection,
                                      currentLightColor, pushData.environment);
 

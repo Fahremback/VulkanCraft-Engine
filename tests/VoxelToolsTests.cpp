@@ -5,6 +5,8 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <process.h>
+#include <string>
 #include <iostream>
 #include <memory>
 
@@ -114,7 +116,7 @@ int main() {
     structure.set_variant("wall", "material.wall.default");
     structure.add_entity({"marker.spawn", {4, 1, 4}});
 
-    const auto root = std::filesystem::temp_directory_path() / "voxel_tools_tests";
+    const auto root = std::filesystem::temp_directory_path() / ("voxel_tools_tests_" + std::to_string(_getpid()));
     std::filesystem::remove_all(root);
     std::filesystem::create_directories(root);
     const auto sourcePath = root / "generic.voxelstructure";

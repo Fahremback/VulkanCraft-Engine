@@ -6,7 +6,7 @@
 #include "../src/engine/gameplay/VehicleRuntime.hpp"
 #include "../src/engine/gameplay/DestructionRuntime.hpp"
 #include "../src/engine/audio/AudioRuntime.hpp"
-#include "../src/engine/navigation/Navigation.hpp"
+#include "engine/navigation/INavigationProvider.hpp"
 #include "../src/engine/physics/PhysicsRuntime.hpp"
 
 #include <any>
@@ -967,19 +967,39 @@ bool test_play_world_advanced() {
     CHECK(destructible.fully_destroyed());
     destructible.destroy(world);
 
-    // --- NavigationGrid + NavigationAgent ---
-    NavigationGrid grid(10, 10, 1.0f);
-    for (int y = 2; y < 8; ++y) grid.set_blocked({4, y}, true);   // partial wall at x=4
-    NavigationPath path = grid.find_path({0, 0}, {9, 9});
-    CHECK(path.success);
-    CHECK(path.points.size() >= 2);
-    NavigationAgent agent;
-    agent.position = {0, 0, 0};
-    agent.speed = 5.0f;
-    agent.set_path(path);
-    const glm::vec3 before = agent.position;
-    agent.update(1.0f);
-    CHECK(glm::distance(agent.position, before) > 0.01f);  // moved toward the path
+    // --- Navigation provider (FALTANTES item 12: the legacy grid track was
+    // removed — the public Recast provider is the authority) ---
+    auto provider = engine::navigation::create_recast_navigation_provider();
+    engine::navigation::NavmeshConfig config;
+    config.boundsMinX = -1.0f;
+    config.boundsMaxX = 10.0f;
+    config.boundsMinZ = -1.0f;
+    config.boundsMaxZ = 10.0f;
+    config.cellSize = 0.5f;
+    config.cellHeight = 0.2f;
+    config.agentRadius = 0.4f;
+    config.agentHeight = 1.8f;
+    config.agentMaxClimb = 1.0f;
+    std::vector<engine::navigation::VoxelColumn> columns;
+    for (int gx = 0; gx < 20; ++gx) {
+        for (int gz = 0; gz < 20; ++gz) {
+            const float cx = -1.0f + (gx + 0.5f) * 0.5f;
+            const float cz = -1.0f + (gz + 0.5f) * 0.5f;
+            // Wall 2 units thick so a probe at its center (x=4) is outside
+            // the walkable search extents (agentRadius*2 = 0.8).
+            const bool wall = (cx >= 3.0f && cx <= 5.0f) && (cz >= 2.0f && cz <= 8.0f);
+            if (wall) continue;  // omitted cells = blocked
+            columns.push_back({ cx, cz, 0.0f, 1.0f, true });
+        }
+    }
+    std::string navError;
+    CHECK(provider->build(config, columns, navError));
+    engine::navigation::PathResult path;
+    CHECK(provider->find_path(0.5f, 1.0f, 0.5f, 9.5f, 1.0f, 9.5f, path));
+    CHECK(path.found);
+    CHECK(path.waypoints.size() >= 6);  // detours around the wall
+    CHECK(provider->is_walkable(0.5f, 1.0f, 0.5f));
+    CHECK(!provider->is_walkable(4.0f, 1.0f, 5.0f));  // inside the wall footprint
 
     // --- Audio Mixer voice lifecycle ---
     Audio::Mixer mixer;

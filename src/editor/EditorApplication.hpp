@@ -35,8 +35,25 @@
 #include "../engine/gameplay/DialogueSystem.hpp"
 #include "../engine/gameplay/DestructionRuntime.hpp"
 #include "../engine/audio/AudioRuntime.hpp"
-#include "../engine/navigation/Navigation.hpp"
+#include "engine/navigation/INavigationProvider.hpp"
 #include "../engine/editor/ui/EditorGUI.hpp"
+
+// Play-mode nav agent (Fase 8): follows a path from the public navigation
+// provider toward the primary camera entity, writing its position back to the
+// entity transform each frame. Replaces the legacy NavigationAgent (the grid
+// track was removed — FALTANTES item 12).
+struct PlayNavAgent {
+    glm::vec3 position{ 0.0f };
+    float speed{ 3.0f };
+    float stoppingDistance{ 0.05f };
+    bool reached{ true };
+    std::vector<glm::vec3> path;
+    std::size_t waypoint{ 0 };
+
+    void set_path(std::vector<glm::vec3> points);
+    void update(float deltaTime);
+    bool reached_destination() const { return reached; }
+};
 #include "../engine/assets/AssetRegistry.hpp"
 #if VC_ENABLE_VOXEL_PLUGIN
 #include "../plugins/voxel/VoxelPlugin.hpp"
@@ -513,11 +530,14 @@ private:
     // Play-world destructibles (Fase 8): one DestructibleRuntime per
     // DestructionComponent entity; weapon hits apply radial damage.
     std::unordered_map<UUID, Engine::Gameplay::DestructibleRuntime> m_playDestructibles;
-    // Play-world navigation (Fase 8): one NavigationWorld tile per
-    // NavigationComponent entity with a NavigationAgent chasing the camera
-    // entity; the agent's position writes back to the entity transform.
-    Engine::NavigationWorld m_playNavWorld;
-    std::unordered_map<UUID, Engine::NavigationAgent> m_playNavAgents;
+    // Play-world navigation (Fase 8): the public INavigationProvider (Recast
+    // + Detour, the promoted authority) bakes from columns of the play
+    // physics bodies; one PlayNavAgent per NavigationComponent entity chases
+    // the camera entity and writes its position back to the transform. The
+    // legacy grid track (NavigationGrid/NavigationWorld) was removed
+    // (FALTANTES item 12).
+    std::unique_ptr<engine::navigation::INavigationProvider> m_playNav;
+    std::unordered_map<UUID, PlayNavAgent> m_playNavAgents;
     void setup_play_runtime();
     void tick_play_runtime(float deltaTime);
     void teardown_play_runtime();

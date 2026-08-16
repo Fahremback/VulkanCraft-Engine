@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <process.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -208,7 +209,9 @@ int main() {
     // The generated GLSL must compile to SPIR-V with glslc — the editor viewport
     // compiles material-graph shaders at runtime through exactly this path.
     const auto compileWithGlslc = [](const std::string& source, const std::string& tag) {
-        const std::filesystem::path tmp = std::filesystem::temp_directory_path() / ("vc_test_mat_" + tag);
+        // pid suffix: concurrent instances must not share temp paths.
+        const std::filesystem::path tmp = std::filesystem::temp_directory_path() /
+            ("vc_test_mat_" + std::to_string(_getpid()) + "_" + tag);
         const std::filesystem::path srcFile = std::filesystem::path(tmp.string() + ".frag");
         const std::filesystem::path spvFile = std::filesystem::path(tmp.string() + ".spv");
         {
@@ -277,7 +280,8 @@ int main() {
 
     // FileWatcher: detects content changes for hot reload.
     {
-        const std::filesystem::path tmpDir = std::filesystem::temp_directory_path() / "vc_watcher_test";
+        const std::filesystem::path tmpDir = std::filesystem::temp_directory_path() /
+            ("vc_watcher_test_" + std::to_string(_getpid()));
         std::filesystem::remove_all(tmpDir);
         std::filesystem::create_directories(tmpDir);
         const std::filesystem::path file = tmpDir / "material.txt";

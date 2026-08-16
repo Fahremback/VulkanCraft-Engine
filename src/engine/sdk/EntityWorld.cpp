@@ -144,6 +144,12 @@ public:
         return true;
     }
 
+    bool get_tick_interval(EntityId handle, float& out) const override {
+        if (!alive(handle)) return false;
+        out = tickInterval(handle.id);
+        return true;
+    }
+
     // ---- Project components -------------------------------------------------
 
     bool set_component(EntityId handle, const ComponentData& component) override {
@@ -163,6 +169,26 @@ public:
         if (found == byType.end()) return false;
         out = found->second;
         return true;
+    }
+
+    void for_each_component(
+        EntityId handle,
+        const std::function<void(const ComponentData&)>& visit) const override {
+        if (!alive(handle)) return;
+        // Deterministic order: sorted by component type (the underlying map
+        // order is not stable).
+        const auto& byType =
+            registry_.get<ProjectComponents>(byId_.at(handle.id)).byType;
+        std::vector<std::string> types;
+        types.reserve(byType.size());
+        for (const auto& [type, component] : byType) {
+            (void)component;
+            types.push_back(type);
+        }
+        std::sort(types.begin(), types.end());
+        for (const std::string& type : types) {
+            visit(byType.at(type));
+        }
     }
 
     // ---- Headless simulation -----------------------------------------------
@@ -250,6 +276,24 @@ public:
             }
         }
         return out;
+    }
+
+    void for_each_entity(
+        const std::function<void(EntityId)>& visit) const override {
+        if (!visit) return;
+        std::vector<EntityId> order;
+        order.reserve(byId_.size());
+        for (const auto& [id, raw] : byId_) {
+            if (registry_.valid(raw)) {
+                order.push_back(EntityId{ id, generations_.at(id) });
+            }
+        }
+        std::sort(order.begin(), order.end(),
+                  [](const EntityId& a, const EntityId& b) { return a.id < b.id; });
+        for (const EntityId& handle : order) {
+            if (!alive(handle)) continue;
+            visit(handle);
+        }
     }
 
     // ---- Persistence ---------------------------------------------------------

@@ -1,7 +1,6 @@
 #include "World.hpp"
 #include "VoxelMesher.hpp"
 #include "ChunkLighting.hpp"
-#include "Mob.hpp"
 #include "Structures.hpp"
 #include "TerrainGenerator.hpp"
 #include <cmath>
@@ -46,11 +45,21 @@ void print_far_lod_curve(float endpointFraction, int reachChunks) {
             << " | Q(" << safeReach << ")=" << qualityAt(safeReach) * 100.0f << '%';
     std::cout << message.str() << std::endl;
 }
+
+// Estimated bytes of one chunk's loaded data (FALTANTES §4 item 6): populated
+// voxel cells (block id u16 + fluid u8) up to the render extent, plus a fixed
+// overhead for the override maps / mesh / light / bookkeeping. Consistent and
+// monotonic with actual usage — the budget is a cache bound, not an allocator.
+uint64_t chunk_memory_estimate(const Chunk& chunk) {
+    const int extent = std::clamp(chunk.vertical_render_extent(), 1, CHUNK_SIZE_Y);
+    return static_cast<uint64_t>(extent) * CHUNK_SIZE_X * CHUNK_SIZE_Z * 3u + 1024u;
 }
 
-World::World(MobManager& mobManager, size_t workerThreads)
-    : mobManager_(mobManager),
-      threadPool(workerThreads == 0 ? std::thread::hardware_concurrency() : workerThreads) {
+}  // namespace
+
+World::World(size_t workerThreads)
+    : threadPool(workerThreads == 0 ? std::thread::hardware_concurrency() : workerThreads),
+      workerThreads_(workerThreads == 0 ? std::thread::hardware_concurrency() : workerThreads) {
     noise.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2);
     noise.SetFrequency(0.015f);
     set_chunk_budget(chunkBudget);
@@ -203,6 +212,7 @@ void World::set_fluid_level_at(const glm::vec3& worldPos, uint8_t level) {
     if (st == ChunkState::Unloaded || st == ChunkState::Generating) return;
     it->second->set_fluid_level(bx, by, bz, level);
     it->second->isDirty = true;
+    it->second->hasUnsavedEdits.store(true, std::memory_order_release);
     if (bx == 0) { auto n = chunks.find({ cx - 1, cz }); if (n != chunks.end() && n->second) n->second->isDirty = true; }
     if (bx == CHUNK_SIZE_X - 1) { auto n = chunks.find({ cx + 1, cz }); if (n != chunks.end() && n->second) n->second->isDirty = true; }
     if (bz == 0) { auto n = chunks.find({ cx, cz - 1 }); if (n != chunks.end() && n->second) n->second->isDirty = true; }
@@ -302,9 +312,57 @@ bool World::apply_mesh_result(ChunkMeshResult result) {
     return true;
 }
 
+engine::voxel::StreamingSnapshot World::streaming_snapshot() const {
+    engine::voxel::StreamingSnapshot snapshot;
+    snapshot.chunkBudget = chunkBudget;
+    snapshot.chunkBudgetMin = MIN_CHUNK_BUDGET;
+    snapshot.chunkBudgetMax = MAX_CHUNK_BUDGET;
+    snapshot.farLodPercent = far_lod_endpoint_percent();
+    snapshot.workerThreads = workerThreads_;
+    snapshot.memoryBudgetBytes = memoryBudget;
+    snapshot.blockEntities = blockEntities_.size();
+    snapshot.activeFluidCells = activeFluidSet.size();
+    snapshot.lightDirtyChunks = lightDirtyChunks_.size();
+    {
+        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+        snapshot.chunksLoaded = chunks.size();
+        uint64_t usage = 0;
+        for (const auto& [key, chunk] : chunks) {
+            switch (chunk->state.load(std::memory_order_acquire)) {
+                case ChunkState::Generating: ++snapshot.chunksGenerating; break;
+                case ChunkState::MeshReady: ++snapshot.chunksMeshReady; break;
+                case ChunkState::Uploaded: ++snapshot.chunksUploaded; break;
+                case ChunkState::Unloaded: break;
+            }
+            if (chunk->isDirty.load(std::memory_order_acquire)) ++snapshot.chunksDirty;
+            usage += chunk_memory_estimate(*chunk);
+        }
+        snapshot.ramUsageBytes = usage;
+    }
+    return snapshot;
+}
+
 void World::set_chunk_budget(int budget) {
     chunkBudget = std::clamp(budget, MIN_CHUNK_BUDGET, MAX_CHUNK_BUDGET);
     renderDistance = chunkBudget;
+}
+
+void World::set_memory_budget(uint64_t bytes) {
+    memoryBudget = bytes;
+}
+
+void World::mark_chunks_saved(
+    const std::vector<std::pair<std::pair<int, int>, uint64_t>>& savedChunks) {
+    std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+    for (const auto& [key, savedRevision] : savedChunks) {
+        const auto found = chunks.find(key);
+        if (found == chunks.end() || !found->second) continue;
+        // Only clear when nothing changed since the save captured the chunk
+        // (revision still matches): a mid-save edit must stay pinned.
+        if (found->second->revision() == savedRevision) {
+            found->second->hasUnsavedEdits.store(false, std::memory_order_release);
+        }
+    }
 }
 
 void World::cycle_chunk_budget(int direction) {
@@ -414,6 +472,7 @@ void World::set_block_at(const glm::vec3& worldPos, RuntimeBlockId type) {
         if (st == ChunkState::Unloaded || st == ChunkState::Generating) return;
         it->second->set_block(bx, by, bz, type);
         it->second->isDirty = true;
+        it->second->hasUnsavedEdits.store(true, std::memory_order_release);
 
         // Placing any fluid creates a source cell (level 0, always fed) — the
         // water special case generalized to data-driven fluids (META §13).
@@ -463,6 +522,7 @@ void World::set_water_at(const glm::vec3& worldPos, uint8_t level) {
     if (st == ChunkState::Unloaded || st == ChunkState::Generating) return;
     it->second->set_water(bx, by, bz, level);
     it->second->isDirty = true;
+    it->second->hasUnsavedEdits.store(true, std::memory_order_release);
     if (bx == 0) { auto n = chunks.find({ cx - 1, cz }); if (n != chunks.end() && n->second) n->second->isDirty = true; }
     if (bx == CHUNK_SIZE_X - 1) { auto n = chunks.find({ cx + 1, cz }); if (n != chunks.end() && n->second) n->second->isDirty = true; }
     if (bz == 0) { auto n = chunks.find({ cx, cz - 1 }); if (n != chunks.end() && n->second) n->second->isDirty = true; }
@@ -612,6 +672,109 @@ bool World::is_chunk_loaded_at(const glm::vec3& worldPos) const {
     return false;
 }
 
+void World::set_restoring(bool active) {
+    restoring_ = active;
+}
+
+bool World::ensure_chunk_restored(int cx, int cz, const glm::vec3& playerPos,
+                                  WorldRenderBridge& renderBridge) {
+    for (int frame = 0; frame < 600; ++frame) {
+        std::shared_ptr<Chunk> chunk;
+        {
+            std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+            auto it = chunks.find({ cx, cz });
+            if (it == chunks.end() || !it->second) {
+                // Absent chunk: create it directly — restore must not depend
+                // on the streaming window (region pages span arbitrary tiles).
+                chunk = std::make_shared<Chunk>(cx, cz,
+                                                nextChunkGeneration.fetch_add(1));
+                chunks[{ cx, cz }] = chunk;
+            } else if (it->second->state.load(std::memory_order_acquire) !=
+                       ChunkState::Generating) {
+                // Existing, no in-flight generator: take it over in place.
+                chunk = it->second;
+            }
+            // else: a generator worker owns the chunk data — wait it out
+            // below (update() applies finished meshes and advances states).
+        }
+        if (chunk) {
+            chunk->state.store(ChunkState::Uploaded, std::memory_order_release);
+            chunk->isDirty.store(true, std::memory_order_release);
+            mark_chunk_light_dirty(cx, cz);
+            return true;
+        }
+        update(playerPos, renderBridge, 1.0f / 60.0f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return false;
+}
+
+bool World::restore_chunk_data(int cx, int cz, int extent,
+                               const RuntimeBlockId* blocks, const uint8_t* water,
+                               const glm::vec3& playerPos,
+                               WorldRenderBridge& renderBridge) {
+    if (extent <= 0 || extent > CHUNK_SIZE_Y) return false;
+    // Materialize on demand: same creating/take-over semantics as
+    // ensure_chunk_restored (absent chunk created directly — restore is
+    // window-independent; an in-flight generator is waited out via update()).
+    if (!ensure_chunk_restored(cx, cz, playerPos, renderBridge)) return false;
+    // Batch write (FALTANTES §4 item 18): fill the dense arrays directly — no
+    // per-voxel set_block_at (mutex re-acquire, border neighbor scans, fluid
+    // enqueues, light-dirty on 5 chunks per voxel). One invalidation total.
+    std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+    auto it = chunks.find({ cx, cz });
+    if (it == chunks.end() || !it->second) return false;
+    const std::shared_ptr<Chunk>& chunk = it->second;
+    // Restore REPLACES the chunk's content wholesale: stale overrides (from
+    // pre-load edits) or upper sections must not shadow the restored bytes.
+    chunk->voxelOverrides.clear();
+    chunk->upperSections.clear();
+    std::size_t index = 0;
+    for (int y = 0; y < extent; ++y) {
+        for (int z = 0; z < CHUNK_SIZE_Z; ++z) {
+            for (int x = 0; x < CHUNK_SIZE_X; ++x) {
+                chunk->blocks[x][y][z] = blocks[index];
+                const uint8_t level = water[index];
+                ++index;
+                // Fluid levels are only meaningful on fluid blocks (mirrors
+                // the old per-voxel restore semantics); a stored byte on a
+                // non-fluid cell is left untouched.
+                if (level != WATER_LEVEL_NONE) {
+                    chunk->waterLevels[x][y][z] = level;
+                }
+            }
+        }
+    }
+    chunk->dataVersion.fetch_add(1, std::memory_order_acq_rel);
+    // The saved extent is derived from the source chunk's vertical extent, so
+    // the restored content occupies exactly [0, extent) (mesh/raycast queries
+    // read highestOccupiedY).
+    chunk->highestOccupiedY = std::max(chunk->highestOccupiedY, extent - 1);
+    // Restored content IS the persisted state — never flagged as an unsaved
+    // edit (the save gate must not report a spurious delta right after load).
+    chunk->hasUnsavedEdits.store(false, std::memory_order_release);
+    // ensure_chunk_restored marked this chunk light-dirty; the per-voxel path
+    // also dirtied the four neighbors (block light crosses borders) — mark
+    // them once here for the same single-pass relight.
+    mark_chunk_light_dirty(cx - 1, cz);
+    mark_chunk_light_dirty(cx + 1, cz);
+    mark_chunk_light_dirty(cx, cz - 1);
+    mark_chunk_light_dirty(cx, cz + 1);
+    return true;
+}
+
+bool World::can_touch_chunk_at(const glm::vec3& worldPos) const {
+    int cx = static_cast<int>(std::floor(worldPos.x / CHUNK_SIZE_X));
+    int cz = static_cast<int>(std::floor(worldPos.z / CHUNK_SIZE_Z));
+
+    std::pair<int, int> key = { cx, cz };
+    std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+    auto it = chunks.find(key);
+    if (it == chunks.end() || !it->second) return false;
+    const ChunkState state = it->second->state.load(std::memory_order_acquire);
+    return state != ChunkState::Generating && state != ChunkState::Unloaded;
+}
+
 void World::update_fluid_physics(const glm::vec3& playerPos) {
     (void)playerPos;
     const FluidCell horizontal[4] = { {1,0,0}, {-1,0,0}, {0,0,1}, {0,0,-1} };
@@ -683,7 +846,26 @@ void World::update_fluid_physics(const glm::vec3& playerPos) {
         if (spread > params->maxLevel) continue;
         for (const FluidCell& d : horizontal) {
             const FluidCell neighbor{ cell.x + d.x, cell.y, cell.z + d.z };
-            if (!is_chunk_loaded_at(pos(neighbor))) continue;
+            // Safety guard mirrors set_block_at: skip only chunks that are
+            // absent or still generating. Requiring Uploaded here (the old
+            // is_chunk_loaded_at check) races with the dirty-chunk remesh: a
+            // block placement marks the chunk MeshReady, the fluid step runs
+            // in the same update, the check fails, and the source cell (already
+            // popped) is never re-scheduled — the fluid dies permanently (the
+            // voxel_sdk_tests timing flake). MeshReady chunks are safe: meshing
+            // only reads chunk data.
+            if (!can_touch_chunk_at(pos(neighbor))) {
+                // FALTANTES §8 item 165: a cell whose spread target is an
+                // unloaded chunk must NOT die here — it stays queued so it
+                // resumes the moment the chunk streams/restores in. Without
+                // this, a fluid pinned against an unloaded boundary (or with
+                // every other exit walled off) stops forever and never flows
+                // into the chunk when it later loads. Re-enqueueing is cheap:
+                // the scheduler dedups by cell and sleeps cells outside the
+                // active region.
+                enqueue_fluid_neighborhood(worldPos);
+                continue;
+            }
             const RuntimeBlockId neighborType = get_block_at(pos(neighbor));
             const uint8_t neighborLevel = get_fluid_level_at(pos(neighbor));
             if (neighborType == kRuntimeAirId ||
@@ -734,8 +916,10 @@ void World::update(const glm::vec3& playerPos, WorldRenderBridge& renderBridge, 
                                      needsFarLod ? chunkBudget : 0,
                                      far_lod_endpoint_fraction());
 
-    // 1. Descarregar chunks fora da janela densa de interação.
-    {
+    // 1. Descarregar chunks fora da janela densa de interação. Suprimido
+    // durante restore (set_restoring): os chunks escritos por um load devem
+    // sobreviver aos update() do próprio load (FALTANTES §4 item 1).
+    if (!restoring_) {
         std::lock_guard<std::recursive_mutex> lock(chunksMutex);
         std::unordered_set<std::pair<int, int>, ChunkHash> evictions;
         for (const auto& pair : chunks) {
@@ -808,11 +992,17 @@ void World::update(const glm::vec3& playerPos, WorldRenderBridge& renderBridge, 
         }
     }
 
-    // 3. Agendamento multithreaded de novos chunks
+    // 3. Agendamento multithreaded de novos chunks. Suprimido durante restore
+    // (set_restoring, FALTANTES §4 item 17): o load sob demanda materializa os
+    // chunks do save DIRETAMENTE — gerar a janela do jogador aqui só produziria
+    // chunks que o restore sobrescreveria em seguida (e o wait de um chunk em
+    // Generating, dentro do restore, empurraria a geração da janela inteira).
+    // Após o load (set_restoring(false)), a passagem normal de streaming gera
+    // o que o save não cobriu.
     int tasksDispatched = 0;
     const int maxTasksPerFrame = 16;
 
-    if (pendingTasks.load() < 32) {
+    if (!restoring_ && pendingTasks.load() < 32) {
         for (const auto& key : desiredChunks) {
             if (tasksDispatched >= maxTasksPerFrame || pendingTasks.load() >= 32) break;
 
@@ -965,28 +1155,8 @@ void World::update(const glm::vec3& playerPos, WorldRenderBridge& renderBridge, 
     }
 
     // Conteúdo exclusivo da 1.1, aplicado sobre o terreno/árvores/grama da 1.0.
-    for (const auto& key : newlyUploaded) {
-        if (!mobSpawningEnabled) continue;
-        if (!mobPopulatedChunks.insert(key).second) continue;
-        const uint32_t hash = static_cast<uint32_t>(key.first * 92837111u) ^
-                              static_cast<uint32_t>(key.second * 689287499u);
-        if (hash % 23u != 0u) continue;
-        const int wx = key.first * CHUNK_SIZE_X + 8;
-        const int wz = key.second * CHUNK_SIZE_Z + 8;
-        int surfaceY = -1;
-        for (int y = GENERATED_TERRAIN_HEIGHT - 3; y >= 1; --y) {
-            if (is_solid_block_id(get_block_at(glm::vec3(wx, y, wz))) &&
-                get_block_at(glm::vec3(wx, y + 1, wz)) == kRuntimeAirId) {
-                surfaceY = y + 1;
-                break;
-            }
-        }
-        if (surfaceY > 0) {
-            const MobType type = static_cast<MobType>((hash / 23u) % 6u);
-            mobManager_.spawn_mob(type, glm::vec3(wx + 0.5f, surfaceY, wz + 0.5f));
-        }
-    }
-
+    // (Mob spawning moved to the entity layer — FALTANTES item 11: mobs are
+    // IEntityWorld entities advanced by the public IMobBehavior.)
     struct StructureSpawn { int cx, cz, y; StructureType type; bool enabled; };
     static const std::array<StructureSpawn, 5> structureSpawns = [] {
         auto find_site = [](int anchorX, int anchorZ, StructureType type) {
@@ -1111,14 +1281,69 @@ void World::update(const glm::vec3& playerPos, WorldRenderBridge& renderBridge, 
     // crosses borders and converges chunk by chunk.
     run_light_pass(playerPos);
 
-    mobManager_.update(deltaTime, playerPos, *this);
+    // RAM-budgeted chunk cache (FALTANTES §4 item 6): when the estimated
+    // loaded data exceeds the budget, evict the farthest chunks WITHOUT
+    // unsaved edits until under budget. Chunks with unsaved edits are never
+    // evicted (a cache eviction must not lose edits; the flag is cleared by
+    // World::mark_chunks_saved once a save persists them). isDirty is NOT a
+    // don't-evict signal here — it means "needs remesh" and is cleared at
+    // remesh dispatch, before the mesh job completes, so relying on it would
+    // evict freshly edited chunks. An over-tight budget thrashes (regenerates)
+    // — the honest cost of a budget smaller than the window. Runs at the END
+    // of the frame so every update boundary satisfies the budget.
+    if (memoryBudget > 0 && !restoring_) {
+        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+        uint64_t usage = 0;
+        std::vector<std::pair<int64_t, std::pair<int, int>>> candidates;
+        candidates.reserve(chunks.size());
+        for (const auto& [key, chunk] : chunks) {
+            if (!chunk) continue;
+            usage += chunk_memory_estimate(*chunk);
+            if (chunk->hasUnsavedEdits.load(std::memory_order_acquire)) continue;
+            const int64_t dx = static_cast<int64_t>(key.first) - playerChunkX;
+            const int64_t dz = static_cast<int64_t>(key.second) - playerChunkZ;
+            candidates.push_back({ dx * dx + dz * dz, key });
+        }
+        if (usage > memoryBudget) {
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const auto& lhs, const auto& rhs) {
+                          return lhs.first > rhs.first;  // farthest first
+                      });
+            for (const auto& [distanceSquared, key] : candidates) {
+                if (usage <= memoryBudget) break;
+                auto it = chunks.find(key);
+                if (it == chunks.end() || !it->second) continue;
+                renderBridge.retire_chunk(ChunkId{
+                    { it->second->chunkX, it->second->chunkZ }, 0 });
+                scheduler_.cancel_chunk(key.first, key.second);
+                usage -= chunk_memory_estimate(*it->second);
+                chunks.erase(it);
+            }
+        }
+    }
 }
 
 void World::mark_chunk_light_dirty(int cx, int cz) {
     lightDirtyChunks_.insert({ cx, cz });
 }
 
+void World::set_light_table_overrides(
+    std::unordered_map<RuntimeBlockId, LightOverride> overrides) {
+    lightOverrides_ = std::move(overrides);
+    // The plugin takes effect immediately: every loaded chunk is queued for
+    // the next budgeted relight pass.
+    {
+        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+        for (const auto& [key, chunk] : chunks) {
+            chunk->isDirty.store(true, std::memory_order_release);
+            mark_chunk_light_dirty(key.first, key.second);
+        }
+    }
+}
+
 uint8_t World::light_emission(RuntimeBlockId id) const {
+    const auto override = lightOverrides_.find(id);
+    if (override != lightOverrides_.end()) return override->second.emission;
     if (is_builtin_block(id)) {
         switch (as_builtin_block(id)) {
         case BlockType::Lava:
@@ -1136,13 +1361,13 @@ uint8_t World::light_emission(RuntimeBlockId id) const {
 }
 
 uint8_t World::light_absorption(RuntimeBlockId id) const {
+    const auto override = lightOverrides_.find(id);
+    if (override != lightOverrides_.end()) return override->second.absorption;
     if (is_builtin_block(id)) {
-        const BlockType type = as_builtin_block(id);
-        if (type == BlockType::Air) return 0;
-        if (type == BlockType::Water || type == BlockType::Lava) return 1;
-        if (is_leaf_block(type)) return 1;
-        if (is_transparent_block(type)) return 0;  // glass passes light
-        return 15;  // opaque blocks absorb fully
+        // FALTANTES §8 item 166: the light simulation reads the SIMULATION
+        // table (BLOCK_SIM_PROPS) — never the visual material. air=0,
+        // glass=0, water/lava/leaves=1, opaque=15 (see get_block_sim).
+        return get_block_sim(as_builtin_block(id)).lightAbsorption;
     }
     const auto found = runtimeBlocks_.find(id);
     return found == runtimeBlocks_.end() ? 15 : found->second.lightAbsorption;

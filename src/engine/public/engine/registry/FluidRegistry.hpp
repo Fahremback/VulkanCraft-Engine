@@ -100,6 +100,13 @@ public:
     // world builds its fluid table from this sequence).
     std::vector<FluidDefinition> all_definitions() const;
 
+    // Cross-reference validation (FALTANTES item 9): the namespaced block each
+    // fluid drives must resolve in the given BlockRegistry (builtin or
+    // catalog). Collects one diagnostic per dangling reference and returns
+    // whether the registry is clean.
+    bool validate_block_references(const class BlockRegistry& blocks,
+                                   std::vector<std::string>& errorsOut) const;
+
 private:
     bool add(FluidDefinition definition, std::string& errorOut);
 

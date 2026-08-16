@@ -7,7 +7,7 @@
 #include "../engine/gameplay/DialogueSystem.hpp"
 #include "../engine/gameplay/DestructionRuntime.hpp"
 #include "../engine/gameplay/MissionSystem.hpp"
-#include "../engine/navigation/Navigation.hpp"
+#include "engine/navigation/INavigationProvider.hpp"
 #include <array>
 #include <cstdlib>
 #include <filesystem>
@@ -26,6 +26,41 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
 #include <VkBootstrap.h>
+
+// PlayNavAgent — the public provider's path follower (mirrors the legacy
+// NavigationAgent stepping so the Fase 8 behavior is preserved).
+void PlayNavAgent::set_path(std::vector<glm::vec3> points) {
+    path = std::move(points);
+    waypoint = 0;
+    reached = path.empty();
+}
+
+void PlayNavAgent::update(float deltaTime) {
+    if (reached) return;
+    if (waypoint >= path.size()) {
+        reached = true;
+        return;
+    }
+    float remaining = speed * deltaTime;
+    while (remaining > 0.0f && waypoint < path.size()) {
+        const glm::vec3 target = path[waypoint];
+        const glm::vec3 dir = target - position;
+        const float dist = glm::length(dir);
+        if (dist <= stoppingDistance) {
+            position = target;
+            ++waypoint;
+            continue;
+        }
+        const float step = std::min(remaining, dist);
+        position += (dir / dist) * step;
+        remaining -= step;
+        if (step >= dist - 1e-4f) {
+            position = target;
+            ++waypoint;
+        }
+    }
+    if (waypoint >= path.size()) reached = true;
+}
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -125,9 +160,10 @@ void update_embedded_game(GLFWwindow* editorWindow, const ImVec2& screenPosition
     }
 
     // ImGui coordinates in this single-platform-window editor are already in
-    // the GLFW client coordinate space. Calling ScreenToClient here caused the
-    // editor window position to be subtracted a second time, making the child
-    // game appear pinned to the desktop when the editor was dragged.
+    // the GLFW client coordinate space. Calling the screen-to-client
+    // conversion here caused the editor window position to be subtracted a
+    // second time, making the child game appear pinned to the desktop when the
+    // editor was dragged.
     const int clientX = static_cast<int>(std::lround(screenPosition.x));
     const int clientY = static_cast<int>(std::lround(screenPosition.y));
     MoveWindow(g_hGameWindow, clientX, clientY,
@@ -819,35 +855,64 @@ void EditorApplication::setup_play_runtime() {
         }
     }
 
-    // Play navigation (Fase 8): bake a NavigationGrid tile (blockers from play
-    // physics bodies) and drive a NavigationAgent toward the primary camera
-    // entity each frame; the agent position writes back to the transform.
+    // Play navigation (Fase 8): bake the public navmesh — one column per grid
+    // cell of the NavigationComponent; cells covered by a play physics body
+    // are omitted (blocked), exactly the footprint the legacy grid used. The
+    // promoted INavigationProvider (Recast + Detour) is the navigation
+    // authority (FALTANTES item 12: the grid track was removed).
     for (const auto& [id, nc] : playScene->navigationComponents) {
         if (!nc.enabled) continue;
         const auto tit = playScene->transformComponents.find(id);
         const glm::vec3 start = (tit != playScene->transformComponents.end()) ? tit->second.position : glm::vec3(0.0f);
-        Engine::NavigationGrid grid(nc.gridWidth, nc.gridHeight, nc.cellSize);
-        for (const auto& [bid, handle] : m_playBodies) {
-            (void)bid;
-            Physics::RigidBody* body = m_playPhysics.body(handle);
-            if (!body) continue;
-            const glm::vec3 half = std::visit([](const auto& s) -> glm::vec3 {
-                using T = std::decay_t<decltype(s)>;
-                if constexpr (std::is_same_v<T, Physics::BoxShape>) return s.halfExtents;
-                else if constexpr (std::is_same_v<T, Physics::SphereShape>) return glm::vec3(s.radius);
-                else return glm::vec3(s.radius, s.halfHeight, s.radius);
-            }, body->collider.shape);
-            const glm::vec3 min = body->position - half;
-            const glm::vec3 max = body->position + half;
-            for (float wx = min.x; wx <= max.x; wx += nc.cellSize) {
-                for (float wz = min.z; wz <= max.z; wz += nc.cellSize) {
-                    const auto cell = grid.cell_at({wx, 0.0f, wz});
-                    if (cell) grid.set_blocked(*cell, true);
+        if (!m_playNav) m_playNav = engine::navigation::create_recast_navigation_provider();
+
+        engine::navigation::NavmeshConfig config;
+        config.boundsMinX = start.x - nc.gridWidth * nc.cellSize * 0.5f;
+        config.boundsMaxX = start.x + nc.gridWidth * nc.cellSize * 0.5f;
+        config.boundsMinZ = start.z - nc.gridHeight * nc.cellSize * 0.5f;
+        config.boundsMaxZ = start.z + nc.gridHeight * nc.cellSize * 0.5f;
+        config.boundsMinY = start.y - 8.0f;
+        config.boundsMaxY = start.y + 200.0f;
+        config.cellSize = nc.cellSize;
+        config.cellHeight = 0.2f;
+        config.agentRadius = 0.4f;
+        config.agentHeight = 1.8f;
+        config.agentMaxClimb = 1.0f;
+        config.agentMaxSlope = 45.0f;
+
+        std::vector<engine::navigation::VoxelColumn> columns;
+        const float floorY = start.y;
+        for (int gx = 0; gx < nc.gridWidth; ++gx) {
+            for (int gz = 0; gz < nc.gridHeight; ++gz) {
+                const float cx = config.boundsMinX + (gx + 0.5f) * nc.cellSize;
+                const float cz = config.boundsMinZ + (gz + 0.5f) * nc.cellSize;
+                bool blocked = false;
+                for (const auto& [bid, handle] : m_playBodies) {
+                    (void)bid;
+                    Physics::RigidBody* body = m_playPhysics.body(handle);
+                    if (!body) continue;
+                    const glm::vec3 half = std::visit([](const auto& s) -> glm::vec3 {
+                        using T = std::decay_t<decltype(s)>;
+                        if constexpr (std::is_same_v<T, Physics::BoxShape>) return s.halfExtents;
+                        else if constexpr (std::is_same_v<T, Physics::SphereShape>) return glm::vec3(s.radius);
+                        else return glm::vec3(s.radius, s.halfHeight, s.radius);
+                    }, body->collider.shape);
+                    const glm::vec3 min = body->position - half;
+                    const glm::vec3 max = body->position + half;
+                    if (cx >= min.x && cx <= max.x && cz >= min.z && cz <= max.z) {
+                        blocked = true;
+                        break;
+                    }
                 }
+                if (blocked) continue;
+                columns.push_back({ cx, cz, floorY, floorY + 1.0f, true });
             }
         }
-        m_playNavWorld.load_tile({0, 0}, std::move(grid));
-        Engine::NavigationAgent agent;
+        if (!columns.empty()) {
+            std::string navError;
+            m_playNav->build(config, columns, navError);
+        }
+        PlayNavAgent agent;
         agent.position = start;
         agent.speed = nc.agentSpeed;
         m_playNavAgents.emplace(id, agent);
@@ -1057,9 +1122,21 @@ void EditorApplication::tick_play_runtime(float deltaTime) {
     }
     if (!haveTarget) target = m_editorCamera.position;
     for (auto& [id, agent] : m_playNavAgents) {
-        if (agent.reached_destination() || glm::distance(agent.position, target) > 1.0f) {
-            Engine::NavigationPath path = m_playNavWorld.find_path(agent.position, target);
-            if (path.success) agent.set_path(std::move(path));
+        if (m_playNav &&
+            (agent.reached_destination() ||
+             glm::distance(agent.position, target) > 1.0f)) {
+            engine::navigation::PathResult result;
+            if (m_playNav->find_path(agent.position.x, agent.position.y,
+                                     agent.position.z, target.x, target.y,
+                                     target.z, result) && result.found) {
+                std::vector<glm::vec3> points;
+                points.reserve(result.waypoints.size() / 3);
+                for (std::size_t i = 0; i + 2 < result.waypoints.size(); i += 3) {
+                    points.emplace_back(result.waypoints[i], result.waypoints[i + 1],
+                                        result.waypoints[i + 2]);
+                }
+                agent.set_path(std::move(points));
+            }
         }
         agent.update(deltaTime);
         auto tit = playScene->transformComponents.find(id);
@@ -1107,7 +1184,7 @@ void EditorApplication::teardown_play_runtime() {
     }
     m_playDestructibles.clear();
     m_playNavAgents.clear();
-    m_playNavWorld.unload_tile({0, 0});
+    m_playNav.reset();
 }
 
 int EditorApplication::run_render_graph_self_test() {
@@ -5966,6 +6043,11 @@ void EditorApplication::cleanup() {
         }
 
         vkDestroyDevice(m_device, nullptr);
+        // run() calls cleanup() and the destructor calls it again — reset the
+        // device so the second pass is a no-op. Without this, the second pass
+        // called vkDeviceWaitIdle on the already-destroyed handle
+        // ("vkDeviceWaitIdle: Invalid device" from the loader at shutdown).
+        m_device = VK_NULL_HANDLE;
         vkDestroySurfaceKHR(m_instance, m_surface, nullptr);
         vkDestroyInstance(m_instance, nullptr);
 

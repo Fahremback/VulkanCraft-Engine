@@ -169,9 +169,11 @@ void Chunk::generate_terrain(const FastNoiseLite& noise, engine::voxel::IVoxelGe
     // Public SDK generator override: a registered generator replaces the
     // builtin height/cave/ore sampling (biomes clamp to a neutral index so
     // custom generators stay safe). nullptr keeps the builtin TerrainGenerator.
-    const auto sample_terrain = [generator](float wx, float wz) -> TerrainSample {
+    const auto sample_terrain = [generator](float wx, float wz,
+                                            engine::voxel::TerrainPoint& pointOut) -> TerrainSample {
         if (generator) {
-            const engine::voxel::TerrainPoint point = generator->sample(wx, wz);
+            pointOut = generator->sample(wx, wz);
+            const engine::voxel::TerrainPoint& point = pointOut;
             TerrainSample sample;
             sample.height = point.height;
             sample.biome = static_cast<BiomeType>(std::min<unsigned>(
@@ -205,7 +207,8 @@ void Chunk::generate_terrain(const FastNoiseLite& noise, engine::voxel::IVoxelGe
             float worldX = static_cast<float>(worldOffsetX + x);
             float worldZ = static_cast<float>(worldOffsetZ + z);
 
-            const TerrainSample terrain = sample_terrain(worldX, worldZ);
+            engine::voxel::TerrainPoint terrainPoint;
+            const TerrainSample terrain = sample_terrain(worldX, worldZ, terrainPoint);
             const int height = terrain.height;
             heightMap[x][z] = height;
             biomeMap[x][z] = terrain.biome;
@@ -213,6 +216,14 @@ void Chunk::generate_terrain(const FastNoiseLite& noise, engine::voxel::IVoxelGe
                 height < seaLevel ? seaLevel : height);
 
             auto surface_block = [&](int depth) -> BlockType {
+                // Data-driven surface override (META section 18): a generator
+                // may supply its own block for this depth; 0 keeps the builtin
+                // per-biome surface.
+                if (generator) {
+                    const std::uint32_t overrideId =
+                        generator->surface_block(terrainPoint, depth);
+                    if (overrideId != 0) return static_cast<BlockType>(overrideId);
+                }
                 const bool exposedCliff = terrain.slope > 4.20f;
                 switch (terrain.biome) {
                 case BiomeType::DeepOcean:
@@ -266,16 +277,33 @@ void Chunk::generate_terrain(const FastNoiseLite& noise, engine::voxel::IVoxelGe
                     // deixem biomas inteiros suspensos por apenas cinco blocos.
                     const bool caveAllowed = y > 3 && depth > 12 &&
                         !(oceanic && y > seaLevel - 12);
-                    if (caveAllowed && sample_cave(worldX, static_cast<float>(y), worldZ) > 0.0f) {
-                        if (y <= 7) {
-                            blocks[x][y][z] = runtime_id(BlockType::Lava);
-                            // Generated lava is a source pool (like ocean
-                            // water): it must never read as an unfed cell and
-                            // evaporate when the fluid sim touches it, and its
-                            // level byte must be canonical in saves (META §13).
-                            waterLevels[x][y][z] = WATER_SOURCE_LEVEL;
-                        } else {
+                    const float caveDensity =
+                        sample_cave(worldX, static_cast<float>(y), worldZ);
+                    if (caveAllowed && caveDensity > 0.0f) {
+                        const std::uint32_t builtinCarve =
+                            (y <= 7) ? static_cast<std::uint32_t>(BlockType::Lava)
+                                     : static_cast<std::uint32_t>(kRuntimeAirId);
+                        std::uint32_t carveBlock = builtinCarve;
+                        // Data-driven carver fill (META section 18): the
+                        // generator may replace what fills the carved cell.
+                        if (generator) {
+                            carveBlock = generator->carve_block(
+                                caveDensity, y, depth, builtinCarve);
+                        }
+                        if (carveBlock == 0) {
                             blocks[x][y][z] = kRuntimeAirId;
+                        } else {
+                            blocks[x][y][z] =
+                                static_cast<RuntimeBlockId>(carveBlock);
+                            if (carveBlock == static_cast<std::uint32_t>(BlockType::Lava) ||
+                                carveBlock == static_cast<std::uint32_t>(BlockType::Water)) {
+                                // Generated fluid is a source pool (like ocean
+                                // water): it must never read as an unfed cell
+                                // and evaporate when the fluid sim touches it,
+                                // and its level byte must be canonical in
+                                // saves (META §13).
+                                waterLevels[x][y][z] = WATER_SOURCE_LEVEL;
+                            }
                         }
                         continue;
                     }
@@ -293,6 +321,16 @@ void Chunk::generate_terrain(const FastNoiseLite& noise, engine::voxel::IVoxelGe
                         else if (y < 256 && ore > 0.70f) block = BlockType::IronOre;
                         else if (y < 320 && ore > 0.66f) block = BlockType::CoalOre;
                         else if (y > 80 && y < 176 && ore < -0.72f) block = BlockType::CopperOre;
+                        // Data-driven ore substitution (META section 18): the
+                        // generator may override the builtin vein result.
+                        if (generator) {
+                            const std::uint32_t overrideOre =
+                                generator->ore_block(ore, y,
+                                                     static_cast<std::uint32_t>(block));
+                            if (overrideOre != 0) {
+                                block = static_cast<BlockType>(overrideOre);
+                            }
+                        }
                     }
                     blocks[x][y][z] = runtime_id(block);
                 } else if (y <= seaLevel && height < seaLevel) {
@@ -319,6 +357,36 @@ void Chunk::generate_terrain(const FastNoiseLite& noise, engine::voxel::IVoxelGe
             const float worldX = static_cast<float>(worldOffsetX + x);
             const float worldZ = static_cast<float>(worldOffsetZ + z);
             const int height = heightMap[x][z];
+
+            // Data-driven decoration (META section 18): a generator may place
+            // its own surface features for this land column; true skips the
+            // builtin per-biome tree pass for the column.
+            if (generator && height > seaLevel + 2) {
+                engine::voxel::DecorationContext ctx;
+                ctx.localX = x;
+                ctx.localZ = z;
+                ctx.worldX = worldX;
+                ctx.worldZ = worldZ;
+                ctx.surfaceHeight = height;
+                ctx.biomeIndex = static_cast<std::uint32_t>(biomeMap[x][z]);
+                const auto writer = [&](int lx, int ly, int lz,
+                                        std::uint32_t blockId) -> bool {
+                    if (lx < 0 || lx >= CHUNK_SIZE_X || lz < 0 ||
+                        lz >= CHUNK_SIZE_Z || ly < 1 ||
+                        ly >= GENERATED_TERRAIN_HEIGHT) {
+                        return false;
+                    }
+                    const RuntimeBlockId current = blocks[lx][ly][lz];
+                    if (current != kRuntimeAirId &&
+                        !is_leaf_block(as_builtin_block(current))) {
+                        return false;
+                    }
+                    blocks[lx][ly][lz] = static_cast<RuntimeBlockId>(blockId);
+                    if (ly > highestOccupiedY) highestOccupiedY = ly;
+                    return true;
+                };
+                if (generator->decorate_column(ctx, writer)) continue;
+            }
             if (height <= seaLevel + 2 || blocks[x][height][z] != runtime_id(BlockType::Grass)) continue;
 
             const float treeChance = hash_tree(worldX, worldZ, 0.0f);

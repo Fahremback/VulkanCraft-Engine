@@ -35,7 +35,7 @@ struct NavmeshConfig {
     int minRegionArea{ 8 };          // regions smaller than this are discarded
     int mergeRegionArea{ 20 };
     float detailSampleDist{ 6.0f };
-    float detailSampleMaxError{ 1.0f };
+    float detailSampleMaxError{ 0.4f };   // < 1 block so single-block steps survive
     int maxPolys{ 2048 };            // path search budget
 };
 

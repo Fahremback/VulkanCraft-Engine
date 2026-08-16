@@ -17,6 +17,11 @@ enum class ChunkState : uint8_t {
 struct ChunkRuntimeState {
     std::atomic<ChunkState> state{ChunkState::Unloaded};
     std::atomic_bool isDirty{false};
+    // True while this chunk holds edits (blocks/fluids) that a save has not
+    // persisted yet. Distinct from isDirty ("needs remesh", cleared at remesh
+    // dispatch): a cache eviction must never drop unsaved edits, so the budget
+    // pass skips chunks with this flag and it is cleared by World on save.
+    std::atomic_bool hasUnsavedEdits{false};
     std::atomic<uint64_t> dataVersion{0};
     // Revisions of the 4 neighbors observed at the last mesh of this chunk
     // (guarded by World::chunksMutex). Drives the border gap-fill gate.

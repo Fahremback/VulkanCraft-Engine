@@ -173,7 +173,10 @@ function searchCode(args) {
   if (!caseSensitive) rgArgs.push("--ignore-case");
   if (typeof args.glob === "string" && args.glob) rgArgs.push("--glob", args.glob);
   rgArgs.push(query, root.absolute);
-  const result = spawnSync("rg", rgArgs, { encoding: "utf8", windowsHide: true, maxBuffer: 4 * 1024 * 1024 });
+  // Bound the scan: a pathological tree (no .gitignore in non-git workspaces)
+  // can make rg take seconds; timeout falls back to the in-JS search instead
+  // of hanging the server forever.
+  const result = spawnSync("rg", rgArgs, { encoding: "utf8", windowsHide: true, maxBuffer: 4 * 1024 * 1024, timeout: 15000 });
   if (!result.error && (result.status === 0 || result.status === 1)) {
     const matches = result.stdout.split(/\r?\n/).filter(Boolean).slice(0, maxResults).map((line) => {
       const match = line.match(/^(.*?):(\d+):(.*)$/);

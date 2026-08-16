@@ -18,29 +18,6 @@ option(VC_ENABLE_ROCKSDB "Promote RocksDB into the build" ON)
 set(VC_SOLUTIONS_DIR ${CMAKE_SOURCE_DIR}/external/solutions)
 set(VC_GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
 
-# A clean public clone needs only these promoted solutions, not the internal
-# research catalogue. Fail early with an actionable message when one is absent.
-set(VC_REQUIRED_SOLUTIONS entt recast-navigation)
-if(VC_ENABLE_ZSTD)
-    list(APPEND VC_REQUIRED_SOLUTIONS zstd)
-endif()
-if(VC_ENABLE_BLAKE3)
-    list(APPEND VC_REQUIRED_SOLUTIONS blake3)
-endif()
-if(VC_ENABLE_FLATBUFFERS)
-    list(APPEND VC_REQUIRED_SOLUTIONS flatbuffers)
-endif()
-if(VC_ENABLE_ROCKSDB)
-    list(APPEND VC_REQUIRED_SOLUTIONS rocksdb)
-endif()
-foreach(VC_SOLUTION IN LISTS VC_REQUIRED_SOLUTIONS)
-    if(NOT EXISTS "${VC_SOLUTIONS_DIR}/${VC_SOLUTION}")
-        message(FATAL_ERROR
-            "Missing dependency external/solutions/${VC_SOLUTION}. "
-            "Follow DEPENDENCIES.md; other internal solution clones are not required.")
-    endif()
-endforeach()
-
 if(VC_ENABLE_ZSTD)
     file(GLOB VC_ZSTD_COMMON ${VC_SOLUTIONS_DIR}/zstd/lib/common/*.c)
     file(GLOB VC_ZSTD_COMPRESS ${VC_SOLUTIONS_DIR}/zstd/lib/compress/*.c)
@@ -138,6 +115,49 @@ add_library(vc_navigation STATIC ${VC_RECAST_SOURCES} ${VC_DETOUR_SOURCES})
 target_include_directories(vc_navigation PUBLIC
     ${VC_SOLUTIONS_DIR}/recast-navigation/Recast/Include
     ${VC_SOLUTIONS_DIR}/recast-navigation/Detour/Include)
+
+# fast-wfc (Mathieu Fehr & Nathanaël Courant, MIT) — deterministic structures/
+# interiors via wave function collapse. Sources compiled directly from the
+# pinned clone (src/lib + src/include); the upstream CMake is not used. The
+# public contract engine/procgen/IStructureGenerator.hpp never includes
+# fast-wfc; only src/engine/sdk/FastWfcStructures.cpp does (adapter rule).
+set(VC_FASTWFC_SOURCES
+    ${VC_SOLUTIONS_DIR}/fast-wfc/src/lib/wave.cpp
+    ${VC_SOLUTIONS_DIR}/fast-wfc/src/lib/propagator.cpp
+    ${VC_SOLUTIONS_DIR}/fast-wfc/src/lib/wfc.cpp)
+add_library(vc_fastwfc STATIC ${VC_FASTWFC_SOURCES})
+target_include_directories(vc_fastwfc PUBLIC ${VC_SOLUTIONS_DIR}/fast-wfc/src/include)
+
+# delaunator (Volodymyr Bilonenko, MIT) + earcut.hpp (Mapbox, ISC) — parceling/
+# road graph via Delaunay triangulation and polygon triangulation. Header-only,
+# used directly from the pinned clones; the upstream CMake is not used. The
+# public contract engine/procgen/IParcellation.hpp never includes them; only
+# src/engine/sdk/Parcellation.cpp does (adapter rule).
+add_library(vc_delaunator INTERFACE)
+target_include_directories(vc_delaunator INTERFACE ${VC_SOLUTIONS_DIR}/delaunator-cpp/include)
+add_library(vc_earcut INTERFACE)
+target_include_directories(vc_earcut INTERFACE ${VC_SOLUTIONS_DIR}/earcut-hpp/include)
+
+# meshoptimizer (Arseny Kapoulkine, MIT) + xatlas (Jonathan Young, MIT) —
+# headless mesh cooking (unwrap/optimize/simplify/analyze). Sources compiled
+# directly from the pinned clones; upstream CMake is not used. The public
+# contract engine/procgen/IMeshCooking.hpp never includes them; only
+# src/engine/sdk/MeshCooking.cpp does (adapter rule). manifold (TBB) and
+# geometry-central (Eigen) are BLOCKED at the gate — deps not vendored (see
+# DEPENDENCY_POLICY).
+file(GLOB VC_MESHOPTIMIZER_SOURCES ${VC_SOLUTIONS_DIR}/meshoptimizer/src/*.cpp)
+add_library(vc_meshoptimizer STATIC ${VC_MESHOPTIMIZER_SOURCES})
+target_include_directories(vc_meshoptimizer PUBLIC ${VC_SOLUTIONS_DIR}/meshoptimizer/src)
+add_library(vc_xatlas STATIC ${VC_SOLUTIONS_DIR}/xatlas/source/xatlas/xatlas.cpp)
+target_include_directories(vc_xatlas PUBLIC ${VC_SOLUTIONS_DIR}/xatlas/source/xatlas)
+
+# FastNoise2 (catalog authority for "noise graph") is BLOCKED at the promotion
+# gate: this pinned clone requires FastSIMD (include/FastNoise/Utility/Config.h
+# -> <FastSIMD/DispatchClass.h>) which is not vendored in the clone nor in the
+# catalog. The procgen contract (engine/procgen/INoiseGraph.hpp) is implemented
+# with the engine's in-project noise authority (FastNoiseLite, already used by
+# TerrainGenerator/World) behind the adapter; swapping to FastNoise2 only needs
+# the adapter once FastSIMD is vendored (see DEPENDENCY_POLICY).
 
 if(CMAKE_CONFIGURATION_TYPES)
     list(APPEND CMAKE_CONFIGURATION_TYPES Shipping)
@@ -289,10 +309,26 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/RecipeRegistry.cpp
     src/engine/sdk/EntityWorld.cpp
     src/engine/sdk/RecastNavigation.cpp
+    src/engine/sdk/VoxelReplication.cpp
+    src/engine/sdk/FastNoiseGraph.cpp
+    src/engine/sdk/ClimateBiome.cpp
+    src/engine/sdk/WorldFeatures.cpp
+    src/engine/sdk/FastWfcStructures.cpp
+    src/engine/sdk/Parcellation.cpp
+    src/engine/sdk/ShapeGrammar.cpp
+    src/engine/sdk/HeightmapErosion.cpp
+    src/engine/sdk/MeshCooking.cpp
+    src/engine/sdk/ProcgenPreview.cpp
+    src/engine/sdk/ProcgenJobs.cpp
+    src/engine/sdk/LodTerrainSampler.cpp
+    src/engine/sdk/MobBehavior.cpp
+    src/engine/sdk/WorldManager.cpp
     src/engine/sdk/RegistryJson.cpp
+
     src/engine/core/compression/ZstdCompression.cpp
     src/engine/core/hashing/Blake3Hash.cpp
     src/engine/core/storage/RocksDbChunkStorage.cpp
+    src/engine/core/storage/RegionChunkStorage.cpp
 )
 # Promoted-solution adapters: these TUs are the ONLY ones that include the
 # external headers; the include dirs stay private to this module.
@@ -300,6 +336,11 @@ target_include_directories(vc_sdk_public PRIVATE
     ${VC_SOLUTIONS_DIR}/entt/single_include
     ${VC_SOLUTIONS_DIR}/recast-navigation/Recast/Include
     ${VC_SOLUTIONS_DIR}/recast-navigation/Detour/Include
+    ${VC_SOLUTIONS_DIR}/fast-wfc/src/include
+    ${VC_SOLUTIONS_DIR}/delaunator-cpp/include
+    ${VC_SOLUTIONS_DIR}/earcut-hpp/include
+    ${VC_SOLUTIONS_DIR}/meshoptimizer/src
+    ${VC_SOLUTIONS_DIR}/xatlas/source/xatlas
 )
 if(VC_ENABLE_ZSTD OR VC_ENABLE_BLAKE3 OR VC_ENABLE_FLATBUFFERS OR VC_ENABLE_ROCKSDB)
     target_include_directories(vc_sdk_public PRIVATE
@@ -314,7 +355,24 @@ if(VC_ENABLE_FLATBUFFERS)
     # The generated header is produced by flatc before this module compiles.
     add_dependencies(vc_sdk_public vc_generate_world_save)
 endif()
-vc_object_module(vc_entity_runtime src/simulation/entities/Mob.cpp)
+# Public gameplay runtime (FALTANTES item 9 / META section 20): the adapter
+# src/engine/sdk/GameplayRuntime.cpp is the ONLY TU that crosses from the
+# public surface into the internal physics/gameplay layers. The internal TUs
+# are compiled into this module so external consumers (tests, projects) link
+# them together with the public contract.
+vc_object_module(vc_gameplay_sdk
+    src/engine/sdk/GameplayRuntime.cpp
+    src/engine/physics/PhysicsRuntime.cpp
+    src/engine/physics/PhysicsBackend.cpp
+    src/engine/physics/JoltPhysicsBackend.cpp
+    src/engine/physics/BulletPhysicsBackend.cpp
+    src/engine/physics/Ragdoll.cpp
+    src/engine/gameplay/WeaponSystem.cpp
+    src/engine/gameplay/VehicleRuntime.cpp
+    src/engine/gameplay/DestructionRuntime.cpp
+    src/engine/core/uuid/UUID.cpp
+)
+target_include_directories(vc_gameplay_sdk PRIVATE src)
 vc_object_module(vc_advanced_runtime
     src/engine/physics/PhysicsRuntime.cpp
     src/engine/physics/PhysicsAdvanced.cpp
@@ -331,7 +389,6 @@ vc_object_module(vc_advanced_runtime
     src/engine/gameplay/DialogueSystem.cpp
     src/engine/audio/AudioRuntime.cpp
     src/engine/networking/NetworkRuntime.cpp
-    src/engine/navigation/Navigation.cpp
     src/engine/scripting/ScriptRuntime.cpp
     src/engine/scripting/ScriptDebugger.cpp
     src/engine/scripting/VisualScriptCanvas.cpp
@@ -426,10 +483,15 @@ if(VC_ENABLE_VOXEL_PLUGIN)
 add_executable(vulkan_craft
     src/app/main.cpp
     src/plugins/voxel/VoxelPlugin.cpp
+    # Public entity layer + mob behavior (FALTANTES item 11): the legacy
+    # Mob/MobManager track was removed; the app hosts mobs as IEntityWorld
+    # entities advanced by the public IMobBehavior.
+    src/engine/sdk/EntityWorld.cpp
+    src/engine/sdk/MobBehavior.cpp
+    src/engine/sdk/RegistryJson.cpp
     $<TARGET_OBJECTS:vc_core_runtime>
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:$<TARGET_OBJECTS:vc_voxel_generation>>
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:$<TARGET_OBJECTS:vc_voxel_runtime>>
-    $<TARGET_OBJECTS:vc_entity_runtime>
     $<TARGET_OBJECTS:vc_advanced_runtime>
     $<TARGET_OBJECTS:vc_editor_extensions>
     $<TARGET_OBJECTS:vc_feature_player>
@@ -437,6 +499,9 @@ add_executable(vulkan_craft
     $<TARGET_OBJECTS:vc_app_runtime>
 )
 add_dependencies(vulkan_craft compile_shaders)
+target_include_directories(vulkan_craft PRIVATE
+    ${VC_SOLUTIONS_DIR}/entt/single_include
+)
 target_link_libraries(vulkan_craft PRIVATE
     vc_build_options glfw glm vk-bootstrap Vulkan::Vulkan windowscodecs ole32
 )
@@ -457,13 +522,15 @@ add_executable(VulkanEngineEditor
     src/editor/EditorApplication.cpp
     src/engine/editor/ui/EditorGUI.cpp
     src/editor/tools/SpecializedEditorsPanel.cpp
+    # Public navigation provider (FALTANTES item 12): the editor's play nav
+    # bakes via Recast + Detour — the legacy grid track was removed.
+    src/engine/sdk/RecastNavigation.cpp
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:src/engine/audio/SoundEngine.cpp>
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:src/plugins/voxel/VoxelPlugin.cpp>
     ${IMGUI_SOURCES}
     $<TARGET_OBJECTS:vc_core_runtime>
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:$<TARGET_OBJECTS:vc_voxel_generation>>
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:$<TARGET_OBJECTS:vc_voxel_runtime>>
-    $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:$<TARGET_OBJECTS:vc_entity_runtime>>
     $<TARGET_OBJECTS:vc_advanced_runtime>
     $<TARGET_OBJECTS:vc_editor_extensions>
 )
@@ -471,9 +538,11 @@ target_include_directories(VulkanEngineEditor PRIVATE
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
     src/editor
+    ${VC_SOLUTIONS_DIR}/recast-navigation/Recast/Include
+    ${VC_SOLUTIONS_DIR}/recast-navigation/Detour/Include
 )
 target_link_libraries(VulkanEngineEditor PRIVATE
-    vc_build_options glfw glm vk-bootstrap Vulkan::Vulkan windowscodecs ole32 vc_material_pipeline
+    vc_build_options glfw glm vk-bootstrap Vulkan::Vulkan windowscodecs ole32 vc_material_pipeline vc_navigation
 )
 add_dependencies(VulkanEngineEditor compile_shaders)
 
@@ -611,8 +680,7 @@ add_executable(advanced_systems_tests
     src/engine/scene/SceneComponentIntegration.cpp
     src/engine/gameplay/GameplayVisual.cpp
     src/engine/gameplay/WeaponSystem.cpp
-    src/engine/navigation/Navigation.cpp
-    src/engine/navigation/Navmesh.cpp
+    src/engine/sdk/RecastNavigation.cpp
     src/engine/audio/OggDecoder.cpp
     src/engine/audio/MiniaudioImpl.cpp
     src/engine/audio/AudioZones.cpp
@@ -629,7 +697,11 @@ add_executable(advanced_systems_tests
     src/engine/world/WorldRegionPackage.cpp
     src/tools/BuildTools.cpp
 )
-target_link_libraries(advanced_systems_tests PRIVATE vc_build_options glm)
+target_include_directories(advanced_systems_tests PRIVATE
+    ${VC_SOLUTIONS_DIR}/recast-navigation/Recast/Include
+    ${VC_SOLUTIONS_DIR}/recast-navigation/Detour/Include
+)
+target_link_libraries(advanced_systems_tests PRIVATE vc_build_options glm vc_navigation)
 add_test(NAME advanced_systems_tests COMMAND advanced_systems_tests)
 
 add_executable(rendering_tools_tests
@@ -654,15 +726,35 @@ add_executable(gameplay_framework_tests
     src/engine/gameplay/VehicleRuntime.cpp
     src/engine/gameplay/DestructionRuntime.cpp
     src/engine/audio/AudioRuntime.cpp
-    src/engine/navigation/Navigation.cpp
+    src/engine/sdk/RecastNavigation.cpp
     src/engine/physics/PhysicsRuntime.cpp
     src/engine/physics/PhysicsBackend.cpp
     src/engine/physics/JoltPhysicsBackend.cpp
     src/engine/physics/BulletPhysicsBackend.cpp
     src/engine/core/uuid/UUID.cpp
 )
-target_link_libraries(gameplay_framework_tests PRIVATE vc_build_options glm)
+
+target_include_directories(gameplay_framework_tests PRIVATE
+    ${VC_SOLUTIONS_DIR}/recast-navigation/Recast/Include
+    ${VC_SOLUTIONS_DIR}/recast-navigation/Detour/Include
+)
+target_link_libraries(gameplay_framework_tests PRIVATE vc_build_options glm vc_navigation)
 add_test(NAME gameplay_framework_tests COMMAND gameplay_framework_tests)
+
+# Public gameplay runtime (FALTANTES item 9 / META section 20): the contract
+# compiles only with public SDK headers; the equivalence gates drive the same
+# scenarios through the INTERNAL runtimes (the internal layers never leak into
+# the public surface).
+add_executable(gameplay_runtime_tests
+    tests/GameplayRuntimeTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+)
+target_include_directories(gameplay_runtime_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(gameplay_runtime_tests PRIVATE vc_build_options glm)
+add_test(NAME gameplay_runtime_tests COMMAND gameplay_runtime_tests)
 
 add_executable(visual_authoring_tests
     tests/VisualAuthoringTests.cpp
@@ -739,7 +831,6 @@ add_executable(voxel_streaming_tests
     src/simulation/voxel/generation/TerrainGenerator.cpp
     src/simulation/voxel/structure/Structures.cpp
     src/plugins/voxel/VoxelStructure.cpp
-    src/simulation/entities/Mob.cpp
     src/engine/audio/SoundEngine.cpp
     src/engine/audio/MiniaudioImpl.cpp
 )
@@ -762,12 +853,10 @@ add_test(NAME voxel_scheduler_tests COMMAND voxel_scheduler_tests)
 add_executable(voxel_sdk_tests
     tests/VoxelSdkTests.cpp
     $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
     $<TARGET_OBJECTS:vc_voxel_runtime>
     $<TARGET_OBJECTS:vc_voxel_generation>
-    $<TARGET_OBJECTS:vc_entity_runtime>
-    src/engine/core/uuid/UUID.cpp
-    src/engine/audio/SoundEngine.cpp
-    src/engine/audio/MiniaudioImpl.cpp
+    src/engine/networking/NetworkRuntime.cpp
 )
 target_include_directories(voxel_sdk_tests PRIVATE src/engine/public ${glm_SOURCE_DIR})
 target_link_libraries(voxel_sdk_tests PRIVATE
@@ -777,9 +866,44 @@ target_link_libraries(voxel_sdk_tests PRIVATE
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
     $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
     vc_navigation
+    vc_fastwfc
+    vc_meshoptimizer
+    vc_xatlas
 )
-add_dependencies(voxel_sdk_tests vc_generate_world_save)
+if(TARGET vc_generate_world_save)
+    add_dependencies(voxel_sdk_tests vc_generate_world_save)
+endif()
 add_test(NAME voxel_sdk_tests COMMAND voxel_sdk_tests)
+
+# MCP registry-asset gate (FALTANTES item 23 / prioridade 5): the versioned
+# JSON documents the MCP semantic layer authors (Content/Registry/<kind>/*.json)
+# must load through the PUBLIC factories unchanged. The test TU compiles against
+# only the public headers (like voxel_sdk_tests) and mirrors the exact documents
+# tools/mcp-server/protocol-smoke.mjs emits.
+add_executable(mcp_registry_gate_tests
+    tests/McpRegistryGateTests.cpp
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_include_directories(mcp_registry_gate_tests PRIVATE src/engine/public ${glm_SOURCE_DIR})
+target_link_libraries(mcp_registry_gate_tests PRIVATE
+    vc_build_options
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation
+    vc_fastwfc
+    vc_meshoptimizer
+    vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(mcp_registry_gate_tests vc_generate_world_save)
+endif()
+add_test(NAME mcp_registry_gate_tests COMMAND mcp_registry_gate_tests)
 endif()
 
 add_executable(VulkanEngineCooker
@@ -796,10 +920,96 @@ target_link_libraries(VulkanProjectGenerator PRIVATE vc_build_options)
 add_executable(VulkanPackageBuilder src/tools/main_package_builder.cpp src/tools/BuildTools.cpp)
 target_link_libraries(VulkanPackageBuilder PRIVATE vc_build_options)
 
-install(TARGETS VulkanEngineGame VulkanEngineServer VulkanEngineCooker VulkanShaderCompiler VulkanProjectGenerator VulkanPackageBuilder
-    RUNTIME DESTINATION bin)
-install(TARGETS VulkanEngineEditor RUNTIME DESTINATION bin)
+# The built tool/game executables, staged when present (a partial build skips
+# the ones it did not produce). The documented flow is Release; the engine's
+# verification commands all use --config Release.
+foreach(vc_exe VulkanEngineGame VulkanEngineServer VulkanEngineCooker
+        VulkanShaderCompiler VulkanProjectGenerator VulkanPackageBuilder
+        VulkanEngineEditor)
+    install(FILES "${CMAKE_BINARY_DIR}/Release/${vc_exe}.exe" DESTINATION bin OPTIONAL)
+endforeach()
 install(DIRECTORY assets/ DESTINATION assets OPTIONAL)
+
+# FALTANTES item 11 / §24 — redistributable SDK install: only the public
+# headers, the MCP server, the built tools/binaries, and (Windows) the runtime
+# DLLs. No src/, no build/, no workspace paths. The staged tree is verified by
+# tools/portability/clean-machine-gate.mjs.
+install(DIRECTORY src/engine/public/ DESTINATION include FILES_MATCHING PATTERN "*.hpp")
+install(DIRECTORY tools/mcp-server DESTINATION tools
+    FILES_MATCHING PATTERN "*.mjs" PATTERN "package.json" PATTERN "README.md")
+install(FILES SDK.md DESTINATION .)
+if(WIN32)
+    install(DIRECTORY "${CMAKE_BINARY_DIR}/Release/" DESTINATION bin OPTIONAL
+        FILES_MATCHING PATTERN "*.dll")
+endif()
+
+# FALTANTES item 11 / §24 — consumable SDK archive: ONE static library packing
+# the public registries + procgen (vc_sdk_public), the public gameplay runtime
+# (vc_gameplay_sdk), the voxel runtime/generation and the network/sound
+# adapters — the exact object set voxel_sdk_tests links. External projects
+# consume ONLY this archive + the installed public headers + glm; the
+# relocatable package config below resolves every dependency relative to the
+# install prefix (verified by tools/portability/external-consumer-gate.mjs).
+# The object modules already compiled with vc_build_options; only the three
+# direct TUs compile here (same flags via vc_build_options).
+add_library(vc_sdk STATIC
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_link_libraries(vc_sdk PRIVATE vc_build_options)
+if(TARGET vc_generate_world_save)
+    add_dependencies(vc_sdk vc_generate_world_save)
+endif()
+
+# The engine's jolt target shares its OUTPUT_NAME with the Jolt target created
+# by Jolt.cmake; pin it so the installed archive name is deterministic on every
+# filesystem (the build already writes Jolt.lib via case-insensitive collision).
+set_target_properties(jolt PROPERTIES OUTPUT_NAME Jolt)
+
+# The vc_sdk archive links vc_sdk_public, which includes the storage TUs
+# (zstd/blake3/rocksdb/flatbuffers) unconditionally — it cannot be built when
+# those optional deps are OFF (e.g. the clean-machine gate's reduced configure).
+# Install it OPTIONAL so partial builds stage everything else and skip this lib
+# silently; the workspace build always produces it.
+install(FILES "$<TARGET_FILE:vc_sdk>" DESTINATION lib OPTIONAL)
+foreach(vc_lib vc_zstd vc_blake3 vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas)
+    if(TARGET ${vc_lib})
+        # $<TARGET_FILE:...> resolves the real archive path (subdirectory
+        # builds like rocksdb/flatbuffers land outside the top-level Release
+        # dir); OPTIONAL skips silently when a partial build defined the
+        # target but did not build its archive (clean-machine gate, deps OFF).
+        install(FILES "$<TARGET_FILE:${vc_lib}>" DESTINATION lib OPTIONAL)
+    endif()
+endforeach()
+foreach(vc_lib flatbuffers rocksdb jolt bullet)
+    if(TARGET ${vc_lib})
+        install(FILES "$<TARGET_FILE:${vc_lib}>" DESTINATION lib OPTIONAL)
+    endif()
+endforeach()
+# glm headers: the public contracts include <glm/...>, so the consumer needs
+# the same header-only library voxel_sdk_tests compiles against.
+install(DIRECTORY ${glm_SOURCE_DIR}/glm DESTINATION include)
+
+# Relocatable package config: every path resolves from this file's location, so
+# the staged prefix can move or be consumed from another checkout/machine.
+set(VULKAN_CRAFT_SDK_LINK_LIBS "")
+foreach(vc_lib vc_zstd vc_blake3 vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas flatbuffers rocksdb jolt bullet)
+    if(TARGET ${vc_lib})
+        get_target_property(_vc_on ${vc_lib} OUTPUT_NAME)
+        if(NOT _vc_on)
+            set(_vc_on ${vc_lib})
+        endif()
+        list(APPEND VULKAN_CRAFT_SDK_LINK_LIBS "${_vc_on}.lib")
+    endif()
+endforeach()
+string(JOIN ";" VULKAN_CRAFT_SDK_LINK_LIBS_CMAKE ${VULKAN_CRAFT_SDK_LINK_LIBS})
+configure_file(cmake/vulkan_craft_sdk-config.cmake.in
+    ${CMAKE_BINARY_DIR}/vulkan_craft_sdk-config.cmake @ONLY)
+install(FILES ${CMAKE_BINARY_DIR}/vulkan_craft_sdk-config.cmake
+    DESTINATION lib/cmake/vulkan_craft_sdk)
 
 add_executable(far_terrain_sampling_benchmark
     tests/FarTerrainSamplingBenchmark.cpp

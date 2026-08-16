@@ -28,8 +28,6 @@ int main() {
     const auto worldSource = read(root / "src/simulation/voxel/streaming/World.cpp");
     const auto playerHeader = read(root / "src/features/player/Player.hpp");
     const auto playerSource = read(root / "src/features/player/Player.cpp");
-    const auto mobHeader = read(root / "src/simulation/entities/Mob.hpp");
-    const auto mobSource = read(root / "src/simulation/entities/Mob.cpp");
     const auto editorSource = read(root / "src/editor/EditorApplication.cpp");
 
 #ifdef _WIN32
@@ -56,14 +54,27 @@ int main() {
         std::cerr << "Player feature depends directly on GLFW\n";
         return 1;
     }
-    if (contains_forbidden_rendering_type(mobHeader) ||
-        contains_forbidden_rendering_type(mobSource) ||
-        mobHeader.find("VkCommandBuffer") != std::string::npos ||
-        mobSource.find("VkCommandBuffer") != std::string::npos ||
-        mobHeader.find("Frustum") != std::string::npos ||
-        mobSource.find("Frustum") != std::string::npos) {
-        std::cerr << "Mob simulation depends on renderer/Vulkan\n";
+    // FALTANTES §8 item 166: simulation must never read the VISUAL material
+    // table. World.cpp resolves builtin solidity/light through the simulation
+    // table (get_block_sim / BLOCK_SIM_PROPS); get_block_material/BLOCK_MATERIALS
+    // stay in the render path only.
+    if (worldSource.find("get_block_material(") != std::string::npos ||
+        worldSource.find("BLOCK_MATERIALS[") != std::string::npos) {
+        std::cerr << "CPU simulation reads the visual material table\n";
         return 1;
+    }
+    // BlockMaterial must be appearance-only (color/textures). A solid/transparent
+    // member there would let a visual edit silently change physics.
+    const std::size_t materialStruct = voxelCore.find("struct BlockMaterial");
+    const std::size_t materialEnd = voxelCore.find("};", materialStruct);
+    if (materialStruct != std::string::npos && materialEnd != std::string::npos) {
+        const std::string materialBody =
+            voxelCore.substr(materialStruct, materialEnd - materialStruct);
+        if (materialBody.find("bool solid") != std::string::npos ||
+            materialBody.find("bool transparent") != std::string::npos) {
+            std::cerr << "BlockMaterial carries simulation flags\n";
+            return 1;
+        }
     }
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root / "src")) {
         if (!entry.is_regular_file()) continue;

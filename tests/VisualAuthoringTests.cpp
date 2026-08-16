@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <process.h>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -523,7 +524,7 @@ bool run_all() {
         canvas.set_node_title(a, "Begin");
         canvas.mark_saved();
 
-        const std::filesystem::path dir = std::filesystem::temp_directory_path() / "vc_visual_authoring";
+        const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("vc_visual_authoring_" + std::to_string(_getpid()));
         std::filesystem::create_directories(dir);
         const std::filesystem::path file = dir / "canvas.vsc";
         CHECK(canvas.save_to_file(file));
@@ -761,7 +762,7 @@ bool run_all() {
         CHECK(untouched.variations.size() == 1);
 
         // File round-trip.
-        const std::filesystem::path dir = std::filesystem::temp_directory_path() / "vc_audio_editor";
+        const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("vc_audio_editor_" + std::to_string(_getpid()));
         std::filesystem::create_directories(dir);
         const std::filesystem::path file = dir / "event.json";
         CHECK(audio.save_to_file(file));

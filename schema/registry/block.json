@@ -1,0 +1,226 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/registry/block.json",
+  "title": "block registry asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "short block name (e.g. titanium)",
+      "type": "string"
+    },
+    "namespace": {
+      "description": "namespaced prefix",
+      "default": "vulkancraft",
+      "type": "string"
+    },
+    "id": {
+      "description": "persistent UUID; derived from ns:name when omitted",
+      "type": "string"
+    },
+    "class": {
+      "description": "\"class\" registry field",
+      "default": "solid",
+      "enum": [
+        "solid",
+        "transparent",
+        "nonsolid",
+        "non_solid",
+        "fluid"
+      ]
+    },
+    "hardness": {
+      "description": "\"hardness\" registry field",
+      "default": 1,
+      "type": "number"
+    },
+    "lightEmission": {
+      "description": "\"light_emission\" registry field",
+      "default": 0,
+      "type": "number"
+    },
+    "lightAbsorption": {
+      "description": "\"light_absorption\" registry field",
+      "default": 1,
+      "type": "number"
+    },
+    "opaque": {
+      "description": "\"opaque\" registry field",
+      "default": true,
+      "type": "boolean"
+    },
+    "collidable": {
+      "description": "\"collidable\" registry field",
+      "default": true,
+      "type": "boolean"
+    },
+    "collisionShape": {
+      "description": "collision shape (item 2): none = not solid, cross = thin hitbox (physics milestone); none wins over collidable:true",
+      "default": "full",
+      "enum": [
+        "full",
+        "cross",
+        "none"
+      ]
+    },
+    "selectionShape": {
+      "description": "selection/pick-box shape (item 2): feeds the editor milestone",
+      "default": "full",
+      "enum": [
+        "full",
+        "cross",
+        "none"
+      ]
+    },
+    "builtinId": {
+      "description": "unsupported today: the builtin table occupies every id in 0..50, so any declared mapping is refused; author catalog-only blocks (omit builtin_id)",
+      "type": "integer"
+    },
+    "color": {
+      "description": "[r, g, b(, a)] 0..1 — base color (also the fallback for unset faces)",
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 4,
+      "items": {
+        "type": "number"
+      }
+    },
+    "faceTop": {
+      "description": "[r, g, b(, a)] 0..1 — color of the +Y face (overrides color)",
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 4,
+      "items": {
+        "type": "number"
+      }
+    },
+    "faceBottom": {
+      "description": "[r, g, b(, a)] 0..1 — color of the -Y face (overrides color)",
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 4,
+      "items": {
+        "type": "number"
+      }
+    },
+    "faceSide": {
+      "description": "[r, g, b(, a)] 0..1 — color of horizontal faces (overrides color)",
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 4,
+      "items": {
+        "type": "number"
+      }
+    },
+    "occlusion": {
+      "description": "false draws faces even against opaque neighbors (fences/plants)",
+      "default": true,
+      "type": "boolean"
+    },
+    "renderLayer": {
+      "description": "render layer hint in [0, 255]",
+      "default": 0,
+      "type": "integer"
+    },
+    "states": {
+      "description": "named states (FALTANTES item 5): [{ name, color, face_top?, face_side?, face_bottom?, light_emission? }]; states[0] = default state",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "transitions": {
+      "description": "versioned transition rules (FALTANTES item 5): [{ from, to, trigger }]; \"\" = default state",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "fluid": {
+      "description": "inline fluid binding (FALTANTES item 7): the block drives this fluid directly, no separate fluid asset needed — { viscosity, density, range, tick_interval, source, falling, evaporation, damage_per_tick, compressible }",
+      "type": "object"
+    },
+    "soundPlace": {
+      "description": "namespaced sound id for placing the block (item 4)",
+      "type": "string"
+    },
+    "soundBreak": {
+      "description": "namespaced sound id for breaking the block (item 4)",
+      "type": "string"
+    },
+    "soundStep": {
+      "description": "namespaced sound id for stepping on the block (item 4)",
+      "type": "string"
+    },
+    "soundHit": {
+      "description": "namespaced sound id for hitting the block (item 4)",
+      "type": "string"
+    },
+    "particleBreak": {
+      "description": "namespaced particle id emitted when the block breaks (item 4)",
+      "type": "string"
+    },
+    "tool": {
+      "description": "required tool class (item 4): any|pickaxe|axe|shovel|hoe|sword",
+      "default": "any",
+      "type": "string"
+    },
+    "toolTier": {
+      "description": "required mining tier in [0, 4] (item 4)",
+      "default": 0,
+      "type": "integer"
+    },
+    "resistance": {
+      "description": "explosion/destruction resistance, >= 0 (item 4)",
+      "default": 0,
+      "type": "number"
+    },
+    "friction": {
+      "description": "physics friction in 0..1 (item 4)",
+      "default": 0.5,
+      "type": "number"
+    },
+    "bounciness": {
+      "description": "physics restitution in 0..1 (item 4)",
+      "default": 0,
+      "type": "number"
+    },
+    "density": {
+      "description": "physics density, > 0 (item 4)",
+      "default": 1,
+      "type": "number"
+    },
+    "behaviorId": {
+      "description": "declarative behavior reference (item 6): namespaced id (ns:name) or empty",
+      "type": "string"
+    },
+    "tags": {
+      "description": "\"tags\" registry field",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "drops": {
+      "description": "\"drops\" registry field",
+      "default": [
+        "vulkancraft:<name>"
+      ],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "version": {
+      "description": "\"version\" registry field",
+      "default": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "name"
+  ]
+}

@@ -5,7 +5,7 @@ Servidor MCP local e portátil, sem dependências externas, para agentes de IA c
 ## Executar
 
 ```powershell
-node C:\Users\fahre\.gemini\antigravity\scratch\vulkan_craft\engine\tools\mcp-server\server.mjs
+node <engine>/tools/mcp-server/server.mjs
 ```
 
 ## Configuração MCP
@@ -16,12 +16,26 @@ node C:\Users\fahre\.gemini\antigravity\scratch\vulkan_craft\engine\tools\mcp-se
     "vulkancraft-engine": {
       "command": "node",
       "args": [
-        "C:\\Users\\fahre\\.gemini\\antigravity\\scratch\\vulkan_craft\\engine\\tools\\mcp-server\\server.mjs"
+        "<engine>\\tools\\mcp-server\\server.mjs"
       ]
     }
   }
 }
 ```
+
+## CLI de registry assets (FALTANTES item 10)
+
+Sem servidor MCP, o mesmo contrato está disponível em linha de comando (`registry-cli.mjs`, sem dependências — reusa exatamente as factories do servidor):
+
+```
+node <engine>/tools/mcp-server/registry-cli.mjs kinds
+node <engine>/tools/mcp-server/registry-cli.mjs schema <kind>            # JSON Schema draft-07
+node <engine>/tools/mcp-server/registry-cli.mjs export-schemas [outDir] # escreve schema/registry/<kind>.json
+node <engine>/tools/mcp-server/registry-cli.mjs validate <kind> <file.json>   # exit 1 em documento inválido
+node <engine>/tools/mcp-server/registry-cli.mjs author --engine <root> --project <nome> --kind <kind> --name <n> --file <doc.json> [--dry-run] [--update]
+```
+
+Os schemas exportados (draft-07) são o artefato para editor/IDE (intellisense), scripting e CI validarem os documentos de `Content/Registry/`; o `game_capabilities` do MCP também os serve como `registry_schemas`. Gerados do mesmo `REGISTRY_FIELD_SCHEMAS` que a autoria espelha — uma única fonte de verdade.
 
 ## Ferramentas
 
@@ -39,7 +53,18 @@ node C:\Users\fahre\.gemini\antigravity\scratch\vulkan_craft\engine\tools\mcp-se
 - `create_audio_event`: eventos de áudio com variação e espacialização.
 - `create_physics_material`: materiais físicos nativos.
 - `stage_asset`: assets e import settings portáteis.
-- `validate_game_project`: validação sem compilar ou modificar a engine.
+- `author_registry_asset`: assets de registry (block/item/fluid/recipe/biome/structure) como JSON versionado em `Content/Registry/<kind>/<name>.json`, espelhando exatamente os schemas JSON que as factories públicas C++ parseiam. Aceita `dry_run: true` (valida e pré-visualiza o documento/diff sem gravar) e `update: true` (substitui devolvendo o documento anterior para rollback). Assets inválidos são recusados com diagnósticos estruturados.
+- `inspect_registry_assets`: lista e valida todos os assets de registry de um projeto.
+- `validate_game_project`: validação sem compilar ou modificar a engine (inclui assets de registry).
+
+### Assets de registry (FALTANTES §23)
+
+Cada documento é validado estruturalmente contra as regras das factories públicas (`BlockRegistry`/`ItemRegistry`/`FluidRegistry`/`RecipeRegistry`, `IBiomeRegistry`, `IStructureGenerator`). O gate de equivalência `mcp_registry_gate_tests` prova que os documentos emitidos carregam pelas factories públicas sem alteração; `protocol-smoke.mjs` cobre os seis kinds, dry-run e recusas.
+
+Observações honestas do contrato atual:
+- Blocos são **catalog-only**: declarar `builtin_id` é recusado porque a tabela builtin ocupa todos os ids 0..50 (`BlockType::Count`), então qualquer mapeamento falharia no C++ como "already used"/"out of range".
+- Receitas validam estrutura no MCP; as referências de item/tag são validadas pelo `RecipeRegistry` C++ contra um `ItemRegistry` registrado.
+- Valores que o C++ clamparia silenciosamente (viscosity 0..1, range 1..7, damagePerTick ≥ 0, time/energy ≥ 0, chance em (0,1]) são recusados no MCP para o asset autorado round-trip bit-exato.
 
 ### Manutenção da engine
 

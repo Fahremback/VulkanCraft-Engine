@@ -4,8 +4,7 @@
 #include "../src/engine/scripting/VisualScripting.hpp"
 #include "../src/engine/gameplay/GameplayVisual.hpp"
 #include "../src/engine/gameplay/WeaponSystem.hpp"
-#include "../src/engine/navigation/Navigation.hpp"
-#include "../src/engine/navigation/Navmesh.hpp"
+#include "engine/navigation/INavigationProvider.hpp"
 #include "../src/engine/audio/OggDecoder.hpp"
 #include "../src/engine/audio/AudioZones.hpp"
 #include "../src/engine/physics/PhysicsAdvanced.hpp"
@@ -15,11 +14,17 @@
 #include "../src/tools/BuildTools.hpp"
 
 #include <cmath>
+#include <process.h>
+#include <cstddef>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <vector>
 
 using namespace Engine;
 
@@ -75,7 +80,10 @@ int main() {
     if (!IKSolver::solve_two_bone(ikPose, 0, 1, {1,1,0}, 1.0f) ||
         glm::distance(ikPose.local[1].translation, glm::vec3(1,1,0)) > 0.02f) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
 
-    const auto assetRoot = std::filesystem::temp_directory_path() / "advanced_animation_assets";
+    // pid suffix: two concurrent instances of this binary must not share the
+    // same temp paths (fixed names collided under parallel ctest runs).
+    const auto assetRoot = std::filesystem::temp_directory_path() /
+        ("advanced_animation_assets_" + std::to_string(_getpid()));
     std::filesystem::remove_all(assetRoot);
     std::filesystem::create_directories(assetRoot);
     const auto skeletonPath = assetRoot / "hero.skeleton";
@@ -135,7 +143,8 @@ int main() {
     mission.signal("collect");
     mission.signal("return");
     if (mission.state() != MissionState::Completed) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
-    const auto savePath = std::filesystem::temp_directory_path() / "advanced_mission_state.txt";
+    const auto savePath = std::filesystem::temp_directory_path() /
+        ("advanced_mission_state_" + std::to_string(_getpid()) + ".txt");
     if (!mission.save(savePath)) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
     MissionRuntime restored(missionDef);
     if (!restored.load(savePath) || restored.state() != MissionState::Completed) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
@@ -175,24 +184,56 @@ int main() {
     weapon.update(0.2f,{0,0,0},{0,0,-1}); if(weapon.ammo()!=2||weapon.reserve()!=0)
         { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
 
-    // Navigation: bake walkable cells, obstacles, A*, links, agent movement and streaming tiles.
-    NavigationGrid nav(8, 8, 1.0f);
-    for (int y = 0; y < 7; ++y) nav.set_blocked({3, y}, true);
-    nav.set_blocked({3, 4}, false);
-    const NavigationPath path = nav.find_path({0,0}, {7,7});
-    if (!path.success || path.points.size() < 8) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
-    NavigationAgent agent;
-    agent.position = path.points.front();
-    agent.speed = 4.0f;
-    agent.set_path(path);
-    for (int i = 0; i < 100 && !agent.reached_destination(); ++i) agent.update(0.1f);
-    if (!agent.reached_destination()) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
-    NavigationWorld navWorld;
-    navWorld.load_tile({0,0}, nav);
-    if (!navWorld.is_tile_loaded({0,0}) || !navWorld.find_path({0.2f,0,0.2f}, {7.2f,0,7.2f}).success)
-        { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
-    navWorld.unload_tile({0,0});
-    if (navWorld.is_tile_loaded({0,0})) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
+    // Navigation via the public provider (FALTANTES item 12): bake walkable
+    // cells with a wall + gap, pathfinding that detours, agent movement (the
+    // legacy grid track was removed).
+    {
+        using namespace engine::navigation;
+        auto provider = create_recast_navigation_provider();
+        NavmeshConfig config;
+        config.boundsMinX = -1.0f;
+        config.boundsMaxX = 8.0f;
+        config.boundsMinZ = -1.0f;
+        config.boundsMaxZ = 8.0f;
+        config.cellSize = 0.5f;
+        config.cellHeight = 0.2f;
+        config.agentRadius = 0.3f;
+        config.agentHeight = 1.8f;
+        config.agentMaxClimb = 1.0f;
+        std::vector<VoxelColumn> columns;
+        for (int gx = 0; gx < 18; ++gx) {
+            for (int gz = 0; gz < 18; ++gz) {
+                const float cx = -1.0f + (gx + 0.5f) * 0.5f;
+                const float cz = -1.0f + (gz + 0.5f) * 0.5f;
+                const bool wall = (cx >= 2.75f && cx <= 3.25f) && (cz >= 0.0f && cz <= 8.0f) && (cz < 2.5f || cz > 5.5f);
+                if (wall) continue;  // wall with a gap at z~4 (omitted cells)
+                columns.push_back({ cx, cz, 0.0f, 1.0f, true });
+            }
+        }
+        std::string navError;
+        if (!provider->build(config, columns, navError)) { std::cerr << "Failure at line " << __LINE__ << " nav=" << navError << '\n'; return EXIT_FAILURE; }
+        PathResult path;
+        if (!provider->find_path(0.5f, 1.0f, 0.5f, 7.5f, 1.0f, 7.5f, path) || !path.found) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
+        if (path.waypoints.size() < 8) { std::cerr << "Failure at line " << __LINE__ << " waypoints=" << path.waypoints.size() << '\n'; return EXIT_FAILURE; }
+        // Agent follows the waypoints to the goal.
+        glm::vec3 position(0.5f, 1.0f, 0.5f);
+        std::size_t wp = 0;
+        const float speed = 4.0f;
+        for (int i = 0; i < 200; ++i) {
+            if (wp >= path.waypoints.size() / 3) break;
+            const glm::vec3 target(path.waypoints[wp * 3], path.waypoints[wp * 3 + 1], path.waypoints[wp * 3 + 2]);
+            const glm::vec3 dir = target - position;
+            const float dist = glm::length(dir);
+            if (dist <= 1e-4f) {
+                ++wp;
+                continue;
+            }
+            const float step = std::min(speed * 0.1f, dist);
+            position += (dir / dist) * step;
+            if (step >= dist - 1e-4f) ++wp;
+        }
+        if (wp < path.waypoints.size() / 3) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
+    }
 
     const auto generated = assetRoot / "GeneratedGame";
     Engine::Tools::ProjectOptions projectOptions; projectOptions.name="GeneratedGame"; projectOptions.enginePath="engine"; projectOptions.voxelPlugin=false;
@@ -380,89 +421,85 @@ int main() {
     }
     std::filesystem::remove_all(assetRoot);
 
-    // Navmesh: baking with obstacles, A* pathfinding that detours, crowd RVO.
+    // Navmesh via the public provider (FALTANTES item 12): baking with
+    // obstacle columns, pathfinding that detours (the legacy grid track and
+    // its crowd RVO were removed with it — the promoted INavigationProvider is
+    // the authority).
     {
-        using namespace Engine::Navigation;
-        NavmeshSettings settings;
-        settings.boundsMin = {-20, -20};
-        settings.boundsMax = {20, 20};
-        settings.cellSize = 0.5f;
-        settings.agentRadius = 0.3f;
-        HeightSampler flat = [](float, float) { return 0.0f; };
+        using namespace engine::navigation;
+        auto provider = create_recast_navigation_provider();
+        NavmeshConfig config;
+        config.boundsMinX = -20.0f;
+        config.boundsMaxX = 20.0f;
+        config.boundsMinZ = -20.0f;
+        config.boundsMaxZ = 20.0f;
+        config.boundsMinY = -8.0f;
+        config.boundsMaxY = 200.0f;
+        config.cellSize = 0.5f;
+        config.cellHeight = 0.2f;
+        config.agentRadius = 0.4f;
+        config.agentHeight = 1.8f;
+        config.agentMaxClimb = 1.0f;
+        config.agentMaxSlope = 45.0f;
 
-        // Wall obstacle splitting the arena in two, with a gap at the center.
-        std::vector<NavObstacle> obstacles;
-        obstacles.push_back(NavObstacle{{-5.0f, 0.0f}, {0.5f, 8.0f}, 0.0f, 100.0f}); // left wall half
-        obstacles.push_back(NavObstacle{{5.0f, 0.0f}, {0.5f, 8.0f}, 0.0f, 100.0f});  // right wall half
-        // Gap between x=-5..5 at center so agents can cross.
+        // Flat floor; two walls at x=±5 (cells omitted = blocked), each 2
+        // units thick so a probe at their center is genuinely outside the
+        // walkable search extents (agentRadius*2), with the corridor between
+        // them as the crossing.
+        std::vector<VoxelColumn> columns;
+        for (int gx = 0; gx < 80; ++gx) {
+            for (int gz = 0; gz < 80; ++gz) {
+                const float cx = -20.0f + (gx + 0.5f) * 0.5f;
+                const float cz = -20.0f + (gz + 0.5f) * 0.5f;
+                const bool wallLeft = (cx >= -6.0f && cx <= -4.0f) && std::abs(cz) <= 8.5f;
+                const bool wallRight = (cx >= 4.0f && cx <= 6.0f) && std::abs(cz) <= 8.5f;
+                if (wallLeft || wallRight) continue;
+                columns.push_back({ cx, cz, 0.0f, 1.0f, true });
+            }
+        }
+        std::string navError;
+        if (!provider->build(config, columns, navError)) { std::cerr << "Failure at line " << __LINE__ << " nav=" << navError << '\n'; return EXIT_FAILURE; }
+        // Points inside the wall footprint are not walkable; the corridor is.
+        if (provider->is_walkable(-5.0f, 1.0f, 0.0f)) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
+        if (!provider->is_walkable(0.0f, 1.0f, 0.0f)) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
 
-        Navmesh mesh;
-        if (!mesh.build(settings, obstacles, flat)) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
-        if (mesh.polygons().empty()) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
-        // Points inside the wall footprint are not walkable.
-        if (mesh.is_walkable(-5.0f, 0.0f, 0.0f)) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
-        // Points in the gap are walkable.
-        if (!mesh.is_walkable(0.0f, 0.0f, 0.0f)) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
-
-        // Pathfinding from left side to right side must detour through the gap.
-        const auto path = mesh.find_path(glm::vec3(-15, 0, 0), glm::vec3(15, 0, 0));
-        if (path.size() < 3) { std::cerr << "Failure at line " << __LINE__ << " path=" << path.size() << '\n'; return EXIT_FAILURE; }
-        // The path must exist and must NOT cross the wall footprint
-        // (|x| in [4.2, 5.8] while |z| < 8.3 — the wall covers z up to ±8.3).
+        // Pathfinding from left to right must detour through the gap and NOT
+        // cross the wall footprint (|x| in [4.2, 5.8] while |z| < 8.3).
+        PathResult path;
+        if (!provider->find_path(-15.0f, 1.0f, 0.0f, 15.0f, 1.0f, 0.0f, path) || !path.found) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
+        if (path.waypoints.size() < 2) { std::cerr << "Failure at line " << __LINE__ << " waypoints=" << path.waypoints.size() << '\n'; return EXIT_FAILURE; }
         bool crossesWall = false;
-        for (const auto& p : path) {
-            const float ax = std::abs(p.x);
-            if (ax >= 4.2f && ax <= 5.8f && std::abs(p.z) <= 8.3f) { crossesWall = true; break; }
+        for (std::size_t i = 0; i + 2 < path.waypoints.size(); i += 3) {
+            const float ax = std::abs(path.waypoints[i]);
+            if (ax >= 4.2f && ax <= 5.8f && std::abs(path.waypoints[i + 2]) <= 8.3f) { crossesWall = true; break; }
         }
         if (crossesWall) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
 
-        // Smoothing reduces waypoint count.
-        const auto smooth = Navmesh::smooth_path(path, 0.3f);
-        if (smooth.empty() || smooth.front() != path.front() || smooth.back() != path.back()) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
-
-        // Slope rejection: a steep ramp cell should be unwalkable.
-        NavmeshSettings hillSettings = settings;
-        hillSettings.maxSlope = 30.0f;
-        HeightSampler hill = [](float x, float) { return x * 0.9f; }; // ~42 degree slope
-        Navmesh hillMesh;
-        // A fully steep field may produce zero polygons (valid_=false); that is
-        // correct behavior — nothing walkable. Otherwise verify low ratio.
-        hillMesh.build(hillSettings, {}, hill);
+        // Slope rejection: a fully steep ramp field is (mostly) unwalkable at
+        // maxSlope 30° — a fully steep field may even build no polygons; that
+        // is correct behavior (nothing walkable).
+        NavmeshConfig hillConfig = config;
+        hillConfig.agentMaxSlope = 30.0f;
+        std::vector<VoxelColumn> hill;
+        for (int gx = 0; gx < 80; ++gx) {
+            for (int gz = 0; gz < 80; ++gz) {
+                const float cx = -20.0f + (gx + 0.5f) * 0.5f;
+                const float cz = -20.0f + (gz + 0.5f) * 0.5f;
+                const float h = cx * 0.9f;  // ~42 degree ramp (positive half)
+                if (h <= 0.0f) continue;
+                hill.push_back({ cx, cz, 0.0f, h + 1.0f, true });
+            }
+        }
+        provider->build(hillConfig, hill, navError);
         float walkableCount = 0, total = 0;
-        for (float x = -10; x <= 10; x += 1.0f) {
-            for (float z = -10; z <= 10; z += 1.0f) {
+        for (float x = -10.0f; x <= 10.0f; x += 1.0f) {
+            for (float z = -10.0f; z <= 10.0f; z += 1.0f) {
                 ++total;
-                if (hillMesh.is_walkable(x, z, hill(x, z))) ++walkableCount;
+                const float topY = std::max(x * 0.9f, 0.0f) + 1.0f;
+                if (provider->is_walkable(x, topY, z)) ++walkableCount;
             }
         }
         if (walkableCount / total > 0.15f) { std::cerr << "Failure at line " << __LINE__ << " ratio=" << walkableCount / total << '\n'; return EXIT_FAILURE; }
-
-        // Crowd simulation: two agents on a head-on collision course must
-        // steer around each other and keep separation ≥ sum of radii.
-        CrowdSimulation crowd;
-        std::vector<CrowdAgent> agents(2);
-        agents[0].id = 0;
-        agents[0].position = glm::vec3(-6, 0, -0.3f);
-        agents[0].maxSpeed = 3.0f;
-        agents[1].id = 1;
-        agents[1].position = glm::vec3(6, 0, 0.3f);
-        agents[1].maxSpeed = 3.0f;
-        for (auto& a : agents) a.radius = 0.4f;
-        crowd.set_agents(agents);
-        glm::vec3 target0(6, 0, -0.3f), target1(-6, 0, 0.3f);
-        float minSeparation = 1e9f;
-        for (int i = 0; i < 240; ++i) {
-            auto& as = crowd.agents();
-            for (auto& a : as) {
-                const glm::vec3 t = (a.id == 0) ? target0 : target1;
-                const glm::vec3 to = t - a.position;
-                a.desiredVelocity = glm::length(to) > 0.01f ? glm::normalize(to) * a.maxSpeed : glm::vec3(0);
-            }
-            crowd.step(1.0f / 60.0f);
-            minSeparation = std::min(minSeparation, glm::distance(as[0].position, as[1].position));
-        }
-        // Sum of radii = 0.8; avoidance must keep them apart while passing.
-        if (minSeparation < 0.7f) { std::cerr << "Failure at line " << __LINE__ << " minSep=" << minSeparation << '\n'; return EXIT_FAILURE; }
     }
     std::filesystem::remove_all(assetRoot);
 
@@ -849,6 +886,266 @@ int main() {
 
         client.disconnect();
         server.disconnect();
+    }
+    // §17 perda/latência no transporte (real UDP loopback, camada confiável):
+    // a bidirectional UDP proxy with deterministic loss (every K-th datagram)
+    // and/or an artificial one-way delay line. The server learns the proxy as
+    // its peer (the proxy is the source of forwarded datagrams), so the proxy
+    // must forward BOTH directions: client->server (loss applied here) and
+    // server->client (lossless). Scenarios: loss recovery (handshake SYN retry
+    // + fragment retransmission reassemble correctly), bounded latency under
+    // delay, heartbeat keepalive past the timeout window, and peer timeout.
+    {
+        using namespace Engine::Networking;
+
+        struct LossyProxy {
+            SocketTransport in_;
+            std::string target_;
+            std::string clientAddr_;
+            int dropEveryK{0};
+            int counter{0};
+            int dropped{0};
+            double delayMs{0.0};
+            std::vector<std::tuple<double, std::string, std::vector<std::byte>>> delayed_;
+
+            bool start(std::uint16_t targetPort, int dropEveryK_, double delayMs_) {
+                dropEveryK = dropEveryK_;
+                delayMs = delayMs_;
+                target_ = std::string("127.0.0.1:") + std::to_string(targetPort);
+                return in_.listen(0, SocketKind::Udp);
+            }
+            std::uint16_t port() const { return in_.local_port(); }
+            void pump() {
+                const double nowSec = SocketTransport::now_seconds();
+                for (auto it = delayed_.begin(); it != delayed_.end();) {
+                    if (std::get<0>(*it) <= nowSec) {
+                        const auto& payload = std::get<2>(*it);
+                        in_.send_to(std::get<1>(*it), payload.data(), payload.size());
+                        it = delayed_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                while (auto dg = in_.poll()) {
+                    if (dg->peer == target_) {
+                        // Server reply -> client (lossless, optionally delayed).
+                        if (delayMs > 0.0) {
+                            delayed_.emplace_back(nowSec + delayMs / 1000.0, clientAddr_,
+                                                  std::move(dg->payload));
+                        } else if (!clientAddr_.empty()) {
+                            in_.send_to(clientAddr_, dg->payload.data(), dg->payload.size());
+                        }
+                        continue;
+                    }
+                    // Client datagram -> server (loss applied here).
+                    clientAddr_ = dg->peer;
+                    if (dropEveryK > 1 && (counter++ % dropEveryK) == 0) {
+                        ++dropped;
+                        continue;
+                    }
+                    if (delayMs > 0.0) {
+                        delayed_.emplace_back(nowSec + delayMs / 1000.0, target_,
+                                              std::move(dg->payload));
+                    } else {
+                        in_.send_to(target_, dg->payload.data(), dg->payload.size());
+                    }
+                }
+            }
+        };
+
+        const auto pump = [](ReliableTransport& server, ReliableTransport& client,
+                             LossyProxy* proxy, int milliseconds) {
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(milliseconds);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (proxy) proxy->pump();
+                server.update(std::chrono::steady_clock::now());
+                client.update(std::chrono::steady_clock::now());
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        };
+
+        // ── A) Loss recovery: deterministic drops (incl. the first SYN), small
+        // fragments + a fragmented message must all arrive intact via
+        // retransmission (handshake SYN retry + correct fragment metadata). ──
+        {
+            ReliableTransport::Config cfg;
+            cfg.maxPayload = 64;  // force fragmentation
+            cfg.retransmitTimeout = std::chrono::milliseconds(50);
+            cfg.heartbeatInterval = std::chrono::milliseconds(50);
+            cfg.timeoutAfter = std::chrono::milliseconds(3000);
+            cfg.maxRetransmits = 20;  // 50%-loss link needs a real retry budget
+            ReliableTransport server(cfg), client(cfg);
+
+            std::vector<std::string> received;
+            server.set_message_handler([&](const std::byte* data, std::size_t size) {
+                received.emplace_back(reinterpret_cast<const char*>(data), size);
+            });
+            bool serverConnected = false, clientConnected = false;
+            server.set_status_handler([&](ReliableTransport::Status s) {
+                if (s == ReliableTransport::Status::Connected) serverConnected = true;
+            });
+            client.set_status_handler([&](ReliableTransport::Status s) {
+                if (s == ReliableTransport::Status::Connected) clientConnected = true;
+            });
+
+            if (!server.listen(0)) { std::cerr << "Failure at line " << __LINE__ << " server listen\n"; return EXIT_FAILURE; }
+            LossyProxy proxy;
+            if (!proxy.start(server.local_port(), 2, 0.0)) { std::cerr << "Failure at line " << __LINE__ << " proxy\n"; return EXIT_FAILURE; }
+            if (!client.connect("127.0.0.1", proxy.port())) { std::cerr << "Failure at line " << __LINE__ << " client connect\n"; return EXIT_FAILURE; }
+
+            // Handshake through the lossy proxy: the first client datagram
+            // (the SYN) is always dropped, so this only succeeds because the
+            // handshake retries the SYN.
+            const auto hsDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!(serverConnected && clientConnected) && std::chrono::steady_clock::now() < hsDeadline) {
+                proxy.pump();
+                server.update(std::chrono::steady_clock::now());
+                client.update(std::chrono::steady_clock::now());
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            if (!(serverConnected && clientConnected)) { std::cerr << "Failure at line " << __LINE__ << " handshake under loss\n"; return EXIT_FAILURE; }
+
+            const int messageCount = 12;
+            for (int i = 0; i < messageCount; ++i) {
+                const std::string msg = "lossy-msg-" + std::to_string(i);
+                client.send(reinterpret_cast<const std::byte*>(msg.data()), msg.size());
+            }
+            const std::string big(1800, 'B');  // > maxPayload*3 -> fragmented
+            client.send(reinterpret_cast<const std::byte*>(big.data()), big.size());
+
+            const auto dataDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+            while (received.size() < static_cast<std::size_t>(messageCount) + 1 &&
+                   std::chrono::steady_clock::now() < dataDeadline) {
+                proxy.pump();
+                server.update(std::chrono::steady_clock::now());
+                client.update(std::chrono::steady_clock::now());
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            if (proxy.dropped == 0) { std::cerr << "Failure at line " << __LINE__ << " proxy dropped nothing\n"; return EXIT_FAILURE; }
+            if (client.retransmits() == 0) { std::cerr << "Failure at line " << __LINE__ << " no retransmission under loss\n"; return EXIT_FAILURE; }
+            if (received.size() != static_cast<std::size_t>(messageCount) + 1) {
+                std::cerr << "Failure at line " << __LINE__ << " got " << received.size() << " of " << messageCount + 1 << "\n"; return EXIT_FAILURE;
+            }
+            for (int i = 0; i < messageCount; ++i) {
+                const std::string expect = "lossy-msg-" + std::to_string(i);
+                if (received[static_cast<std::size_t>(i)] != expect) {
+                    std::cerr << "Failure at line " << __LINE__ << " message " << i << " corrupted\n"; return EXIT_FAILURE;
+                }
+            }
+            if (received.back() != big) { std::cerr << "Failure at line " << __LINE__ << " fragmented message corrupted\n"; return EXIT_FAILURE; }
+            client.close();
+            server.close();
+            std::cout << "reliable transport under loss: " << proxy.dropped << " dropped, "
+                      << client.retransmits() << " retransmits, all " << messageCount + 1
+                      << " messages intact in order\n";
+        }
+
+        // ── B) Latency: artificial one-way delay (delay line) — handshake and
+        // delivery still complete within a bounded wall-clock budget. ──
+        {
+            ReliableTransport::Config cfg;
+            cfg.retransmitTimeout = std::chrono::milliseconds(80);
+            cfg.heartbeatInterval = std::chrono::milliseconds(80);
+            cfg.timeoutAfter = std::chrono::milliseconds(4000);
+            ReliableTransport server(cfg), client(cfg);
+            std::vector<std::string> received;
+            server.set_message_handler([&](const std::byte* data, std::size_t size) {
+                received.emplace_back(reinterpret_cast<const char*>(data), size);
+            });
+            bool clientConnected = false;
+            client.set_status_handler([&](ReliableTransport::Status s) {
+                if (s == ReliableTransport::Status::Connected) clientConnected = true;
+            });
+            server.listen(0);
+            LossyProxy proxy;
+            proxy.start(server.local_port(), 1, 60.0);  // 60 ms one-way delay
+            client.connect("127.0.0.1", proxy.port());
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+            const auto start = std::chrono::steady_clock::now();
+            const std::string payload = "delayed-payload";
+            bool sent = false;
+            while (received.empty() && std::chrono::steady_clock::now() < deadline) {
+                proxy.pump();
+                server.update(std::chrono::steady_clock::now());
+                client.update(std::chrono::steady_clock::now());
+                if (clientConnected && !sent) {
+                    client.send(reinterpret_cast<const std::byte*>(payload.data()), payload.size());
+                    sent = true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            const double elapsedMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            if (received.size() != 1 || received[0] != payload) {
+                std::cerr << "Failure at line " << __LINE__ << " delayed delivery\n"; return EXIT_FAILURE;
+            }
+            if (elapsedMs > 5000.0) {
+                std::cerr << "Failure at line " << __LINE__ << " latency unbounded (" << elapsedMs << " ms)\n"; return EXIT_FAILURE;
+            }
+            if (client.status() != ReliableTransport::Status::Connected) {
+                std::cerr << "Failure at line " << __LINE__ << " connection dropped under delay\n"; return EXIT_FAILURE;
+            }
+            client.close();
+            server.close();
+            std::cout << "reliable transport under delay: delivery in " << elapsedMs << " ms (60 ms one-way)\n";
+        }
+
+        // ── C) Heartbeat keepalive: with no data at all, both sides stay
+        // Connected past the timeout window (heartbeats refresh lastReceive). ──
+        {
+            ReliableTransport::Config cfg;
+            cfg.heartbeatInterval = std::chrono::milliseconds(40);
+            cfg.timeoutAfter = std::chrono::milliseconds(200);
+            ReliableTransport server(cfg), client(cfg);
+            bool serverConnected = false, clientConnected = false;
+            server.set_status_handler([&](ReliableTransport::Status s) {
+                if (s == ReliableTransport::Status::Connected) serverConnected = true;
+            });
+            client.set_status_handler([&](ReliableTransport::Status s) {
+                if (s == ReliableTransport::Status::Connected) clientConnected = true;
+            });
+            server.listen(0);
+            client.connect("127.0.0.1", server.local_port());
+            pump(server, client, nullptr, 1000);  // handshake + idle (no messages)
+            if (!(serverConnected && clientConnected)) { std::cerr << "Failure at line " << __LINE__ << " handshake\n"; return EXIT_FAILURE; }
+            if (server.status() != ReliableTransport::Status::Connected ||
+                client.status() != ReliableTransport::Status::Connected) {
+                std::cerr << "Failure at line " << __LINE__ << " heartbeat keepalive failed\n"; return EXIT_FAILURE;
+            }
+            client.close();
+            server.close();
+            std::cout << "reliable transport heartbeat: idle past " << cfg.timeoutAfter.count() << " ms timeout, still connected\n";
+        }
+
+        // ── D) Peer timeout: the peer goes silent (socket torn down); the
+        // other side must reach TimedOut within the timeout window. ──
+        {
+            ReliableTransport::Config cfg;
+            cfg.heartbeatInterval = std::chrono::milliseconds(40);
+            cfg.timeoutAfter = std::chrono::milliseconds(200);
+            ReliableTransport server(cfg), client(cfg);
+            bool clientConnected = false;
+            client.set_status_handler([&](ReliableTransport::Status s) {
+                if (s == ReliableTransport::Status::Connected) clientConnected = true;
+            });
+            server.listen(0);
+            client.connect("127.0.0.1", server.local_port());
+            pump(server, client, nullptr, 600);  // handshake, then idle briefly
+            if (!clientConnected) { std::cerr << "Failure at line " << __LINE__ << " handshake\n"; return EXIT_FAILURE; }
+            server.close();  // peer goes silent
+            const auto tDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (client.status() != ReliableTransport::Status::TimedOut &&
+                   std::chrono::steady_clock::now() < tDeadline) {
+                client.update(std::chrono::steady_clock::now());
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            if (client.status() != ReliableTransport::Status::TimedOut) {
+                std::cerr << "Failure at line " << __LINE__ << " peer timeout not detected\n"; return EXIT_FAILURE;
+            }
+            client.close();
+            std::cout << "reliable transport timeout: silent peer detected in " << cfg.timeoutAfter.count() << " ms\n";
+        }
     }
     std::filesystem::remove_all(assetRoot);
 

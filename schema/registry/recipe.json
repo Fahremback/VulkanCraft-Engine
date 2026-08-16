@@ -1,0 +1,78 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/registry/recipe.json",
+  "title": "recipe registry asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "\"name\" registry field",
+      "type": "string"
+    },
+    "namespace": {
+      "description": "\"namespace\" registry field",
+      "default": "vulkancraft",
+      "type": "string"
+    },
+    "id": {
+      "description": "persistent UUID; derived from ns:name when omitted",
+      "type": "string"
+    },
+    "station": {
+      "description": "namespaced crafting station (ns:name)",
+      "type": "string"
+    },
+    "time": {
+      "description": "\"time\" registry field",
+      "default": 1,
+      "type": "number"
+    },
+    "energy": {
+      "description": "\"energy\" registry field",
+      "default": 0,
+      "type": "number"
+    },
+    "fuel": {
+      "description": "namespaced fuel item",
+      "type": "string"
+    },
+    "conditions": {
+      "description": "\"conditions\" registry field",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tags": {
+      "description": "\"tags\" registry field",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "inputs": {
+      "description": "[{item|tag, count>=1, alternatives: [ns:item, ...]}]",
+      "type": "array"
+    },
+    "outputs": {
+      "description": "[{item, count>=1, chance in (0,1]}]",
+      "type": "array"
+    },
+    "byproducts": {
+      "description": "same shape as outputs",
+      "type": "array"
+    },
+    "version": {
+      "description": "\"version\" registry field",
+      "default": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "name",
+    "inputs",
+    "outputs"
+  ]
+}

@@ -1,6 +1,7 @@
 #include "MobRenderer.hpp"
 
 #include "Voxel.hpp"
+#include "../../sdk/RegistryJson.hpp"
 
 #include <glm/gtc/matrix_transform.hpp>
 #include <cmath>
@@ -148,46 +149,80 @@ void MobRenderer::build_mob_limb_meshes(VkDevice device, VmaAllocator allocator)
 
 void MobRenderer::init(VkDevice device, VmaAllocator allocator) {
     build_mob_limb_meshes(device, allocator);
-    std::cout << "[MobManager] Initialized 3D Articulated Minecraft Mobs successfully!\n";
+    std::cout << "[MobRenderer] Entity-layer mob rendering initialized (legacy MobManager track removed)\n";
 }
 
-void MobRenderer::draw(const MobManager& mobManager, VkCommandBuffer cmd, VkPipelineLayout pipelineLayout, const glm::mat4& viewProj,
+// Parses the renderer-relevant fields of a mob component blob (JSON MobSpec).
+// The behavior owns the document; the renderer only reads presentation state.
+bool parse_mob_draw_state(const std::string& blob, uint32_t& typeIndexOut,
+                          float& yawOut, float& walkOut, float& fuseOut) {
+    engine::sdk::JsonValue root;
+    std::string error;
+    if (!engine::sdk::json_parse(blob, root, error) || !root.is_object()) {
+        return false;
+    }
+    typeIndexOut = static_cast<uint32_t>(
+        std::lround(engine::sdk::json_number(root, "typeIndex", 3.0)));
+    yawOut = static_cast<float>(engine::sdk::json_number(root, "yaw", 0.0));
+    walkOut = static_cast<float>(
+        engine::sdk::json_number(root, "walkAnimProgress", 0.0));
+    fuseOut = static_cast<float>(engine::sdk::json_number(root, "fuseTimer", 0.0));
+    return true;
+}
+
+void MobRenderer::draw(const engine::entity::IEntityWorld& entities, VkCommandBuffer cmd, VkPipelineLayout pipelineLayout, const glm::mat4& viewProj,
                            const Frustum& frustum, const glm::vec3& cameraPosition,
                            const glm::vec3& sunDirection, const glm::vec3& sunColor,
                            const glm::vec4& environment) {
-    for (const auto& mob : mobManager.mobs) {
-        if (!mob.isAlive) continue;
+    entities.for_each_entity([&](engine::entity::EntityId id) {
+        engine::entity::ComponentData mob;
+        if (!entities.get_component(id, engine::entity::kMobComponentType, mob)) {
+            return;
+        }
+        engine::entity::Health health;
+        if (!entities.get_health(id, health) || health.value <= 0.0f) return;
+        engine::entity::Position position;
+        if (!entities.get_position(id, position)) return;
 
-        if (!frustum.is_box_visible(mob.position - glm::vec3(1.0f), mob.position + glm::vec3(1.0f, 2.0f, 1.0f))) {
-            continue;
+        uint32_t typeIdx = 3;
+        float yaw = 0.0f;
+        float walkAnimProgress = 0.0f;
+        float creeperFuseTimer = 0.0f;
+        if (!parse_mob_draw_state(mob.blob, typeIdx, yaw, walkAnimProgress,
+                                  creeperFuseTimer)) {
+            return;
+        }
+        if (typeIdx > 5) return;
+
+        const glm::vec3 mobPosition(position.x, position.y, position.z);
+        if (!frustum.is_box_visible(mobPosition - glm::vec3(1.0f), mobPosition + glm::vec3(1.0f, 2.0f, 1.0f))) {
+            return;
         }
 
-        uint32_t typeIdx = static_cast<uint32_t>(mob.type);
-
-        glm::mat4 baseModel = glm::translate(glm::mat4(1.0f), mob.position);
-        baseModel = glm::rotate(baseModel, mob.yaw, glm::vec3(0, 1, 0));
+        glm::mat4 baseModel = glm::translate(glm::mat4(1.0f), mobPosition);
+        baseModel = glm::rotate(baseModel, yaw, glm::vec3(0, 1, 0));
 
         // Efeito de inchaço do Creeper ao explodir
-        if (mob.type == MobType::Creeper && mob.creeperFuseTimer > 0.0f) {
-            float swell = 1.0f + std::sin(mob.creeperFuseTimer * 20.0f) * 0.2f;
+        if (typeIdx == 2 && creeperFuseTimer > 0.0f) {
+            float swell = 1.0f + std::sin(creeperFuseTimer * 20.0f) * 0.2f;
             baseModel = glm::scale(baseModel, glm::vec3(swell, swell, swell));
         }
 
         // Matrizes de Articulação de Membros (Física e Animação de Caminhada)
-        float swing = std::sin(mob.walkAnimProgress) * 0.6f;
+        float swing = std::sin(walkAnimProgress) * 0.6f;
         float swingOpp = -swing;
 
         std::array<glm::mat4, 6> limbTransforms;
         limbTransforms[0] = baseModel; // Head
         limbTransforms[1] = baseModel; // Body
 
-        if (mob.type == MobType::Zombie) {
+        if (typeIdx == 0) {
             // Braços de Zumbi sempre levantados para a frente
             limbTransforms[2] = glm::rotate(baseModel, -1.4f + swing * 0.2f, glm::vec3(1, 0, 0));
             limbTransforms[3] = glm::rotate(baseModel, -1.4f + swingOpp * 0.2f, glm::vec3(1, 0, 0));
             limbTransforms[4] = glm::rotate(baseModel, swing, glm::vec3(1, 0, 0));
             limbTransforms[5] = glm::rotate(baseModel, swingOpp, glm::vec3(1, 0, 0));
-        } else if (mob.type == MobType::Skeleton) {
+        } else if (typeIdx == 1) {
             limbTransforms[2] = glm::rotate(baseModel, swingOpp, glm::vec3(1, 0, 0));
             limbTransforms[3] = glm::rotate(baseModel, swing, glm::vec3(1, 0, 0));
             limbTransforms[4] = glm::rotate(baseModel, swing, glm::vec3(1, 0, 0));
@@ -220,7 +255,7 @@ void MobRenderer::draw(const MobManager& mobManager, VkCommandBuffer cmd, VkPipe
             vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.buffer.buffer, &offset);
             vkCmdDraw(cmd, mesh.vertexCount, 1, 0, 0);
         }
-    }
+    });
 }
 
 void MobRenderer::cleanup(VkDevice device, VmaAllocator allocator) {

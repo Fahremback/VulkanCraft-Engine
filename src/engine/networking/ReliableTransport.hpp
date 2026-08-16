@@ -80,6 +80,10 @@ public:
     [[nodiscard]] std::uint32_t dropped_fragments() const noexcept { return droppedFragments_; }
 
     void disconnect();
+    // disconnect() + tears down the local socket and receive thread — the
+    // peer effectively goes silent (used to simulate a peer that stops
+    // responding, e.g. the timeout test).
+    void close();
 
     [[nodiscard]] static std::size_t compress(const std::byte* in, std::size_t size,
                                               std::byte* out, std::size_t capacity);
@@ -108,8 +112,15 @@ private:
     struct OutgoingPacket {
         std::uint32_t seq{};
         std::vector<std::byte> payload;   // single fragment payload (pre-compression)
+        std::uint16_t fragmentIndex{};    // kept so retransmits reassemble correctly
+        std::uint16_t fragmentCount{};
         std::chrono::steady_clock::time_point lastSent{};
         std::uint32_t retries{};
+        // Randomized extra delay before the next retry (RFC-6298-style
+        // jitter). A deterministic retry schedule can phase-lock with a
+        // deterministic loss pattern, letting the same packet be dropped
+        // round after round while its neighbors sail through.
+        std::uint32_t retryJitterMs{};
         bool acked{false};
     };
 
@@ -129,6 +140,10 @@ private:
                          std::chrono::steady_clock::time_point now);
     void process_data(const PacketHeader& header, const std::byte* payload, std::size_t size,
                       std::chrono::steady_clock::time_point now);
+    // Delivers every complete, contiguous unit starting at nextInSeq_ (single-
+    // fragment messages from reorderBuffer_, completed partials from
+    // partials_) — the reliable-ordered guarantee under loss/reorder.
+    void deliver_ordered();
     void deliver_message(std::vector<std::byte> message);
     void retransmit(std::chrono::steady_clock::time_point now);
     void send_heartbeat(std::chrono::steady_clock::time_point now);
@@ -157,6 +172,7 @@ private:
     std::chrono::steady_clock::time_point lastReceive_{};
     std::chrono::steady_clock::time_point lastHeartbeat_{};
     bool handshakeSent_{false};
+    std::uint32_t synRetries_{0};  // handshake SYN retries (loss-resilient connect)
     std::string peerTarget_;  // "ip:port" of the peer (server side, learned from SYN)
 
     MessageHandler messageHandler_;

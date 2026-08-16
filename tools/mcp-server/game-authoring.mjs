@@ -37,6 +37,224 @@ export const SCRIPT_NODE_KINDS = Object.freeze([
   "Function", "FunctionCall", "Log", "Scope", "ScopeEnd"
 ]);
 
+// Registry asset kinds the MCP authors (FALTANTES item 23 / prioridade 5). Each
+// document mirrors EXACTLY the versioned JSON the public C++ registries parse
+// (BlockRegistry/ItemRegistry/FluidRegistry/RecipeRegistry in
+// engine/registry/*, IBiomeRegistry + IStructureGenerator in
+// engine/procgen/*), so an authored asset loads through the public factories
+// unchanged (proved by tests/McpRegistryGateTests.cpp).
+export const REGISTRY_KINDS = Object.freeze(["block", "item", "fluid", "recipe", "biome", "structure"]);
+
+// Mirrors BlockType::Count in src/simulation/voxel/core/Voxel.hpp (51).
+const MAX_BUILTIN_BLOCK_ID = 50;
+const BLOCK_CLASSES = new Set(["solid", "transparent", "nonsolid", "non_solid", "fluid"]);
+
+// Engine baked-in block names (FALTANTES item 9 cross-reference validation).
+// Mirrors the kBuiltinBlocks table in src/engine/sdk/BlockRegistry.cpp — a
+// stable public engine contract: a fluid may drive any of these blocks even
+// when the project does not author it.
+const ENGINE_BUILTIN_BLOCKS = new Set([
+  "vulkancraft:air", "vulkancraft:grass", "vulkancraft:dirt", "vulkancraft:stone", "vulkancraft:bedrock",
+  "vulkancraft:sand", "vulkancraft:wood", "vulkancraft:leaves", "vulkancraft:planks", "vulkancraft:cobblestone",
+  "vulkancraft:glass", "vulkancraft:bricks", "vulkancraft:water", "vulkancraft:lava", "vulkancraft:clay",
+  "vulkancraft:coal_ore", "vulkancraft:iron_ore", "vulkancraft:gold_ore", "vulkancraft:diamond_ore", "vulkancraft:emerald_ore",
+  "vulkancraft:redstone_ore", "vulkancraft:lapis_ore", "vulkancraft:copper_ore", "vulkancraft:birch_wood", "vulkancraft:birch_leaves",
+  "vulkancraft:birch_planks", "vulkancraft:spruce_wood", "vulkancraft:spruce_leaves", "vulkancraft:spruce_planks", "vulkancraft:granite",
+  "vulkancraft:diorite", "vulkancraft:andesite", "vulkancraft:deepslate", "vulkancraft:blackstone", "vulkancraft:basalt",
+  "vulkancraft:netherrack", "vulkancraft:end_stone", "vulkancraft:obsidian", "vulkancraft:sandstone", "vulkancraft:terracotta",
+  "vulkancraft:glowstone", "vulkancraft:sea_lantern", "vulkancraft:magma_block", "vulkancraft:crafting_table", "vulkancraft:furnace",
+  "vulkancraft:chest", "vulkancraft:tnt", "vulkancraft:bookshelf", "vulkancraft:prismarine", "vulkancraft:mossy_cobblestone",
+  "vulkancraft:snow_block"
+]);
+const CLIMATE_AXES = Object.freeze(["temperature", "moisture", "continentalness", "erosion", "weirdness", "river"]);
+const STRUCTURE_SYMMETRIES = new Set([1, 2, 4, 8]);
+
+// Compact field contracts surfaced by game_capabilities so an agent can author
+// a registry asset without reading the engine source.
+export const REGISTRY_FIELD_SCHEMAS = Object.freeze({
+  block: [
+    { name: "name", type: "string", required: true, description: "short block name (e.g. titanium)" },
+    { name: "namespace", type: "string", required: false, default: "vulkancraft", description: "namespaced prefix" },
+    { name: "id", type: "string", required: false, description: "persistent UUID; derived from ns:name when omitted" },
+    { name: "class", type: "enum", values: [...BLOCK_CLASSES], required: false, default: "solid" },
+    { name: "hardness", type: "number", required: false, default: 1.0 },
+    { name: "light_emission", type: "number", required: false, default: 0.0 },
+    { name: "light_absorption", type: "number", required: false, default: 1.0 },
+    { name: "opaque", type: "boolean", required: false, default: true },
+    { name: "collidable", type: "boolean", required: false, default: true },
+    { name: "collision_shape", type: "enum", values: ["full", "cross", "none"], required: false, default: "full", description: "collision shape (item 2): none = not solid, cross = thin hitbox (physics milestone); none wins over collidable:true" },
+    { name: "selection_shape", type: "enum", values: ["full", "cross", "none"], required: false, default: "full", description: "selection/pick-box shape (item 2): feeds the editor milestone" },
+    { name: "builtin_id", type: "integer", required: false, description: `unsupported today: the builtin table occupies every id in 0..${MAX_BUILTIN_BLOCK_ID}, so any declared mapping is refused; author catalog-only blocks (omit builtin_id)` },
+    { name: "color", type: "array[3..4]", required: false, description: "[r, g, b(, a)] 0..1 — base color (also the fallback for unset faces)" },
+    { name: "face_top", type: "array[3..4]", required: false, description: "[r, g, b(, a)] 0..1 — color of the +Y face (overrides color)" },
+    { name: "face_bottom", type: "array[3..4]", required: false, description: "[r, g, b(, a)] 0..1 — color of the -Y face (overrides color)" },
+    { name: "face_side", type: "array[3..4]", required: false, description: "[r, g, b(, a)] 0..1 — color of horizontal faces (overrides color)" },
+    { name: "occlusion", type: "boolean", required: false, default: true, description: "false draws faces even against opaque neighbors (fences/plants)" },
+    { name: "render_layer", type: "integer", required: false, default: 0, description: "render layer hint in [0, 255]" },
+    { name: "states", type: "array[object]", required: false, default: [], description: "named states (FALTANTES item 5): [{ name, color, face_top?, face_side?, face_bottom?, light_emission? }]; states[0] = default state" },
+    { name: "transitions", type: "array[object]", required: false, default: [], description: "versioned transition rules (FALTANTES item 5): [{ from, to, trigger }]; \"\" = default state" },
+    { name: "fluid", type: "object", required: false, description: "inline fluid binding (FALTANTES item 7): the block drives this fluid directly, no separate fluid asset needed — { viscosity, density, range, tick_interval, source, falling, evaporation, damage_per_tick, compressible }" },
+    { name: "sound_place", type: "string", required: false, description: "namespaced sound id for placing the block (item 4)" },
+    { name: "sound_break", type: "string", required: false, description: "namespaced sound id for breaking the block (item 4)" },
+    { name: "sound_step", type: "string", required: false, description: "namespaced sound id for stepping on the block (item 4)" },
+    { name: "sound_hit", type: "string", required: false, description: "namespaced sound id for hitting the block (item 4)" },
+    { name: "particle_break", type: "string", required: false, description: "namespaced particle id emitted when the block breaks (item 4)" },
+    { name: "tool", type: "string", required: false, default: "any", description: "required tool class (item 4): any|pickaxe|axe|shovel|hoe|sword" },
+    { name: "tool_tier", type: "integer", required: false, default: 0, description: "required mining tier in [0, 4] (item 4)" },
+    { name: "resistance", type: "number", required: false, default: 0, description: "explosion/destruction resistance, >= 0 (item 4)" },
+    { name: "friction", type: "number", required: false, default: 0.5, description: "physics friction in 0..1 (item 4)" },
+    { name: "bounciness", type: "number", required: false, default: 0, description: "physics restitution in 0..1 (item 4)" },
+    { name: "density", type: "number", required: false, default: 1, description: "physics density, > 0 (item 4)" },
+    { name: "behavior", type: "string", required: false, description: "declarative behavior reference (item 6): namespaced id (ns:name) or empty" },
+    { name: "tags", type: "array[string]", required: false, default: [] },
+    { name: "drops", type: "array[string]", required: false, default: ["vulkancraft:<name>"] },
+    { name: "version", type: "integer", required: false, default: 1 }
+  ],
+  item: [
+    { name: "name", type: "string", required: true },
+    { name: "namespace", type: "string", required: false, default: "vulkancraft" },
+    { name: "id", type: "string", required: false, description: "persistent UUID; derived from ns:name when omitted" },
+    { name: "max_stack", type: "integer", required: false, default: 64 },
+    { name: "durability", type: "integer", required: false, default: 0 },
+    { name: "icon", type: "string", required: false, default: "" },
+    { name: "model", type: "string", required: false, default: "" },
+    { name: "use_cooldown", type: "integer", required: false, default: 0, description: "use cooldown in ms [0, 60000] (item 8)" },
+    { name: "use_mode", type: "enum", values: ["none", "instant", "continuous"], required: false, default: "none", description: "use mode (item 8)" },
+    { name: "equip_slot", type: "enum", values: ["none", "hand", "offhand", "head", "chest", "legs", "feet"], required: false, default: "none", description: "equipment slot (item 8)" },
+    { name: "attack_damage", type: "number", required: false, default: 0, description: "melee attack damage [0, 100] (item 8)" },
+    { name: "armor", type: "number", required: false, default: 0, description: "armor value [0, 100] (item 8)" },
+    { name: "behavior", type: "string", required: false, description: "declarative behavior reference (item 8): namespaced id (ns:name) or empty" },
+    { name: "tags", type: "array[string]", required: false, default: [] },
+    { name: "version", type: "integer", required: false, default: 1 }
+  ],
+  fluid: [
+    { name: "block", type: "string", required: true, description: "namespaced block the fluid drives, e.g. vulkancraft:sludge" },
+    { name: "id", type: "string", required: false, description: "persistent UUID; derived from block when omitted" },
+    { name: "viscosity", type: "number", required: false, default: 0.5, description: "0..1 rheology hint" },
+    { name: "density", type: "number", required: false, default: 1.0 },
+    { name: "range", type: "integer", required: false, default: 7, description: "horizontal spread budget 1..7" },
+    { name: "tick_interval", type: "number", required: false, default: 0.08 },
+    { name: "source", type: "boolean", required: false, default: true },
+    { name: "falling", type: "boolean", required: false, default: true },
+    { name: "evaporation", type: "boolean", required: false, default: true },
+    { name: "damage_per_tick", type: "number", required: false, default: 0.0 },
+    { name: "compressible", type: "boolean", required: false, default: false },
+    { name: "color", type: "array[3..4]", required: false, description: "[r, g, b(, a)] 0..1" },
+    { name: "version", type: "integer", required: false, default: 1 }
+  ],
+  recipe: [
+    { name: "name", type: "string", required: true },
+    { name: "namespace", type: "string", required: false, default: "vulkancraft" },
+    { name: "id", type: "string", required: false, description: "persistent UUID; derived from ns:name when omitted" },
+    { name: "station", type: "string", required: false, description: "namespaced crafting station (ns:name)" },
+    { name: "time", type: "number", required: false, default: 1.0 },
+    { name: "energy", type: "number", required: false, default: 0.0 },
+    { name: "fuel", type: "string", required: false, description: "namespaced fuel item" },
+    { name: "conditions", type: "array[string]", required: false, default: [] },
+    { name: "tags", type: "array[string]", required: false, default: [] },
+    { name: "inputs", type: "array", required: true, description: "[{item|tag, count>=1, alternatives: [ns:item, ...]}]" },
+    { name: "outputs", type: "array", required: true, description: "[{item, count>=1, chance in (0,1]}]" },
+    { name: "byproducts", type: "array", required: false, description: "same shape as outputs" },
+    { name: "version", type: "integer", required: false, default: 1 }
+  ],
+  biome: [
+    { name: "name", type: "string", required: false, description: "asset file name (e.g. my_biomes); carried by the file name, NOT a document property" },
+    { name: "biomes", type: "array", required: true, description: "[{name, engine_biome_index 0..255, climate, surface}]" },
+    { name: "version", type: "integer", required: false, default: 1 }
+  ],
+  structure: [
+    { name: "name", type: "string", required: false, description: "asset file name; carried by the file name, NOT a document property" },
+    { name: "sample_width", type: "integer", required: true, description: ">= 1" },
+    { name: "sample_height", type: "integer", required: true, description: ">= 1" },
+    { name: "sample", type: "array[integer]", required: true, description: "block ids, row-major (z * w + x), length == sample_width * sample_height" },
+    { name: "pattern_size", type: "integer", required: false, default: 3, description: "1..min(sample_width, sample_height)" },
+    { name: "symmetry", type: "integer", required: false, default: 1, description: "1, 2, 4 or 8" },
+    { name: "periodic_output", type: "boolean", required: false, default: false },
+    { name: "ground", type: "boolean", required: false, default: false },
+    { name: "seed", type: "integer", required: false, default: 0 },
+    { name: "profiles", type: "array", required: false, description: "[{block_id != 0, layers: [non-empty]}]" },
+    { name: "version", type: "integer", required: false, default: 1 }
+  ]
+});
+
+// The authoring ARG names (snake_case, what an agent passes to
+// author_registry_asset) differ from the DOCUMENT keys (camelCase, what the
+// public C++ factories parse and what lands in Content/Registry/*.json). The
+// exported JSON Schema validates DOCUMENTS, so its property names are the C++
+// keys — single source: buildRegistryDocument (same mapping as here).
+const DOC_KEYS = Object.freeze({
+  block: {
+    collision_shape: "collisionShape", selection_shape: "selectionShape",
+    light_emission: "lightEmission", light_absorption: "lightAbsorption",
+    render_layer: "renderLayer", builtin_id: "builtinId",
+    face_top: "faceTop", face_bottom: "faceBottom", face_side: "faceSide",
+    sound_place: "soundPlace", sound_break: "soundBreak", sound_step: "soundStep",
+    sound_hit: "soundHit", particle_break: "particleBreak", tool_tier: "toolTier",
+    behavior: "behaviorId"
+  },
+  item: {
+    max_stack: "maxStack", use_cooldown: "useCooldown", use_mode: "useMode",
+    equip_slot: "equipSlot", attack_damage: "attackDamage", behavior: "behaviorId"
+  },
+  fluid: { tick_interval: "tickInterval", damage_per_tick: "damagePerTick" },
+  recipe: {},
+  biome: {},
+  structure: {
+    sample_width: "sampleWidth", sample_height: "sampleHeight",
+    pattern_size: "patternSize", periodic_output: "periodicOutput"
+  }
+});
+
+// JSON Schema (draft-07) for one registry kind, generated from the SAME
+// REGISTRY_FIELD_SCHEMAS contracts the MCP authors against — a single source
+// of truth so the exported schema can never drift from what the mirror
+// validation accepts. This is the artifact the editor/IDE (intellisense),
+// scripting and CI consume (FALTANTES item 10); the C++ factories ignore
+// unknown fields, so additionalProperties stays permissive.
+export function buildRegistryJsonSchema(kind) {
+  const fields = REGISTRY_FIELD_SCHEMAS[kind];
+  if (!fields) throw new Error(`unsupported registry kind '${kind}'`);
+  const docKeys = DOC_KEYS[kind] ?? {};
+  const properties = {};
+  const required = [];
+  for (const field of fields) {
+    const docKey = docKeys[field.name] ?? field.name;
+    let schema = { description: field.description ?? `"${field.name}" registry field` };
+    if (field.default !== undefined) schema.default = field.default;
+    switch (field.type) {
+      case "string": schema.type = "string"; break;
+      case "boolean": schema.type = "boolean"; break;
+      case "number": schema.type = "number"; break;
+      case "integer": schema.type = "integer"; break;
+      case "enum": schema.enum = [...field.values]; break;
+      case "object": schema.type = "object"; break;
+      case "array": schema.type = "array"; break;
+      case "array[string]": schema.type = "array"; schema.items = { type: "string" }; break;
+      case "array[integer]": schema.type = "array"; schema.items = { type: "integer" }; break;
+      case "array[boolean]": schema.type = "array"; schema.items = { type: "boolean" }; break;
+      case "array[object]": schema.type = "array"; schema.items = { type: "object" }; break;
+      case "array[3..4]":
+        schema.type = "array";
+        schema.minItems = 3;
+        schema.maxItems = 4;
+        schema.items = { type: "number" };
+        break;
+      default: throw new Error(`unknown field type '${field.type}' in ${kind} schema`);
+    }
+    properties[docKey] = schema;
+    if (field.required) required.push(docKey);
+  }
+  return {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    $id: `https://vulkancraft.engine/schema/registry/${kind}.json`,
+    title: `${kind} registry asset`,
+    type: "object",
+    additionalProperties: true,
+    properties,
+    ...(required.length > 0 ? { required } : {})
+  };
+}
+
 const PROJECT_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const PROFILE_NAMES = new Set(["Debug", "Development", "Shipping", "Server", "Editor"]);
 const PLATFORM_NAMES = new Set(["windows-x64", "linux-x64", "macos-universal", "dedicated-server"]);
@@ -97,7 +315,8 @@ function projectPaths(engineRoot, projectName) {
     assets: path.join(root, "Assets"),
     materials: path.join(root, "Content", "Materials"),
     audioEvents: path.join(root, "Content", "AudioEvents"),
-    physicsMaterials: path.join(root, "Content", "PhysicsMaterials")
+    physicsMaterials: path.join(root, "Content", "PhysicsMaterials"),
+    registry: path.join(root, "Content", "Registry")
   };
 }
 
@@ -173,11 +392,30 @@ function capabilityDocument() {
     supported_operations: [
       "create/list/inspect projects", "create/inspect scenes", "create/remove entities",
       "add/update/remove components", "author visual scripts", "stage source assets", "validate projects"
-      , "author materials", "author audio events", "author physics materials"
+      , "author materials", "author audio events", "author physics materials",
+      "author registry assets (blocks/items/fluids/recipes/biomes/structures)",
+      "inspect registry assets", "dry-run registry asset updates"
     ],
     components: COMPONENT_SCHEMAS,
     light_types: { Directional: 0, Point: 1, Spot: 2, Area: 3 },
     script_node_kinds: SCRIPT_NODE_KINDS,
+    registry_asset_kinds: REGISTRY_KINDS.map((kind) => ({
+      kind,
+      file: `Content/Registry/${kind}/<name>.json`,
+      fields: REGISTRY_FIELD_SCHEMAS[kind]
+    })),
+    // Full JSON Schema (draft-07) per registry kind (FALTANTES item 10): the
+    // editor/IDE, scripting and CI validate or auto-complete assets against
+    // these; they are generated from REGISTRY_FIELD_SCHEMAS, the same
+    // contracts the author tool mirrors.
+    registry_schemas: Object.fromEntries(
+      REGISTRY_KINDS.map((kind) => [kind, buildRegistryJsonSchema(kind)])
+    ),
+    registry_validation: {
+      note: "Each document mirrors exactly the versioned JSON the public C++ factories parse (BlockRegistry/ItemRegistry/FluidRegistry/RecipeRegistry, IBiomeRegistry, IStructureGenerator); the MCP validates structure only — item/tag references in recipes are validated by the C++ RecipeRegistry against a registered ItemRegistry.",
+      dry_run: "author_registry_asset accepts dry_run: true to validate and preview the document/diff without writing.",
+      rollback: "Updates return the previous document; re-authoring it with update: true restores the prior state."
+    },
     engine_source_modification_required: false
   };
 }
@@ -376,8 +614,106 @@ export function semanticToolDefinitions() {
       }
     },
     {
+      name: "author_registry_asset",
+      description: "Author a registry asset (block/item/fluid/recipe/biome/structure) as a versioned JSON document in Content/Registry/<kind>/, mirroring exactly the public C++ registry JSON schemas. Validates structure against the public contracts; dry_run previews the document/diff without writing; update replaces an existing asset and returns the previous document for rollback.",
+      inputSchema: {
+        type: "object",
+        required: ["project", "kind", "name"],
+        properties: {
+          project: { type: "string" },
+          kind: { type: "string", enum: REGISTRY_KINDS },
+          name: { type: "string", minLength: 1, description: "asset name (becomes the file name)" },
+          dry_run: { type: "boolean", default: false },
+          update: { type: "boolean", default: false },
+          id: { type: "string", description: "persistent UUID; derived from the namespaced name when omitted" },
+          namespace: { type: "string", default: "vulkancraft" },
+          version: { type: "integer", default: 1 },
+          // block
+          class: { type: "string", enum: [...BLOCK_CLASSES] },
+          hardness: { type: "number" }, light_emission: { type: "number" }, light_absorption: { type: "number" },
+          opaque: { type: "boolean" }, collidable: { type: "boolean" }, builtin_id: { type: "integer" },
+          color: { type: "array", items: { type: "number" } }, tags: { type: "array", items: { type: "string" } }, drops: { type: "array", items: { type: "string" } },
+          states: { type: "array", items: { type: "object", properties: { name: { type: "string" }, color: { type: "array", items: { type: "number" } }, face_top: { type: "array", items: { type: "number" } }, face_bottom: { type: "array", items: { type: "number" } }, face_side: { type: "array", items: { type: "number" } }, light_emission: { type: "number" } }, additionalProperties: false } },
+          transitions: { type: "array", items: { type: "object", properties: { from: { type: "string" }, to: { type: "string" }, trigger: { type: "string" } }, additionalProperties: false } },
+          fluid: { type: "object", properties: { viscosity: { type: "number" }, density: { type: "number" }, range: { type: "integer" }, tick_interval: { type: "number" }, source: { type: "boolean" }, falling: { type: "boolean" }, evaporation: { type: "boolean" }, damage_per_tick: { type: "number" }, compressible: { type: "boolean" } }, additionalProperties: false },
+          sound_place: { type: "string" }, sound_break: { type: "string" }, sound_step: { type: "string" }, sound_hit: { type: "string" },
+          particle_break: { type: "string" }, tool: { type: "string" }, tool_tier: { type: "integer" },
+          resistance: { type: "number" }, friction: { type: "number" }, bounciness: { type: "number" }, density: { type: "number" },
+          behavior: { type: "string" },
+          // item (§2 item 8: use/equipment/behavior components)
+          max_stack: { type: "integer" }, durability: { type: "integer" }, icon: { type: "string" }, model: { type: "string" },
+          use_cooldown: { type: "integer", description: "use cooldown in ms (0..60000)" },
+          use_mode: { type: "string", enum: ["none", "instant", "continuous"] },
+          equip_slot: { type: "string", enum: ["none", "hand", "offhand", "head", "chest", "legs", "feet"] },
+          attack_damage: { type: "number", description: "0..100" },
+          armor: { type: "number", description: "0..100" },
+          behavior: { type: "string", description: "namespaced behavior id (ns:name) or empty" },
+          // fluid
+          block: { type: "string", description: "namespaced block the fluid drives (required for kind=fluid)" },
+          viscosity: { type: "number" }, density: { type: "number" }, range: { type: "integer" },
+          tick_interval: { type: "number" }, source: { type: "boolean" }, falling: { type: "boolean" },
+          evaporation: { type: "boolean" }, damage_per_tick: { type: "number" }, compressible: { type: "boolean" },
+          // recipe
+          station: { type: "string" }, time: { type: "number" }, energy: { type: "number" }, fuel: { type: "string" },
+          conditions: { type: "array", items: { type: "string" } },
+          inputs: {
+            type: "array", items: {
+              type: "object", properties: { item: { type: "string" }, tag: { type: "string" }, count: { type: "integer" }, alternatives: { type: "array", items: { type: "string" } } }, additionalProperties: false
+            }
+          },
+          outputs: {
+            type: "array", items: {
+              type: "object", required: ["item"], properties: { item: { type: "string" }, count: { type: "integer" }, chance: { type: "number" } }, additionalProperties: false
+            }
+          },
+          byproducts: {
+            type: "array", items: {
+              type: "object", required: ["item"], properties: { item: { type: "string" }, count: { type: "integer" }, chance: { type: "number" } }, additionalProperties: false
+            }
+          },
+          // biome
+          biomes: {
+            type: "array", items: {
+              type: "object", required: ["name"], properties: {
+                name: { type: "string" }, engine_biome_index: { type: "integer" },
+                climate: { type: "object", additionalProperties: { type: "array", items: { type: "number" }, minItems: 2, maxItems: 2 } },
+                surface: {
+                  type: "array", items: {
+                    type: "object", properties: {
+                      block_id: { type: "integer" }, min_depth: { type: "integer" }, max_depth: { type: "integer" },
+                      min_height: { type: "integer" }, max_height: { type: "integer" }, min_slope: { type: "number" }
+                    }, additionalProperties: false
+                  }
+                }
+              }, additionalProperties: false
+            }
+          },
+          // structure
+          sample_width: { type: "integer" }, sample_height: { type: "integer" },
+          sample: { type: "array", items: { type: "integer" } },
+          pattern_size: { type: "integer" }, symmetry: { type: "integer" },
+          periodic_output: { type: "boolean" }, ground: { type: "boolean" }, seed: { type: "integer" },
+          profiles: {
+            type: "array", items: {
+              type: "object", required: ["block_id", "layers"], properties: {
+                block_id: { type: "integer" }, layers: { type: "array", items: { type: "integer" } }
+              }, additionalProperties: false
+            }
+          }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_registry_assets",
+      description: "List and validate every registry asset (block/item/fluid/recipe/biome/structure) under Content/Registry for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
       name: "validate_game_project",
-      description: "Validate the portable project, scenes, entity UUIDs, components, hierarchy, scripts, and asset metadata without compiling the engine.",
+      description: "Validate the portable project, scenes, entity UUIDs, components, hierarchy, scripts, registry assets, and asset metadata without compiling the engine.",
       inputSchema: {
         type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
       }
@@ -402,6 +738,8 @@ export function callSemanticTool(engineRoot, name, args = {}) {
     case "create_audio_event": return createAudioEvent(engineRoot, args);
     case "create_physics_material": return createPhysicsMaterial(engineRoot, args);
     case "stage_asset": return stageAsset(engineRoot, args);
+    case "author_registry_asset": return authorRegistryAsset(engineRoot, args);
+    case "inspect_registry_assets": return inspectRegistryAssets(engineRoot, args.project);
     case "validate_game_project": return validateProject(engineRoot, args.project);
     default: return undefined;
   }
@@ -430,7 +768,7 @@ function createProject(engineRoot, args) {
   if (!PROFILE_NAMES.has(profile)) throw new Error(`unsupported profile '${profile}'`);
   if (!PLATFORM_NAMES.has(platform)) throw new Error(`unsupported platform '${platform}'`);
 
-  for (const directory of [paths.content, paths.scenes, paths.scripts, paths.assets, paths.materials, paths.audioEvents, paths.physicsMaterials, path.join(paths.root, "Config"), path.join(paths.root, "Intermediate"), path.join(paths.root, "Build")]) {
+  for (const directory of [paths.content, paths.scenes, paths.scripts, paths.assets, paths.materials, paths.audioEvents, paths.physicsMaterials, paths.registry, path.join(paths.root, "Config"), path.join(paths.root, "Intermediate"), path.join(paths.root, "Build")]) {
     fs.mkdirSync(directory, { recursive: true });
   }
   const scene = createEmptyScene(initialScene);
@@ -672,6 +1010,643 @@ function stageAsset(engineRoot, args) {
   return { staged: true, project: project.project, asset: `Assets/${destinationName}`, sha256: metadata.sha256, cooking_required: true };
 }
 
+function validateRegistryBlock(document, errors) {
+  if (typeof document.name !== "string" || !document.name) errors.push("block 'name' is required");
+  if (typeof document.namespace !== "string" || !document.namespace) errors.push("block 'namespace' cannot be empty");
+  if (document.class !== undefined && !BLOCK_CLASSES.has(String(document.class))) errors.push(`block 'class' must be one of ${[...BLOCK_CLASSES].join(", ")}`);
+  if (document.builtinId !== undefined) {
+    if (!Number.isInteger(document.builtinId) || document.builtinId < 0 || document.builtinId > MAX_BUILTIN_BLOCK_ID) {
+      errors.push(`block 'builtinId' must be an integer in [0, ${MAX_BUILTIN_BLOCK_ID}] (BlockType::Count)`);
+    } else {
+      // The builtin table registers every id in [0, Count); a JSON block that
+      // declares a builtinId is refused by BlockRegistry::add as "already
+      // used". The MCP authors catalog-only blocks: omit builtin_id.
+      errors.push(`block 'builtinId' ${document.builtinId} is already used by the builtin table; omit builtin_id (catalog-only block)`);
+    }
+  }
+  if (document.color !== undefined && (!Array.isArray(document.color) || document.color.length < 3 || document.color.some((channel) => typeof channel !== "number" || channel < 0 || channel > 1))) {
+    errors.push("block 'color' must be [r, g, b(, a)] with each channel in 0..1");
+  }
+  for (const face of ["faceTop", "faceBottom", "faceSide"]) {
+    const faceValue = document[face];
+    if (faceValue !== undefined && (!Array.isArray(faceValue) || faceValue.length < 3 || faceValue.some((channel) => typeof channel !== "number" || channel < 0 || channel > 1))) {
+      errors.push(`block '${face}' must be [r, g, b(, a)] with each channel in 0..1`);
+    }
+  }
+  if (document.occlusion !== undefined && typeof document.occlusion !== "boolean") {
+    errors.push("block 'occlusion' must be a boolean");
+  }
+  // Collision/selection shapes (FALTANTES item 2), mirrored from the strict
+  // C++ enums: explicit unknown values are refused, never guessed.
+  for (const shapeField of ["collisionShape", "selectionShape"]) {
+    const shape = document[shapeField];
+    if (shape !== undefined && !["full", "cross", "none"].includes(String(shape))) {
+      errors.push(`block '${shapeField}' must be one of full, cross, none`);
+    }
+  }
+  if (document.renderLayer !== undefined && (!Number.isInteger(document.renderLayer) || document.renderLayer < 0 || document.renderLayer > 255)) {
+    errors.push("block 'renderLayer' must be an integer in [0, 255]");
+  }
+  for (const field of ["tags", "drops"]) {
+    if (document[field] !== undefined && (!Array.isArray(document[field]) || document[field].some((value) => typeof value !== "string"))) {
+      errors.push(`block '${field}' must be an array of strings`);
+    }
+  }
+  // Named states + versioned transitions (FALTANTES item 5), mirrored from the
+  // C++ BlockRegistry::add (all-or-nothing: duplicates, unknown refs, empty
+  // trigger and self/duplicate rules are refused).
+  const states = Array.isArray(document.states) ? document.states : [];
+  const stateNames = new Set();
+  for (const state of states) {
+    if (!state || typeof state !== "object" || Array.isArray(state)) {
+      errors.push("block 'states' entries must be objects");
+      continue;
+    }
+    if (typeof state.name !== "string" || !state.name) errors.push("block state name cannot be empty");
+    else if (stateNames.has(state.name)) errors.push(`block has duplicate state '${state.name}'`);
+    stateNames.add(state.name);
+    if (state.color !== undefined && (!Array.isArray(state.color) || state.color.length < 3 || state.color.some((channel) => typeof channel !== "number" || channel < 0 || channel > 1))) {
+      errors.push(`block state '${state.name}' 'color' must be [r, g, b(, a)] with each channel in 0..1`);
+    }
+    for (const face of ["faceTop", "faceBottom", "faceSide"]) {
+      const faceValue = state[face];
+      if (faceValue !== undefined && (!Array.isArray(faceValue) || faceValue.length < 3 || faceValue.some((channel) => typeof channel !== "number" || channel < 0 || channel > 1))) {
+        errors.push(`block state '${state.name}' '${face}' must be [r, g, b(, a)] with each channel in 0..1`);
+      }
+    }
+    if (state.lightEmission !== undefined && (typeof state.lightEmission !== "number" || state.lightEmission < 0 || state.lightEmission > 1)) {
+      errors.push(`block state '${state.name}' 'lightEmission' must be a number in 0..1`);
+    }
+  }
+  const transitions = Array.isArray(document.transitions) ? document.transitions : [];
+  const seenRules = new Set();
+  for (const transition of transitions) {
+    if (!transition || typeof transition !== "object" || Array.isArray(transition)) {
+      errors.push("block 'transitions' entries must be objects");
+      continue;
+    }
+    const from = String(transition.from ?? "");
+    const to = String(transition.to ?? "");
+    const trigger = String(transition.trigger ?? "");
+    if (!trigger) errors.push("block transition trigger cannot be empty");
+    if (from === to) errors.push(`block transition '${trigger}' from and to state are identical`);
+    if (from && !stateNames.has(from)) errors.push(`block transition '${trigger}' references unknown from-state '${from}'`);
+    if (to && !stateNames.has(to)) errors.push(`block transition '${trigger}' references unknown to-state '${to}'`);
+    const rule = `${from}|${trigger}`;
+    if (seenRules.has(rule)) errors.push(`block has duplicate transition (from '${from}', trigger '${trigger}')`);
+    seenRules.add(rule);
+  }
+  // Inline fluid binding (FALTANTES item 7), mirrored from BlockRegistry::add:
+  // out-of-contract inline fluid values are refused (never clamped).
+  if (document.fluid !== undefined) {
+    if (!document.fluid || typeof document.fluid !== "object" || Array.isArray(document.fluid)) {
+      errors.push("block 'fluid' must be an object");
+    } else {
+      const fluid = document.fluid;
+      if (fluid.range !== undefined && (!Number.isInteger(fluid.range) || fluid.range < 1 || fluid.range > 7)) {
+        errors.push("block 'fluid.range' must be an integer in 1..7");
+      }
+      if (fluid.viscosity !== undefined && (typeof fluid.viscosity !== "number" || fluid.viscosity < 0 || fluid.viscosity > 1)) {
+        errors.push("block 'fluid.viscosity' must be a number in 0..1");
+      }
+      if (fluid.density !== undefined && (typeof fluid.density !== "number" || fluid.density < 0)) {
+        errors.push("block 'fluid.density' cannot be negative");
+      }
+      if (fluid.tickInterval !== undefined && (typeof fluid.tickInterval !== "number" || fluid.tickInterval < 0)) {
+        errors.push("block 'fluid.tickInterval' cannot be negative");
+      }
+      if (fluid.damagePerTick !== undefined && (typeof fluid.damagePerTick !== "number" || fluid.damagePerTick < 0)) {
+        errors.push("block 'fluid.damagePerTick' cannot be negative");
+      }
+    }
+  }
+  // Sound/particle/tool/resistance/physics component (FALTANTES item 4),
+  // mirrored from BlockRegistry::add (all-or-nothing, never clamped).
+  for (const ref of ["soundPlace", "soundBreak", "soundStep", "soundHit", "particleBreak"]) {
+    if (document[ref] !== undefined && document[ref] !== "" && !String(document[ref]).includes(":")) {
+      errors.push(`block '${ref}' must be namespaced (ns:name)`);
+    }
+  }
+  if (document.tool !== undefined && !["any", "pickaxe", "axe", "shovel", "hoe", "sword"].includes(String(document.tool))) {
+    errors.push("block 'tool' must be any|pickaxe|axe|shovel|hoe|sword");
+  }
+  if (document.toolTier !== undefined && (!Number.isInteger(document.toolTier) || document.toolTier < 0 || document.toolTier > 4)) {
+    errors.push("block 'toolTier' must be an integer in [0, 4]");
+  }
+  if (document.resistance !== undefined && (typeof document.resistance !== "number" || document.resistance < 0)) {
+    errors.push("block 'resistance' cannot be negative");
+  }
+  if (document.friction !== undefined && (typeof document.friction !== "number" || document.friction < 0 || document.friction > 1)) {
+    errors.push("block 'friction' must be a number in 0..1");
+  }
+  if (document.bounciness !== undefined && (typeof document.bounciness !== "number" || document.bounciness < 0 || document.bounciness > 1)) {
+    errors.push("block 'bounciness' must be a number in 0..1");
+  }
+  if (document.density !== undefined && (typeof document.density !== "number" || document.density <= 0)) {
+    errors.push("block 'density' must be positive");
+  }
+  // Declarative behavior reference (FALTANTES item 6), mirrored from the C++.
+  if (document.behaviorId !== undefined && document.behaviorId !== "" && (!String(document.behaviorId).includes(":"))) {
+    errors.push("block 'behaviorId' must be namespaced (ns:name)");
+  }
+}
+
+function validateRegistryItem(document, errors) {
+  if (typeof document.name !== "string" || !document.name) errors.push("item 'name' is required");
+  if (typeof document.namespace !== "string" || !document.namespace) errors.push("item 'namespace' cannot be empty");
+  for (const field of ["icon", "model"]) {
+    if (document[field] !== undefined && typeof document[field] !== "string") errors.push(`item '${field}' must be a string`);
+  }
+  if (document.tags !== undefined && (!Array.isArray(document.tags) || document.tags.some((value) => typeof value !== "string"))) {
+    errors.push("item 'tags' must be an array of strings");
+  }
+  // §2 item 8 — use/equipment/behavior components, mirrored from the C++
+  // ItemRegistry validation (all-or-nothing, never clamp/guess).
+  if (document.maxStack !== undefined && (!Number.isInteger(document.maxStack) || document.maxStack < 1 || document.maxStack > 64)) {
+    errors.push("item 'maxStack' must be an integer in 1..64");
+  }
+  if (document.useCooldown !== undefined && (!Number.isInteger(document.useCooldown) || document.useCooldown < 0 || document.useCooldown > 60000)) {
+    errors.push("item 'useCooldown' must be an integer in 0..60000");
+  }
+  if (document.useMode !== undefined && !["none", "instant", "continuous"].includes(document.useMode)) {
+    errors.push("item 'useMode' must be none|instant|continuous");
+  }
+  if (document.equipSlot !== undefined && !["none", "hand", "offhand", "head", "chest", "legs", "feet"].includes(document.equipSlot)) {
+    errors.push("item 'equipSlot' must be none|hand|offhand|head|chest|legs|feet");
+  }
+  if (document.attackDamage !== undefined && (typeof document.attackDamage !== "number" || document.attackDamage < 0 || document.attackDamage > 100)) {
+    errors.push("item 'attackDamage' must be a number in 0..100");
+  }
+  if (document.armor !== undefined && (typeof document.armor !== "number" || document.armor < 0 || document.armor > 100)) {
+    errors.push("item 'armor' must be a number in 0..100");
+  }
+  if (document.behaviorId !== undefined && document.behaviorId !== "" && (!String(document.behaviorId).includes(":"))) {
+    errors.push("item 'behaviorId' must be namespaced (ns:name)");
+  }
+}
+
+function validateRegistryFluid(document, errors) {
+  if (typeof document.block !== "string" || !document.block) errors.push("fluid 'block' is required (the namespaced block name it drives)");
+  if (document.viscosity !== undefined && (typeof document.viscosity !== "number" || document.viscosity < 0 || document.viscosity > 1)) errors.push("fluid 'viscosity' must be a number in 0..1");
+  if (document.range !== undefined && (!Number.isInteger(document.range) || document.range < 1 || document.range > 7)) errors.push("fluid 'range' must be an integer in 1..7");
+  if (document.damagePerTick !== undefined && (typeof document.damagePerTick !== "number" || document.damagePerTick < 0)) errors.push("fluid 'damagePerTick' cannot be negative");
+}
+
+function validateRegistryRecipe(document, errors) {
+  if (typeof document.name !== "string" || !document.name) errors.push("recipe 'name' is required");
+  if (typeof document.namespace !== "string" || !document.namespace) errors.push("recipe 'namespace' cannot be empty");
+  if (document.station !== undefined && document.station !== "" && !String(document.station).includes(":")) errors.push("recipe 'station' must be namespaced (ns:name)");
+  if (document.time !== undefined && (typeof document.time !== "number" || document.time < 0)) errors.push("recipe 'time' cannot be negative");
+  if (document.energy !== undefined && (typeof document.energy !== "number" || document.energy < 0)) errors.push("recipe 'energy' cannot be negative");
+  const inputs = Array.isArray(document.inputs) ? document.inputs : [];
+  if (inputs.length === 0) errors.push("recipe needs at least one input");
+  inputs.forEach((input, index) => {
+    if (!input || typeof input !== "object" || Array.isArray(input)) return errors.push(`recipe input ${index} must be an object`);
+    if ((!input.item || typeof input.item !== "string") && (!input.tag || typeof input.tag !== "string")) errors.push(`recipe input ${index} requires 'item' or 'tag'`);
+    if (input.count !== undefined && (!Number.isInteger(input.count) || input.count < 1)) errors.push(`recipe input ${index} 'count' must be an integer >= 1`);
+    if (input.alternatives !== undefined && (!Array.isArray(input.alternatives) || input.alternatives.some((value) => typeof value !== "string"))) errors.push(`recipe input ${index} 'alternatives' must be an array of strings`);
+  });
+  const outputs = [...(Array.isArray(document.outputs) ? document.outputs : []), ...(Array.isArray(document.byproducts) ? document.byproducts : [])];
+  if (outputs.length === 0) errors.push("recipe needs at least one output");
+  outputs.forEach((output, index) => {
+    if (!output || typeof output !== "object" || Array.isArray(output)) return errors.push(`recipe output ${index} must be an object`);
+    if (!output.item || typeof output.item !== "string") errors.push(`recipe output ${index} requires 'item'`);
+    if (output.count !== undefined && (!Number.isInteger(output.count) || output.count < 1)) errors.push(`recipe output ${index} 'count' must be an integer >= 1`);
+    if (output.chance !== undefined && (typeof output.chance !== "number" || output.chance <= 0 || output.chance > 1)) errors.push(`recipe output ${index} 'chance' must be in (0, 1]`);
+  });
+  for (const field of ["conditions", "tags"]) {
+    if (document[field] !== undefined && (!Array.isArray(document[field]) || document[field].some((value) => typeof value !== "string"))) {
+      errors.push(`recipe '${field}' must be an array of strings`);
+    }
+  }
+}
+
+function validateRegistryBiome(document, errors) {
+  if (!Array.isArray(document.biomes) || document.biomes.length === 0) {
+    errors.push("biome registry needs a non-empty 'biomes' array");
+    return;
+  }
+  document.biomes.forEach((biome, index) => {
+    if (!biome || typeof biome !== "object" || Array.isArray(biome)) return errors.push(`biome ${index} must be an object`);
+    if (typeof biome.name !== "string" || !biome.name) errors.push(`biome ${index} has an empty name`);
+    if (biome.engineBiomeIndex !== undefined && (!Number.isInteger(biome.engineBiomeIndex) || biome.engineBiomeIndex < 0 || biome.engineBiomeIndex > 255)) errors.push(`biome ${index} 'engineBiomeIndex' must be an integer in 0..255`);
+    if (biome.climate !== undefined) {
+      if (!biome.climate || typeof biome.climate !== "object" || Array.isArray(biome.climate)) return errors.push(`biome ${index} 'climate' must be an object`);
+      for (const axis of CLIMATE_AXES) {
+        const bounds = biome.climate[axis];
+        if (bounds === undefined) continue;
+        if (!Array.isArray(bounds) || bounds.length !== 2 || bounds.some((value) => typeof value !== "number")) {
+          errors.push(`biome ${index} climate '${axis}' must be [min, max]`);
+        } else if (bounds[0] > bounds[1]) {
+          errors.push(`biome ${index} climate '${axis}' has inverted bounds`);
+        }
+      }
+    }
+    if (biome.surface !== undefined) {
+      if (!Array.isArray(biome.surface)) return errors.push(`biome ${index} 'surface' must be an array`);
+      biome.surface.forEach((rule, ruleIndex) => {
+        if (!rule || typeof rule !== "object" || Array.isArray(rule)) return errors.push(`biome ${index} surface rule ${ruleIndex} must be an object`);
+        if (!Number.isInteger(rule.blockId) || rule.blockId <= 0) errors.push(`biome ${index} surface rule ${ruleIndex} 'blockId' must be a non-zero integer`);
+        if (rule.minDepth !== undefined && rule.maxDepth !== undefined && rule.maxDepth < rule.minDepth) errors.push(`biome ${index} surface rule ${ruleIndex} has inverted depth bounds`);
+        if (rule.minHeight !== undefined && rule.maxHeight !== undefined && rule.maxHeight < rule.minHeight) errors.push(`biome ${index} surface rule ${ruleIndex} has inverted height bounds`);
+        if (rule.minSlope !== undefined && (typeof rule.minSlope !== "number" || rule.minSlope < 0)) errors.push(`biome ${index} surface rule ${ruleIndex} 'minSlope' cannot be negative`);
+      });
+    }
+  });
+}
+
+function validateRegistryStructure(document, errors) {
+  if (!Number.isInteger(document.sampleWidth) || document.sampleWidth < 1 || !Number.isInteger(document.sampleHeight) || document.sampleHeight < 1) {
+    errors.push("structure 'sampleWidth'/'sampleHeight' must be integers >= 1");
+    return;
+  }
+  if (!Array.isArray(document.sample) || document.sample.length !== document.sampleWidth * document.sampleHeight || document.sample.some((value) => !Number.isInteger(value) || value < 0)) {
+    errors.push("structure 'sample' must be an array of block ids with length sampleWidth * sampleHeight");
+    return;
+  }
+  if (document.patternSize !== undefined && (!Number.isInteger(document.patternSize) || document.patternSize < 1 || document.patternSize > Math.min(document.sampleWidth, document.sampleHeight))) {
+    errors.push("structure 'patternSize' must be an integer in 1..min(sampleWidth, sampleHeight)");
+  }
+  if (document.symmetry !== undefined && !STRUCTURE_SYMMETRIES.has(Number(document.symmetry))) errors.push("structure 'symmetry' must be 1, 2, 4 or 8");
+  if (document.profiles !== undefined) {
+    if (!Array.isArray(document.profiles)) return errors.push("structure 'profiles' must be an array");
+    document.profiles.forEach((profile, index) => {
+      if (!profile || typeof profile !== "object" || Array.isArray(profile)) return errors.push(`structure profile ${index} must be an object`);
+      if (!Number.isInteger(profile.blockId) || profile.blockId <= 0) errors.push(`structure profile ${index} 'blockId' must be a non-zero integer`);
+      if (!Array.isArray(profile.layers) || profile.layers.length === 0 || profile.layers.some((value) => !Number.isInteger(value))) errors.push(`structure profile ${index} 'layers' must be a non-empty array of block ids`);
+    });
+  }
+}
+
+// Structured validation mirroring the public C++ factories. Returns
+// { valid, errors } with one human-readable diagnostic per rule breach.
+export function validateRegistryDocument(kind, document) {
+  const errors = [];
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
+    return { valid: false, errors: ["registry asset must be a JSON object"] };
+  }
+  if (document.version !== undefined && document.version !== 1) errors.push("registry asset 'version' must be 1");
+  if (kind === "block") validateRegistryBlock(document, errors);
+  else if (kind === "item") validateRegistryItem(document, errors);
+  else if (kind === "fluid") validateRegistryFluid(document, errors);
+  else if (kind === "recipe") validateRegistryRecipe(document, errors);
+  else if (kind === "biome") validateRegistryBiome(document, errors);
+  else if (kind === "structure") validateRegistryStructure(document, errors);
+  else errors.push(`unsupported registry kind '${kind}'`);
+  return { valid: errors.length === 0, errors };
+}
+
+function buildRegistryDocument(kind, args) {
+  const value = (key, fallback, alternateKeys = []) => {
+    if (args[key] !== undefined) return args[key];
+    for (const alternate of alternateKeys) if (args[alternate] !== undefined) return args[alternate];
+    return fallback;
+  };
+  const namespaced = (key) => (args[key] !== undefined ? String(args[key]) : "vulkancraft");
+  if (kind === "block") {
+    const document = {
+      version: Number(value("version", 1)),
+      namespace: namespaced("namespace"),
+      name: String(args.name),
+      class: String(value("class", "solid")),
+      hardness: Number(value("hardness", 1)),
+      lightEmission: Number(value("light_emission", 0)),
+      lightAbsorption: Number(value("light_absorption", 1)),
+      opaque: Boolean(value("opaque", true)),
+      collidable: Boolean(value("collidable", true)),
+      // Collision/selection shapes (FALTANTES item 2): strict enums — an
+      // explicit unknown value is refused by the mirror validation. A
+      // collisionShape of "none" wins over collidable:true in the C++ runtime
+      // (the voxel raycast skips the block).
+      collisionShape: String(value("collision_shape", "full")),
+      selectionShape: String(value("selection_shape", "full")),
+      tags: value("tags", [], "tags") ?? [],
+      drops: value("drops", [], "drops") ?? []
+    };
+    if (args.id !== undefined) document.id = String(args.id);
+    if (args.builtin_id !== undefined) document.builtinId = Number(args.builtin_id);
+    if (args.color !== undefined) document.color = [...args.color];
+    if (args.face_top !== undefined) document.faceTop = [...args.face_top];
+    if (args.face_bottom !== undefined) document.faceBottom = [...args.face_bottom];
+    if (args.face_side !== undefined) document.faceSide = [...args.face_side];
+    if (args.occlusion !== undefined) document.occlusion = Boolean(args.occlusion);
+    if (args.render_layer !== undefined) document.renderLayer = Number(args.render_layer);
+    // Named states + versioned transitions (FALTANTES item 5).
+    if (args.states !== undefined) {
+      document.states = args.states.map((state) => {
+        const entry = {
+          name: String(state.name),
+          color: Array.isArray(state.color) ? [...state.color] : [1, 1, 1, 1]
+        };
+        if (state.face_top !== undefined) entry.faceTop = [...state.face_top];
+        if (state.face_bottom !== undefined) entry.faceBottom = [...state.face_bottom];
+        if (state.face_side !== undefined) entry.faceSide = [...state.face_side];
+        if (state.light_emission !== undefined) entry.lightEmission = Number(state.light_emission);
+        return entry;
+      });
+    }
+    if (args.transitions !== undefined) {
+      document.transitions = args.transitions.map((transition) => ({
+        from: String(transition.from ?? ""),
+        to: String(transition.to ?? ""),
+        trigger: String(transition.trigger ?? "")
+      }));
+    }
+    // Inline fluid binding (FALTANTES item 7): the block declares the fluid
+    // behavior it drives; no separate fluid asset needed.
+    if (args.fluid !== undefined) {
+      document.fluid = {
+        viscosity: Number(args.fluid.viscosity ?? 0.5),
+        density: Number(args.fluid.density ?? 1.0),
+        range: Number(args.fluid.range ?? 7),
+        tickInterval: Number(args.fluid.tick_interval ?? 0.08),
+        source: Boolean(args.fluid.source ?? true),
+        falling: Boolean(args.fluid.falling ?? true),
+        evaporation: Boolean(args.fluid.evaporation ?? true),
+        damagePerTick: Number(args.fluid.damage_per_tick ?? 0.0),
+        compressible: Boolean(args.fluid.compressible ?? false)
+      };
+    }
+    // Sound/particle/tool/resistance/physics component (FALTANTES item 4).
+    if (args.sound_place !== undefined) document.soundPlace = String(args.sound_place);
+    if (args.sound_break !== undefined) document.soundBreak = String(args.sound_break);
+    if (args.sound_step !== undefined) document.soundStep = String(args.sound_step);
+    if (args.sound_hit !== undefined) document.soundHit = String(args.sound_hit);
+    if (args.particle_break !== undefined) document.particleBreak = String(args.particle_break);
+    if (args.tool !== undefined) document.tool = String(args.tool);
+    if (args.tool_tier !== undefined) document.toolTier = Number(args.tool_tier);
+    if (args.resistance !== undefined) document.resistance = Number(args.resistance);
+    if (args.friction !== undefined) document.friction = Number(args.friction);
+    if (args.bounciness !== undefined) document.bounciness = Number(args.bounciness);
+    if (args.density !== undefined) document.density = Number(args.density);
+    // Declarative behavior reference (FALTANTES item 6).
+    if (args.behavior !== undefined) document.behaviorId = String(args.behavior);
+    return document;
+  }
+  if (kind === "item") {
+    const document = {
+      version: Number(value("version", 1)),
+      namespace: namespaced("namespace"),
+      name: String(args.name),
+      maxStack: Number(value("max_stack", 64)),
+      durability: Number(value("durability", 0)),
+      icon: String(value("icon", "")),
+      model: String(value("model", "")),
+      tags: value("tags", [], "tags") ?? []
+    };
+    if (args.id !== undefined) document.id = String(args.id);
+    if (args.use_cooldown !== undefined) document.useCooldown = Number(args.use_cooldown);
+    if (args.use_mode !== undefined) document.useMode = String(args.use_mode);
+    if (args.equip_slot !== undefined) document.equipSlot = String(args.equip_slot);
+    if (args.attack_damage !== undefined) document.attackDamage = Number(args.attack_damage);
+    if (args.armor !== undefined) document.armor = Number(args.armor);
+    if (args.behavior !== undefined) document.behaviorId = String(args.behavior);
+    return document;
+  }
+  if (kind === "fluid") {
+    const document = {
+      version: Number(value("version", 1)),
+      block: String(args.block),
+      viscosity: Number(value("viscosity", 0.5)),
+      density: Number(value("density", 1)),
+      range: Number(value("range", 7)),
+      tickInterval: Number(value("tick_interval", 0.08)),
+      source: Boolean(value("source", true)),
+      falling: Boolean(value("falling", true)),
+      evaporation: Boolean(value("evaporation", true)),
+      damagePerTick: Number(value("damage_per_tick", 0)),
+      compressible: Boolean(value("compressible", false))
+    };
+    if (args.id !== undefined) document.id = String(args.id);
+    if (args.color !== undefined) document.color = [...args.color];
+    return document;
+  }
+  if (kind === "recipe") {
+    const normalizeInput = (input) => {
+      const result = {};
+      if (input.item !== undefined) result.item = String(input.item);
+      if (input.tag !== undefined) result.tag = String(input.tag);
+      if (input.count !== undefined) result.count = Number(input.count);
+      if (input.alternatives !== undefined) result.alternatives = input.alternatives.map(String);
+      return result;
+    };
+    const normalizeOutput = (output) => {
+      const result = { item: String(output.item) };
+      if (output.count !== undefined) result.count = Number(output.count);
+      if (output.chance !== undefined) result.chance = Number(output.chance);
+      return result;
+    };
+    const document = {
+      version: Number(value("version", 1)),
+      namespace: namespaced("namespace"),
+      name: String(args.name),
+      station: String(value("station", "")),
+      time: Number(value("time", 1)),
+      energy: Number(value("energy", 0)),
+      fuel: String(value("fuel", "")),
+      conditions: value("conditions", [], "conditions") ?? [],
+      tags: value("tags", [], "tags") ?? [],
+      inputs: (value("inputs", [], "inputs") ?? []).map(normalizeInput),
+      outputs: (value("outputs", [], "outputs") ?? []).map(normalizeOutput)
+    };
+    if (args.id !== undefined) document.id = String(args.id);
+    if (args.byproducts !== undefined) document.byproducts = args.byproducts.map(normalizeOutput);
+    return document;
+  }
+  if (kind === "biome") {
+    const biomes = (value("biomes", [], "biomes") ?? []).map((biome) => {
+      const entry = { name: String(biome.name) };
+      if (biome.engine_biome_index !== undefined) entry.engineBiomeIndex = Number(biome.engine_biome_index);
+      if (biome.engineBiomeIndex !== undefined) entry.engineBiomeIndex = Number(biome.engineBiomeIndex);
+      if (biome.climate !== undefined) {
+        entry.climate = {};
+        for (const axis of CLIMATE_AXES) {
+          if (biome.climate[axis] !== undefined) entry.climate[axis] = [...biome.climate[axis]];
+        }
+      }
+      if (biome.surface !== undefined) {
+        entry.surface = biome.surface.map((rule) => {
+          const result = { blockId: Number(rule.block_id ?? rule.blockId) };
+          if (rule.min_depth !== undefined) result.minDepth = Number(rule.min_depth);
+          if (rule.max_depth !== undefined) result.maxDepth = Number(rule.max_depth);
+          if (rule.min_height !== undefined) result.minHeight = Number(rule.min_height);
+          if (rule.max_height !== undefined) result.maxHeight = Number(rule.max_height);
+          if (rule.min_slope !== undefined) result.minSlope = Number(rule.min_slope);
+          return result;
+        });
+      }
+      return entry;
+    });
+    return { version: Number(value("version", 1)), biomes };
+  }
+  if (kind === "structure") {
+    const document = {
+      version: Number(value("version", 1)),
+      sampleWidth: Number(args.sample_width),
+      sampleHeight: Number(args.sample_height),
+      sample: (value("sample", [], "sample") ?? []).map(Number),
+      patternSize: Number(value("pattern_size", 3)),
+      symmetry: Number(value("symmetry", 1)),
+      periodicOutput: Boolean(value("periodic_output", false)),
+      ground: Boolean(value("ground", false)),
+      seed: Number(value("seed", 0)),
+      profiles: (value("profiles", [], "profiles") ?? []).map((profile) => ({
+        blockId: Number(profile.block_id ?? profile.blockId),
+        layers: (profile.layers ?? []).map(Number)
+      }))
+    };
+    return document;
+  }
+  throw new Error(`unsupported registry kind '${kind}'`);
+}
+
+function registryDiff(previous, document) {
+  const keys = new Set([...Object.keys(previous), ...Object.keys(document)]);
+  const changed = [...keys].filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(document[key])).sort();
+  return { changed_fields: changed };
+}
+
+function authorRegistryAsset(engineRoot, args) {
+  const project = requireProject(engineRoot, args.project);
+  const kind = String(args.kind);
+  if (!REGISTRY_KINDS.includes(kind)) throw new Error(`unsupported registry kind '${kind}' (supported: ${REGISTRY_KINDS.join(", ")})`);
+  const name = assetName(args.name ?? (kind === "fluid" ? args.block : ""));
+  const document = buildRegistryDocument(kind, args);
+  const validation = validateRegistryDocument(kind, document);
+  if (!validation.valid) {
+    return {
+      refused: true,
+      project: project.project,
+      kind,
+      name,
+      diagnostics: validation.errors,
+      reason: "registry asset fails public-contract validation; nothing was written"
+    };
+  }
+  const file = path.join(project.registry, kind, `${name}.json`);
+  const previous = fs.existsSync(file) ? readJson(file) : null;
+  const diff = previous ? registryDiff(previous, document) : null;
+  const relative = path.relative(project.root, file).replaceAll(path.sep, "/");
+  if (args.dry_run) {
+    return {
+      dry_run: true,
+      would_write: relative,
+      project: project.project,
+      kind,
+      name,
+      document,
+      diagnostics: [],
+      diff
+    };
+  }
+  if (previous && !args.update) throw new Error(`registry asset '${kind}/${name}' already exists (pass update: true to replace, or use dry_run to preview the diff)`);
+  atomicWriteJson(file, document);
+  return {
+    created: !previous,
+    updated: Boolean(previous),
+    project: project.project,
+    kind,
+    name,
+    path: relative,
+    sha256: sha256File(file),
+    diagnostics: [],
+    diff,
+    rollback: previous ? { document: previous, hint: "re-author with update: true and this document to restore" } : undefined
+  };
+}
+
+function countRegistryAssets(project) {
+  let count = 0;
+  for (const kind of REGISTRY_KINDS) {
+    const directory = path.join(project.registry, kind);
+    if (!fs.existsSync(directory)) continue;
+    count += fs.readdirSync(directory).filter((file) => file.endsWith(".json")).length;
+  }
+  return count;
+}
+
+// Reads every registry asset of a project with its structural diagnostics.
+// The parsed document is kept for the cross-reference pass (item 9).
+function readRegistryAssets(project) {
+  const assets = [];
+  for (const kind of REGISTRY_KINDS) {
+    const directory = path.join(project.registry, kind);
+    if (!fs.existsSync(directory)) continue;
+    for (const fileName of fs.readdirSync(directory).filter((file) => file.endsWith(".json")).sort()) {
+      const file = path.join(directory, fileName);
+      let document = null;
+      const diagnostics = [];
+      try {
+        document = readJson(file);
+      } catch (error) {
+        diagnostics.push(`malformed JSON: ${error.message}`);
+      }
+      if (document) diagnostics.push(...validateRegistryDocument(kind, document).errors);
+      assets.push({
+        kind,
+        name: fileName.replace(/\.json$/, ""),
+        path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+        document,
+        valid: diagnostics.length === 0,
+        diagnostics
+      });
+    }
+  }
+  return assets;
+}
+
+// Cross-reference validation (FALTANTES item 9), mirroring the C++ factories:
+// every block drop must be namespaced and resolve to an authored item (a block
+// without drops auto-fills "<ns>:<name>" exactly like BlockRegistry::add);
+// every fluid's driven block must resolve to an authored or engine-builtin
+// block. Diagnostics append to each asset; structurally invalid documents are
+// skipped (their own errors already flag them).
+function collectCrossReferenceDiagnostics(assets) {
+  const items = new Map();
+  const blocks = new Map();
+  const docsOf = (asset) => (Array.isArray(asset.document) ? asset.document : [asset.document]);
+  for (const asset of assets) {
+    if (!asset.valid) continue;
+    for (const entry of docsOf(asset)) {
+      if (!entry || typeof entry !== "object") continue;
+      const ns = entry.namespace ?? "vulkancraft";
+      if (asset.kind === "item" && entry.name) items.set(`${ns}:${entry.name}`, true);
+      if (asset.kind === "block" && entry.name) blocks.set(`${ns}:${entry.name}`, true);
+    }
+  }
+  for (const asset of assets) {
+    if (!asset.valid) continue;
+    for (const entry of docsOf(asset)) {
+      if (!entry || typeof entry !== "object") continue;
+      const ns = entry.namespace ?? "vulkancraft";
+      if (asset.kind === "block" && entry.name) {
+        const drops = Array.isArray(entry.drops) && entry.drops.length ? entry.drops : [`${ns}:${entry.name}`];
+        for (const drop of drops) {
+          if (!String(drop).includes(":")) {
+            asset.diagnostics.push(`block '${ns}:${entry.name}': drop '${drop}' must be namespaced (ns:name)`);
+          } else if (!items.has(String(drop))) {
+            asset.diagnostics.push(`block '${ns}:${entry.name}': drop '${drop}' references an unknown item`);
+          }
+        }
+      }
+      if (asset.kind === "fluid" && entry.block) {
+        const ref = String(entry.block);
+        if (!blocks.has(ref) && !ENGINE_BUILTIN_BLOCKS.has(ref)) {
+          asset.diagnostics.push(`fluid for block '${ref}' references an unknown block`);
+        }
+      }
+    }
+    asset.valid = asset.valid && asset.diagnostics.length === 0;
+  }
+  return assets;
+}
+
+function inspectRegistryAssets(engineRoot, projectName) {
+  const project = requireProject(engineRoot, projectName);
+  const assets = collectCrossReferenceDiagnostics(readRegistryAssets(project));
+  return { project: project.project, registry_assets: assets, count: assets.length };
+}
+
 function validateProject(engineRoot, projectName) {
   const project = requireProject(engineRoot, projectName);
   const errors = [];
@@ -729,5 +1704,15 @@ function validateProject(engineRoot, projectName) {
     }
   }
 
-  return { project: project.project, valid: errors.length === 0, errors, warnings, scenes: sceneFiles.length };
+  // Registry assets: structural validation + cross-reference validation
+  // (FALTANTES item 9 — block drops resolve to items, fluid blocks resolve to
+  // authored/builtin blocks), mirrored from the public C++ factories.
+  const registryAssets = collectCrossReferenceDiagnostics(readRegistryAssets(project));
+  for (const asset of registryAssets) {
+    for (const diagnostic of asset.diagnostics) {
+      errors.push(`Content/Registry/${asset.kind}/${asset.name}.json: ${diagnostic}`);
+    }
+  }
+
+  return { project: project.project, valid: errors.length === 0, errors, warnings, scenes: sceneFiles.length, registry_assets: registryAssets.length };
 }

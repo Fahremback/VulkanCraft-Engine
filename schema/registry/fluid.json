@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/registry/fluid.json",
+  "title": "fluid registry asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "block": {
+      "description": "namespaced block the fluid drives, e.g. vulkancraft:sludge",
+      "type": "string"
+    },
+    "id": {
+      "description": "persistent UUID; derived from block when omitted",
+      "type": "string"
+    },
+    "viscosity": {
+      "description": "0..1 rheology hint",
+      "default": 0.5,
+      "type": "number"
+    },
+    "density": {
+      "description": "\"density\" registry field",
+      "default": 1,
+      "type": "number"
+    },
+    "range": {
+      "description": "horizontal spread budget 1..7",
+      "default": 7,
+      "type": "integer"
+    },
+    "tickInterval": {
+      "description": "\"tick_interval\" registry field",
+      "default": 0.08,
+      "type": "number"
+    },
+    "source": {
+      "description": "\"source\" registry field",
+      "default": true,
+      "type": "boolean"
+    },
+    "falling": {
+      "description": "\"falling\" registry field",
+      "default": true,
+      "type": "boolean"
+    },
+    "evaporation": {
+      "description": "\"evaporation\" registry field",
+      "default": true,
+      "type": "boolean"
+    },
+    "damagePerTick": {
+      "description": "\"damage_per_tick\" registry field",
+      "default": 0,
+      "type": "number"
+    },
+    "compressible": {
+      "description": "\"compressible\" registry field",
+      "default": false,
+      "type": "boolean"
+    },
+    "color": {
+      "description": "[r, g, b(, a)] 0..1",
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 4,
+      "items": {
+        "type": "number"
+      }
+    },
+    "version": {
+      "description": "\"version\" registry field",
+      "default": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "block"
+  ]
+}

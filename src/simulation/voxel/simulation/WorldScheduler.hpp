@@ -19,8 +19,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // One voxel coordinate of tick work.
@@ -64,10 +66,24 @@ public:
         FluidTick = 2,     // cell-driven fluid work (the world's fluid sim is
                            // driven by the fixed-tick callback, see below)
         ScheduledTick = 3, // absolute-tick deadlines (one-shot / periodic)
-        Count = 4
+        NeighborTick = 4,  // ordered neighbor propagation (FALTANTES §6 item
+                           // 124): a changed center notifies its orthogonal
+                           // neighbors in a fixed, deterministic order
+        Count = 5
     };
 
     using Handler = std::function<void(const TickCell&)>;
+    // Neighbor phase payload: the changed `center` and the `neighbor` cell
+    // being notified (center + one unit on an axis). The project decides what
+    // a neighbor does (light/fluid/reaction propagation) from the fixed order.
+    struct NeighborUpdate {
+        TickCell center{ -1, -1, -1 };
+        TickCell neighbor{ -1, -1, -1 };
+        int axis{ 0 };   // 0..2
+        int sign{ 0 };   // -1 or +1 along axis
+        friend bool operator==(const NeighborUpdate&, const NeighborUpdate&) = default;
+    };
+    using NeighborHandler = std::function<void(const NeighborUpdate&)>;
 
     // seed drives random-tick cell selection; chunkSize matches the world's
     // chunk dimensions (default 16) for active-region and column math;
@@ -85,16 +101,25 @@ public:
     void schedule_random_tick(int chunkX, int chunkZ);
     void schedule_fluid_tick(TickCell cell);
     void schedule_scheduled_tick(TickCell cell, uint64_t atTick);
+    // FALTANTES §6 item 124: queues the cell's SIX orthogonal neighbors (one
+    // unit on each axis, both signs) for the NeighborTick phase. Deduped by
+    // center; the handler receives one NeighborUpdate per neighbor in the
+    // fixed order (-x, +x, -y, +y, -z, +z).
+    void schedule_neighbor_tick(TickCell cell);
     // Removes the cell from every pending phase (including scheduled).
     void cancel_cell(TickCell cell);
     // Removes every pending cell/chunk inside the given chunk (used when the
     // world evicts a chunk: queued work must not outlive its chunk).
     void cancel_chunk(int chunkX, int chunkZ);
+    // Removes the center's pending neighbor propagation.
+    void cancel_neighbor(TickCell cell);
 
     // ---- configuration ----
     void set_handler(Phase phase, Handler handler);
+    void set_neighbor_handler(NeighborHandler handler);
     // -1 = unlimited (default). Work beyond the budget carries to the next
-    // tick, in the same sorted order.
+    // tick, in the same sorted order. NeighborTick budget counts NEIGHBORS
+    // dispatched (six per queued center).
     void set_budget(Phase phase, int maxPerTick);
     // Fired once after every completed tick (after all phases). The engine
     // world uses it to run its fluid simulation at the fixed cadence.
@@ -104,6 +129,39 @@ public:
     // center of (-1, -1) disables the active region (everything ticks).
     void set_active_center(int chunkX, int chunkZ);
     void set_active_radius(int chunks);
+
+    // ---- replay / rollback / save / headless (FALTANTES §6 item 129) ----
+    // The scheduler's full determinism-relevant state: the fixed-tick clock
+    // (tick, accumulator) and every pending queue (block priorities, random
+    // chunks, fluid cells, scheduled deadlines, neighbor centers). Captured in
+    // SORTED order (never hash order) so the byte stream is deterministic and
+    // two identical runs capture identical state. restore_state() rewinds the
+    // clock and queues to a previous capture (replay/rollback); the engine
+    // persists capture_state() with the world save and a dedicated/headless
+    // server restores it on load so tick work continues exactly where the
+    // saved session was.
+    struct State {
+        uint64_t tick{ 0 };
+        float accumulator{ 0.0f };
+        std::vector<std::pair<TickCell, int>> block;
+        std::vector<TickChunk> randomChunks;
+        std::vector<TickCell> fluid;
+        std::vector<std::pair<TickCell, uint64_t>> scheduled;
+        std::vector<TickCell> neighbors;
+        friend bool operator==(const State&, const State&) = default;
+    };
+
+    [[nodiscard]] State capture_state() const;
+    void restore_state(const State& state);
+
+    // Versioned binary serialization of capture_state() (magic "VCWS" + u32
+    // version + state). Deterministic: the same scheduler captures identical
+    // bytes; deserialize accepts only the current version and returns false
+    // with a diagnostic otherwise (never silently resets). Const: safe to
+    // capture from the world's const save paths.
+    std::vector<std::byte> serialize_state() const;
+    bool deserialize_state(const std::vector<std::byte>& data,
+                           std::string& errorOut);
 
     // ---- observability ----
     [[nodiscard]] uint64_t current_tick() const { return tick_; }
@@ -117,6 +175,7 @@ private:
     void run_phase(Phase phase);
     void run_random_phase();
     void run_scheduled_phase();
+    void run_neighbor_phase();
     // Deterministic column (x, z, y) inside a chunk from seed/chunk/tick.
     [[nodiscard]] TickCell random_cell(int chunkX, int chunkZ, uint64_t tick) const;
     // True when the cell's chunk is inside the active region (or none set).
@@ -131,18 +190,21 @@ private:
     int maxTicksPerAdvance_{ 128 };
 
     // Per-phase pending work. BlockTick maps cell -> priority; ScheduledTick
-    // maps cell -> absolute deadline; RandomTick holds chunk keys.
+    // maps cell -> absolute deadline; RandomTick holds chunk keys; NeighborTick
+    // holds the changed centers awaiting neighbor dispatch.
     std::unordered_map<TickCell, int, TickCellHash> blockPending_;
     std::unordered_set<TickChunk, TickChunkHash> randomChunks_;
     std::unordered_set<TickCell, TickCellHash> fluidPending_;
     std::unordered_map<TickCell, uint64_t, TickCellHash> scheduledPending_;
+    std::unordered_set<TickCell, TickCellHash> neighborCenters_;
 
-    std::function<void(const TickCell&)> handlers_[4];
+    std::function<void(const TickCell&)> handlers_[5];
+    std::function<void(const NeighborUpdate&)> neighborHandler_;
     std::function<void(uint64_t)> tickCallback_;
-    int budgets_[4]{ -1, -1, -1, -1 };
+    int budgets_[5]{ -1, -1, -1, -1, -1 };
     int activeCenterX_{ -1 };
     int activeCenterZ_{ -1 };
     int activeRadius_{ -1 };
 
-    std::size_t executed_[4]{ 0, 0, 0, 0 };
+    std::size_t executed_[5]{ 0, 0, 0, 0 };
 };

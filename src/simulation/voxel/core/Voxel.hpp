@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 enum class BlockType : uint8_t {
     Air = 0,
@@ -100,14 +101,66 @@ inline BlockType as_builtin_block(RuntimeBlockId id) {
 struct RuntimeBlockInfo {
     std::string uuid;              // persistent identity (empty = builtin)
     glm::vec4 color{ 1.0f };       // data-driven base color (no texture layer)
+    // Per-face material overrides (FALTANTES §14): mirror of
+    // BlockDefinition.faceTop/Bottom/Side; the mesher picks by face normal.
+    glm::vec4 faceTop{ 1.0f };
+    glm::vec4 faceBottom{ 1.0f };
+    glm::vec4 faceSide{ 1.0f };
+    bool faceTopSet{ false };
+    bool faceBottomSet{ false };
+    bool faceSideSet{ false };
+    bool occludes{ true };         // face-culling hint (false = draw vs opaque)
+    uint8_t renderLayer{ 0 };
     bool solid{ true };            // collision / raycast
     bool transparent{ false };     // render pass / culling hints
     bool fluid{ false };
+    // Collision/selection shapes (FALTANTES item 2): mirror of
+    // BlockDefinition.collisionShape/selectionShape. collisionShape: 0 =
+    // full, 1 = cross, 2 = none (none wins over the `solid` flag in raycast
+    // consumers that check the shape); selectionShape feeds the editor
+    // pick-box milestone.
+    uint8_t collisionShape{ 0 };
+    uint8_t selectionShape{ 0 };
+    // Tool/physics component (FALTANTES item 4): mirror of
+    // BlockDefinition.tool/toolTier/resistance/friction/bounciness/density.
+    // Consumed by the gameplay/physics milestones (tool gating, destruction
+    // scaling, dynamic-body response); mirrored here so consumers never touch
+    // the registry. tool: 0 = any, 1..5 = pickaxe/axe/shovel/hoe/sword.
+    uint8_t tool{ 0 };
+    uint8_t toolTier{ 0 };
+    float resistance{ 0.0f };
+    float friction{ 0.5f };
+    float bounciness{ 0.0f };
+    float density{ 1.0f };
+    std::string soundPlace;
+    std::string soundBreak;
+    std::string soundStep;
+    std::string soundHit;
+    std::string particleBreak;
+    // Behavior component (FALTANTES item 6): namespaced behavior reference;
+    // resolved by the abilities/block entity milestone.
+    std::string behaviorId;
     // Discrete lighting (META section 12), 0..15. lightAbsorption is the
     // propagation cost of a cell (15 = opaque, blocks sky and block light);
     // the JSON float (0..1) is scaled by 15 when the runtime table is built.
     uint8_t lightEmission{ 0 };
     uint8_t lightAbsorption{ 15 };
+
+    // Named states (FALTANTES item 5): mirror of BlockDefinition.states with
+    // light already discretized. states[0] is the default; the mesher resolves
+    // per-state material via VoxelMesher::resolve_state_material.
+    struct RuntimeBlockState {
+        std::string name;
+        glm::vec4 color{ 1.0f };
+        glm::vec4 faceTop{ 1.0f };
+        glm::vec4 faceBottom{ 1.0f };
+        glm::vec4 faceSide{ 1.0f };
+        bool faceTopSet{ false };
+        bool faceBottomSet{ false };
+        bool faceSideSet{ false };
+        uint8_t lightEmission{ 0 };
+    };
+    std::vector<RuntimeBlockState> states;
 };
 
 // Every texture occupies one layer in TextureManager's 2D array.
@@ -183,30 +236,58 @@ struct FaceTextures {
     }
 };
 
+// Appearance-only block material (FALTANTES §8 item 166): color + optional
+// textures. SIMULATION flags (solidity, light absorption) do NOT live here —
+// they belong to BlockSimProps / the runtime block table. A visual change can
+// never alter physics, and vice versa. A block only needs a color;
+// FaceTextures::none() is a fully supported material, not a fallback error.
 struct BlockMaterial {
     glm::vec4 color{ 1.0f };
     FaceTextures textures{ FaceTextures::none() };
-    bool solid{ true };
-    bool transparent{ false };
 };
 
-// Single registry for block appearance and physical flags. A block only needs a
-// color; FaceTextures::none() is a fully supported material, not a fallback error.
+// Simulation-only properties of builtin blocks (FALTANTES §8 item 166): the
+// physical flags live in their OWN table, never in the visual material.
+// Data-driven (registry) blocks get the same properties from BlockDefinition
+// via RuntimeBlockInfo instead; the two paths share no struct.
+struct BlockSimProps {
+    bool solid{ true };            // collision / raycast
+    bool transparent{ false };     // light passes (0 absorption)
+    uint8_t lightAbsorption{ 15 }; // 0..15 propagation cost
+};
+
+// Builtin simulation table: opaque solids absorb fully (15); glass is solid
+// for collision but passes light (0); water/lava and leaves attenuate to 1;
+// air absorbs nothing. This mirrors the historical material-table flags 1:1
+// (behavior preserved, verified by test_material_simulation_separation).
+inline const std::array<BlockSimProps, static_cast<std::size_t>(BlockType::Count)> BLOCK_SIM_PROPS = [] {
+    std::array<BlockSimProps, static_cast<std::size_t>(BlockType::Count)> table;
+    table.fill(BlockSimProps{ true, false, 15 });  // opaque solid default
+    table[static_cast<std::size_t>(BlockType::Air)] = BlockSimProps{ false, true, 0 };
+    table[static_cast<std::size_t>(BlockType::Leaves)] = BlockSimProps{ false, true, 1 };
+    table[static_cast<std::size_t>(BlockType::Glass)] = BlockSimProps{ true, true, 0 };
+    table[static_cast<std::size_t>(BlockType::Water)] = BlockSimProps{ false, true, 1 };
+    table[static_cast<std::size_t>(BlockType::Lava)] = BlockSimProps{ false, false, 1 };
+    table[static_cast<std::size_t>(BlockType::LeavesBirch)] = BlockSimProps{ false, true, 1 };
+    table[static_cast<std::size_t>(BlockType::LeavesSpruce)] = BlockSimProps{ false, true, 1 };
+    return table;
+}();
+
 inline const std::array<BlockMaterial, static_cast<std::size_t>(BlockType::Count)> BLOCK_MATERIALS{{
-    { glm::vec4(0.0f), FaceTextures::none(), false, true },
+    { glm::vec4(0.0f), FaceTextures::none() },
     { glm::vec4(1.0f), FaceTextures::directional(TextureIndex::GrassTop, TextureIndex::GrassSide, TextureIndex::Dirt) },
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::Dirt) },
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::Stone) },
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::Bedrock) },
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::Sand) },
     { glm::vec4(1.0f), FaceTextures::directional(TextureIndex::WoodTop, TextureIndex::WoodSide, TextureIndex::WoodTop) },
-    { glm::vec4(0.85f, 1.0f, 0.85f, 0.90f), FaceTextures::all(TextureIndex::Leaves), false, true },
+    { glm::vec4(0.85f, 1.0f, 0.85f, 0.90f), FaceTextures::all(TextureIndex::Leaves) },
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::Planks) },
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::Cobblestone) },
-    { glm::vec4(1.0f, 1.0f, 1.0f, 0.45f), FaceTextures::all(TextureIndex::Glass), true, true },
+    { glm::vec4(1.0f, 1.0f, 1.0f, 0.45f), FaceTextures::all(TextureIndex::Glass) },
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::Bricks) },
-    { glm::vec4(0.80f, 0.90f, 1.0f, 0.65f), FaceTextures::all(TextureIndex::Water), false, true },
-    { glm::vec4(1.0f), FaceTextures::all(TextureIndex::Lava), false, false },
+    { glm::vec4(0.80f, 0.90f, 1.0f, 0.65f), FaceTextures::all(TextureIndex::Water) },
+    { glm::vec4(1.0f), FaceTextures::all(TextureIndex::Lava) },
     { glm::vec4(0.64f, 0.31f, 0.22f, 1.0f), FaceTextures::none() },
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::CoalOre) },
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::IronOre) },
@@ -217,10 +298,10 @@ inline const std::array<BlockMaterial, static_cast<std::size_t>(BlockType::Count
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::LapisOre) },
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::CopperOre) },
     { glm::vec4(1.0f), FaceTextures::directional(TextureIndex::BirchWoodTop, TextureIndex::BirchWoodSide, TextureIndex::BirchWoodTop) },
-    { glm::vec4(0.85f, 1.0f, 0.85f, 0.90f), FaceTextures::all(TextureIndex::BirchLeaves), false, true },
+    { glm::vec4(0.85f, 1.0f, 0.85f, 0.90f), FaceTextures::all(TextureIndex::BirchLeaves) },
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::BirchPlanks) },
     { glm::vec4(1.0f), FaceTextures::directional(TextureIndex::SpruceWoodTop, TextureIndex::SpruceWoodSide, TextureIndex::SpruceWoodTop) },
-    { glm::vec4(0.85f, 1.0f, 0.85f, 0.90f), FaceTextures::all(TextureIndex::SpruceLeaves), false, true },
+    { glm::vec4(0.85f, 1.0f, 0.85f, 0.90f), FaceTextures::all(TextureIndex::SpruceLeaves) },
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::SprucePlanks) },
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::Granite) },
     { glm::vec4(1.0f), FaceTextures::all(TextureIndex::Diorite) },
@@ -250,6 +331,8 @@ static_assert(static_cast<std::size_t>(BlockType::Air) == 0,
               "Block IDs are serialized/material-registry IDs and must remain stable");
 static_assert(BLOCK_MATERIALS.size() == static_cast<std::size_t>(BlockType::Count),
               "Every block ID must have exactly one fixed material entry");
+static_assert(BLOCK_SIM_PROPS.size() == static_cast<std::size_t>(BlockType::Count),
+              "Every block ID must have exactly one fixed simulation entry");
 static_assert(static_cast<std::size_t>(TextureIndex::GrassTop) == 0,
               "Texture array layers are a stable GPU ABI and must remain append-only");
 
@@ -258,6 +341,12 @@ inline const BlockMaterial& get_block_material(BlockType type) {
     if (index < BLOCK_MATERIALS.size()) return BLOCK_MATERIALS[index];
     static const BlockMaterial missing{ glm::vec4(1.0f, 0.0f, 1.0f, 1.0f), FaceTextures::none() };
     return missing;
+}
+
+inline BlockSimProps get_block_sim(BlockType type) {
+    const std::size_t index = static_cast<std::size_t>(type);
+    if (index < BLOCK_SIM_PROPS.size()) return BLOCK_SIM_PROPS[index];
+    return BlockSimProps{ true, false, 15 };
 }
 
 inline std::optional<TextureIndex> get_block_texture(BlockType type, const glm::vec3& normal) {
@@ -286,8 +375,11 @@ inline bool is_emissive_block(BlockType type) {
     return type == BlockType::Lava || type == BlockType::Glowstone ||
            type == BlockType::SeaLantern || type == BlockType::MagmaBlock;
 }
-inline bool is_transparent_block(BlockType type) { return get_block_material(type).transparent; }
-inline bool is_solid_block(BlockType type) { return get_block_material(type).solid; }
+// Simulation predicates read the SIMULATION table (FALTANTES §8 item 166) —
+// never the visual material. is_solid_block drives collision/raycast,
+// is_transparent_block drives light propagation (glass passes light).
+inline bool is_transparent_block(BlockType type) { return get_block_sim(type).transparent; }
+inline bool is_solid_block(BlockType type) { return get_block_sim(type).solid; }
 
 constexpr uint8_t WATER_SOURCE_LEVEL = 0;
 constexpr uint8_t WATER_MAX_LEVEL = 7;

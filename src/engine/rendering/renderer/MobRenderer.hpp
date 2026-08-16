@@ -1,8 +1,9 @@
 #pragma once
 
 #include "Frustum.hpp"
-#include "Mob.hpp"
 #include "VulkanTypes.hpp"
+#include "engine/entity/IEntityWorld.hpp"
+#include "engine/entity/IMobBehavior.hpp"
 
 #include <array>
 
@@ -15,7 +16,10 @@ struct LimbMesh {
 class MobRenderer final {
 public:
     void init(VkDevice device, VmaAllocator allocator);
-    void draw(const MobManager& mobManager, VkCommandBuffer commandBuffer,
+    // Draws every entity carrying the mob component (kMobComponentType, JSON
+    // MobSpec blob: typeIndex/yaw/walkAnimProgress/fuseTimer) from the public
+    // entity layer — FALTANTES item 11 removed the legacy MobManager track.
+    void draw(const engine::entity::IEntityWorld& entities, VkCommandBuffer commandBuffer,
               VkPipelineLayout pipelineLayout, const glm::mat4& viewProjection,
               const Frustum& frustum, const glm::vec3& cameraPosition,
               const glm::vec3& sunDirection, const glm::vec3& sunColor,

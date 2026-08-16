@@ -46,6 +46,16 @@ table EntityComponentEntry {
   blob: [ubyte];
 }
 
+// One region tile (added 2026-08-15, FALTANTES §4 item 1): a fixed NxN chunk
+// area of the paged save. A region-backed storage persists each region as its
+// own page ("r.<x>.<z>") next to the "world" manifest page; the manifest
+// carries the region list so a loader restores every page. Optional field:
+// monolithic v5 saves have no regions (null == "not paged").
+table RegionEntry {
+  x: int;
+  z: int;
+}
+
 // One world entity (added 2026-08-14, META section 15): registered entity
 // type, position, builtin health, tick policy and project components. The
 // field on WorldSave is optional, so v5 buffers written before this addition
@@ -66,6 +76,13 @@ table WorldSave {
   chunks: [ChunkEntry];
   entities: [BlockEntityEntry];
   world_entities: [EntityEntry];
+  regions: [RegionEntry];
+  // Opaque scheduler state (FALTANTES §6 item 129): the WorldScheduler's
+  // versioned binary capture (clock + pending queues), so a dedicated/headless
+  // server restores tick work exactly where the saved session was. Optional:
+  // null/empty means "no scheduler state" (e.g. v1-v4 migrated saves start a
+  // fresh clock). The engine never interprets the bytes here.
+  scheduler_state: [ubyte];
 }
 
 root_type WorldSave;

@@ -24,5 +24,14 @@ namespace storage {
 // IVoxelWorld::register_storage. The rocksdb headers never appear here.
 std::shared_ptr<engine::voxel::IChunkStorage> create_rocksdb_chunk_storage();
 
+// Builds a REGION-PAGED chunk store (FALTANTES §4 item 1): each save is a
+// directory whose pages are per-region files ("r.<x>.<z>") plus a "world"
+// manifest page — so a world save is a set of pages, not one monolithic blob.
+// Implements the paged surface of IChunkStorage; the world owns the page
+// encoding. regionSize is the region tile in chunks (default 8 -> 128x128
+// blocks). Pure std/filesystem, no third-party backend.
+std::shared_ptr<engine::voxel::IChunkStorage> create_region_chunk_storage(
+    int regionSize = 8);
+
 }  // namespace storage
 }  // namespace engine

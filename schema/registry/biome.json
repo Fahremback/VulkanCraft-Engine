@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/registry/biome.json",
+  "title": "biome registry asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset file name (e.g. my_biomes); carried by the file name, NOT a document property",
+      "type": "string"
+    },
+    "biomes": {
+      "description": "[{name, engine_biome_index 0..255, climate, surface}]",
+      "type": "array"
+    },
+    "version": {
+      "description": "\"version\" registry field",
+      "default": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "biomes"
+  ]
+}

@@ -45,8 +45,6 @@ struct FluidParams {
     bool compressible{ false };
 };
 
-class MobManager;
-
 struct FluidCellHash {
     std::size_t operator()(const FluidCell& cell) const {
         std::size_t h = std::hash<int>{}(cell.x);
@@ -70,15 +68,22 @@ public:
     // Fixed cadence of the world's fluid simulation (the scheduler's FluidTick
     // phase step). The SDK derives per-fluid tickEveryTicks from this.
     static constexpr float kFluidTickSeconds = 0.08f;
+    // Lighting plugin overrides (FALTANTES §3 item 2): per-block emission/
+    // absorption pushed by the facade from a registered IVoxelLighting plugin;
+    // consulted BEFORE the builtin tables by the light pass.
+    struct LightOverride {
+        uint8_t emission{ 0 };
+        uint8_t absorption{ 15 };
+    };
 
     // Alcance visual em chunks. Apenas a janela de interação próxima vira
     // chunks/voxels completos; o restante é um clipmap de superfície.
     int chunkBudget{ 4096 };
+    uint64_t memoryBudget{ 0 };  // bytes; 0 = unlimited (FALTANTES §4 item 6)
     int renderDistance{ 4096 };
     int maxGpuUploadsPerFrame{ 8 };
-    // Mob/terrain population can be disabled for deterministic headless runs
-    // (tests): mobs and structures never touch the world in that mode.
-    bool mobSpawningEnabled{ true };
+    // Terrain population (structures) can be disabled for deterministic
+    // headless runs (tests): structures never touch the world in that mode.
     bool structureSpawningEnabled{ true };
     // Qualidade relativa no limite do alcance. O restante da curva e derivado
     // continuamente por Q(d) = pow(Qfinal, d / reach). O valor e ajustavel em
@@ -92,7 +97,6 @@ public:
     std::unordered_map<std::pair<int, int>, std::shared_ptr<Chunk>, ChunkHash> chunks;
     std::deque<FluidCell> activeFluidCells;
     std::unordered_set<FluidCell, FluidCellHash> activeFluidSet;
-    std::unordered_set<std::pair<int, int>, ChunkHash> mobPopulatedChunks;
     std::unordered_set<std::pair<int, int>, ChunkHash> structurePopulatedChunks;
     int visibleCenterChunkX{ 0 };
     int visibleCenterChunkZ{ 0 };
@@ -129,6 +133,7 @@ public:
     // Direct access for engine tools/tests to configure phases, budgets and
     // the active region before update() drives the clock.
     WorldScheduler& scheduler() { return scheduler_; }
+    const WorldScheduler& scheduler() const { return scheduler_; }
 
     // ---- Block entities (META section 8) ----
     // Voxels with project-owned state. The engine stores them keyed by world
@@ -189,14 +194,37 @@ public:
 
     // workerThreads = 0 keeps the default (hardware concurrency); tests and
     // headless servers can pass a small fixed count for deterministic runs.
-    explicit World(MobManager& mobManager, size_t workerThreads = 0);
+    explicit World(size_t workerThreads = 0);
+
+private:
+    // Resolved worker pool size (0 input -> hardware concurrency), exposed in
+    // the streaming snapshot.
+    size_t workerThreads_{ 0 };
+public:
     ~World();
 
     void set_chunk_budget(int budget);
+    // RAM-budgeted chunk cache (FALTANTES §4 item 6): 0 = unlimited. See the
+    // public contract on IVoxelWorld for the eviction policy (farthest
+    // non-dirty chunks while over budget).
+    void set_memory_budget(uint64_t bytes);
+    // Clears the "has unsaved edits" pin on the given chunks after a save
+    // persisted them. A revision is per chunk: the flag is cleared ONLY when
+    // the chunk's current revision still matches the one that was just saved
+    // (an edit made mid-save bumps the revision and keeps the flag, so the
+    // next save persists it).
+    void mark_chunks_saved(const std::vector<std::pair<std::pair<int, int>,
+                            uint64_t>>& savedChunks);
     void cycle_chunk_budget(int direction);
     void adjust_far_lod_quality(int direction, int steps = 1);
     [[nodiscard]] float far_lod_endpoint_fraction() const;
     [[nodiscard]] float far_lod_endpoint_percent() const;
+
+    // Streaming/budget observability (FALTANTES §3): snapshot of the streaming
+    // state — chunk state census under the chunk mutex, budgets and worker/
+    // entity/fluid counts. Best-effort live measurements for the public
+    // engine::voxel::StreamingSnapshot contract.
+    [[nodiscard]] engine::voxel::StreamingSnapshot streaming_snapshot() const;
 
     void update(const glm::vec3& playerPos, WorldRenderBridge& renderBridge, float deltaTime);
     void cleanup();
@@ -207,12 +235,48 @@ public:
     void set_block_at(const glm::vec3& worldPos, RuntimeBlockId type);
     void set_water_at(const glm::vec3& worldPos, uint8_t level);
     bool is_chunk_loaded_at(const glm::vec3& worldPos) const;
+    // Chunk present and not generating/unloaded — safe for fluid reads AND
+    // writes (mirrors set_block_at's guard; Meshing/Uploaded states are fine).
+    bool can_touch_chunk_at(const glm::vec3& worldPos) const;
+
+    // Persistence restore support (FALTANTES §4 item 1): while `restoring` is
+    // true the eviction pass of update() is suppressed, so chunks written by a
+    // load survive the load's own update() calls (each restore may wait out an
+    // in-flight generator, and that wait advances the pipeline via update()).
+    void set_restoring(bool active);
+    // Makes chunk (cx,cz) writable for a restore — creates it in the world map
+    // (or takes over an existing one, waiting out an in-flight generator via
+    // update()) and marks it Uploaded + dirty so the next remesh pass rebuilds
+    // its mesh from the restored data. Returns false only if the generator
+    // never finishes (bounded wait). The wait advances the pipeline through
+    // update(), so it needs the player position and render bridge like update.
+    bool ensure_chunk_restored(int cx, int cz, const glm::vec3& playerPos,
+                               WorldRenderBridge& renderBridge);
+    // FALTANTES §4 item 18: restores a chunk's voxel data in ONE batch write
+    // (no per-voxel set_block_at machinery), with a single invalidation — one
+    // dataVersion bump, one dirty flag, one light-dirty pass (chunk + 4
+    // neighbors). Creating/take-over semantics match ensure_chunk_restored
+    // (absent chunk created directly, in-flight generator waited out via
+    // update()); restored content is the persisted state, so hasUnsavedEdits
+    // is cleared, never set. `extent` is the vertical count of layers to
+    // restore (rows in [0, extent)); blocks/water are laid out y-major,
+    // layerBytes per layer (16*16).
+    bool restore_chunk_data(int cx, int cz, int extent,
+                            const RuntimeBlockId* blocks, const uint8_t* water,
+                            const glm::vec3& playerPos,
+                            WorldRenderBridge& renderBridge);
 
     // Data-driven fluids (META section 13): the facade derives the fluid
     // table from the project's FluidRegistry (plus water/lava defaults) and
     // pushes it here as plain data — the simulation never touches the
     // registry. Must be set before fluids are simulated.
     void set_fluid_table(std::unordered_map<RuntimeBlockId, FluidParams> table);
+    // Lighting plugin substitution (FALTANTES §3 item 2): per-block emission/
+    // absorption overrides pushed from a registered IVoxelLighting plugin;
+    // consulted before the builtin tables by the light pass. Empty map
+    // restores the builtin behavior; queued chunks for an immediate relight.
+    void set_light_table_overrides(
+        std::unordered_map<RuntimeBlockId, LightOverride> overrides);
     // Fluid parameters for a runtime id; nullptr when the block is not a fluid.
     [[nodiscard]] const FluidParams* fluid_params_for_id(RuntimeBlockId id) const;
     [[nodiscard]] bool is_fluid_runtime_id(RuntimeBlockId id) const;
@@ -228,8 +292,6 @@ public:
     void set_fluid_level_at(const glm::vec3& worldPos, uint8_t level);
 
 private:
-    MobManager& mobManager_;
-
     // Player position seen by the scheduler's tick callback (fluid runs with
     // the latest known focus; the callback itself is registered once).
     glm::vec3 lastFluidPlayerPos_{ 0.0f, 0.0f, 0.0f };
@@ -237,6 +299,8 @@ private:
     // Chunks whose discrete light is stale (edits, water changes, uploads and
     // changed neighbors). Processed by the budgeted light pass in update().
     std::unordered_set<std::pair<int, int>, ChunkHash> lightDirtyChunks_;
+    // Restore mode (set_restoring): suppresses chunk eviction during loads.
+    bool restoring_{ false };
     void run_light_pass(const glm::vec3& playerPos);
     // Emission/absorption tables (builtin + registry-derived dynamic blocks).
     uint8_t light_emission(RuntimeBlockId id) const;
@@ -270,4 +334,6 @@ private:
 
     // Fluid table (runtime id -> parameters), pushed by the SDK facade.
     std::unordered_map<RuntimeBlockId, FluidParams> fluidTable_;
+
+    std::unordered_map<RuntimeBlockId, LightOverride> lightOverrides_;
 };

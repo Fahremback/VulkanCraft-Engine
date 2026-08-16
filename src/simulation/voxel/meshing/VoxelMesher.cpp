@@ -27,10 +27,34 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
             color = get_block_color(type, normal);
             layer = get_block_texture_layer(type, normal);
         } else if (const RuntimeBlockInfo* info = snapshot.find_runtime_block(id)) {
-            color = info->color;
+            // State-aware material (FALTANTES item 5): state 0 is the default
+            // (base per-face material), identical to the block-level rules.
+            color = resolve_state_material(*info, 0, normal);
         }
         return std::pair<glm::vec4, float>{ color, layer };
     };
+
+    // FALTANTES §8 item 167: a fluid is ANY block that drives the fluid
+    // simulation — builtin Water/Lava, or a registry-defined (dynamic) block
+    // whose class is Fluid. is_fluid feeds face culling (fluids never draw
+    // shared faces).
+    auto is_fluid = [&](RuntimeBlockId id) {
+        if (is_builtin_block(id)) return is_fluid_block(static_cast<BlockType>(id));
+        const RuntimeBlockInfo* info = snapshot.find_runtime_block(id);
+        return info != nullptr && info->fluid;
+    };
+    // Which fluids get the FLUID MESH (transparent, height-sampled by level,
+    // emitted into waterMeshVertices): builtin Water (Water texture layer) and
+    // project fluids (dynamic, class "fluid", color-only). Builtin lava keeps
+    // the opaque textured cube path — its material carries the Lava texture
+    // layer, and the water pass material check is the hard geometry contract
+    // that separates the two passes.
+    auto is_fluid_mesh = [&](RuntimeBlockId id) {
+        if (is_builtin_block(id)) return static_cast<BlockType>(id) == BlockType::Water;
+        const RuntimeBlockInfo* info = snapshot.find_runtime_block(id);
+        return info != nullptr && info->fluid;
+    };
+
 
     float offsetX = static_cast<float>(snapshot.id.coord.x * CHUNK_SIZE_X);
     float offsetZ = static_cast<float>(snapshot.id.coord.z * CHUNK_SIZE_Z);
@@ -43,7 +67,7 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
         glm::vec3 uv1(1.0f, 0.0f, layer);
         glm::vec3 uv2(1.0f, 1.0f, layer);
         glm::vec3 uv3(0.0f, 1.0f, layer);
-        auto& vertices = type == waterId ? mesh.waterMeshVertices : mesh.meshVertices;
+        auto& vertices = is_fluid_mesh(type) ? mesh.waterMeshVertices : mesh.meshVertices;
         vertices.push_back({ p0, normal, col, uv0 });
         vertices.push_back({ p1, normal, col, uv1 });
         vertices.push_back({ p2, normal, col, uv2 });
@@ -54,15 +78,30 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
 
     auto should_draw_face = [&](RuntimeBlockId current, RuntimeBlockId neighbor) {
         if (neighbor == kRuntimeAirId) return true;
-        const bool currentWater = is_water_block(as_builtin_block(current));
-        const bool neighborWater = is_water_block(as_builtin_block(neighbor));
+        const bool currentFluid = is_fluid(current);
+        const bool neighborFluid = is_fluid(neighbor);
         const bool currentLeaf = is_leaf_block(as_builtin_block(current));
         const bool neighborLeaf = is_leaf_block(as_builtin_block(neighbor));
-        if (currentWater && neighborWater) return false;
-        if (currentWater && !neighborWater) return true;
-        if (!currentWater && neighborWater) return true;
+        if (currentFluid && neighborFluid) return false;
+        if (currentFluid && !neighborFluid) return true;
+        if (!currentFluid && neighborFluid) return true;
         if (!currentLeaf && neighborLeaf) return true;
         if (current != glassId && neighbor == glassId) return true;
+        // Dynamic (registry-defined) blocks: transparency and occlusion drive
+        // face culling (FALTANTES §14). Transparent blocks always draw (glass
+        // semantics); two opaque occluding blocks skip the shared face; a
+        // non-occluding block (fence/plant) draws its face even against an
+        // opaque neighbor so the shape reads.
+        if (!is_builtin_block(current) || !is_builtin_block(neighbor)) {
+            const RuntimeBlockInfo* curInfo = snapshot.find_runtime_block(current);
+            const RuntimeBlockInfo* nbInfo = snapshot.find_runtime_block(neighbor);
+            const bool curTransparent = curInfo && curInfo->transparent;
+            const bool curOccludes = !curInfo || curInfo->occludes;
+            const bool nbOccludes = !nbInfo || nbInfo->occludes;
+            if (curTransparent) return true;
+            if (curOccludes && nbOccludes) return false;
+            return true;
+        }
         return false;
     };
 
@@ -117,7 +156,7 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
                     continue;
                 }
 
-                if (type == waterId) {
+                if (is_fluid_mesh(type)) {
                     auto sample_height = [&](int dx, int dz) {
                         const int nx = x + dx, nz = z + dz;
                         uint8_t level = WATER_LEVEL_NONE;
@@ -150,7 +189,7 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
                     const float hNE = corner_height(1, 1);
                     const float hNW = corner_height(-1, 1);
 
-                    if (topNeighbor != waterId) {
+                    if (topNeighbor != type) {  // same fluid above: no top face
                         add_face(pos + glm::vec3(0, hNW, 1), pos + glm::vec3(1, hNE, 1),
                                  pos + glm::vec3(1, hSE, 0), pos + glm::vec3(0, hSW, 0),
                                  glm::vec3(0, 1, 0), type);
@@ -255,7 +294,17 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
                 p.x < minX || p.x > maxX || p.z < minZ || p.z > maxZ ||
                 p.y < -0.001f || p.y > static_cast<float>(CHUNK_SIZE_Y) + 0.001f) return false;
             const bool waterMaterial = std::abs(vertex.uv.z - static_cast<float>(TextureIndex::Water)) < 0.25f;
-            if (waterPass != waterMaterial) return false;
+            // uv.z == -1 is a color-only material (VoxelVertex contract). On
+            // the water pass that is a PROJECT fluid (class "fluid", its own
+            // color, no texture); on the solid pass it is a solid dynamic
+            // block or the color-only clay builtin. The two passes must never
+            // mix: water pass accepts only water-material or color-only
+            // vertices, the solid pass rejects water-material vertices.
+            if (waterPass) {
+                if (!waterMaterial && !(vertex.uv.z < 0.0f)) return false;
+            } else if (waterMaterial) {
+                return false;
+            }
         }
         return true;
     };
@@ -269,4 +318,31 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
     // changed while it was being built.
     mesh.meshVersion = snapshot.revision;
     return result;
+}
+
+glm::vec4 VoxelMesher::resolve_state_material(const RuntimeBlockInfo& info,
+                                              int stateIndex,
+                                              const glm::vec3& normal) {
+    const RuntimeBlockInfo::RuntimeBlockState* state = nullptr;
+    if (!info.states.empty()) {
+        // With states, index addresses states directly and 0 is the default
+        // state; out-of-range clamps to the default (never the base material
+        // of a block that declares states).
+        const int index = stateIndex >= 0 &&
+                                  stateIndex < static_cast<int>(info.states.size())
+                              ? stateIndex
+                              : 0;
+        state = &info.states[static_cast<std::size_t>(index)];
+    }
+    const glm::vec4* base = state ? &state->color : &info.color;
+    const glm::vec4* top = state ? &state->faceTop : &info.faceTop;
+    const glm::vec4* bottom = state ? &state->faceBottom : &info.faceBottom;
+    const glm::vec4* side = state ? &state->faceSide : &info.faceSide;
+    const bool topSet = state ? state->faceTopSet : info.faceTopSet;
+    const bool bottomSet = state ? state->faceBottomSet : info.faceBottomSet;
+    const bool sideSet = state ? state->faceSideSet : info.faceSideSet;
+    if (normal.y > 0.5f && topSet) return *top;
+    if (normal.y < -0.5f && bottomSet) return *bottom;
+    if (std::abs(normal.y) < 0.5f && sideSet) return *side;
+    return *base;
 }

@@ -28,6 +28,10 @@ int main(){
  const auto generatedResult=Tools::ProjectGenerator::generate(generated,projectOptions);
  if(!generatedResult||!std::filesystem::exists(generated/"Config/Plugins.ini"))return fail("project generation failed");
  {std::ifstream plugins(generated/"Config/Plugins.ini");std::string text((std::istreambuf_iterator<char>(plugins)),{});if(text.find("Voxel=true")!=std::string::npos||text.find("Voxel=ON")!=std::string::npos)return fail("empty project unexpectedly enables voxel");}
+ // FALTANTES item 11 / §24 — the generated manifest must reference the engine
+ // RELATIVELY (no absolute workspace path embedded), so the project stays
+ // portable when the tree is copied to another computer.
+ {std::ifstream manifest(generated/"project.json");std::string text((std::istreambuf_iterator<char>(manifest)),{});const auto pos=text.find("\"engine\": \"");if(pos==std::string::npos)return fail("project.json has no engine field");const auto start=pos+11;const auto end=text.find('"',start);if(end==std::string::npos)return fail("project.json engine field is unterminated");const std::filesystem::path engineRef=text.substr(start,end-start);if(engineRef.empty()||engineRef.is_absolute())return fail("project.json embeds an absolute engine path");}
 
  Scene scene("Empty Project Scene");
  const Entity camera=scene.create_entity("Main Camera");scene.cameraComponents[camera.get_id()]={70,.1f,2000,true};scene.transformComponents[camera.get_id()].position={0,2,5};

@@ -9,6 +9,26 @@ namespace registry {
 
 namespace {
 
+// Strict enum parsing: an explicitly provided but unknown value is refused
+// (all-or-nothing), never silently mapped to None. Returns false on unknown.
+bool parse_item_use_mode(const std::string& value, ItemUseMode& out) {
+    if (value.empty() || value == "none") { out = ItemUseMode::None; return true; }
+    if (value == "instant") { out = ItemUseMode::Instant; return true; }
+    if (value == "continuous") { out = ItemUseMode::Continuous; return true; }
+    return false;
+}
+
+bool parse_item_equip_slot(const std::string& value, ItemEquipSlot& out) {
+    if (value.empty() || value == "none") { out = ItemEquipSlot::None; return true; }
+    if (value == "hand") { out = ItemEquipSlot::Hand; return true; }
+    if (value == "offhand" || value == "off_hand") { out = ItemEquipSlot::OffHand; return true; }
+    if (value == "head") { out = ItemEquipSlot::Head; return true; }
+    if (value == "chest") { out = ItemEquipSlot::Chest; return true; }
+    if (value == "legs") { out = ItemEquipSlot::Legs; return true; }
+    if (value == "feet") { out = ItemEquipSlot::Feet; return true; }
+    return false;
+}
+
 bool add_item_from_json(ItemRegistry& registry, const sdk::JsonValue& object,
                         std::string& errorOut) {
     ItemDefinition definition;
@@ -19,6 +39,22 @@ bool add_item_from_json(ItemRegistry& registry, const sdk::JsonValue& object,
     definition.durability = static_cast<int>(sdk::json_number(object, "durability", 0.0));
     definition.icon = sdk::json_string(object, "icon", "");
     definition.model = sdk::json_string(object, "model", "");
+    definition.useCooldownMs = static_cast<int>(sdk::json_number(object, "useCooldown", 0.0));
+    const std::string useMode = sdk::json_string(object, "useMode", "");
+    if (!parse_item_use_mode(useMode, definition.useMode)) {
+        errorOut = "item '" + definition.ns + ':' + definition.name +
+                   "': useMode must be none|instant|continuous";
+        return false;
+    }
+    const std::string equipSlot = sdk::json_string(object, "equipSlot", "");
+    if (!parse_item_equip_slot(equipSlot, definition.equipSlot)) {
+        errorOut = "item '" + definition.ns + ':' + definition.name +
+                   "': equipSlot must be none|hand|offhand|head|chest|legs|feet";
+        return false;
+    }
+    definition.attackDamage = static_cast<float>(sdk::json_number(object, "attackDamage", 0.0));
+    definition.armor = static_cast<float>(sdk::json_number(object, "armor", 0.0));
+    definition.behaviorId = sdk::json_string(object, "behaviorId", "");
     definition.tags = sdk::json_string_array(object, "tags");
     definition.version = static_cast<int32_t>(sdk::json_number(object, "version", 1.0));
     return registry.register_item(std::move(definition), errorOut);
@@ -47,6 +83,27 @@ bool ItemRegistry::register_item(const ItemDefinition& definition, std::string& 
     if (definition.maxStack < 1 || definition.maxStack > 64) {
         errorOut = "item '" + definition.ns + ':' + definition.name +
                    "': maxStack must be in [1, 64]";
+        return false;
+    }
+    if (definition.useCooldownMs < 0 || definition.useCooldownMs > 60000) {
+        errorOut = "item '" + definition.ns + ':' + definition.name +
+                   "': useCooldown must be in [0, 60000]";
+        return false;
+    }
+    if (definition.attackDamage < 0.0f || definition.attackDamage > 100.0f) {
+        errorOut = "item '" + definition.ns + ':' + definition.name +
+                   "': attackDamage must be in [0, 100]";
+        return false;
+    }
+    if (definition.armor < 0.0f || definition.armor > 100.0f) {
+        errorOut = "item '" + definition.ns + ':' + definition.name +
+                   "': armor must be in [0, 100]";
+        return false;
+    }
+    if (!definition.behaviorId.empty() &&
+        definition.behaviorId.find(':') == std::string::npos) {
+        errorOut = "item '" + definition.ns + ':' + definition.name +
+                   "': behaviorId must be namespaced (ns:name)";
         return false;
     }
 

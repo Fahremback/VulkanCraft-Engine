@@ -10,6 +10,8 @@
 // ids never depend on load order.
 
 #include "engine/entity/IEntityWorld.hpp"
+#include "engine/entity/IMobBehavior.hpp"
+#include "engine/voxel/IVoxelStreaming.hpp"
 
 #include <glm/glm.hpp>
 
@@ -68,6 +70,25 @@ struct TerrainPoint {
     uint8_t biomeIndex{ 0 };
 };
 
+// Per-column decoration context (META section 18). The world fills this for
+// every land column before the builtin tree pass and hands it to the
+// generator's decorate_column hook.
+struct DecorationContext {
+    int localX{ 0 };         // chunk-local column X
+    int localZ{ 0 };         // chunk-local column Z
+    float worldX{ 0.0f };    // world-space column X
+    float worldZ{ 0.0f };    // world-space column Z
+    int surfaceHeight{ 0 };  // terrain surface height of the column
+    uint32_t biomeIndex{ 0 };  // engine BiomeType index (clamped)
+};
+
+// Places a block at chunk-local coordinates (localY is world Y). Returns
+// false when out of chunk bounds or the slot is occupied by a non-air,
+// non-leaf block. The world updates its occupancy bookkeeping on every
+// accepted write.
+using BlockWriter = std::function<bool(int localX, int localY, int localZ,
+                                       uint32_t blockId)>;
+
 class IVoxelGenerator {
 public:
     virtual ~IVoxelGenerator() = default;
@@ -75,6 +96,53 @@ public:
     virtual TerrainPoint sample(float worldX, float worldZ) const = 0;
     virtual float cave_density(float worldX, float worldY, float worldZ) const = 0;
     virtual float ore_density(float worldX, float worldY, float worldZ) const = 0;
+
+    // Optional data-driven ore substitution (META section 18): called for
+    // stone-family blocks at depth > 5, AFTER the builtin geology/vein
+    // substitution. `oreDensity` is the world's 3D ore-field sample at this
+    // block (the same value the builtin thresholds use); `builtinBlock` is
+    // what the builtin would place. Return a non-zero block id to override;
+    // 0 keeps the builtin result.
+    virtual uint32_t ore_block(float oreDensity, int y, uint32_t builtinBlock) const {
+        (void)oreDensity;
+        (void)y;
+        (void)builtinBlock;
+        return 0;
+    }
+
+    // Optional data-driven carver fill (META section 18): called for every
+    // carved cell (cave_density above the carve threshold). `builtinCarve` is
+    // what the world would place (Air, or Lava at low y). Return the block to
+    // place; the default returns `builtinCarve`, so behavior is unchanged.
+    virtual uint32_t carve_block(float caveDensity, int y, int depth,
+                                 uint32_t builtinCarve) const {
+        (void)caveDensity;
+        (void)y;
+        (void)depth;
+        return builtinCarve;
+    }
+
+    // Optional data-driven surface decoration (META section 18): called for
+    // every land column before the builtin tree pass. Return true to skip the
+    // builtin per-biome tree placement for this column (data replaces code);
+    // false keeps it.
+    virtual bool decorate_column(const DecorationContext& ctx,
+                                 const BlockWriter& write) const {
+        (void)ctx;
+        (void)write;
+        return false;
+    }
+
+    // Optional data-driven surface override (META section 18): return a
+    // non-zero block id to place instead of the builtin per-biome surface at
+    // `depth` below the terrain surface (0 = top block); return 0 to keep the
+    // builtin behavior. The default keeps every existing generator behaving
+    // exactly as before.
+    virtual uint32_t surface_block(const TerrainPoint& point, int depth) const {
+        (void)point;
+        (void)depth;
+        return 0;
+    }
 };
 
 // A single block edit inside a transaction. `blockId` 0 removes the block
@@ -93,6 +161,53 @@ struct TransactionEvent {
     Kind kind{ Kind::Committed };
     std::size_t editCount{ 0 };
     std::size_t undoDepth{ 0 };
+};
+
+// Structural per-transaction limits (FALTANTES §7 item 138), enforced in the
+// VALIDATION stage — before any edit is applied. 0 disables the limit.
+struct TransactionLimits {
+    std::size_t maxEdits{ 0 };        // 0 = unlimited; a larger transaction is rejected
+    uint64_t maxBoxVolume{ 0 };       // 0 = unlimited; bounding-box volume of ALL
+                                      // edit positions (dx+1)*(dy+1)*(dz+1)
+    bool operator==(const TransactionLimits&) const = default;
+};
+
+// Authoritative per-transaction validation (FALTANTES §7 item 138). The
+// project (or server) registers one policy; every transaction is validated
+// against it in the validation stage, BEFORE any edit is applied — a rejection
+// leaves the world untouched (nothing applied, RolledBack event). This is the
+// permission authority: block types, regions, or whole-transaction rules.
+class ITransactionPolicy {
+public:
+    virtual ~ITransactionPolicy() = default;
+
+    // Return a non-empty diagnostic to REJECT the edit (permission denied for
+    // this block type / position / policy rule). Empty = allow.
+    virtual std::string validate_edit(const BlockEdit& edit) const = 0;
+
+    // Whole-transaction rule (edit count, spatial pattern, budget). Return a
+    // non-empty diagnostic to reject; the default allows.
+    virtual std::string validate_transaction(
+        const std::vector<BlockEdit>& edits) const {
+        (void)edits;
+        return std::string();
+    }
+};
+
+// Result of a transaction dry-run (FALTANTES §7 item 141): previews what a
+// commit WOULD do without applying anything. `valid` mirrors commit()'s
+// outcome (same validation: limits, policy, block ids, loaded chunks); on
+// failure `error` carries the same diagnostic commit would produce; on success
+// `diff` holds one BlockEdit per input edit with previousBlockId = the current
+// world block (the before-state), so an editor/MCP can show the exact change
+// set and validate before touching the world. Dry-run never mutates the world,
+// never fires transaction events and never touches the undo stack.
+struct EditDryRunResult {
+    bool valid{ false };
+    std::string error;
+    std::vector<BlockEdit> diff;
+
+    bool operator==(const EditDryRunResult&) const = default;
 };
 
 // Transactional edit API (META section 11): every world mutation flows through
@@ -161,6 +276,12 @@ public:
     virtual std::shared_ptr<engine::entity::IEntityWorld> entity_world() = 0;
     virtual void register_entity_world(
         std::shared_ptr<engine::entity::IEntityWorld> world) = 0;
+
+    // Mob world queries (FALTANTES item 11): the minimal world view the
+    // public IMobBehavior needs (fluid damage, block/fluid probes). The world
+    // hosts it, so projects tick mobs through the public entity layer without
+    // adapting their own world.
+    virtual engine::entity::IMobWorldQuery& mob_world_query() = 0;
     virtual void register_mesher(std::shared_ptr<IVoxelMesher> mesher) = 0;
     virtual void register_lighting(std::shared_ptr<IVoxelLighting> lighting) = 0;
     virtual void register_fluid_simulation(
@@ -169,26 +290,69 @@ public:
         std::shared_ptr<IVoxelReplication> replication) = 0;
     virtual std::vector<std::string> registered_services() const = 0;
 
-    // Server/test knob: disables mob spawning for deterministic headless runs.
-    virtual void set_mob_spawning(bool enabled) = 0;
 
     virtual bool is_chunk_loaded(int chunkX, int chunkZ) const = 0;
     virtual int chunk_budget() const = 0;
     virtual void set_chunk_budget(int budget) = 0;
+    // RAM-budgeted chunk cache (FALTANTES §4 item 6): bounds the estimated
+    // bytes of loaded chunk data. Each update evicts the farthest NON-dirty
+    // chunks while the estimate exceeds the budget (dirty chunks are never
+    // evicted — edits are never lost to a cache eviction). 0 = unlimited
+    // (default). streaming_snapshot reports memoryBudgetBytes/ramUsageBytes.
+    virtual void set_memory_budget(uint64_t bytes) = 0;
+
+    // Streaming/budget observability (FALTANTES §3): a snapshot of the
+    // world's streaming state (chunk census + budgets), readable headless at
+    // any time. Also the query surface the editor/CLI/servers use to show
+    // what the world is doing.
+    virtual StreamingSnapshot streaming_snapshot() const = 0;
+    // Optional push observability: the world calls on_streaming_update after
+    // each update() while streaming state changed. Null clears.
+    virtual void set_streaming_monitor(
+        std::shared_ptr<IVoxelStreamingMonitor> monitor) = 0;
+    // Effective runtime block table (FALTANTES §3 item 2): what the world
+    // knows about each block AFTER the registry and plugin overrides merge.
+    // Sorted by id; the mesher/light consumers read exactly this data.
+    virtual std::vector<BlockRuntimeView> runtime_block_views() const = 0;
 
     // Transactional editing (META section 11). Edits via this API are the only
     // mutation path of the public contract: they are validated, applied
     // atomically (full rollback on failure), and land on the undo stack.
+    //
+    // The undo/redo history is SESSION-SCOPED (FALTANTES §7 item 140): it is
+    // not persisted with any save format and a successful world load
+    // (deserialize_world or load_world/load_world_regions) clears the undo
+    // and redo stacks and resets the edit log — an undo after a load would
+    // revert blocks against the freshly loaded world (not the session that
+    // produced them), so the new session starts with a clean history. The
+    // edit log is the total edits committed in the CURRENT session.
     virtual std::unique_ptr<IVoxelTransaction> begin_transaction() = 0;
     virtual bool undo_last_transaction() = 0;
     virtual bool redo_last_transaction() = 0;
     virtual std::size_t undo_depth() const = 0;
+
+    // Dry-run + diff + structured diagnostic (FALTANTES §7 item 141): the
+    // editor/MCP previews a transaction before committing. Runs the EXACT
+    // validation of commit() (limits, policy, block registry, loaded chunks)
+    // without applying, and reports the diff (before-state per edit) on
+    // success. Pure: never mutates, never fires events, never touches undo.
+    virtual EditDryRunResult dry_run_edits(
+        const std::vector<BlockEdit>& edits) const = 0;
 
     // Event log: total edits committed through transactions (logs/replay) and
     // an optional listener for commit/rollback/undo/redo notifications.
     virtual std::size_t edit_log_count() const = 0;
     virtual void set_transaction_listener(
         std::function<void(const TransactionEvent&)> listener) = 0;
+
+    // Permissions, authoritative validation and per-transaction limits
+    // (FALTANTES §7 item 138): a registered policy is the permission authority
+    // for every transaction (per-edit and whole-transaction), and structural
+    // limits bound edit count and world-space volume. All enforced in the
+    // validation stage, before anything is applied.
+    virtual void set_transaction_limits(const TransactionLimits& limits) = 0;
+    virtual TransactionLimits transaction_limits() const = 0;
+    virtual void set_transaction_policy(std::shared_ptr<ITransactionPolicy> policy) = 0;
 
     // Discrete world lighting (META section 12): skylight + block light,
     // computed deterministically by the engine from block data (emission and
@@ -224,6 +388,19 @@ public:
     virtual void set_block_entity_listener(
         std::function<void(const BlockEntityEvent&)> listener) = 0;
 
+    // Region replication (META section 17 / FALTANTES item 6): enumerates the
+    // block entities attached inside one chunk column, in deterministic
+    // position order (x, y, z). Empty when the chunk has none. The engine
+    // owns storage; this is how a region snapshot syncs block entities.
+    virtual std::vector<std::pair<glm::ivec3, std::shared_ptr<IVoxelBlockEntity>>>
+    block_entities_in_chunk(int chunkX, int chunkZ) const = 0;
+    // Factory lookup for region replication / save reconstruction: returns a
+    // fresh instance for a registered type id, or nullptr with a diagnostic
+    // when the type has no registered factory (a snapshot referencing an
+    // unknown type is refused — never a guessed entity).
+    virtual std::shared_ptr<IVoxelBlockEntity> create_block_entity(
+        const std::string& typeId, std::string& errorOut) = 0;
+
     // Persistence (META section 10). save/load are versioned and checksummed:
     // a save captures the authoritative voxel state of every loaded chunk;
     // load restores it and refuses corrupted or newer-schema data with a
@@ -233,6 +410,66 @@ public:
     virtual bool load_world(const std::string& filePath, std::string& errorOut) = 0;
     virtual std::string serialize_world(std::string& errorOut) = 0;
     virtual bool deserialize_world(const std::string& data, std::string& errorOut) = 0;
+
+    // Schema versioning + migration (FALTANTES §4 item 9): the save format is
+    // versioned (v1-v5, see the format comment in the SDK). world_save_schema_
+    // version reads the version field WITHOUT a full parse (0 = not a world
+    // save) so a caller can decide to load or migrate before committing.
+    // migrate_world_save upgrades a legacy save (v1-v4) to the CURRENT schema
+    // version, all-or-nothing with the same gates as load (checksum, palette
+    // uuids vs the current registry, block ids) — it is PURE: the live world
+    // is untouched and the migrated bytes are returned for the caller to
+    // persist. A save already at the current version is a no-op success; a
+    // save from a NEWER engine is refused with a clear diagnostic (never
+    // silently downgraded).
+    virtual uint32_t world_save_schema_version(const std::string& data) const = 0;
+    virtual bool migrate_world_save(const std::string& legacyData,
+                                    std::string& migratedOut,
+                                    std::string& errorOut) = 0;
+
+    // Async persistence (FALTANTES §4 item 5): the expensive parts of a save
+    // (palette + zstd encode) and of a load (file reads, decompression, chunk
+    // apply) run on background jobs; `onDone(ok, error)` fires on a background
+    // thread when the op finishes. The return value only reports whether the
+    // op was DISPATCHED; the result comes from onDone or wait_async_saves.
+    // Requires a region-capable (paged) storage — otherwise a clear
+    // diagnostic is returned and nothing is dispatched. One async op at a
+    // time: a save/load while one is in flight is refused. wait_async_saves
+    // blocks until any in-flight op completes and returns its result (no-op
+    // true when nothing is in flight). Contract: the async save captures a
+    // consistent snapshot at dispatch, so the caller may keep simulating; an
+    // async LOAD applies chunks from a background thread, so the caller must
+    // not touch the world until onDone/wait_async_saves.
+    virtual bool save_world_async(
+        const std::string& filePath,
+        std::function<void(bool ok, std::string error)> onDone,
+        std::string& errorOut) = 0;
+    virtual bool load_world_async(
+        const std::string& filePath,
+        std::function<void(bool ok, std::string error)> onDone,
+        std::string& errorOut) = 0;
+    virtual bool wait_async_saves(std::string& errorOut) = 0;
+
+    // Autosave (FALTANTES §4 item 7): while enabled, the headless update()
+    // tick checks two triggers — an elapsed-time interval and a change-volume
+    // threshold (loaded chunks whose revision moved since the last autosave,
+    // the same delta gate as region saves). When either fires AND no async op
+    // is in flight, a DELTA async save (items 3 + 5: only changed region
+    // tiles, encoded/written on background jobs) is dispatched to the
+    // configured autosave path; the caller keeps simulating. A fire while
+    // another save/load is in flight is skipped and the timers keep running,
+    // so the next eligible update fires it. Disabling autosave stops future
+    // fires; an in-flight autosave still completes and is reported by
+    // wait_async_saves. Requires a region-capable (paged) storage, like
+    // save_world_async.
+    struct AutosaveConfig {
+        bool enabled = false;
+        double intervalSeconds = 30.0;        // time trigger; <= 0 disables
+        std::size_t dirtyChunkThreshold = 0;  // volume trigger; 0 disables
+    };
+    virtual void set_autosave(const AutosaveConfig& config,
+                              const std::string& autosavePath) = 0;
+    virtual AutosaveConfig autosave_config() const = 0;
 
     // Headless simulation tick (server/tests): generation, meshing and fluid
     // simulation run without any renderer attached.

@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/registry/structure.json",
+  "title": "structure registry asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset file name; carried by the file name, NOT a document property",
+      "type": "string"
+    },
+    "sampleWidth": {
+      "description": ">= 1",
+      "type": "integer"
+    },
+    "sampleHeight": {
+      "description": ">= 1",
+      "type": "integer"
+    },
+    "sample": {
+      "description": "block ids, row-major (z * w + x), length == sample_width * sample_height",
+      "type": "array",
+      "items": {
+        "type": "integer"
+      }
+    },
+    "patternSize": {
+      "description": "1..min(sample_width, sample_height)",
+      "default": 3,
+      "type": "integer"
+    },
+    "symmetry": {
+      "description": "1, 2, 4 or 8",
+      "default": 1,
+      "type": "integer"
+    },
+    "periodicOutput": {
+      "description": "\"periodic_output\" registry field",
+      "default": false,
+      "type": "boolean"
+    },
+    "ground": {
+      "description": "\"ground\" registry field",
+      "default": false,
+      "type": "boolean"
+    },
+    "seed": {
+      "description": "\"seed\" registry field",
+      "default": 0,
+      "type": "integer"
+    },
+    "profiles": {
+      "description": "[{block_id != 0, layers: [non-empty]}]",
+      "type": "array"
+    },
+    "version": {
+      "description": "\"version\" registry field",
+      "default": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "sampleWidth",
+    "sampleHeight",
+    "sample"
+  ]
+}

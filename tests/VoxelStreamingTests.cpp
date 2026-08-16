@@ -17,7 +17,6 @@
 #include "WorldRenderBridge.hpp"
 #include "Chunk.hpp"
 #include "VoxelMesher.hpp"
-#include "Mob.hpp"
 #include "SoundEngine.hpp"
 #include "Voxel.hpp"
 
@@ -82,16 +81,16 @@ int total_uploads(const std::unordered_map<uint64_t, int>& counts) {
 
 struct TestWorld {
     SoundEngine audio;
-    MobManager mobs{ audio };
-    World world{ mobs, 4 };  // small worker pool: deterministic, no oversubscription
+    World world{ 4 };  // small worker pool: deterministic, no oversubscription
     MockBridge bridge;
     glm::vec3 player{ 8.0f, 40.0f, 8.0f };  // inside chunk (0,0)
 
     explicit TestWorld(int budget = 16) {
         world.set_chunk_budget(budget);
-        // Deterministic runs: no mobs (creeper explosions edit blocks) and no
-        // structures, so the only block edits come from the test itself.
-        world.mobSpawningEnabled = false;
+        // Deterministic runs: no structures, so the only block edits come
+        // from the test itself. (Mob spawning moved to the entity layer —
+        // FALTANTES item 11; the cow-in-lava equivalence lives in
+        // voxel_sdk_tests as test_mob_behavior.)
         world.structureSpawningEnabled = false;
     }
 
@@ -240,67 +239,8 @@ bool scenario_border(TestWorld& test) {
 // A registry-defined (JSON-only) block meshes with its data-driven color: the
 // snapshot carries the dynamic runtime table and the mesher resolves ids >=
 // BlockType::Count through it (color-only, no engine texture layer).
-// Data-driven fluid damage (META section 13): a fluid with damagePerTick in
-// the world's table hurts entities inside it. The cow sinks through the lava
-// (fluids are never ground) and takes 4 damage/s until the check fires.
-bool scenario_fluid_damage(TestWorld& test) {
-    CHECK(test.world.is_chunk_loaded_at(test.player));
-
-    // Lava as a real fluid with damage, no falling (the pool stays put).
-    std::unordered_map<RuntimeBlockId, FluidParams> fluids;
-    FluidParams lava;
-    lava.viscosity = 1.0f;
-    lava.density = 2.0f;
-    lava.maxLevel = 1;
-    lava.levelsPerTick = 1;
-    lava.source = true;
-    lava.falling = false;
-    lava.evaporation = false;
-    lava.damagePerTick = 4.0f;
-    fluids[runtime_id(BlockType::Lava)] = lava;
-    test.world.set_fluid_table(std::move(fluids));
-
-    // Carve a basin over the whole chunk area (0..15 x 0..15): stone floor,
-    // 3-tall lava lake, and everything above cleared to air. The terrain is
-    // uneven (the surface scan below found a single column), so carving the
-    // full volume guarantees the cow falls INTO lava instead of landing on a
-    // ledge above a buried pool.
-    glm::vec3 surface{ 8.0f, 0.0f, 8.0f };
-    for (int y = 150; y >= 40; --y) {
-        surface.y = static_cast<float>(y);
-        if (test.world.get_block_at(surface) != kRuntimeAirId) break;
-    }
-    CHECK(test.world.get_block_at(surface) != kRuntimeAirId);
-    const int platformY = static_cast<int>(surface.y);
-    for (int x = 0; x < CHUNK_SIZE_X; ++x) {
-        for (int z = 0; z < CHUNK_SIZE_Z; ++z) {
-            test.world.set_block_at(glm::vec3(x, platformY, z), runtime_id(BlockType::Stone));
-            for (int dy = 1; dy <= 3; ++dy) {
-                test.world.set_block_at(glm::vec3(x, platformY + dy, z),
-                                        runtime_id(BlockType::Lava));
-            }
-            for (int dy = 4; dy <= 15; ++dy) {
-                test.world.set_block_at(glm::vec3(x, platformY + dy, z), kRuntimeAirId);
-            }
-        }
-    }
-
-    // The cow falls into the lake, sinks through the lava (fluids are not
-    // ground) and rests with its feet inside it: damage accumulates until the
-    // check fires (4/s -> 1.5 HP lost in ~0.4s of contact).
-    test.mobs.spawn_mob(MobType::Cow, glm::vec3(8.5f, platformY + 5.5f, 8.5f));
-    const bool damaged = test.run_until([&test] {
-        return test.mobs.mobs.size() == 1 &&
-               test.mobs.mobs[0].health <= 10.0f - 1.5f;
-    }, 10000);
-    CHECK(damaged);
-    CHECK(test.mobs.mobs.size() == 1);
-    CHECK(test.mobs.mobs[0].health < 10.0f);
-    std::cout << "[test] fluid damage: cow in lava lost "
-              << (10.0f - test.mobs.mobs[0].health) << " HP (4/s)\n";
-    return damaged;
-}
-
+// (The data-driven fluid-damage scenario moved to voxel_sdk_tests as
+// test_mob_behavior — mobs are IEntityWorld entities now, FALTANTES item 11.)
 bool scenario_dynamic_block_meshes() {
     const RuntimeBlockId dynamicId = static_cast<RuntimeBlockId>(BlockType::Count) + 7;
 
@@ -350,6 +290,232 @@ bool scenario_dynamic_block_meshes() {
     return g_failures == 0;
 }
 
+// Per-face materials + occlusion (FALTANTES §14): a dynamic block with
+// faceTop/faceSide overrides meshes each face with its own color, unset
+// faces fall back to the base color; occlusion=false draws the shared face
+// against an opaque neighbor while two opaque blocks skip it.
+bool scenario_face_materials_and_occlusion() {
+    const RuntimeBlockId dynamicId = static_cast<RuntimeBlockId>(BlockType::Count) + 8;
+
+    ChunkSnapshot snapshot;
+    snapshot.id = { { 0, 0 }, 1 };
+    snapshot.revision = 1;
+    snapshot.verticalExtent = 1;
+    snapshot.layers = { 130 };
+    auto& layer = snapshot.center[130];
+    layer.blocks.fill(kRuntimeAirId);
+    layer.blocks[8 * CHUNK_SIZE_X + 8] = dynamicId;
+
+    RuntimeBlockInfo info;
+    info.uuid = "00000000-0000-0000-0000-0000000000ac";
+    info.color = glm::vec4(0.9f, 0.1f, 0.1f, 1.0f);
+    info.faceTop = glm::vec4(0.2f, 0.8f, 0.2f, 1.0f);
+    info.faceSide = glm::vec4(0.5f, 0.35f, 0.2f, 1.0f);
+    info.faceTopSet = true;
+    info.faceSideSet = true;
+    info.solid = true;
+    snapshot.runtimeBlocks.emplace_back(dynamicId, info);
+
+    const ChunkMeshResult result = VoxelMesher::build(snapshot);
+    CHECK(result.valid);
+    int topCount = 0, sideCount = 0, bottomCount = 0;
+    for (const VoxelVertex& vertex : result.mesh.meshVertices) {
+        if (vertex.normal.y > 0.5f) {
+            ++topCount;
+            CHECK(std::abs(vertex.color.g - 0.8f) < 1e-3f);  // faceTop
+            CHECK(std::abs(vertex.color.r - 0.2f) < 1e-3f);
+        } else if (vertex.normal.y < -0.5f) {
+            ++bottomCount;
+            CHECK(std::abs(vertex.color.r - 0.9f) < 1e-3f);  // base color (unset)
+            CHECK(std::abs(vertex.color.g - 0.1f) < 1e-3f);
+        } else {
+            ++sideCount;
+            CHECK(std::abs(vertex.color.r - 0.5f) < 1e-3f);  // faceSide
+            CHECK(std::abs(vertex.color.g - 0.35f) < 1e-3f);
+        }
+    }
+    CHECK(topCount == 6 && sideCount == 24 && bottomCount == 6);
+
+    // Occlusion: two adjacent opaque dynamic blocks skip the shared face (10
+    // faces = 60 vertices); with occlusion=false on one side both draw (12
+    // faces = 72 vertices).
+    const RuntimeBlockId aId = static_cast<RuntimeBlockId>(BlockType::Count) + 9;
+    const RuntimeBlockId bId = static_cast<RuntimeBlockId>(BlockType::Count) + 10;
+    auto make_pair = [&](bool aOccludes, bool bOccludes) {
+        ChunkSnapshot pair;
+        pair.id = { { 0, 0 }, 1 };
+        pair.revision = 1;
+        pair.verticalExtent = 1;
+        pair.layers = { 130 };
+        auto& pl = pair.center[130];
+        pl.blocks.fill(kRuntimeAirId);
+        pl.blocks[8 * CHUNK_SIZE_X + 8] = aId;
+        pl.blocks[9 * CHUNK_SIZE_X + 8] = bId;
+        RuntimeBlockInfo ai;
+        ai.uuid = "00000000-0000-0000-0000-0000000000ad";
+        ai.color = glm::vec4(0.3f, 0.3f, 0.3f, 1.0f);
+        ai.solid = true;
+        ai.occludes = aOccludes;
+        RuntimeBlockInfo bi = ai;
+        bi.uuid = "00000000-0000-0000-0000-0000000000ae";
+        bi.occludes = bOccludes;
+        pair.runtimeBlocks.emplace_back(aId, ai);
+        pair.runtimeBlocks.emplace_back(bId, bi);
+        return VoxelMesher::build(pair);
+    };
+    const ChunkMeshResult opaquePair = make_pair(true, true);
+    CHECK(opaquePair.valid);
+    int opaqueZ = 0;
+    for (const VoxelVertex& vertex : opaquePair.mesh.meshVertices) {
+        if (std::abs(vertex.normal.z) > 0.5f) ++opaqueZ;
+    }
+    CHECK(opaqueZ == 12);  // 2 outer north/south faces, shared face skipped
+    const ChunkMeshResult openPair = make_pair(false, true);
+    CHECK(openPair.valid);
+    int openZ = 0;
+    for (const VoxelVertex& vertex : openPair.mesh.meshVertices) {
+        if (std::abs(vertex.normal.z) > 0.5f) ++openZ;
+    }
+    CHECK(openZ == 24);  // shared faces drawn on both sides (occlusion off)
+
+    std::cout << "[test] per-face materials + occlusion (top=" << topCount
+              << " side=" << sideCount << " bottom=" << bottomCount
+              << ", opaquePairZ=" << opaqueZ << " openPairZ=" << openZ << ")\n";
+    return g_failures == 0;
+}
+
+// FALTANTES §8 item 167: um fluido de PROJETO (id dinâmico, classe fluid)
+// mesha como FLUIDO — mesh de água com altura por nível (waterMeshVertices),
+// não um cubo sólido opaco. O mesher roteia pelo flag `fluid` do
+// RuntimeBlockInfo (não pelo enum builtin Water).
+bool scenario_dynamic_fluid_meshes_as_fluid() {
+    const RuntimeBlockId dynamicFluid = static_cast<RuntimeBlockId>(BlockType::Count) + 20;
+
+    ChunkSnapshot snapshot;
+    snapshot.id = { { 0, 0 }, 1 };
+    snapshot.revision = 1;
+    snapshot.verticalExtent = 1;
+    snapshot.layers = { 130 };
+    auto& layer = snapshot.center[130];
+    layer.blocks.fill(kRuntimeAirId);
+    layer.blocks[8 * CHUNK_SIZE_X + 8] = dynamicFluid;
+    layer.water[8 * CHUNK_SIZE_X + 8] = 2;  // level 2: thinning fluid
+
+    RuntimeBlockInfo info;
+    info.uuid = "00000000-0000-0000-0000-0000000000b0";
+    info.color = glm::vec4(0.3f, 1.0f, 0.2f, 0.7f);
+    info.solid = false;
+    info.fluid = true;  // project fluid (block class "fluid")
+    snapshot.runtimeBlocks.emplace_back(dynamicFluid, info);
+
+    const ChunkMeshResult result = VoxelMesher::build(snapshot);
+    CHECK(result.valid);
+    // O cubo sólido fica VAZIO: a célula de fluido só emite na mesh de água.
+    CHECK(result.mesh.meshVertices.empty());
+    CHECK(!result.mesh.waterMeshVertices.empty());
+    // A face de topo segue a altura por nível (topo elevado, não cubo cheio).
+    bool sawElevatedTop = false;
+    for (const VoxelVertex& vertex : result.mesh.waterMeshVertices) {
+        if (vertex.normal.y > 0.5f && vertex.position.y > 0.1f) sawElevatedTop = true;
+    }
+    CHECK(sawElevatedTop);
+
+    // Contraste: o MESMO bloco sem o flag fluid mesha como sólido opaco.
+    ChunkSnapshot solid;
+    solid.id = { { 0, 0 }, 2 };
+    solid.revision = 2;
+    solid.verticalExtent = 1;
+    solid.layers = { 130 };
+    auto& solidLayer = solid.center[130];
+    solidLayer.blocks.fill(kRuntimeAirId);
+    solidLayer.blocks[8 * CHUNK_SIZE_X + 8] = dynamicFluid;
+    RuntimeBlockInfo solidInfo = info;
+    solidInfo.fluid = false;
+    solid.runtimeBlocks.emplace_back(dynamicFluid, solidInfo);
+    const ChunkMeshResult solidResult = VoxelMesher::build(solid);
+    CHECK(solidResult.valid);
+    CHECK(!solidResult.mesh.meshVertices.empty());
+    CHECK(solidResult.mesh.waterMeshVertices.empty());
+
+    std::cout << "[test] project-defined fluid meshes as fluid (water mesh by "
+                 "level, not a solid cube) OK\n";
+    return g_failures == 0;
+}
+
+// State-aware materials (FALTANTES item 5): a dynamic block carrying named
+// states meshes with its DEFAULT state (states[0]) through the ordinary path,
+// and VoxelMesher::resolve_state_material addresses every state directly
+// (index 0 = states[0], k = states[k], out-of-range clamps to default).
+bool scenario_state_materials() {
+    const RuntimeBlockId dynamicId = static_cast<RuntimeBlockId>(BlockType::Count) + 11;
+
+    ChunkSnapshot snapshot;
+    snapshot.id = { { 0, 0 }, 1 };
+    snapshot.revision = 1;
+    snapshot.verticalExtent = 1;
+    snapshot.layers = { 130 };
+    auto& layer = snapshot.center[130];
+    layer.blocks.fill(kRuntimeAirId);
+    layer.blocks[8 * CHUNK_SIZE_X + 8] = dynamicId;
+
+    RuntimeBlockInfo info;
+    info.uuid = "00000000-0000-0000-0000-0000000000af";
+    info.color = glm::vec4(0.1f, 0.1f, 0.1f, 1.0f);
+    info.faceSide = glm::vec4(0.2f, 0.2f, 0.2f, 1.0f);
+    info.faceSideSet = true;
+    info.solid = true;
+    RuntimeBlockInfo::RuntimeBlockState lit;
+    lit.name = "lit";
+    lit.color = glm::vec4(1.0f, 0.6f, 0.1f, 1.0f);
+    lit.faceTop = glm::vec4(0.9f, 0.9f, 0.9f, 1.0f);
+    lit.faceTopSet = true;
+    RuntimeBlockInfo::RuntimeBlockState dim;
+    dim.name = "dim";
+    dim.color = glm::vec4(0.3f, 0.2f, 0.1f, 1.0f);
+    info.states = { lit, dim };
+    snapshot.runtimeBlocks.emplace_back(dynamicId, info);
+
+    // Default state (states[0]) drives the ordinary mesh: top faces use the
+    // lit state's override, sides fall back to its base color.
+    const ChunkMeshResult result = VoxelMesher::build(snapshot);
+    CHECK(result.valid);
+    int topWithOverride = 0;
+    int sideWithBase = 0;
+    for (const VoxelVertex& vertex : result.mesh.meshVertices) {
+        if (vertex.normal.y > 0.5f) {
+            ++topWithOverride;
+            CHECK(vertex.color == lit.faceTop);
+        } else if (std::abs(vertex.normal.y) < 0.5f) {
+            ++sideWithBase;
+            CHECK(vertex.color == lit.color);
+        }
+    }
+    CHECK(topWithOverride == 6);
+    CHECK(sideWithBase == 24);
+
+    // Direct state addressing: 0 = states[0] (default), k = states[k],
+    // out-of-range clamps to default; without states, base per-face material.
+    const glm::vec3 up(0.0f, 1.0f, 0.0f);
+    const glm::vec3 side(1.0f, 0.0f, 0.0f);
+    CHECK(VoxelMesher::resolve_state_material(info, 0, up) == lit.faceTop);
+    CHECK(VoxelMesher::resolve_state_material(info, 0, side) == lit.color);
+    CHECK(VoxelMesher::resolve_state_material(info, 1, up) == dim.color);
+    CHECK(VoxelMesher::resolve_state_material(info, 1, side) == dim.color);
+    CHECK(VoxelMesher::resolve_state_material(info, 99, up) == lit.faceTop);
+    CHECK(VoxelMesher::resolve_state_material(info, -1, up) == lit.faceTop);
+    RuntimeBlockInfo plain;
+    plain.color = glm::vec4(0.9f, 0.1f, 0.1f, 1.0f);
+    plain.faceSide = glm::vec4(0.5f, 0.35f, 0.2f, 1.0f);
+    plain.faceSideSet = true;
+    CHECK(VoxelMesher::resolve_state_material(plain, 0, up) == plain.color);
+    CHECK(VoxelMesher::resolve_state_material(plain, 0, side) == plain.faceSide);
+    CHECK(VoxelMesher::resolve_state_material(plain, 7, up) == plain.color);
+
+    std::cout << "[test] state materials: default mesh = states[0], index "
+                 "addressing + clamping OK\n";
+    return g_failures == 0;
+}
+
 // Without further edits the world must settle: the upload-driven neighbor
 // dirtying is gated by chunk revisions, so there is no remesh ping-pong.
 bool scenario_no_pingpong(TestWorld& test) {
@@ -374,10 +540,12 @@ int main() {
     run_with_retry("edit->remesh->upload", scenario_edit);
     run_with_retry("border propagation", scenario_border);
     run_with_retry("no ping-pong", scenario_no_pingpong);
-    run_with_retry("fluid damage", scenario_fluid_damage);
-    // Mesher-level check (no world needed): dynamic ids resolve through the
-    // snapshot's runtime table.
+    // Mesher-level checks (no world needed): dynamic ids resolve through the
+    // snapshot's runtime table; per-face materials and occlusion follow §14.
     scenario_dynamic_block_meshes();
+    scenario_face_materials_and_occlusion();
+    scenario_dynamic_fluid_meshes_as_fluid();
+    scenario_state_materials();
 
     if (g_failures != 0) {
         std::cerr << "[voxel_streaming_tests] " << g_failures << " failure(s)\n";

@@ -20,7 +20,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -73,7 +72,6 @@ public:
         const int maxEdgeLen = static_cast<int>(config.maxEdgeLen / config.cellSize);
 
         rcContext context(false);  // no logging/timers (stack context, new API)
-        std::cerr << "[nav-build] create hf\n";
         rcHeightfield solid;
         if (!rcCreateHeightfield(&context, solid, sizeX, sizeZ, bmin, bmax,
                                  config.cellSize, config.cellHeight)) {
@@ -109,10 +107,8 @@ public:
         // Standard filtering: remove unreachable low-hanging obstacles, ledges
         // and spans that do not leave enough headroom for the agent.
         rcFilterLowHangingWalkableObstacles(&context, walkableClimb, solid);
-        std::cerr << "[nav-build] filter lowhang\n";
         rcFilterLedgeSpans(&context, walkableHeight, walkableClimb, solid);
         rcFilterWalkableLowHeightSpans(&context, walkableHeight, solid);
-        std::cerr << "[nav-build] filters done\n";
 
         rcCompactHeightfield chf;
         if (!rcBuildCompactHeightfield(&context, walkableHeight, walkableClimb,
@@ -121,18 +117,14 @@ public:
             return false;
         }
 
-        std::cerr << "[nav-build] chf built (" << chf.width << "x" << chf.height
-                  << ")\n";
         if (!rcErodeWalkableArea(&context, walkableRadius, chf)) {
             errorOut = "navigation: rcErodeWalkableArea failed";
             return false;
         }
-        std::cerr << "[nav-build] erode done\n";
         if (!rcBuildDistanceField(&context, chf)) {
             errorOut = "navigation: rcBuildDistanceField failed";
             return false;
         }
-        std::cerr << "[nav-build] distance done\n";
         if (!rcBuildRegions(&context, chf, 0, config.minRegionArea,
                             config.mergeRegionArea)) {
             errorOut = "navigation: rcBuildRegions failed";
@@ -145,22 +137,10 @@ public:
             errorOut = "navigation: rcBuildContours failed";
             return false;
         }
-
-        std::cerr << "[nav-build] regions done\n";
         rcPolyMesh mesh;
         if (!rcBuildPolyMesh(&context, contours, 6, mesh)) {
             errorOut = "navigation: rcBuildPolyMesh failed";
             return false;
-        }
-        std::cerr << "[nav-build] polymesh done (" << mesh.nverts << "v "
-                  << mesh.npolys << "p) bmin=(" << mesh.bmin[0] << ","
-                  << mesh.bmin[1] << "," << mesh.bmin[2] << ") bmax=("
-                  << mesh.bmax[0] << "," << mesh.bmax[1] << "," << mesh.bmax[2]
-                  << ")\n";
-        for (int vi = 0; vi < mesh.nverts && vi < 8; ++vi) {
-            std::cerr << "[nav-build]   v" << vi << "=(" << mesh.verts[vi * 3]
-                      << "," << mesh.verts[vi * 3 + 1] << ","
-                      << mesh.verts[vi * 3 + 2] << ")\n";
         }
 
         rcPolyMeshDetail detail;
@@ -170,14 +150,58 @@ public:
             return false;
         }
 
-        std::cerr << "[nav-build] detail done\n";
         if (mesh.npolys == 0) {
             errorOut = "navigation: navmesh has no polygons";
             return false;
         }
 
-        // Package the poly mesh into Detour tile data.
-        std::vector<unsigned short> polyFlags(mesh.npolys, kWalkFlag);
+        // Slope rejection: this Recast build (new API) keeps no triangle list
+        // on the poly mesh, so decompose each polygon into a fan and test the
+        // face slope against agentMaxSlope; steeper polygons are marked
+        // RC_NULL_AREA (not walkable) so they never appear in queries.
+        const float walkableLimitY = std::cos(config.agentMaxSlope * (RC_PI / 180.0f));
+        for (int i = 0; i < mesh.npolys; ++i) {
+            const unsigned short* p = &mesh.polys[i * mesh.nvp * 2];
+            int nv = 0;
+            while (nv < mesh.nvp && p[nv] != RC_MESH_NULL_IDX) ++nv;
+            if (nv < 3) {
+                mesh.areas[i] = RC_NULL_AREA;
+                continue;
+            }
+            const unsigned short* v0 = &mesh.verts[p[0] * 3];
+            const float v0x = static_cast<float>(v0[0]);
+            const float v0y = static_cast<float>(v0[1]);
+            const float v0z = static_cast<float>(v0[2]);
+            bool steep = false;
+            for (int j = 1; j + 1 < nv && !steep; ++j) {
+                const unsigned short* va = &mesh.verts[p[j] * 3];
+                const unsigned short* vb = &mesh.verts[p[j + 1] * 3];
+                // World-space edges: x/z scale by cs, y by ch.
+                const float e0x = (static_cast<float>(va[0]) - v0x) * mesh.cs;
+                const float e0y = (static_cast<float>(va[1]) - v0y) * mesh.ch;
+                const float e0z = (static_cast<float>(va[2]) - v0z) * mesh.cs;
+                const float e1x = (static_cast<float>(vb[0]) - v0x) * mesh.cs;
+                const float e1y = (static_cast<float>(vb[1]) - v0y) * mesh.ch;
+                const float e1z = (static_cast<float>(vb[2]) - v0z) * mesh.cs;
+                const float nx = e0y * e1z - e0z * e1y;
+                const float ny = e0z * e1x - e0x * e1z;
+                const float nz = e0x * e1y - e0y * e1x;
+                const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+                if (len <= 0.0f) continue;
+                // |ny|/len: faces are wound CCW viewed from above; taking the
+                // absolute keeps the slope test correct for either winding.
+                if (std::fabs(ny) / len <= walkableLimitY) steep = true;
+            }
+            if (steep) mesh.areas[i] = RC_NULL_AREA;
+        }
+
+        // Package the poly mesh into Detour tile data. Only walkable-area
+        // polygons get the walk flag; RC_NULL_AREA (steep/unwalkable) polys
+        // keep flag 0 and are excluded by the query filter.
+        std::vector<unsigned short> polyFlags(mesh.npolys, 0);
+        for (int i = 0; i < mesh.npolys; ++i) {
+            if (mesh.areas[i] == RC_WALKABLE_AREA) polyFlags[i] = kWalkFlag;
+        }
         dtNavMeshCreateParams params;
         std::memset(&params, 0, sizeof(params));
         params.verts = mesh.verts;
@@ -250,9 +274,13 @@ public:
 
         dtPolyRef path[2048];
         int pathCount = 0;
-        if (dtStatusFailed(query_->findPath(startRef, goalRef, startPt, goalPt,
-                                            &filter, path, &pathCount,
-                                            config_.maxPolys))) {
+        const dtStatus pathStatus =
+            query_->findPath(startRef, goalRef, startPt, goalPt, &filter, path,
+                             &pathCount, config_.maxPolys);
+        if (dtStatusFailed(pathStatus) || (pathStatus & DT_PARTIAL_RESULT)) {
+            // Partial result = the query could not reach the goal polygon
+            // (e.g. an island cut off by maxClimb); report the goal as
+            // unreachable instead of a best-guess path.
             return false;
         }
         if (pathCount == 0) return false;
