@@ -3,6 +3,7 @@
 // separated list to restrict (default: all three).
 #include "engine/physics/PhysicsRuntime.hpp"
 #include "engine/physics/PhysicsBackend.hpp"
+#include "engine/physics/Ragdoll.hpp"
 
 #include <glm/glm.hpp>
 
@@ -171,6 +172,163 @@ void test_debug_geometry(PhysicsBackendKind kind, const char* name) {
     std::printf("  [%s] lines=%zu\n", name, lines.size());
 }
 
+// Angle between the world-space Y axes of two bodies (the swing twist axis).
+float y_axis_angle(const PhysicsRuntime& world, BodyHandle a, BodyHandle b) {
+    const RigidBody* ra = world.body(a);
+    const RigidBody* rb = world.body(b);
+    if (!ra || !rb) return 10.0f;
+    const glm::vec3 ya = glm::normalize(ra->rotation * glm::vec3(0.0f, 1.0f, 0.0f));
+    const glm::vec3 yb = glm::normalize(rb->rotation * glm::vec3(0.0f, 1.0f, 0.0f));
+    return std::acos(glm::clamp(glm::dot(ya, yb), -1.0f, 1.0f));
+}
+
+// Swing-twist ragdoll joint (FALTANTES item 2). Jolt implements the seam; the
+// other backends report InvalidConstraint so the caller falls back. Zero
+// gravity isolates the joint from the pendulum.
+void test_swing_twist(PhysicsBackendKind kind, const char* name) {
+    WorldSettings settings;
+    settings.gravity = {0.0f, 0.0f, 0.0f};
+    PhysicsRuntime world(settings, kind);
+    const BodyHandle parent = world.create_body(make_box({0.0f, 0.0f, 0.0f}, 0.0f, MotionType::Static));
+    BodyDesc childDesc;
+    childDesc.motion = MotionType::Dynamic;
+    childDesc.position = {0.0f, 1.0f, 0.0f};
+    childDesc.mass = 1.0f;
+    childDesc.collider.shape = BoxShape{glm::vec3(0.2f)};
+    childDesc.collider.filter.layer = 1u;
+    childDesc.collider.filter.mask = 0u;  // never collide with the parent
+    const BodyHandle child = world.create_body(childDesc);
+
+    const auto make_joint = [&](float cone, bool motor) {
+        SwingTwistConstraintDesc joint;
+        joint.bodyA = parent;
+        joint.bodyB = child;
+        joint.localAnchorA = {0.0f, 0.0f, 0.0f};
+        joint.localAnchorB = {0.0f, -1.0f, 0.0f};  // shared anchor at the parent origin
+        joint.normalHalfConeAngle = cone;
+        joint.planeHalfConeAngle = cone;
+        joint.twistMinAngle = -0.3f;
+        joint.twistMaxAngle = 0.3f;
+        joint.motorOn = motor;
+        joint.motorTarget = {1.0f, 0.0f, 0.0f, 0.0f};  // drive child aligned with parent
+        return joint;
+    };
+
+    if (kind == PhysicsBackendKind::Jolt) {
+        // Cone limit: sustained torque about X drives the child against the
+        // half-cone, which caps the Y-axis deviation at the cone angle.
+        {
+            PhysicsRuntime w(settings, kind);
+            const BodyHandle p = w.create_body(make_box({0.0f, 0.0f, 0.0f}, 0.0f, MotionType::Static));
+            BodyDesc c;
+            c.motion = MotionType::Dynamic;
+            c.position = {0.0f, 1.0f, 0.0f};
+            c.mass = 1.0f;
+            c.collider.shape = BoxShape{glm::vec3(0.2f)};
+            c.collider.filter.mask = 0u;
+            const BodyHandle ch = w.create_body(c);
+            const ConstraintHandle j = w.create_swing_twist_constraint(make_joint(0.3f, false));
+            check(j != InvalidConstraint, "Jolt creates a swing-twist constraint");
+            for (int i = 0; i < 60; ++i) {
+                w.add_torque(ch, {2.0f, 0.0f, 0.0f});
+                w.step(1.0f / 60.0f);
+            }
+            for (int i = 0; i < 60; ++i) w.step(1.0f / 60.0f);
+            const float angle = y_axis_angle(w, p, ch);
+            check(angle >= 0.2f && angle <= 0.45f, "swing cone holds the child near the limit");
+            // Control: a wide cone lets the same torque rotate much further.
+            PhysicsRuntime w2(settings, kind);
+            const BodyHandle p2 = w2.create_body(make_box({0.0f, 0.0f, 0.0f}, 0.0f, MotionType::Static));
+            BodyDesc c2;
+            c2.motion = MotionType::Dynamic;
+            c2.position = {0.0f, 1.0f, 0.0f};
+            c2.mass = 1.0f;
+            c2.collider.shape = BoxShape{glm::vec3(0.2f)};
+            c2.collider.filter.mask = 0u;
+            const BodyHandle ch2 = w2.create_body(c2);
+            (void)w2.create_swing_twist_constraint(make_joint(1.5f, false));
+            for (int i = 0; i < 60; ++i) {
+                w2.add_torque(ch2, {2.0f, 0.0f, 0.0f});
+                w2.step(1.0f / 60.0f);
+            }
+            for (int i = 0; i < 60; ++i) w2.step(1.0f / 60.0f);
+            const float wide = y_axis_angle(w2, p2, ch2);
+            check(wide > 0.5f, "wide cone allows the same torque past the narrow limit");
+            std::printf("  [%s] cone angle=%.3f wide=%.3f\n", name, angle, wide);
+        }
+        // Motor: with the position motor on, the same torque is overcome and
+        // the child returns toward the target (aligned with the parent).
+        {
+            PhysicsRuntime w(settings, kind);
+            const BodyHandle p = w.create_body(make_box({0.0f, 0.0f, 0.0f}, 0.0f, MotionType::Static));
+            BodyDesc c;
+            c.motion = MotionType::Dynamic;
+            c.position = {0.0f, 1.0f, 0.0f};
+            c.mass = 1.0f;
+            c.collider.shape = BoxShape{glm::vec3(0.2f)};
+            c.collider.filter.mask = 0u;
+            const BodyHandle ch = w.create_body(c);
+            (void)w.create_swing_twist_constraint(make_joint(1.5f, true));
+            for (int i = 0; i < 30; ++i) {
+                w.add_torque(ch, {2.0f, 0.0f, 0.0f});
+                w.step(1.0f / 60.0f);
+            }
+            for (int i = 0; i < 180; ++i) w.step(1.0f / 60.0f);
+            const float angle = y_axis_angle(w, p, ch);
+            check(angle < 0.2f, "position motor returns the child to the target");
+            std::printf("  [%s] motor recovered angle=%.3f\n", name, angle);
+        }
+    } else {
+        const ConstraintHandle j = world.create_swing_twist_constraint(make_joint(0.3f, false));
+        check(j == InvalidConstraint, "backend without the seam reports InvalidConstraint");
+        std::printf("  [%s] swing-twist unsupported (fallback expected)\n", name);
+    }
+}
+
+void test_ragdoll_joints(PhysicsBackendKind kind, const char* name) {
+    // Two-bone ragdoll through the Ragdoll class. Jolt gets real swing-twist
+    // joints; the others keep the distance-constraint fallback (FALTANTES
+    // item 2). Both must keep the chain together under gravity.
+    WorldSettings settings;
+    PhysicsRuntime world(settings, kind);
+    std::vector<RagdollBoneDesc> bones;
+    RagdollBoneDesc root;
+    root.name = "root";
+    root.position = {0.0f, 0.0f, 0.0f};
+    root.length = 0.6f;
+    root.radius = 0.12f;
+    root.mass = 2.0f;
+    bones.push_back(root);
+    RagdollBoneDesc head;
+    head.name = "head";
+    head.parent = "root";
+    head.position = {0.0f, 1.0f, 0.0f};
+    head.length = 0.4f;
+    head.radius = 0.12f;
+    head.mass = 1.0f;
+    bones.push_back(head);
+    // Static floor (top at y = 0) so the chain settles instead of falling forever.
+    world.create_body(make_box({0.0f, -0.5f, 0.0f}, 0.0f, MotionType::Static));
+    Ragdoll ragdoll;
+    check(ragdoll.create(world, bones, {0.0f, 3.0f, 0.0f}), "ragdoll created");
+    check(ragdoll.uses_swing_twist_joints() == (kind == PhysicsBackendKind::Jolt),
+          "Jolt ragdoll uses swing-twist joints; others fall back");
+    for (int i = 0; i < 120; ++i) world.step(1.0f / 60.0f);
+    const auto pose = ragdoll.pose(world);
+    check(pose.size() == 2, "ragdoll keeps both bones");
+    // The chain settled on the floor, still connected: bones stay within a few
+    // meters of the spawn (a broken chain would fall/tumble far past it).
+    for (const RagdollPoseBone& bone : pose) {
+        const float drift = glm::length(bone.position - glm::vec3(0.0f, 3.0f, 0.0f));
+        check(drift < 4.0f, "chain stays together under gravity");
+    }
+    const bool usedSwingTwist = ragdoll.uses_swing_twist_joints();
+    ragdoll.destroy(world);
+    check(ragdoll.empty(), "ragdoll destroyed");
+    std::printf("  [%s] ragdoll bones=%zu swingTwist=%s\n", name, pose.size(),
+                usedSwingTwist ? "true" : "false");
+}
+
 std::vector<PhysicsBackendKind> backends_from_env() {
     std::vector<PhysicsBackendKind> result;
     const char* env = std::getenv("VC_PHYSICS_BACKENDS");
@@ -205,6 +363,8 @@ int main() {
         test_overlap(kind, name);
         test_filters(kind, name);
         test_debug_geometry(kind, name);
+        test_swing_twist(kind, name);
+        test_ragdoll_joints(kind, name);
     }
 
     // String helpers.

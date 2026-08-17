@@ -27,6 +27,18 @@ public:
 
     virtual BodyHandle create_body(const BodyDesc& description) = 0;
     virtual bool destroy_body(BodyHandle body) = 0;
+    // Kinematic <-> Dynamic flip (fracture/destruction debris). Default:
+    // backends that mutate the engine RigidBody directly (builtin) need no
+    // extra work; external backends must push the change through (Jolt) AND
+    // restore real mass properties for the dynamic body (a kinematic body
+    // carries zero inverse mass — without it gravity has no effect). `mass`
+    // is the target dynamic mass.
+    virtual bool set_motion_type(BodyHandle body, MotionType motion, float mass) {
+        (void)body;
+        (void)motion;
+        (void)mass;
+        return true;
+    }
 
     virtual void set_transform(BodyHandle body, const glm::vec3& position, const glm::quat& rotation) = 0;
     virtual bool get_state(BodyHandle body, glm::vec3& position, glm::quat& rotation,
@@ -41,6 +53,13 @@ public:
     virtual void wake(BodyHandle body) = 0;
 
     virtual ConstraintHandle create_distance_constraint(const DistanceConstraintDesc& description) = 0;
+    // Swing-twist ragdoll joint. Backends without a specialized solver return
+    // InvalidConstraint and the caller falls back (Ragdoll uses distance
+    // constraints on builtin/bullet).
+    virtual ConstraintHandle create_swing_twist_constraint(const SwingTwistConstraintDesc&) {
+        return InvalidConstraint;
+    }
+    virtual bool supports_swing_twist() const { return false; }
     virtual bool destroy_constraint(ConstraintHandle constraint) = 0;
 
     virtual std::optional<RaycastHit> raycast(const glm::vec3& origin, const glm::vec3& direction,

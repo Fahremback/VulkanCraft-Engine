@@ -75,8 +75,10 @@ bool test_destruction_equivalence() {
         }
         CHECK(detached == 4);
 
-        // Equivalence: the same scenario through the internal runtime.
-        Engine::Physics::PhysicsRuntime internalWorld;
+        // Equivalence: the same scenario through the internal runtime, on the
+        // SAME authority (Jolt is the standard-world backend — FALTANTES item 1).
+        Engine::Physics::PhysicsRuntime internalWorld(
+            {}, Engine::Physics::PhysicsBackendKind::Jolt);
         Engine::Gameplay::DestructibleRuntime internal;
         std::vector<Engine::Gameplay::DestructionChunkDesc> chunks;
         for (int i = 0; i < 4; ++i) {
@@ -160,8 +162,10 @@ bool test_vehicle_equivalence() {
         CHECK(vehicle->speed() < publicDriveSpeed);
     }
 
-    // Equivalence: the same scenario through the internal runtime.
-    Engine::Physics::PhysicsRuntime world;
+    // Equivalence: the same scenario through the internal runtime, on the
+    // SAME authority (Jolt is the standard-world backend — FALTANTES item 1).
+    Engine::Physics::PhysicsRuntime world(
+        {}, Engine::Physics::PhysicsBackendKind::Jolt);
     Engine::Physics::BodyDesc groundDesc;
     groundDesc.motion = Engine::Physics::MotionType::Static;
     groundDesc.collider.shape =
@@ -360,8 +364,10 @@ bool test_ragdoll_equivalence() {
         CHECK(ragdoll->pose().size() == 2);
     }
 
-    // Equivalence: the internal ragdoll creates the same bone set.
-    Engine::Physics::PhysicsRuntime world;
+    // Equivalence: the internal ragdoll creates the same bone set, on the
+    // SAME authority (Jolt is the standard-world backend — FALTANTES item 1).
+    Engine::Physics::PhysicsRuntime world(
+        {}, Engine::Physics::PhysicsBackendKind::Jolt);
     std::vector<Engine::Physics::RagdollBoneDesc> descs;
     Engine::Physics::RagdollBoneDesc spine;
     spine.name = "spine";
@@ -383,6 +389,77 @@ bool test_ragdoll_equivalence() {
     CHECK(internal.bone_body("spine") != Engine::Physics::InvalidBody);
     CHECK(internal.bone_body("head") != Engine::Physics::InvalidBody);
     CHECK(internal.pose(world).size() == 2);
+    // FALTANTES item 2: on the standard world (Jolt) the ragdoll joints are
+    // real swing-twist constraints, not the handcrafted distance fallback.
+    CHECK(internal.uses_swing_twist_joints());
+    return true;
+}
+
+// ---- Standard-world authority (FALTANTES item 1 / META section 20) --------
+// The standard world defaults to Jolt as the single authority for rigid
+// bodies/contacts/constraints; Builtin/Bullet remain explicitly selectable.
+// Proves the default AND that the public surface drives Jolt correctly for the
+// core physics operations (rigid bodies, contacts, raycast, impulse).
+bool test_standard_world_backend() {
+    using namespace engine::gameplay;
+
+    // Default factory -> Jolt.
+    {
+        auto runtime = create_gameplay_runtime();
+        CHECK(runtime != nullptr);
+        CHECK(runtime->physics_backend() == PhysicsBackend::Jolt);
+    }
+    // Explicit selection still works (Builtin/Bullet remain usable).
+    {
+        auto runtime = create_gameplay_runtime(PhysicsBackend::Builtin);
+        CHECK(runtime != nullptr);
+        CHECK(runtime->physics_backend() == PhysicsBackend::Builtin);
+    }
+    {
+        auto runtime = create_gameplay_runtime(PhysicsBackend::Bullet);
+        CHECK(runtime != nullptr);
+        CHECK(runtime->physics_backend() == PhysicsBackend::Bullet);
+    }
+
+    // Jolt as the standard-world authority: a dynamic box dropped on a static
+    // floor falls, generates contacts, and rests (rigid body + contact path).
+    {
+        auto runtime = create_gameplay_runtime();  // Jolt
+        CHECK(runtime != nullptr);
+        BodySpec floor;
+        floor.motion = MotionType::Static;
+        floor.position = { 0.0f, -0.5f, 0.0f };
+        floor.shape = BoxShape{ { 0.5f, 0.5f, 0.5f } };
+        CHECK(runtime->physics().create_body(floor).valid());
+        BodySpec box;
+        box.motion = MotionType::Dynamic;
+        box.position = { 0.0f, 10.0f, 0.0f };
+        box.mass = 1.0f;
+        box.shape = BoxShape{ { 0.5f, 0.5f, 0.5f } };
+        const BodyId falling = runtime->physics().create_body(box);
+        CHECK(falling.valid());
+
+        for (int i = 0; i < 180; ++i) runtime->step(1.0f / 60.0f);
+        BodyState state;
+        CHECK(runtime->physics().body_state(falling, state));
+        CHECK(state.position.y > 0.35f && state.position.y < 1.2f);
+        CHECK(std::fabs(state.linearVelocity.y) < 0.5f);
+
+        // Raycast through the public surface hits the floor body.
+        RaycastHit hit;
+        CHECK(runtime->physics().raycast(
+            { 0.0f, 5.0f, 0.0f }, { 0.0f, -1.0f, 0.0f }, 100.0f, hit));
+        CHECK(hit.body.valid());
+        CHECK(hit.distance > 3.5f && hit.distance < 6.0f);
+
+        // Impulse changes the linear velocity through the public surface.
+        BodyState before;
+        CHECK(runtime->physics().body_state(falling, before));
+        runtime->physics().apply_impulse(falling, { 0.0f, 5.0f, 0.0f });
+        BodyState after;
+        CHECK(runtime->physics().body_state(falling, after));
+        CHECK(after.linearVelocity.y > before.linearVelocity.y + 1.0f);
+    }
     return true;
 }
 
@@ -393,7 +470,10 @@ int main() {
     if (!test_vehicle_equivalence()) return EXIT_FAILURE;
     if (!test_weapon_equivalence()) return EXIT_FAILURE;
     if (!test_ragdoll_equivalence()) return EXIT_FAILURE;
+    if (!test_standard_world_backend()) return EXIT_FAILURE;
     std::cout << "GameplayRuntimeTests: public gameplay runtime consolidated "
                  "with equivalence gates OK\n";
+    std::cout << "GameplayRuntimeTests: standard world = Jolt (FALTANTES item 1) "
+                 "with rigid-body/contact/raycast/impulse battery OK\n";
     return EXIT_SUCCESS;
 }

@@ -18,6 +18,14 @@ struct RagdollBoneDesc {
     float radius{0.12f};
     float mass{1.0f};
     glm::vec3 jointAnchor{0.0f};
+    // Joint parameters used when the world backend supports swing-twist joints
+    // (Jolt — FALTANTES item 2). Ignored on backends without the seam, which
+    // keep the distance-constraint fallback.
+    float jointConeAngle{0.6f};     // swing half cone (radians)
+    float jointTwistRange{0.5f};    // twist half range (radians)
+    bool jointMotorOn{false};       // active ragdoll: drive toward jointMotorTarget
+    float jointMotorFrequency{4.0f};
+    float jointMotorDamping{2.0f};
 };
 
 struct RagdollPoseBone {
@@ -41,14 +49,23 @@ public:
     void destroy(PhysicsRuntime& world);
     void apply_impulse(PhysicsRuntime& world, const std::string& bone, const glm::vec3& impulse);
     void set_awake(PhysicsRuntime& world, bool awake);
+    // Drives the bodies to a ragdoll-space pose (one matrix per bone, model
+    // space relative to the ragdoll root): position/rotation are decomposed
+    // and written through PhysicsRuntime::set_transform (kinematic drive).
+    bool set_pose(PhysicsRuntime& world, const glm::vec3& rootPosition,
+                  const std::vector<glm::mat4>& ragdollPose);
     std::vector<RagdollPoseBone> pose(const PhysicsRuntime& world) const;
     BodyHandle bone_body(const std::string& bone) const;
     bool empty() const noexcept { return bodies_.empty(); }
+    // True when the joints were created as real swing-twist constraints (Jolt)
+    // instead of the distance-constraint fallback.
+    bool uses_swing_twist_joints() const noexcept { return swingTwist_ && !joints_.empty(); }
 
 private:
     std::vector<std::string> order_;
     std::unordered_map<std::string, BodyHandle> bodies_;
     std::vector<ConstraintHandle> joints_;
+    bool swingTwist_{false};
 };
 
 } // namespace Engine::Physics

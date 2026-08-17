@@ -258,6 +258,7 @@ bool add_block_from_json(BlockRegistry& registry, const sdk::JsonValue& object,
     definition.friction = static_cast<float>(sdk::json_number(object, "friction", 0.5));
     definition.bounciness = static_cast<float>(sdk::json_number(object, "bounciness", 0.0));
     definition.density = static_cast<float>(sdk::json_number(object, "density", 1.0));
+    definition.flammability = static_cast<float>(sdk::json_number(object, "flammability", 0.0));
     definition.behaviorId = sdk::json_string(object, "behaviorId", "");
     // A storage mapping exists only when the asset explicitly declares a
     // builtinId; an absent field means "catalog-only" (world rejects setting
@@ -549,6 +550,10 @@ bool BlockRegistry::add(BlockDefinition definition, std::string& errorOut) {
     }
     if (definition.bounciness < 0.0f || definition.bounciness > 1.0f) {
         errorOut = "block '" + blockName + "': bounciness must be in [0, 1]";
+        return false;
+    }
+    if (definition.flammability < 0.0f || definition.flammability > 1.0f) {
+        errorOut = "block '" + blockName + "': flammability must be in [0, 1]";
         return false;
     }
     if (definition.density <= 0.0f) {

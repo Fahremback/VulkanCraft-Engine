@@ -367,16 +367,28 @@ vc_object_module(vc_gameplay_sdk
     src/engine/physics/JoltPhysicsBackend.cpp
     src/engine/physics/BulletPhysicsBackend.cpp
     src/engine/physics/Ragdoll.cpp
+    src/engine/physics/SkeletonPoseMapper.cpp
+    src/engine/physics/PhysicsStreamingBridge.cpp
+    src/engine/physics/VoxelConnectivity.cpp
     src/engine/gameplay/WeaponSystem.cpp
     src/engine/gameplay/VehicleRuntime.cpp
     src/engine/gameplay/DestructionRuntime.cpp
+    src/engine/gameplay/FractureConfig.cpp
+    src/engine/gameplay/ExplosionRuntime.cpp
+    src/engine/gameplay/DebrisRuntime.cpp
+    src/engine/gameplay/DestructionHistoryRuntime.cpp
     src/engine/core/uuid/UUID.cpp
 )
+# RegistryJson stays owned by vc_sdk_public (the canonical copy every consumer
+# links); the gameplay TUs reference its json_* helpers, resolved at link time.
 target_include_directories(vc_gameplay_sdk PRIVATE src)
 vc_object_module(vc_advanced_runtime
     src/engine/physics/PhysicsRuntime.cpp
     src/engine/physics/PhysicsAdvanced.cpp
     src/engine/physics/Ragdoll.cpp
+    src/engine/physics/SkeletonPoseMapper.cpp
+    src/engine/physics/PhysicsStreamingBridge.cpp
+    src/engine/physics/VoxelConnectivity.cpp
     src/engine/physics/PhysicsBackend.cpp
     src/engine/physics/JoltPhysicsBackend.cpp
     src/engine/physics/BulletPhysicsBackend.cpp
@@ -384,6 +396,10 @@ vc_object_module(vc_advanced_runtime
     src/engine/gameplay/WeaponSystem.cpp
     src/engine/gameplay/VehicleRuntime.cpp
     src/engine/gameplay/DestructionRuntime.cpp
+    src/engine/gameplay/FractureConfig.cpp
+    src/engine/gameplay/ExplosionRuntime.cpp
+    src/engine/gameplay/DebrisRuntime.cpp
+    src/engine/gameplay/DestructionHistoryRuntime.cpp
     src/engine/gameplay/ParticleSimulation.cpp
     src/engine/gameplay/MissionSystem.cpp
     src/engine/gameplay/DialogueSystem.cpp
@@ -472,6 +488,10 @@ endforeach()
 
 add_executable(VulkanEngineGame
     src/app/main_game.cpp
+    # RegistryJson lives in vc_sdk_public; these app targets link vc_advanced_runtime
+    # (which compiles FractureConfig using the json helpers) without sdk_public, so
+    # they compile the sdk TU directly — same pattern as vulkan_craft below.
+    src/engine/sdk/RegistryJson.cpp
     $<TARGET_OBJECTS:vc_core_runtime>
     $<TARGET_OBJECTS:vc_advanced_runtime>
 )
@@ -525,6 +545,10 @@ add_executable(VulkanEngineEditor
     # Public navigation provider (FALTANTES item 12): the editor's play nav
     # bakes via Recast + Detour — the legacy grid track was removed.
     src/engine/sdk/RecastNavigation.cpp
+    # RegistryJson lives in vc_sdk_public; this target links vc_advanced_runtime
+    # (which compiles FractureConfig using the json helpers) without sdk_public,
+    # so it compiles the sdk TU directly — same pattern as vulkan_craft below.
+    src/engine/sdk/RegistryJson.cpp
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:src/engine/audio/SoundEngine.cpp>
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:src/plugins/voxel/VoxelPlugin.cpp>
     ${IMGUI_SOURCES}
@@ -550,10 +574,28 @@ add_executable(VulkanEngineServer
     src/server/main_server.cpp
     $<TARGET_OBJECTS:vc_core_runtime>
     $<TARGET_OBJECTS:vc_advanced_runtime>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
 )
 target_compile_features(VulkanEngineServer PRIVATE cxx_std_20)
-target_include_directories(VulkanEngineServer PRIVATE src ${glm_SOURCE_DIR})
-target_link_libraries(VulkanEngineServer PRIVATE glm jolt bullet)
+target_include_directories(VulkanEngineServer PRIVATE
+    src
+    src/engine/public
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(VulkanEngineServer PRIVATE
+    vc_build_options
+    glm jolt bullet
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(VulkanEngineServer vc_generate_world_save)
+endif()
 
 add_executable(terrain_generator_tests
     tests/TerrainGeneratorTests.cpp
@@ -603,6 +645,7 @@ add_executable(empty_project_tests
     src/engine/physics/JoltPhysicsBackend.cpp
     src/engine/physics/BulletPhysicsBackend.cpp
     src/engine/physics/Ragdoll.cpp
+    src/engine/physics/SkeletonPoseMapper.cpp
     src/engine/scene/Scene.cpp
     src/engine/scene/Prefab.cpp
     src/engine/scene/ComponentRegistry.cpp
@@ -660,11 +703,30 @@ add_executable(physics_backend_tests
     src/engine/physics/PhysicsBackend.cpp
     src/engine/physics/JoltPhysicsBackend.cpp
     src/engine/physics/BulletPhysicsBackend.cpp
+    src/engine/physics/Ragdoll.cpp
+    src/engine/physics/SkeletonPoseMapper.cpp
 )
 target_compile_features(physics_backend_tests PRIVATE cxx_std_20)
 target_include_directories(physics_backend_tests PRIVATE src)
 target_link_libraries(physics_backend_tests PRIVATE vc_build_options glm)
 add_test(NAME physics_backend_tests COMMAND physics_backend_tests)
+
+# Jolt SkeletonMapper adapter (FALTANTES item 2): maps poses between the
+# animation skeleton and the ragdoll bodies through Jolt's SkeletonMapper.
+add_executable(skeleton_mapper_tests
+    tests/SkeletonMapperTests.cpp
+    src/engine/physics/PhysicsRuntime.cpp
+    src/engine/physics/PhysicsBackend.cpp
+    src/engine/physics/JoltPhysicsBackend.cpp
+    src/engine/physics/BulletPhysicsBackend.cpp
+    src/engine/physics/Ragdoll.cpp
+    src/engine/physics/SkeletonPoseMapper.cpp
+    src/engine/core/uuid/UUID.cpp
+)
+target_compile_features(skeleton_mapper_tests PRIVATE cxx_std_20)
+target_include_directories(skeleton_mapper_tests PRIVATE src)
+target_link_libraries(skeleton_mapper_tests PRIVATE vc_build_options glm)
+add_test(NAME skeleton_mapper_tests COMMAND skeleton_mapper_tests)
 
 add_executable(advanced_systems_tests
     tests/AdvancedSystemsTests.cpp
@@ -747,6 +809,9 @@ add_test(NAME gameplay_framework_tests COMMAND gameplay_framework_tests)
 # the public surface).
 add_executable(gameplay_runtime_tests
     tests/GameplayRuntimeTests.cpp
+    # vc_gameplay_sdk compiles FractureConfig (json helpers); RegistryJson lives
+    # in vc_sdk_public, so this light target compiles the sdk TU directly.
+    src/engine/sdk/RegistryJson.cpp
     $<TARGET_OBJECTS:vc_gameplay_sdk>
 )
 target_include_directories(gameplay_runtime_tests PRIVATE
@@ -874,6 +939,222 @@ if(TARGET vc_generate_world_save)
     add_dependencies(voxel_sdk_tests vc_generate_world_save)
 endif()
 add_test(NAME voxel_sdk_tests COMMAND voxel_sdk_tests)
+
+# Physics x streaming x server authority (FALTANTES §16 item 6): the bridge
+# owns the physics bodies mirroring the streaming world — loaded chunks get
+# static terrain slabs, dynamic bodies rest and sleep on them, wake_region
+# wakes them, and unloaded chunks despawn their contained bodies (no orphans).
+add_executable(physics_streaming_tests
+    tests/PhysicsStreamingTests.cpp
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(physics_streaming_tests PRIVATE cxx_std_20)
+target_include_directories(physics_streaming_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(physics_streaming_tests PRIVATE
+    vc_build_options
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(physics_streaming_tests vc_generate_world_save)
+endif()
+add_test(NAME physics_streaming_tests COMMAND physics_streaming_tests)
+
+# Incremental voxel connectivity (FALTANTES §16 item 9): only voxel islands
+# that LOST their connection to the anchored mass become dynamic Jolt bodies.
+# VoxelConnectivity does the bounded flood-fill island detection over the
+# PUBLIC world surface; the bridge turns each detached island into a dynamic
+# body (mass from block density) that falls and rests on the streamed terrain.
+add_executable(connectivity_tests
+    tests/ConnectivityTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(connectivity_tests PRIVATE cxx_std_20)
+target_include_directories(connectivity_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(connectivity_tests PRIVATE
+    vc_build_options
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(connectivity_tests vc_generate_world_save)
+endif()
+add_test(NAME connectivity_tests COMMAND connectivity_tests)
+
+# Integrated explosions (FALTANTES §16 item 10): the ExplosionRuntime combines
+# materials (blast resistance + flammability from the registry JSON), heat
+# (fireball burns flammables), pressure (falloff drives the carve), impulse
+# (dynamic bodies pushed by the wave) and terrain (the affected voxel box
+# feeds the connectivity layer — detached islands become dynamic bodies).
+add_executable(explosion_tests
+    tests/ExplosionTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(explosion_tests PRIVATE cxx_std_20)
+target_include_directories(explosion_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(explosion_tests PRIVATE
+    vc_build_options
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(explosion_tests vc_generate_world_save)
+endif()
+add_test(NAME explosion_tests COMMAND explosion_tests)
+
+# Production debris (FALTANTES §16 item 11): DebrisRuntime owns the debris
+# lifecycle — pooling (parked bodies reused, not recreated), LOD (cull beyond
+# the focus radius, re-enter on return), selective persistence (only resting,
+# in-radius, above-min-mass debris snapshot/restore) and replication (drained
+# lifecycle events).
+add_executable(debris_tests
+    tests/DebrisTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(debris_tests PRIVATE cxx_std_20)
+target_include_directories(debris_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(debris_tests PRIVATE
+    vc_build_options
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(debris_tests vc_generate_world_save)
+endif()
+add_test(NAME debris_tests COMMAND debris_tests)
+
+# Revoxelize sleeping debris (FALTANTES §16 item 12): debris that fell and
+# SLEEPS is written back into the voxel world as terrain per the asset policy
+# (settle delay, material filter, footprint caps), then despawned into the
+# pool — the destruction pipeline converges back to solid terrain.
+add_executable(revoxelize_tests
+    tests/RevoxelizeTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(revoxelize_tests PRIVATE cxx_std_20)
+target_include_directories(revoxelize_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(revoxelize_tests PRIVATE
+    vc_build_options
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(revoxelize_tests vc_generate_world_save)
+endif()
+add_test(NAME revoxelize_tests COMMAND revoxelize_tests)
+
+# Destruction history (FALTANTES §16 item 13): ONE generic capture/restore
+# mechanism reconstructs a region's destruction state (voxel cells + debris)
+# regardless of the damage source — explosion carve, fracture detach, manual
+# carve, or debris revoxelization. No per-source special cases.
+add_executable(history_tests
+    tests/HistoryTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(history_tests PRIVATE cxx_std_20)
+target_include_directories(history_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(history_tests PRIVATE
+    vc_build_options
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(history_tests vc_generate_world_save)
+endif()
+add_test(NAME history_tests COMMAND history_tests)
+
+# Configurable voxel fracture (FALTANTES §16 item 8): the data-driven
+# FractureConfig turns a solid voxel region into a destructible whose chunks
+# detach as dynamic debris (mass from block density); the Jolt motion-type
+# flip makes the debris actually fall in the standard world.
+add_executable(fracture_tests
+    tests/FractureTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(fracture_tests PRIVATE cxx_std_20)
+target_include_directories(fracture_tests PRIVATE src/engine/public src ${glm_SOURCE_DIR})
+target_link_libraries(fracture_tests PRIVATE
+    vc_build_options glm
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(fracture_tests vc_generate_world_save)
+endif()
+add_test(NAME fracture_tests COMMAND fracture_tests)
 
 # MCP registry-asset gate (FALTANTES item 23 / prioridade 5): the versioned
 # JSON documents the MCP semantic layer authors (Content/Registry/<kind>/*.json)

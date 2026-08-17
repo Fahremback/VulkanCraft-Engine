@@ -254,9 +254,18 @@ public:
 };
 
 // ---- Runtime (owns the physics world) --------------------------------------
+// The physics backend of the standard world. Jolt is the production authority
+// (FALTANTES item 1 / META section 20); Builtin and Bullet remain selectable
+// for specialized or fallback use.
+enum class PhysicsBackend : std::uint8_t { Jolt, Builtin, Bullet };
+
 class IGameplayRuntime {
 public:
     virtual ~IGameplayRuntime() = default;
+
+    // The backend this runtime actually advances (matches the factory argument;
+    // "jolt" for the default factory call).
+    virtual PhysicsBackend physics_backend() const = 0;
 
     virtual IPhysicsWorld& physics() = 0;
     virtual void step(float deltaTime) = 0;
@@ -271,7 +280,9 @@ public:
 };
 
 // The only implementation of IGameplayRuntime (src/engine/sdk/GameplayRuntime.cpp).
-std::unique_ptr<IGameplayRuntime> create_gameplay_runtime();
+// The standard world defaults to Jolt as the single physics authority.
+std::unique_ptr<IGameplayRuntime> create_gameplay_runtime(
+    PhysicsBackend backend = PhysicsBackend::Jolt);
 
 }  // namespace gameplay
 }  // namespace engine

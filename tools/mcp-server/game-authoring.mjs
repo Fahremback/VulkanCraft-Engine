@@ -105,6 +105,7 @@ export const REGISTRY_FIELD_SCHEMAS = Object.freeze({
     { name: "friction", type: "number", required: false, default: 0.5, description: "physics friction in 0..1 (item 4)" },
     { name: "bounciness", type: "number", required: false, default: 0, description: "physics restitution in 0..1 (item 4)" },
     { name: "density", type: "number", required: false, default: 1, description: "physics density, > 0 (item 4)" },
+    { name: "flammability", type: "number", required: false, default: 0, description: "heat/explosion ignition axis in 0..1 — explosions burn blocks with flammability > 0 (item 10)" },
     { name: "behavior", type: "string", required: false, description: "declarative behavior reference (item 6): namespaced id (ns:name) or empty" },
     { name: "tags", type: "array[string]", required: false, default: [] },
     { name: "drops", type: "array[string]", required: false, default: ["vulkancraft:<name>"] },

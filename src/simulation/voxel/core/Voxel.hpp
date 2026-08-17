@@ -122,16 +122,18 @@ struct RuntimeBlockInfo {
     uint8_t collisionShape{ 0 };
     uint8_t selectionShape{ 0 };
     // Tool/physics component (FALTANTES item 4): mirror of
-    // BlockDefinition.tool/toolTier/resistance/friction/bounciness/density.
-    // Consumed by the gameplay/physics milestones (tool gating, destruction
-    // scaling, dynamic-body response); mirrored here so consumers never touch
-    // the registry. tool: 0 = any, 1..5 = pickaxe/axe/shovel/hoe/sword.
+    // BlockDefinition.tool/toolTier/resistance/friction/bounciness/density/
+    // flammability. Consumed by the gameplay/physics milestones (tool
+    // gating, destruction scaling, dynamic-body response, explosion heat);
+    // mirrored here so consumers never touch the registry. tool: 0 = any,
+    // 1..5 = pickaxe/axe/shovel/hoe/sword.
     uint8_t tool{ 0 };
     uint8_t toolTier{ 0 };
     float resistance{ 0.0f };
     float friction{ 0.5f };
     float bounciness{ 0.0f };
     float density{ 1.0f };
+    float flammability{ 0.0f };   // 0..1 (FALTANTES §16 item 10 heat axis)
     std::string soundPlace;
     std::string soundBreak;
     std::string soundStep;

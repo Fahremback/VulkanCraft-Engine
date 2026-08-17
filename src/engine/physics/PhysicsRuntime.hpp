@@ -23,6 +23,9 @@ using BodyHandle = std::uint32_t;
 using ConstraintHandle = std::uint32_t;
 inline constexpr BodyHandle InvalidBody = 0;
 inline constexpr ConstraintHandle InvalidConstraint = 0;
+// Swing-twist handles live in a separate space above this offset so they never
+// collide with distance-constraint handles (dense indices from 1).
+inline constexpr ConstraintHandle kSwingTwistHandleOffset = 1u << 28;
 
 struct SphereShape { float radius{0.5f}; };
 struct BoxShape { glm::vec3 halfExtents{0.5f}; };
@@ -143,6 +146,39 @@ struct DistanceConstraint : DistanceConstraintDesc {
     bool broken{false};
 };
 
+// Swing-twist joint (Jolt humanoid ragdoll constraint): limits the relative
+// rotation between two bodies around a shared anchor. The constraint frames
+// are defined in body-local space of each body (twist axis + plane axis); at
+// rest with identity frames the twist axes coincide. Swing cone angles limit
+// how far the child's twist axis can rotate away from the parent's, twist
+// min/max limit the roll around the twist axis. Optional motors (Position
+// state) drive the joint toward `motorTarget` (relative orientation of body B
+// in body A's frame) with a spring defined by frequency/damping — this is the
+// "constraint motors" of a Jolt active ragdoll.
+struct SwingTwistConstraintDesc {
+    BodyHandle bodyA{InvalidBody};
+    BodyHandle bodyB{InvalidBody};
+    glm::vec3 localAnchorA{0.0f};
+    glm::vec3 localAnchorB{0.0f};
+    glm::vec3 twistAxisA{0.0f, 1.0f, 0.0f};
+    glm::vec3 planeAxisA{0.0f, 0.0f, 1.0f};
+    glm::vec3 twistAxisB{0.0f, 1.0f, 0.0f};
+    glm::vec3 planeAxisB{0.0f, 0.0f, 1.0f};
+    float normalHalfConeAngle{0.5f};
+    float planeHalfConeAngle{0.5f};
+    float twistMinAngle{-0.4f};
+    float twistMaxAngle{0.4f};
+    bool motorOn{false};
+    float motorFrequency{4.0f};
+    float motorDamping{2.0f};
+    glm::quat motorTarget{1.0f, 0.0f, 0.0f, 0.0f};
+};
+
+struct SwingTwistConstraint : SwingTwistConstraintDesc {
+    ConstraintHandle handle{InvalidConstraint};
+    bool broken{false};
+};
+
 struct WorldSettings {
     glm::vec3 gravity{0.0f, -9.81f, 0.0f};
     std::uint32_t solverIterations{8};
@@ -168,7 +204,12 @@ public:
     RigidBody* body(BodyHandle handle);
     const RigidBody* body(BodyHandle handle) const;
 
+    // Instantly moves a body (kinematic drive used by ragdoll pose mapping).
+    void set_transform(BodyHandle body, const glm::vec3& position, const glm::quat& rotation);
+
     ConstraintHandle create_distance_constraint(const DistanceConstraintDesc& description);
+    ConstraintHandle create_swing_twist_constraint(const SwingTwistConstraintDesc& description);
+    bool supports_swing_twist() const noexcept;
     bool destroy_constraint(ConstraintHandle constraint);
 
     void add_force(BodyHandle body, const glm::vec3& force);
@@ -176,6 +217,11 @@ public:
     void apply_impulse(BodyHandle body, const glm::vec3& impulse);
     void apply_impulse_at_point(BodyHandle body, const glm::vec3& impulse, const glm::vec3& worldPoint);
     void wake(BodyHandle body);
+    // Kinematic <-> Dynamic flip (fracture/destruction debris): updates the
+    // mirror AND pushes the change through the external backend (Jolt), so a
+    // detached chunk actually falls under gravity in the standard world. The
+    // mirror does not store mass, so the caller passes it for inverseMass.
+    void set_motion(BodyHandle body, MotionType motion, float mass);
 
     void step(float deltaTime);
     std::optional<RaycastHit> raycast(const glm::vec3& origin, const glm::vec3& direction,
@@ -211,10 +257,13 @@ private:
     std::unique_ptr<PhysicsBackend> external_;
     std::vector<std::optional<RigidBody>> bodies_{1};
     std::vector<std::optional<DistanceConstraint>> constraints_{1};
+    std::vector<std::optional<SwingTwistConstraint>> swingTwistConstraints_;
     std::vector<BodyHandle> freeBodies_;
     std::vector<ConstraintHandle> freeConstraints_;
+    std::vector<ConstraintHandle> freeSwingTwist_;
     std::vector<BodyHandle> backendBodies_;      // engine handle -> backend handle (external only)
     std::vector<ConstraintHandle> backendConstraints_;
+    std::vector<ConstraintHandle> backendSwingTwist_;
     std::unordered_map<BodyHandle, BodyHandle> backendToEngine_;
     std::vector<Contact> contacts_;
     std::vector<TriggerPair> triggerPairs_;

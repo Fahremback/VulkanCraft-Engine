@@ -64,6 +64,19 @@ struct BlockRuntimeView {
     uint8_t renderLayer{ 0 };    // 0 = opaque world layer
     uint8_t lightEmission{ 0 };  // 0..15 (plugin-mergeable)
     uint8_t lightAbsorption{ 15 };  // 0..15 (plugin-mergeable)
+
+    // Physical material (FALTANTES §16 item 7 + item 10): mirror of the
+    // registry's friction/bounciness/density/resistance/flammability,
+    // consumed by the physics layer (terrain slab colliders carry the surface
+    // block's material; density feeds mass scaling for debris/destruction;
+    // resistance + flammability drive the explosion response). Data-driven:
+    // the JSON registry is the single source, this view is what physics
+    // consumers read.
+    float friction{ 0.5f };      // 0..1 contact friction
+    float bounciness{ 0.0f };    // 0..1 restitution
+    float density{ 1.0f };       // mass per unit volume (> 0)
+    float resistance{ 0.0f };    // blast/explosion resistance (>= 0)
+    float flammability{ 0.0f };  // 0..1 heat/ignition axis
 };
 
 // Push observability (FALTANTES §3): an optional monitor installed on the

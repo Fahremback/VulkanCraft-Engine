@@ -179,11 +179,14 @@ struct BlockDefinition {
     // Resistance + physical properties (FALTANTES item 4). resistance scales
     // destruction/explosion work (hardness is the mining counterpart);
     // friction/bounciness/density feed the physics response when a block
-    // produces dynamic bodies (Jolt milestone).
+    // produces dynamic bodies (Jolt milestone). flammability (FALTANTES §16
+    // item 10) is the heat axis: an explosion's fireball burns blocks with
+    // flammability > 0 while non-flammables survive the heat.
     float resistance{ 0.0f };
     float friction{ 0.5f };
     float bounciness{ 0.0f };
     float density{ 1.0f };
+    float flammability{ 0.0f };   // 0..1 (heat/explosion ignition axis)
 
     int32_t version{ 1 };
 
@@ -242,6 +245,7 @@ struct BlockDefinition {
 //   "friction": 0.6,                               // 0..1
 //   "bounciness": 0.0,                             // 0..1
 //   "density": 2.5,                                // > 0
+//   "flammability": 0.0,                           // 0..1 (heat/explosion axis, item 10)
 //   "behaviorId": "vulkancraft:spread_fire",      // optional namespaced ref (item 6)
 //   "version": 1
 // }

@@ -4,9 +4,10 @@
 // WeaponRuntime, Ragdoll) behind the self-contained public contract and is the
 // ONLY place that crosses from the public surface into those internal layers.
 //
-// Physics world is the internal PhysicsRuntime (builtin solver by default;
-// Jolt/Bullet stay selectable through the internal world). The public surface
-// exposes exactly the physics operations the gameplay subsystems need.
+// Physics world is the internal PhysicsRuntime. The standard world defaults to
+// Jolt as the single authority for rigid bodies/contacts/constraints (FALTANTES
+// item 1 / META section 20); Builtin and Bullet remain explicitly selectable
+// through the public factory for specialized or fallback use.
 
 #include "engine/gameplay/IGameplayRuntime.hpp"
 
@@ -425,9 +426,20 @@ private:
 
 class GameplayRuntimeImpl final : public IGameplayRuntime {
 public:
-    GameplayRuntimeImpl()
-        : world_(std::make_unique<Engine::Physics::PhysicsRuntime>()),
+    explicit GameplayRuntimeImpl(PhysicsBackend backend)
+        : world_(std::make_unique<Engine::Physics::PhysicsRuntime>(
+              Engine::Physics::WorldSettings{},
+              to_internal_backend(backend))),
           physics_(std::make_unique<PhysicsWorldImpl>(*world_)) {}
+
+    PhysicsBackend physics_backend() const override {
+        switch (world_->backend_kind()) {
+            case Engine::Physics::PhysicsBackendKind::Jolt: return PhysicsBackend::Jolt;
+            case Engine::Physics::PhysicsBackendKind::Bullet: return PhysicsBackend::Bullet;
+            case Engine::Physics::PhysicsBackendKind::Builtin: break;
+        }
+        return PhysicsBackend::Builtin;
+    }
 
     IPhysicsWorld& physics() override { return *physics_; }
 
@@ -460,14 +472,25 @@ public:
     }
 
 private:
+    static Engine::Physics::PhysicsBackendKind to_internal_backend(
+        PhysicsBackend backend) {
+        switch (backend) {
+            case PhysicsBackend::Jolt: return Engine::Physics::PhysicsBackendKind::Jolt;
+            case PhysicsBackend::Bullet: return Engine::Physics::PhysicsBackendKind::Bullet;
+            case PhysicsBackend::Builtin: break;
+        }
+        return Engine::Physics::PhysicsBackendKind::Builtin;
+    }
+
     std::unique_ptr<Engine::Physics::PhysicsRuntime> world_;
     std::unique_ptr<PhysicsWorldImpl> physics_;
 };
 
 }  // namespace
 
-std::unique_ptr<IGameplayRuntime> create_gameplay_runtime() {
-    return std::make_unique<GameplayRuntimeImpl>();
+std::unique_ptr<IGameplayRuntime> create_gameplay_runtime(
+    PhysicsBackend backend) {
+    return std::make_unique<GameplayRuntimeImpl>(backend);
 }
 
 }  // namespace gameplay

@@ -93,6 +93,39 @@ bool Ragdoll::create(PhysicsRuntime& world, const std::vector<RagdollBoneDesc>& 
         const RigidBody* parent = world.body(bodies_.at(bone.parent));
         if (!child || !parent) { destroy(world); return false; }
         const glm::vec3 worldAnchor = rootPosition + bone.position + bone.rotation * bone.jointAnchor;
+        if (world.supports_swing_twist()) {
+            // Jolt ragdoll joint (FALTANTES item 2): real swing-twist constraint
+            // with cone limits and optional position motors. The twist axis is
+            // the bone direction (parent -> child) in each body's local frame;
+            // the motor target is the authored relative orientation so an
+            // active ragdoll holds the pose.
+            SwingTwistConstraintDesc joint;
+            joint.bodyA = parent->handle;
+            joint.bodyB = child->handle;
+            joint.localAnchorA = glm::inverse(parent->rotation) * (worldAnchor - parent->position);
+            joint.localAnchorB = glm::inverse(child->rotation) * (worldAnchor - child->position);
+            const glm::vec3 boneAxis = glm::normalize(bone.position - [&]() -> glm::vec3 {
+                for (const auto& other : bones) if (other.name == bone.parent) return other.position;
+                return glm::vec3(0.0f, 1.0f, 0.0f);
+            }());
+            joint.twistAxisA = glm::inverse(parent->rotation) * boneAxis;
+            joint.twistAxisB = glm::inverse(child->rotation) * boneAxis;
+            joint.normalHalfConeAngle = glm::clamp(bone.jointConeAngle, 0.0f, glm::pi<float>());
+            joint.planeHalfConeAngle = glm::clamp(bone.jointConeAngle, 0.0f, glm::pi<float>());
+            joint.twistMinAngle = -glm::clamp(bone.jointTwistRange, 0.0f, glm::pi<float>());
+            joint.twistMaxAngle = glm::clamp(bone.jointTwistRange, 0.0f, glm::pi<float>());
+            joint.motorOn = bone.jointMotorOn;
+            joint.motorFrequency = bone.jointMotorFrequency;
+            joint.motorDamping = bone.jointMotorDamping;
+            joint.motorTarget = glm::inverse(parent->rotation) * child->rotation;
+            const ConstraintHandle handle = world.create_swing_twist_constraint(joint);
+            if (handle == InvalidConstraint) { destroy(world); return false; }
+            joints_.push_back(handle);
+            swingTwist_ = true;
+            continue;
+        }
+        // Fallback (builtin/bullet backends): distance constraint holding the
+        // initial bone separation.
         DistanceConstraintDesc joint;
         joint.bodyA = parent->handle;
         joint.bodyB = child->handle;
@@ -121,6 +154,19 @@ void Ragdoll::destroy(PhysicsRuntime& world) {
 
 void Ragdoll::apply_impulse(PhysicsRuntime& world, const std::string& bone, const glm::vec3& impulse) {
     if (const auto found = bodies_.find(bone); found != bodies_.end()) world.apply_impulse(found->second, impulse);
+}
+
+bool Ragdoll::set_pose(PhysicsRuntime& world, const glm::vec3& rootPosition,
+                       const std::vector<glm::mat4>& ragdollPose) {
+    if (ragdollPose.size() != order_.size()) return false;
+    for (std::size_t i = 0; i < order_.size(); ++i) {
+        const auto found = bodies_.find(order_[i]);
+        if (found == bodies_.end()) return false;
+        const glm::vec3 position(ragdollPose[i][3]);
+        const glm::quat rotation = glm::quat_cast(ragdollPose[i]);
+        world.set_transform(found->second, rootPosition + position, rotation);
+    }
+    return true;
 }
 
 void Ragdoll::set_awake(PhysicsRuntime& world, bool awake) {

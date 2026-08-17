@@ -51,11 +51,13 @@ bool DestructibleRuntime::detach_chunk(Physics::PhysicsRuntime& world, std::size
     Physics::RigidBody* body = world.body(chunk.body);
     if (!body) return false;
     chunk.detached = true;
-    body->motion = Physics::MotionType::Dynamic;
-    body->inverseMass = 1.0f / std::max(0.001f, chunk.mass);
     body->continuous = true;
     body->allowSleep = true;
-    body->sleeping = false;
+    // Kinematic -> Dynamic through the runtime: the mirror AND the external
+    // backend (Jolt) both flip, so the debris actually falls under gravity in
+    // the standard world (SetMotionType + Activate), then the impulse pushes
+    // it out of the fracture.
+    world.set_motion(chunk.body, Physics::MotionType::Dynamic, chunk.mass);
     world.apply_impulse(chunk.body, impulse);
     return true;
 }

@@ -27,6 +27,8 @@
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Constraints/DistanceConstraint.h>
+#include <Jolt/Physics/Constraints/SwingTwistConstraint.h>
+#include <Jolt/Physics/Constraints/MotorSettings.h>
 #include <Jolt/Physics/Constraints/ConstraintManager.h>
 
 #include <algorithm>
@@ -136,6 +138,7 @@ struct RawContact {
 class EngineContactListener final : public JPH::ContactListener {
 public:
     void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
         rawContacts_.clear();
         pairsThisStep_.clear();
     }
@@ -155,12 +158,25 @@ public:
         record(inBody1, inBody2, inManifold, ioSettings);
     }
 
-    const std::vector<RawContact>& raw_contacts() const { return rawContacts_; }
-    const std::set<std::uint64_t>& pairs_this_step() const { return pairsThisStep_; }
+    // Contact callbacks run on Jolt's job threads during Update(); the main
+    // thread clears (before Update) and reads (after Update) these containers.
+    // Return copies under the lock so no reference escapes into job-thread
+    // storage; reads happen after all jobs are joined, so this only serializes
+    // the concurrent record() writers during the step.
+    std::vector<RawContact> raw_contacts() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return rawContacts_;
+    }
+
+    std::set<std::uint64_t> pairs_this_step() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return pairsThisStep_;
+    }
 
 private:
     void record(const JPH::Body& b1, const JPH::Body& b2, const JPH::ContactManifold& manifold,
                 const JPH::ContactSettings& settings) {
+        std::lock_guard<std::mutex> lock(mutex_);
         const std::uint32_t id1 = b1.GetID().GetIndexAndSequenceNumber();
         const std::uint32_t id2 = b2.GetID().GetIndexAndSequenceNumber();
         pairsThisStep_.insert(pair_key(id1, id2));
@@ -181,6 +197,7 @@ private:
         rawContacts_.push_back(contact);
     }
 
+    mutable std::mutex mutex_;
     std::vector<RawContact> rawContacts_;
     std::set<std::uint64_t> pairsThisStep_;
 };
@@ -315,7 +332,7 @@ void JoltPhysicsBackend::step(float deltaTime) {
     impl_->physicsSystem->Update(frame, collisionSteps, impl_->tempAllocator.get(), impl_->jobSystem.get());
 
     // Trigger diff: current overlap pairs vs previous.
-    const std::set<std::uint64_t>& current = impl_->contactListener->pairs_this_step();
+    const std::set<std::uint64_t> current = impl_->contactListener->pairs_this_step();
     const std::set<std::uint64_t>& previous = impl_->previousPairs_;
     impl_->triggerEvents_.clear();
     for (const std::uint64_t pair : current) {
@@ -381,6 +398,11 @@ BodyHandle JoltPhysicsBackend::create_body(const BodyDesc& description) {
     JPH::Body* body = bodyInterface.CreateBody(creation);
     if (!body) return InvalidBody;
     bodyInterface.AddBody(body->GetID(), JPH::EActivation::Activate);
+    // BodyDesc.linearVelocity/angularVelocity must survive into Jolt (initial
+    // state of a spawned body — the builtin backend keeps them on the
+    // RigidBody, so the Jolt path was silently dropping them).
+    bodyInterface.SetLinearVelocity(body->GetID(), to_jolt(description.linearVelocity));
+    bodyInterface.SetAngularVelocity(body->GetID(), to_jolt(description.angularVelocity));
 
     const BodyHandle handle = impl_->nextBodyHandle_++;
     impl_->bodies_[handle] = {body->GetID(), description.collider.filter, description.collider.trigger};
@@ -399,9 +421,50 @@ bool JoltPhysicsBackend::destroy_body(BodyHandle body) {
     }
     for (const ConstraintHandle handle : toRemove) destroy_constraint(handle);
 
+    // Jolt's DestroyBody REQUIRES the body to be inactive and out of the
+    // broadphase first (BodyManager::RemoveBodyInternal asserts it; with
+    // JPH_ENABLE_ASSERTS off the assert vanishes and the body is FREED while
+    // still in the active list — the next Update() then dereferences a
+    // dangling body in JobApplyGravity). RemoveBody must precede DestroyBody.
+    JPH::BodyInterface& bodyInterface = impl_->physicsSystem->GetBodyInterface();
+    bodyInterface.RemoveBody(it->second.id);
+    bodyInterface.DestroyBody(it->second.id);
     impl_->bodyToHandle_.erase(it->second.id.GetIndexAndSequenceNumber());
-    impl_->physicsSystem->GetBodyInterface().DestroyBody(it->second.id);
     impl_->bodies_.erase(it);
+    return true;
+}
+
+bool JoltPhysicsBackend::set_motion_type(BodyHandle body, MotionType motion,
+                                         float mass) {
+    const auto it = impl_->bodies_.find(body);
+    if (it == impl_->bodies_.end()) return false;
+    // Kinematic -> Dynamic flip (fracture/destruction debris): the Jolt body
+    // must actually change motion type, or gravity/impulses are ignored and
+    // the detached chunk floats in place (the engine-side mirror alone is
+    // invisible to the backend). Activate so the newly-dynamic body wakes.
+    JPH::BodyInterface& bodyInterface = impl_->physicsSystem->GetBodyInterface();
+    bodyInterface.SetMotionType(it->second.id, motion_type(motion),
+                                JPH::EActivation::Activate);
+    if (motion == MotionType::Dynamic && mass > 0.0f) {
+        // Body::SetMotionType does NOT restore mass: a kinematic body keeps
+        // zero inverse mass, so gravity would produce no acceleration and the
+        // debris would float forever. Scale the shape's mass properties to the
+        // caller's mass (same normalization as create_body) and apply them
+        // through the body lock interface (the sanctioned direct path).
+        JPH::MassProperties massProperties =
+            bodyInterface.GetShape(it->second.id)->GetMassProperties();
+        if (massProperties.mMass > 1.0e-6f) {
+            const float scale = mass / massProperties.mMass;
+            massProperties.mMass = mass;
+            massProperties.mInertia = massProperties.mInertia * scale;
+        }
+        JPH::BodyLockWrite lock(impl_->physicsSystem->GetBodyLockInterface(),
+                                it->second.id);
+        if (lock.Succeeded() && lock.GetBody().GetMotionProperties() != nullptr) {
+            lock.GetBody().GetMotionProperties()->SetMassProperties(
+                JPH::EAllowedDOFs::All, massProperties);
+        }
+    }
     return true;
 }
 
@@ -499,6 +562,53 @@ ConstraintHandle JoltPhysicsBackend::create_distance_constraint(const DistanceCo
     return handle;
 }
 
+ConstraintHandle JoltPhysicsBackend::create_swing_twist_constraint(const SwingTwistConstraintDesc& description) {
+    const auto itA = impl_->bodies_.find(description.bodyA);
+    const auto itB = impl_->bodies_.find(description.bodyB);
+    if (itA == impl_->bodies_.end() || itB == impl_->bodies_.end()) return InvalidConstraint;
+
+    JPH::BodyLockWrite lockA(impl_->physicsSystem->GetBodyLockInterface(), itA->second.id);
+    JPH::BodyLockWrite lockB(impl_->physicsSystem->GetBodyLockInterface(), itB->second.id);
+    if (!lockA.Succeeded() || !lockB.Succeeded()) return InvalidConstraint;
+
+    auto settings = std::make_unique<JPH::SwingTwistConstraintSettings>();
+    settings->mSpace = JPH::EConstraintSpace::LocalToBodyCOM;
+    settings->mPosition1 = to_jolt(description.localAnchorA);
+    settings->mPosition2 = to_jolt(description.localAnchorB);
+    settings->mTwistAxis1 = to_jolt(glm::normalize(description.twistAxisA));
+    settings->mPlaneAxis1 = to_jolt(glm::normalize(description.planeAxisA));
+    settings->mTwistAxis2 = to_jolt(glm::normalize(description.twistAxisB));
+    settings->mPlaneAxis2 = to_jolt(glm::normalize(description.planeAxisB));
+    settings->mNormalHalfConeAngle = glm::clamp(description.normalHalfConeAngle, 0.0f, glm::pi<float>());
+    settings->mPlaneHalfConeAngle = glm::clamp(description.planeHalfConeAngle, 0.0f, glm::pi<float>());
+    settings->mTwistMinAngle = glm::clamp(description.twistMinAngle, -glm::pi<float>(), 0.0f);
+    settings->mTwistMaxAngle = glm::clamp(description.twistMaxAngle, 0.0f, glm::pi<float>());
+
+    JPH::SwingTwistConstraint* constraint = nullptr;
+    if (description.motorOn) {
+        settings->mSwingMotorSettings.mSpringSettings =
+            JPH::SpringSettings(JPH::ESpringMode::FrequencyAndDamping, description.motorFrequency, description.motorDamping);
+        settings->mTwistMotorSettings.mSpringSettings =
+            JPH::SpringSettings(JPH::ESpringMode::FrequencyAndDamping, description.motorFrequency, description.motorDamping);
+        constraint = static_cast<JPH::SwingTwistConstraint*>(
+            settings->Create(lockA.GetBody(), lockB.GetBody()));
+        if (constraint == nullptr) return InvalidConstraint;
+        constraint->SetSwingMotorState(JPH::EMotorState::Position);
+        constraint->SetTwistMotorState(JPH::EMotorState::Position);
+        constraint->SetTargetOrientationCS(to_jolt(description.motorTarget));
+    } else {
+        constraint = static_cast<JPH::SwingTwistConstraint*>(
+            settings->Create(lockA.GetBody(), lockB.GetBody()));
+        if (constraint == nullptr) return InvalidConstraint;
+    }
+
+    impl_->physicsSystem->AddConstraint(constraint);
+
+    const ConstraintHandle handle = impl_->nextConstraintHandle_++;
+    impl_->constraints_[handle] = {constraint, description.bodyA, description.bodyB};
+    return handle;
+}
+
 bool JoltPhysicsBackend::destroy_constraint(ConstraintHandle constraint) {
     const auto it = impl_->constraints_.find(constraint);
     if (it == impl_->constraints_.end()) return false;
@@ -545,8 +655,9 @@ std::vector<BodyHandle> JoltPhysicsBackend::overlap_aabb(const Aabb& bounds, std
 
 std::vector<Contact> JoltPhysicsBackend::contacts() {
     std::vector<Contact> result;
-    result.reserve(impl_->contactListener->raw_contacts().size());
-    for (const RawContact& raw : impl_->contactListener->raw_contacts()) {
+    const std::vector<RawContact> rawContacts = impl_->contactListener->raw_contacts();
+    result.reserve(rawContacts.size());
+    for (const RawContact& raw : rawContacts) {
         const BodyHandle a = impl_->to_engine_handle(raw.body1);
         const BodyHandle b = impl_->to_engine_handle(raw.body2);
         if (a == InvalidBody || b == InvalidBody) continue;

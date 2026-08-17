@@ -73,6 +73,7 @@ build_runtime_block_table(const engine::registry::BlockRegistry& registry) {
         info.friction = definition.friction;
         info.bounciness = definition.bounciness;
         info.density = definition.density;
+        info.flammability = definition.flammability;
         info.soundPlace = definition.soundPlace;
         info.soundBreak = definition.soundBreak;
         info.soundStep = definition.soundStep;
@@ -722,6 +723,15 @@ public:
             view.renderLayer = info.renderLayer;
             view.lightEmission = info.lightEmission;
             view.lightAbsorption = info.lightAbsorption;
+            // Physical material (FALTANTES §16 item 7 + item 10): the registry
+            // JSON is the single source; the physics layer reads it through
+            // this view. resistance + flammability drive the explosion
+            // response (blast carve vs heat ignition).
+            view.friction = info.friction;
+            view.bounciness = info.bounciness;
+            view.density = info.density;
+            view.resistance = info.resistance;
+            view.flammability = info.flammability;
             views.push_back(std::move(view));
         }
         return views;

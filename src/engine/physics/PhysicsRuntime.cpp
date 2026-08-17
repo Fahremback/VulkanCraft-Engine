@@ -146,6 +146,9 @@ bool PhysicsRuntime::destroy_body(BodyHandle handle) {
     for (auto& constraint : constraints_) {
         if (constraint && (constraint->bodyA == handle || constraint->bodyB == handle)) constraint->broken = true;
     }
+    for (auto& constraint : swingTwistConstraints_) {
+        if (constraint && (constraint->bodyA == handle || constraint->bodyB == handle)) constraint->broken = true;
+    }
     triggerPairs_.erase(std::remove_if(triggerPairs_.begin(), triggerPairs_.end(), [handle](const auto& p) {
         return p.trigger == handle || p.other == handle;
     }), triggerPairs_.end());
@@ -158,6 +161,20 @@ RigidBody* PhysicsRuntime::body(BodyHandle handle) {
 
 const RigidBody* PhysicsRuntime::body(BodyHandle handle) const {
     return handle < bodies_.size() && bodies_[handle] ? &*bodies_[handle] : nullptr;
+}
+
+void PhysicsRuntime::set_transform(BodyHandle handle, const glm::vec3& position, const glm::quat& rotation) {
+    RigidBody* value = body(handle);
+    if (!value) return;
+    value->position = position;
+    value->rotation = glm::normalize(rotation);
+    value->sleeping = false;
+    value->sleepTimer = 0.0f;
+    value->previousPosition = position;
+    if (external_) {
+        const BodyHandle backend = to_backend_handle(handle);
+        if (backend != InvalidBody) external_->set_transform(backend, position, value->rotation);
+    }
 }
 
 ConstraintHandle PhysicsRuntime::create_distance_constraint(const DistanceConstraintDesc& description) {
@@ -182,8 +199,54 @@ ConstraintHandle PhysicsRuntime::create_distance_constraint(const DistanceConstr
     return handle;
 }
 
+ConstraintHandle PhysicsRuntime::create_swing_twist_constraint(const SwingTwistConstraintDesc& description) {
+    if (!external_ || !external_->supports_swing_twist()) return InvalidConstraint;
+    if (!body(description.bodyA) || !body(description.bodyB) || description.bodyA == description.bodyB) return InvalidConstraint;
+    // Separate handle space (high offset) so swing-twist handles never collide
+    // with distance-constraint handles (which are dense indices).
+    ConstraintHandle index;
+    if (!freeSwingTwist_.empty()) {
+        index = freeSwingTwist_.back(); freeSwingTwist_.pop_back();
+    } else {
+        index = static_cast<ConstraintHandle>(swingTwistConstraints_.size());
+        swingTwistConstraints_.emplace_back();
+        backendSwingTwist_.push_back(InvalidConstraint);
+    }
+    SwingTwistConstraint value;
+    static_cast<SwingTwistConstraintDesc&>(value) = description;
+    value.handle = kSwingTwistHandleOffset + index;
+    value.normalHalfConeAngle = glm::clamp(value.normalHalfConeAngle, 0.0f, glm::pi<float>());
+    value.planeHalfConeAngle = glm::clamp(value.planeHalfConeAngle, 0.0f, glm::pi<float>());
+    value.twistMinAngle = glm::clamp(value.twistMinAngle, -glm::pi<float>(), 0.0f);
+    value.twistMaxAngle = glm::clamp(value.twistMaxAngle, 0.0f, glm::pi<float>());
+    backendSwingTwist_[index] = external_->create_swing_twist_constraint(description);
+    if (backendSwingTwist_[index] == InvalidConstraint) {
+        swingTwistConstraints_[index].reset();
+        freeSwingTwist_.push_back(index);
+        return InvalidConstraint;
+    }
+    swingTwistConstraints_[index] = value;
+    return value.handle;
+}
+
+bool PhysicsRuntime::supports_swing_twist() const noexcept {
+    return external_ != nullptr && external_->supports_swing_twist();
+}
+
 bool PhysicsRuntime::destroy_constraint(ConstraintHandle handle) {
-    if (handle == InvalidConstraint || handle >= constraints_.size() || !constraints_[handle]) return false;
+    if (handle == InvalidConstraint) return false;
+    if (handle >= kSwingTwistHandleOffset) {
+        const ConstraintHandle index = handle - kSwingTwistHandleOffset;
+        if (index >= swingTwistConstraints_.size() || !swingTwistConstraints_[index]) return false;
+        if (external_ && index < backendSwingTwist_.size() && backendSwingTwist_[index] != InvalidConstraint) {
+            external_->destroy_constraint(backendSwingTwist_[index]);
+            backendSwingTwist_[index] = InvalidConstraint;
+        }
+        swingTwistConstraints_[index].reset();
+        freeSwingTwist_.push_back(index);
+        return true;
+    }
+    if (handle >= constraints_.size() || !constraints_[handle]) return false;
     if (external_ && handle < backendConstraints_.size() && backendConstraints_[handle] != InvalidConstraint) {
         external_->destroy_constraint(backendConstraints_[handle]);
         backendConstraints_[handle] = InvalidConstraint;
@@ -196,6 +259,18 @@ void PhysicsRuntime::wake(BodyHandle handle) {
         if (external_) external_->wake(to_backend_handle(handle));
         value->sleeping = false; value->sleepTimer = 0.0f;
     }
+}
+
+void PhysicsRuntime::set_motion(BodyHandle handle, MotionType motion, float mass) {
+    RigidBody* value = body(handle);
+    if (!value) return;
+    if (external_) external_->set_motion_type(to_backend_handle(handle), motion, mass);
+    value->motion = motion;
+    value->inverseMass = (motion == MotionType::Dynamic && mass > 0.0f)
+                             ? 1.0f / mass
+                             : 0.0f;
+    value->sleeping = false;
+    value->sleepTimer = 0.0f;
 }
 
 void PhysicsRuntime::add_force(BodyHandle handle, const glm::vec3& force) {

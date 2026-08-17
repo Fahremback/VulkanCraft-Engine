@@ -19,6 +19,7 @@ public:
 
     BodyHandle create_body(const BodyDesc& description) override;
     bool destroy_body(BodyHandle body) override;
+    bool set_motion_type(BodyHandle body, MotionType motion, float mass) override;
 
     void set_transform(BodyHandle body, const glm::vec3& position, const glm::quat& rotation) override;
     bool get_state(BodyHandle body, glm::vec3& position, glm::quat& rotation,
@@ -33,6 +34,8 @@ public:
     void wake(BodyHandle body) override;
 
     ConstraintHandle create_distance_constraint(const DistanceConstraintDesc& description) override;
+    ConstraintHandle create_swing_twist_constraint(const SwingTwistConstraintDesc& description) override;
+    bool supports_swing_twist() const override { return true; }
     bool destroy_constraint(ConstraintHandle constraint) override;
 
     std::optional<RaycastHit> raycast(const glm::vec3& origin, const glm::vec3& direction,
