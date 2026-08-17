@@ -57,6 +57,7 @@ struct EntitySnapshot {
     Position position;
     Health health;
     float tickInterval{ 0.0f };  // 0 = every tick; > 0 = sleeping at interval
+    std::string stableId;        // stable cross-world reference id (empty = none)
     std::vector<ComponentData> components;
 };
 
@@ -82,10 +83,27 @@ public:
     // Reads the tick interval (0 = every tick). False for a dead handle.
     virtual bool get_tick_interval(EntityId handle, float& out) const = 0;
 
+    // ---- Stable ids (persistent cross-world references, META §19) ---------
+    // A stable id is a PROJECT-OWNED, persistent string that survives
+    // save/load and transfer across worlds — unlike the generational handle,
+    // which is world-local and recycled. References between worlds (META
+    // §19 "referências persistentes") name the target by its stable id, so
+    // they keep resolving after reloads and transfers. Empty removes the
+    // stable id. Duplicate stable ids within one world are refused (a stable
+    // id identifies exactly one entity).
+    virtual bool set_stable_id(EntityId handle, const std::string& stableId) = 0;
+    virtual std::string stable_id(EntityId handle) const = 0;
+    // Resolves a stable id to the live entity carrying it; invalid handle
+    // when absent (or when no entity carries that stable id).
+    virtual EntityId entity_by_stable_id(const std::string& stableId) const = 0;
+
     // ---- Project components (versioned opaque blobs) ----------------------
     virtual bool set_component(EntityId handle, const ComponentData& component) = 0;
     virtual bool get_component(EntityId handle, const std::string& type,
                                ComponentData& out) const = 0;
+    // Removes a project component by type (false for a dead handle; a missing
+    // component is a no-op that returns true).
+    virtual bool remove_component(EntityId handle, const std::string& type) = 0;
     // Enumerates every component of an entity in deterministic order (sorted
     // by component type). Used to migrate an entity between worlds (transfer)
     // without losing any component. The visit may not mutate the world.

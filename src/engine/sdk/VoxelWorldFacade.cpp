@@ -1218,6 +1218,9 @@ public:
             entry.add_max_health(snapshot.health.max);
             entry.add_tick_interval(snapshot.tickInterval);
             entry.add_components(componentVec);
+            if (!snapshot.stableId.empty()) {
+                entry.add_stable_id(builder.CreateString(snapshot.stableId));
+            }
             worldEntityOffsets.push_back(entry.Finish());
         }
         const auto worldEntityVec = builder.CreateVector(worldEntityOffsets);
@@ -2067,6 +2070,9 @@ public:
                 snapshot.health.value = entry->health();
                 snapshot.health.max = entry->max_health();
                 snapshot.tickInterval = entry->tick_interval();
+                if (entry->stable_id() != nullptr) {
+                    snapshot.stableId = entry->stable_id()->str();
+                }
                 if (entry->components() != nullptr) {
                     snapshot.components.reserve(entry->components()->size());
                     for (flatbuffers::uoffset_t c = 0;
@@ -2758,6 +2764,9 @@ private:
             entry.add_max_health(snapshot.health.max);
             entry.add_tick_interval(snapshot.tickInterval);
             entry.add_components(componentVec);
+            if (!snapshot.stableId.empty()) {
+                entry.add_stable_id(builder.CreateString(snapshot.stableId));
+            }
             worldEntityOffsets.push_back(entry.Finish());
         }
         const auto worldEntityVec = builder.CreateVector(worldEntityOffsets);

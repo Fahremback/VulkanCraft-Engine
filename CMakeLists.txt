@@ -321,8 +321,13 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/ProcgenPreview.cpp
     src/engine/sdk/ProcgenJobs.cpp
     src/engine/sdk/LodTerrainSampler.cpp
+    src/engine/sdk/XpbdDeformable.cpp
+    src/engine/sdk/TetraMeshCooking.cpp
     src/engine/sdk/MobBehavior.cpp
     src/engine/sdk/WorldManager.cpp
+    src/engine/sdk/WorldReplication.cpp
+    src/engine/sdk/OriginRebase.cpp
+    src/engine/sdk/LocalSpace.cpp
     src/engine/sdk/RegistryJson.cpp
 
     src/engine/core/compression/ZstdCompression.cpp
@@ -377,6 +382,8 @@ vc_object_module(vc_gameplay_sdk
     src/engine/gameplay/ExplosionRuntime.cpp
     src/engine/gameplay/DebrisRuntime.cpp
     src/engine/gameplay/DestructionHistoryRuntime.cpp
+    src/engine/gameplay/DestructionBudget.cpp
+    src/engine/gameplay/DestructionTelemetry.cpp
     src/engine/core/uuid/UUID.cpp
 )
 # RegistryJson stays owned by vc_sdk_public (the canonical copy every consumer
@@ -400,6 +407,8 @@ vc_object_module(vc_advanced_runtime
     src/engine/gameplay/ExplosionRuntime.cpp
     src/engine/gameplay/DebrisRuntime.cpp
     src/engine/gameplay/DestructionHistoryRuntime.cpp
+    src/engine/gameplay/DestructionBudget.cpp
+    src/engine/gameplay/DestructionTelemetry.cpp
     src/engine/gameplay/ParticleSimulation.cpp
     src/engine/gameplay/MissionSystem.cpp
     src/engine/gameplay/DialogueSystem.cpp
@@ -1128,6 +1137,226 @@ if(TARGET vc_generate_world_save)
     add_dependencies(history_tests vc_generate_world_save)
 endif()
 add_test(NAME history_tests COMMAND history_tests)
+
+# Destruction budgets + telemetry (FALTANTES §16 item 14): ONE data-driven
+# budget bounds every pipeline stage per step (explosion carve/burn/impulse,
+# connectivity island promotion, debris spawns, revoxelization, history
+# restore) and telemetry makes the whole destruction step observable — done
+# work AND budget spills, step-scoped with cumulative totals.
+add_executable(destruction_tests
+    tests/DestructionTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(destruction_tests PRIVATE cxx_std_20)
+target_include_directories(destruction_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(destruction_tests PRIVATE
+    vc_build_options
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(destruction_tests vc_generate_world_save)
+endif()
+add_test(NAME destruction_tests COMMAND destruction_tests)
+
+# Deformable providers (FALTANTES §16 item 3): the public IDeformableProvider
+# contract with XPBD (position-based dynamics) as the implemented specialized
+# plugin and FEMFX as the opt-in seam (refused, never silently falling back).
+# Self-contained, deterministic, headless.
+add_executable(deformable_tests
+    tests/DeformableTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(deformable_tests PRIVATE cxx_std_20)
+target_include_directories(deformable_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(deformable_tests PRIVATE
+    vc_build_options
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(deformable_tests vc_generate_world_save)
+endif()
+add_test(NAME deformable_tests COMMAND deformable_tests)
+
+# Tetra mesh cooking (FALTANTES §16 items 4-5): cooks tetrahedral SIMULATION
+# meshes keeping collider/render/simulation separate (deterministic, headless;
+# fTetWild stays a specialized offline cooker) and documents per-provider
+# determinism guarantees (docs/DETERMINISMO_PROVIDERS.md).
+add_executable(tetra_cooking_tests
+    tests/TetraCookingTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(tetra_cooking_tests PRIVATE cxx_std_20)
+target_include_directories(tetra_cooking_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(tetra_cooking_tests PRIVATE
+    vc_build_options
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(tetra_cooking_tests vc_generate_world_save)
+endif()
+add_test(NAME tetra_cooking_tests COMMAND tetra_cooking_tests)
+
+# World-scoped replication (META §19 / FALTANTES "replicação e interesse por
+# mundo"): per-world interest, world-routed edits, portal crossings as
+# interest transitions, per-world client binding.
+add_executable(world_replication_tests
+    tests/WorldReplicationTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(world_replication_tests PRIVATE cxx_std_20)
+target_include_directories(world_replication_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(world_replication_tests PRIVATE
+    vc_build_options
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(world_replication_tests vc_generate_world_save)
+endif()
+add_test(NAME world_replication_tests COMMAND world_replication_tests)
+
+# Persistent references between worlds (META §19 / FALTANTES "referências
+# persistentes entre mundos"): stable entity ids that survive save/load +
+# cross-world references stored as a reserved component on the source entity.
+add_executable(world_ref_tests
+    tests/WorldRefTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(world_ref_tests PRIVATE cxx_std_20)
+target_include_directories(world_ref_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(world_ref_tests PRIVATE
+    vc_build_options
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(world_ref_tests vc_generate_world_save)
+endif()
+add_test(NAME world_ref_tests COMMAND world_ref_tests)
+
+# Origin rebasing / high-precision coordinates (META §19 / FALTANTES §15
+# "origin rebasing ou coordenadas de alta precisão"): the local frame origin
+# (double) follows the gameplay focus so entity positions stay small and the
+# stored float32 is exact at sub-block resolution; a rebase shifts the origin
+# and translates every entity in every world, leaving absolute positions
+# invariant.
+add_executable(origin_rebase_tests
+    tests/OriginRebaseTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(origin_rebase_tests PRIVATE cxx_std_20)
+target_include_directories(origin_rebase_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(origin_rebase_tests PRIVATE
+    vc_build_options
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(origin_rebase_tests vc_generate_world_save)
+endif()
+add_test(NAME origin_rebase_tests COMMAND origin_rebase_tests)
+
+# Hierarchical local spaces (META §19 / FALTANTES §15 "espaços locais
+# hierárquicos para planetas e veículos grandes"): a tree of local frames
+# (planet -> vehicle -> seat) with rigid transforms (position + yaw, double);
+# entities bind to a space via a reserved component (engine.space_ref), so a
+# moving frame carries its occupants for free and the binding persists with
+# the world save / replication.
+add_executable(local_space_tests
+    tests/LocalSpaceTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(local_space_tests PRIVATE cxx_std_20)
+target_include_directories(local_space_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(local_space_tests PRIVATE
+    vc_build_options
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(local_space_tests vc_generate_world_save)
+endif()
+add_test(NAME local_space_tests COMMAND local_space_tests)
 
 # Configurable voxel fracture (FALTANTES §16 item 8): the data-driven
 # FractureConfig turns a solid voxel region into a destructible whose chunks

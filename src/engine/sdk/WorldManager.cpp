@@ -21,6 +21,13 @@ namespace engine {
 namespace world {
 namespace {
 
+// The reserved project component that carries a persistent cross-world
+// reference (META §19). The blob is a tiny JSON document
+// {"toWorld":"<name>","stableId":"<id>"}; the engine never interprets the
+// payload beyond this — it travels with the entity's other components through
+// the world save and the replication region.
+constexpr const char* kWorldRefComponent = "engine.world_ref";
+
 class WorldManagerImpl final : public IWorldManager {
 public:
     // ---- World lifecycle ----------------------------------------------------
@@ -245,6 +252,129 @@ public:
             ids.push_back(id);
         }
         return ids;
+    }
+
+    // ---- Persistent references between worlds (META §19) -------------------
+
+    bool set_entity_ref(const std::string& fromWorld,
+                        engine::entity::EntityId fromEntity,
+                        const WorldEntityRef& ref,
+                        std::string& errorOut) override {
+        const auto fromIt = worlds_.find(fromWorld);
+        if (fromIt == worlds_.end()) {
+            errorOut = "entity ref: unknown source world '" + fromWorld + "'";
+            return false;
+        }
+        if (!ref.valid()) {
+            errorOut = "entity ref: destination world and stable id are required";
+            return false;
+        }
+        if (ref.toWorld == fromWorld) {
+            errorOut = "entity ref: reference must cross worlds (same-world refused)";
+            return false;
+        }
+        if (!worlds_.count(ref.toWorld)) {
+            errorOut = "entity ref: unknown destination world '" + ref.toWorld + "'";
+            return false;
+        }
+        auto* entities = fromIt->second.voxel->entity_world().get();
+        if (entities == nullptr || !entities->alive(fromEntity)) {
+            errorOut = "entity ref: source entity is not alive";
+            return false;
+        }
+        // Stored as a reserved component on the entity: travels with the world
+        // save and the replication region automatically (no separate registry
+        // to keep in sync).
+        engine::entity::ComponentData component;
+        component.type = kWorldRefComponent;
+        component.version = 1;
+        component.blob = "{\"toWorld\":\"" + ref.toWorld +
+                         "\",\"stableId\":\"" + ref.stableId + "\"}";
+        if (!entities->set_component(fromEntity, component)) {
+            errorOut = "entity ref: cannot store the reference component";
+            return false;
+        }
+        errorOut.clear();
+        return true;
+    }
+
+    WorldEntityRef entity_ref(const std::string& fromWorld,
+                              engine::entity::EntityId fromEntity) const override {
+        WorldEntityRef out;
+        const auto it = worlds_.find(fromWorld);
+        if (it == worlds_.end()) return out;
+        const auto* entities = it->second.voxel->entity_world().get();
+        if (entities == nullptr || !entities->alive(fromEntity)) return out;
+        engine::entity::ComponentData component;
+        if (!entities->get_component(fromEntity, kWorldRefComponent, component))
+            return out;
+        // Parse the reserved blob (best-effort; a malformed/stale blob simply
+        // yields an invalid ref — the reference is project data).
+        engine::sdk::JsonValue document;
+        std::string jsonError;
+        if (!engine::sdk::json_parse(component.blob, document, jsonError) ||
+            !document.is_object()) {
+            return out;
+        }
+        out.toWorld = engine::sdk::json_string(document, "toWorld", "");
+        out.stableId = engine::sdk::json_string(document, "stableId", "");
+        return out;
+    }
+
+    bool clear_entity_ref(const std::string& fromWorld,
+                          engine::entity::EntityId fromEntity) override {
+        const auto it = worlds_.find(fromWorld);
+        if (it == worlds_.end()) return false;
+        auto* entities = it->second.voxel->entity_world().get();
+        if (entities == nullptr || !entities->alive(fromEntity)) return false;
+        // Remove the reserved component (a missing one is a no-op -> true).
+        return entities->remove_component(fromEntity, kWorldRefComponent);
+    }
+
+    engine::entity::EntityId resolve_entity_ref(
+        const std::string& fromWorld, engine::entity::EntityId fromEntity,
+        std::string& errorOut) override {
+        const auto fromIt = worlds_.find(fromWorld);
+        if (fromIt == worlds_.end()) {
+            errorOut = "entity ref: unknown source world '" + fromWorld + "'";
+            return {};
+        }
+        auto* sourceEntities = fromIt->second.voxel->entity_world().get();
+        if (sourceEntities == nullptr || !sourceEntities->alive(fromEntity)) {
+            errorOut = "entity ref: source entity is not alive";
+            return {};
+        }
+        engine::entity::ComponentData component;
+        if (!sourceEntities->get_component(fromEntity, kWorldRefComponent,
+                                           component)) {
+            errorOut = "entity ref: entity has no cross-world reference";
+            return {};
+        }
+        const WorldEntityRef ref = entity_ref(fromWorld, fromEntity);
+        if (!ref.valid()) {
+            errorOut = "entity ref: malformed reference component";
+            return {};
+        }
+        const auto toIt = worlds_.find(ref.toWorld);
+        if (toIt == worlds_.end()) {
+            errorOut = "entity ref: destination world '" + ref.toWorld +
+                       "' is not loaded";
+            return {};
+        }
+        auto* targetEntities = toIt->second.voxel->entity_world().get();
+        if (targetEntities == nullptr) {
+            errorOut = "entity ref: destination world has no entity layer";
+            return {};
+        }
+        const engine::entity::EntityId target =
+            targetEntities->entity_by_stable_id(ref.stableId);
+        if (!target.valid()) {
+            errorOut = "entity ref: stable id '" + ref.stableId +
+                       "' is not alive in '" + ref.toWorld + "'";
+            return {};
+        }
+        errorOut.clear();
+        return target;
     }
 
     engine::entity::EntityId transfer_via_portal(

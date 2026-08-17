@@ -244,6 +244,7 @@ std::string encode_entity_body(const engine::entity::EntitySnapshot& e) {
     put_f32(out, e.health.value);
     put_f32(out, e.health.max);
     put_f32(out, e.tickInterval);
+    put_string(out, e.stableId);
     put_u32(out, static_cast<std::uint32_t>(e.components.size()));
     for (const engine::entity::ComponentData& c : e.components) {
         put_string(out, c.type);
@@ -260,6 +261,7 @@ bool decode_entity_body(std::string_view& s, engine::entity::EntitySnapshot& out
     }
     if (!get_f32(s, out.health.value) || !get_f32(s, out.health.max)) return false;
     if (!get_f32(s, out.tickInterval)) return false;
+    if (!get_string(s, out.stableId)) return false;
     std::uint32_t components = 0;
     if (!get_u32(s, components)) return false;
     out.components.clear();

@@ -87,12 +87,26 @@ public:
         return EntityId{ id, generation };
     }
 
+    bool remove_component(EntityId handle, const std::string& type) override {
+        if (!alive(handle)) return false;
+        if (type.empty()) return true;  // nothing to remove
+        registry_.get<ProjectComponents>(byId_.at(handle.id)).byType.erase(type);
+        return true;
+    }
+
     bool despawn(EntityId handle) override {
         if (!alive(handle)) return false;
         registry_.destroy(byId_.at(handle.id));
         byId_.erase(handle.id);
         ++generations_.at(handle.id);
         freeList_.push_back(handle.id);
+        // Drop the stable id (it identified THIS entity; a stale reference
+        // must not alias the entity that reuses the id).
+        const auto stable = stableByEntity_.find(handle.id);
+        if (stable != stableByEntity_.end()) {
+            stableByStable_.erase(stable->second);
+            stableByEntity_.erase(stable);
+        }
         rebuild_index();
         return true;
     }
@@ -106,6 +120,39 @@ public:
     }
 
     // ---- Builtin components ------------------------------------------------
+
+    // ---- Stable ids --------------------------------------------------------
+
+    bool set_stable_id(EntityId handle, const std::string& stableId) override {
+        if (!alive(handle)) return false;
+        // Remove the current mapping first (keeps the maps consistent even
+        // when the entity is re-tagged).
+        const auto current = stableByEntity_.find(handle.id);
+        if (current != stableByEntity_.end()) {
+            if (current->second == stableId) return true;  // no-op
+            stableByStable_.erase(current->second);
+            stableByEntity_.erase(current);
+        }
+        if (stableId.empty()) return true;  // cleared
+        if (stableByStable_.count(stableId) != 0) return false;  // duplicate
+        stableByEntity_[handle.id] = stableId;
+        stableByStable_[stableId] = handle.id;
+        return true;
+    }
+
+    std::string stable_id(EntityId handle) const override {
+        if (!alive(handle)) return {};
+        const auto found = stableByEntity_.find(handle.id);
+        return found == stableByEntity_.end() ? std::string{} : found->second;
+    }
+
+    EntityId entity_by_stable_id(const std::string& stableId) const override {
+        if (stableId.empty()) return {};
+        const auto found = stableByStable_.find(stableId);
+        if (found == stableByStable_.end()) return {};
+        const EntityId handle{ found->second, generations_.at(found->second) };
+        return alive(handle) ? handle : EntityId{};
+    }
 
     bool set_health(EntityId handle, const Health& health) override {
         if (!alive(handle)) return false;
@@ -318,6 +365,7 @@ public:
             snapshot.position = registry_.get<Position>(raw);
             snapshot.health = registry_.get<Health>(raw);
             snapshot.tickInterval = tickInterval(handle.id);
+            snapshot.stableId = stable_id(handle);
             for (const auto& [type, component] :
                  registry_.get<ProjectComponents>(raw).byType) {
                 (void)type;
@@ -356,7 +404,19 @@ public:
             }
         }
         for (const EntityId& handle : current) despawn(handle);
-        // Repopulate in snapshot order.
+        // Repopulate in snapshot order. Validate stable-id uniqueness BEFORE
+        // mutating (all-or-nothing, same as the rest of the snapshot checks).
+        {
+            std::unordered_map<std::string, int> seen;
+            for (const EntitySnapshot& snapshot : entities) {
+                if (snapshot.stableId.empty()) continue;
+                if (++seen[snapshot.stableId] > 1) {
+                    errorOut = "entity restore: duplicate stable id '" +
+                               snapshot.stableId + "'";
+                    return false;
+                }
+            }
+        }
         for (const EntitySnapshot& snapshot : entities) {
             std::string spawnError;
             const EntityId handle =
@@ -368,6 +428,13 @@ public:
             set_health(handle, snapshot.health);
             if (snapshot.tickInterval > 0.0f) {
                 set_tick_interval(handle, snapshot.tickInterval);
+            }
+            if (!snapshot.stableId.empty()) {
+                if (!set_stable_id(handle, snapshot.stableId)) {
+                    errorOut = "entity restore: stable id '" +
+                               snapshot.stableId + "' not accepted";
+                    return false;
+                }
             }
             for (const ComponentData& component : snapshot.components) {
                 set_component(handle, component);
@@ -401,6 +468,9 @@ private:
     std::unordered_map<uint32_t, uint32_t> generations_;
     std::unordered_map<uint32_t, float> tickInterval_;
     std::unordered_map<uint64_t, std::vector<EntityId>> chunkIndex_;
+    // Stable ids (META §19): entity id -> stable id, plus the reverse index.
+    std::unordered_map<uint32_t, std::string> stableByEntity_;
+    std::unordered_map<std::string, uint32_t> stableByStable_;
     bool chunkDirty_{ false };
     uint32_t nextId_{ 1 };
     std::vector<uint32_t> freeList_;

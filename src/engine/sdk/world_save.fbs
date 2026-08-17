@@ -69,6 +69,12 @@ table EntityEntry {
   max_health: float;
   tick_interval: float;
   components: [EntityComponentEntry];
+  // Stable cross-world reference id (META §19 "referências persistentes"):
+  // a project-owned persistent string that survives save/load, so references
+  // between worlds keep resolving after reloads. Optional: absent/empty means
+  // the entity has no stable id (v5 buffers written before this field still
+  // load — flatbuffers nulls the field).
+  stable_id: string;
 }
 
 table WorldSave {

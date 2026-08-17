@@ -43,6 +43,19 @@ struct WorldInfo {
     std::size_t entityCount{ 0 };
 };
 
+// A PERSISTENT reference from one entity (in one world) to an entity in
+// another world (META §19 "referências persistentes entre mundos"). The
+// target is named by (world name + STABLE id), never by the local generational
+// handle — a handle is world-local and recycled after a despawn, while the
+// stable id survives save/load and transfer, so the reference keeps resolving
+// after reloads, restarts and entity migrations.
+struct WorldEntityRef {
+    std::string toWorld;    // destination world name
+    std::string stableId;   // the target's stable id (IEntityWorld::set_stable_id)
+
+    bool valid() const { return !toWorld.empty() && !stableId.empty(); }
+};
+
 // A portal is a generic mapping between two world spaces: an entity crossing
 // it keeps its local offset from the source anchor, rotated by `yawDegrees`
 // around Y, and lands at the destination anchor + rotated offset.
@@ -114,6 +127,35 @@ public:
     virtual engine::entity::EntityId transfer_via_portal(
         const std::string& worldName, engine::entity::EntityId handle,
         uint32_t portalId, std::string& errorOut) = 0;
+
+    // ---- Persistent references between worlds (META §19) -------------------
+    // Sets the persistent reference OF `fromEntity` (in `fromWorld`) to the
+    // entity named by `ref` (world + stable id). The reference is stored as a
+    // reserved project component (engine.world_ref) ON the entity itself, so
+    // it travels with the world save and the replication region — no separate
+    // registry to keep in sync. Fails all-or-nothing: unknown worlds, a dead
+    // source entity, an invalid/empty ref or a same-world ref are refused
+    // without mutating.
+    virtual bool set_entity_ref(const std::string& fromWorld,
+                                engine::entity::EntityId fromEntity,
+                                const WorldEntityRef& ref,
+                                std::string& errorOut) = 0;
+    // Reads the entity's persistent reference (empty/invalid when none).
+    virtual WorldEntityRef entity_ref(const std::string& fromWorld,
+                                      engine::entity::EntityId fromEntity) const = 0;
+    // Clears the reference (returns false for a dead entity; a missing ref is
+    // a no-op that returns true).
+    virtual bool clear_entity_ref(const std::string& fromWorld,
+                                  engine::entity::EntityId fromEntity) = 0;
+    // Resolves the entity's reference to the LIVE entity in the destination
+    // world: looks up the destination world, resolves the stable id to the
+    // live entity (survives despawn/transfer because the stable id is
+    // persistent). Invalid handle + diagnostic when there is no ref, the
+    // destination world is unknown/unloaded, the stable id is missing, or the
+    // target is not alive.
+    virtual engine::entity::EntityId resolve_entity_ref(
+        const std::string& fromWorld, engine::entity::EntityId fromEntity,
+        std::string& errorOut) = 0;
 };
 
 // The only implementation of IWorldManager (src/engine/sdk/WorldManager.cpp).
