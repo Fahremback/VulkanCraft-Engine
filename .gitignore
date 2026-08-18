@@ -22,3 +22,6 @@ ef*.txt
 pb_*.txt
 run_*.txt
 imgui.ini
+
+# Scripts locais de workflow (backup/publicacao manual) — nao vao para o GitHub
+atualizar_github.bat
