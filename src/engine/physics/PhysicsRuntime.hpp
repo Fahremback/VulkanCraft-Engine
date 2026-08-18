@@ -21,8 +21,10 @@ class PhysicsBackend;
 
 using BodyHandle = std::uint32_t;
 using ConstraintHandle = std::uint32_t;
+using VehicleHandle = std::uint32_t;
 inline constexpr BodyHandle InvalidBody = 0;
 inline constexpr ConstraintHandle InvalidConstraint = 0;
+inline constexpr VehicleHandle InvalidVehicle = 0;
 // Swing-twist handles live in a separate space above this offset so they never
 // collide with distance-constraint handles (dense indices from 1).
 inline constexpr ConstraintHandle kSwingTwistHandleOffset = 1u << 28;
@@ -140,6 +142,12 @@ struct DistanceConstraintDesc {
     float breakImpulse{0.0f};
 };
 
+// Vehicle seam types (fully defined in Vehicle.hpp): VehicleDesc/VehicleInput/
+// WheelState are passed by reference so forward declarations suffice here.
+struct VehicleDesc;
+struct VehicleInput;
+struct WheelState;
+
 struct DistanceConstraint : DistanceConstraintDesc {
     ConstraintHandle handle{InvalidConstraint};
     float lastImpulse{0.0f};
@@ -206,11 +214,33 @@ public:
 
     // Instantly moves a body (kinematic drive used by ragdoll pose mapping).
     void set_transform(BodyHandle body, const glm::vec3& position, const glm::quat& rotation);
+    // Instantly sets both velocities (vehicle replication reconcile snaps the
+    // predicted body to the authoritative state, including momentum).
+    void set_velocity(BodyHandle body, const glm::vec3& linearVelocity,
+                      const glm::vec3& angularVelocity);
 
     ConstraintHandle create_distance_constraint(const DistanceConstraintDesc& description);
     ConstraintHandle create_swing_twist_constraint(const SwingTwistConstraintDesc& description);
     bool supports_swing_twist() const noexcept;
+    // Updates the motor of an existing swing-twist constraint (active ragdoll —
+    // FALTANTES §18 item 8): motorOn toggles the Position-state motors,
+    // frequency/damping the spring, and `target` the target relative
+    // orientation of body B in body A's constraint frame (the same convention
+    // as SwingTwistConstraintDesc::motorTarget). Returns false for non
+    // swing-twist handles, unknown handles or backends without the seam.
+    bool set_swing_twist_motor(ConstraintHandle constraint, bool motorOn,
+                               float frequency, float damping,
+                               const glm::quat& target);
     bool destroy_constraint(ConstraintHandle constraint);
+
+    // Vehicle seam (Jolt Vehicles adapter). On backends without a vehicle
+    // solver these return InvalidVehicle / false; callers keep the legacy
+    // raycast model as fallback.
+    VehicleHandle create_vehicle(const VehicleDesc& description);
+    bool destroy_vehicle(VehicleHandle vehicle);
+    bool set_vehicle_input(VehicleHandle vehicle, const VehicleInput& input);
+    bool vehicle_wheel_state(VehicleHandle vehicle, std::size_t index, WheelState& out) const;
+    bool supports_vehicles() const noexcept;
 
     void add_force(BodyHandle body, const glm::vec3& force);
     void add_torque(BodyHandle body, const glm::vec3& torque);
@@ -264,6 +294,8 @@ private:
     std::vector<BodyHandle> backendBodies_;      // engine handle -> backend handle (external only)
     std::vector<ConstraintHandle> backendConstraints_;
     std::vector<ConstraintHandle> backendSwingTwist_;
+    std::vector<VehicleHandle> backendVehicles_;
+    std::vector<VehicleHandle> freeVehicles_;
     std::unordered_map<BodyHandle, BodyHandle> backendToEngine_;
     std::vector<Contact> contacts_;
     std::vector<TriggerPair> triggerPairs_;

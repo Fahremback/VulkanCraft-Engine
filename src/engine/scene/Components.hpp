@@ -210,6 +210,138 @@ struct VoxelVolumeComponent {
     bool enableFarLod{ true };
 };
 
+// ---------------------------------------------------------------------------
+// Wicked-port component set (frontend; PORTS.md). Each struct is authored in
+// its dedicated editor panel. Runtime integration status is noted per struct:
+// where the play world does not simulate the feature yet, the panel carries an
+// explicit TODO(frontend-port) comment and the data is still serialized so a
+// future runtime pass can consume it.
+// ---------------------------------------------------------------------------
+
+// Collision shape authored in the Collider panel. The play world maps this to
+// a physics shape (box/sphere/capsule) on the rigidbody.
+enum class ColliderShape : uint8_t { Box = 0, Sphere = 1, Capsule = 2 };
+struct ColliderComponent {
+    ColliderShape shape{ ColliderShape::Box };
+    glm::vec3 size{ 1.0f, 1.0f, 1.0f };
+    float radius{ 0.5f };
+    float height{ 1.0f };
+    glm::vec3 offset{ 0.0f, 0.0f, 0.0f };
+    bool isTrigger{ false };
+    bool enabled{ true };
+};
+
+// Physics joint authored in the Constraint panel. Runtime integration:
+// TODO(frontend-port) — map to a Jolt/Bullet constraint in the play world.
+enum class ConstraintType : uint8_t { Fixed = 0, Hinge = 1, Spring = 2, Point = 3 };
+struct ConstraintComponent {
+    ConstraintType type{ ConstraintType::Fixed };
+    UUID otherEntity{ 0, 0 };
+    glm::vec3 anchor{ 0.0f, 0.0f, 0.0f };
+    glm::vec3 axis{ 0.0f, 1.0f, 0.0f };
+    float breakForce{ 0.0f };          // 0 = unbreakable
+    bool enabled{ true };
+};
+
+// Cloth/soft body authored in the Soft Body panel. Runtime integration:
+// TODO(frontend-port) — soft body solver in the physics backend.
+struct SoftBodyComponent {
+    uint32_t detail{ 8 };
+    float mass{ 1.0f };
+    float friction{ 0.5f };
+    float restitution{ 0.1f };
+    float pressure{ 0.0f };
+    float vertexRadius{ 0.05f };
+    bool wind{ true };
+    bool enabled{ true };
+};
+
+// Spring dynamics authored in the Spring panel. Runtime integration:
+// TODO(frontend-port) — spring/constraint solver in the physics backend.
+struct SpringComponent {
+    float stiffness{ 0.5f };
+    float drag{ 0.1f };
+    float wind{ 0.0f };
+    float gravity{ 1.0f };
+    float hitRadius{ 0.5f };
+    bool disabled{ false };
+    bool useGravity{ true };
+    bool enabled{ true };
+};
+
+// Projected texture authored in the Decal panel. Runtime integration:
+// TODO(frontend-port) — decal pass in the deferred/forward renderer.
+struct DecalComponent {
+    std::string texturePath;
+    glm::vec3 color{ 1.0f, 1.0f, 1.0f };
+    float slopeBlendPower{ 1.0f };
+    bool projectOnStatic{ true };
+    bool onlyAlpha{ false };
+    bool enabled{ true };
+};
+
+// Catmull-Rom path authored in the Spline panel. Runtime integration:
+// TODO(frontend-port) — spline follower/mesh generator in the play world.
+struct SplineComponent {
+    std::vector<glm::vec3> points{ { 0.0f, 0.0f, 0.0f }, { 1.0f, 0.0f, 0.0f }, { 2.0f, 0.0f, 0.0f } };
+    bool looped{ false };
+    bool filled{ false };
+    float width{ 1.0f };
+    float rotation{ 0.0f };
+    uint32_t subdiv{ 16 };
+    bool enabled{ true };
+};
+
+// Physics zone authored in the Force Field panel. Runtime integration:
+// TODO(frontend-port) — force evaluation against play physics bodies.
+enum class ForceFieldType : uint8_t { Gravity = 0, Push = 1, Wind = 2, Vortex = 3 };
+struct ForceFieldComponent {
+    ForceFieldType type{ ForceFieldType::Gravity };
+    float strength{ 1.0f };
+    float range{ 10.0f };
+    bool enabled{ true };
+};
+
+// Reflection probe authored in the Env Probe panel. Runtime integration:
+// TODO(frontend-port) — cubemap capture pass in the renderer.
+struct EnvProbeComponent {
+    bool realTime{ false };
+    float viewDistance{ 100.0f };
+    uint32_t resolution{ 256 };
+    bool enabled{ true };
+};
+
+// Global weather/sky authored in the Weather panel. Runtime integration:
+// TODO(frontend-port) — sky/fog/atmosphere pass in the renderer.
+struct WeatherComponent {
+    glm::vec3 sunColor{ 1.0f, 0.95f, 0.85f };
+    float fogDensity{ 0.001f };
+    float fogStart{ 100.0f };
+    float skyExposure{ 1.0f };
+    float skyRotation{ 0.0f };
+    float windSpeed{ 5.0f };
+    float rainAmount{ 0.0f };
+    float rainLength{ 1.0f };
+    bool heightFog{ false };
+    bool enabled{ true };
+};
+
+// Hair/strand system authored in the Hair panel. Runtime integration:
+// TODO(frontend-port) — strand rendering in the renderer.
+struct HairParticleComponent {
+    std::string meshPath;
+    uint32_t count{ 1000 };
+    float length{ 0.3f };
+    float width{ 0.01f };
+    float stiffness{ 0.5f };
+    float drag{ 0.1f };
+    float gravityPower{ 1.0f };
+    float randomness{ 0.2f };
+    uint32_t segments{ 8 };
+    uint32_t seed{ 0 };
+    bool enabled{ true };
+};
+
 REFLECT_BEGIN(TransformComponent)
     REFLECT_FIELD(position, FieldType::Vec3, "Position")
     REFLECT_FIELD(rotation, FieldType::Vec3, "Rotation")

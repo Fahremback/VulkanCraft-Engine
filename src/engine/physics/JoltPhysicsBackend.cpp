@@ -7,6 +7,7 @@
 #include <Jolt/Core/Factory.h>
 #include <Jolt/Core/JobSystemThreadPool.h>
 #include <Jolt/Core/TempAllocator.h>
+#include <Jolt/Core/Reference.h>
 #include <Jolt/Physics/EActivation.h>
 #include <Jolt/Physics/PhysicsSystem.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
@@ -30,6 +31,11 @@
 #include <Jolt/Physics/Constraints/SwingTwistConstraint.h>
 #include <Jolt/Physics/Constraints/MotorSettings.h>
 #include <Jolt/Physics/Constraints/ConstraintManager.h>
+#include <Jolt/Physics/Vehicle/VehicleConstraint.h>
+#include <Jolt/Physics/Vehicle/VehicleCollisionTester.h>
+#include <Jolt/Physics/Vehicle/WheeledVehicleController.h>
+#include <Jolt/Physics/Vehicle/MotorcycleController.h>
+#include <Jolt/Physics/Vehicle/TrackedVehicleController.h>
 
 #include <algorithm>
 #include <cmath>
@@ -55,6 +61,8 @@ JPH::Vec3 to_jolt(const glm::vec3& v) { return JPH::Vec3(v.x, v.y, v.z); }
 JPH::RVec3 to_rjolt(const glm::vec3& v) { return JPH::RVec3(v.x, v.y, v.z); }
 JPH::Quat to_jolt(const glm::quat& q) { return JPH::Quat(q.x, q.y, q.z, q.w); }
 glm::vec3 to_glm(const JPH::Vec3& v) { return {v.GetX(), v.GetY(), v.GetZ()}; }
+// Note: this build of Jolt is single-precision (no JPH_DOUBLE_PRECISION), so
+// JPH::RVec3 is an alias of JPH::Vec3 and needs no separate overload.
 glm::quat to_glm(const JPH::Quat& q) { return {q.GetW(), q.GetX(), q.GetY(), q.GetZ()}; }
 
 std::uint64_t pair_key(std::uint32_t a, std::uint32_t b) {
@@ -306,6 +314,15 @@ struct JoltPhysicsBackend::Impl {
     std::unordered_map<ConstraintHandle, ConstraintRecord> constraints_;
     ConstraintHandle nextConstraintHandle_{1};
 
+    struct VehicleRecord {
+        JPH::Ref<JPH::VehicleConstraint> constraint;
+        BodyHandle chassis{InvalidBody};
+        std::vector<WheelDesc> wheels;
+        VehicleKind kind{ VehicleKind::Wheeled };
+    };
+    std::unordered_map<VehicleHandle, VehicleRecord> vehicles_;
+    VehicleHandle nextVehicleHandle_{1};
+
     std::set<std::uint64_t> previousPairs_;
     std::vector<TriggerEvent> triggerEvents_;
 
@@ -316,7 +333,18 @@ struct JoltPhysicsBackend::Impl {
 };
 
 JoltPhysicsBackend::JoltPhysicsBackend(const WorldSettings& settings) : impl_(std::make_unique<Impl>(settings)) {}
-JoltPhysicsBackend::~JoltPhysicsBackend() = default;
+
+JoltPhysicsBackend::~JoltPhysicsBackend() {
+    // Vehicles are registered as step listeners and constraints in the physics
+    // system; they must be removed before the physics system dies (the Impl
+    // holds the system).
+    for (const auto& [handle, record] : impl_->vehicles_) {
+        (void)handle;
+        impl_->physicsSystem->RemoveStepListener(record.constraint);
+        impl_->physicsSystem->RemoveConstraint(record.constraint);
+    }
+    impl_->vehicles_.clear();
+}
 
 void JoltPhysicsBackend::set_gravity(const glm::vec3& gravity) {
     impl_->physicsSystem->SetGravity(to_jolt(gravity));
@@ -421,6 +449,14 @@ bool JoltPhysicsBackend::destroy_body(BodyHandle body) {
     }
     for (const ConstraintHandle handle : toRemove) destroy_constraint(handle);
 
+    // Remove vehicles whose chassis is this body (a constraint referencing a
+    // destroyed body leaves a dangling pointer in the constraint manager).
+    std::vector<VehicleHandle> vehiclesToRemove;
+    for (const auto& [handle, record] : impl_->vehicles_) {
+        if (record.chassis == body) vehiclesToRemove.push_back(handle);
+    }
+    for (const VehicleHandle handle : vehiclesToRemove) destroy_vehicle(handle);
+
     // Jolt's DestroyBody REQUIRES the body to be inactive and out of the
     // broadphase first (BodyManager::RemoveBodyInternal asserts it; with
     // JPH_ENABLE_ASSERTS off the assert vanishes and the body is FREED while
@@ -494,6 +530,14 @@ void JoltPhysicsBackend::set_linear_velocity(BodyHandle body, const glm::vec3& v
     const auto it = impl_->bodies_.find(body);
     if (it == impl_->bodies_.end()) return;
     impl_->physicsSystem->GetBodyInterface().SetLinearVelocity(it->second.id, to_jolt(velocity));
+}
+
+void JoltPhysicsBackend::set_velocity(BodyHandle body, const glm::vec3& linearVelocity,
+                                      const glm::vec3& angularVelocity) {
+    const auto it = impl_->bodies_.find(body);
+    if (it == impl_->bodies_.end()) return;
+    impl_->physicsSystem->GetBodyInterface().SetLinearAndAngularVelocity(
+        it->second.id, to_jolt(linearVelocity), to_jolt(angularVelocity));
 }
 
 void JoltPhysicsBackend::set_gravity_scale(BodyHandle body, float scale) {
@@ -595,7 +639,12 @@ ConstraintHandle JoltPhysicsBackend::create_swing_twist_constraint(const SwingTw
         if (constraint == nullptr) return InvalidConstraint;
         constraint->SetSwingMotorState(JPH::EMotorState::Position);
         constraint->SetTwistMotorState(JPH::EMotorState::Position);
-        constraint->SetTargetOrientationCS(to_jolt(description.motorTarget));
+        // SetTargetOrientationBS: the desc's motorTarget is the RELATIVE
+        // orientation of body B in body A's frame (R2 = R1 * motorTarget).
+        // Passing it raw to SetTargetOrientationCS would conjugate it by the
+        // constraint-frame rotation (c1^-1 * q * c2), silently rotating the
+        // target into the twist axis for non-identity frames (findings #100).
+        constraint->SetTargetOrientationBS(to_jolt(description.motorTarget));
     } else {
         constraint = static_cast<JPH::SwingTwistConstraint*>(
             settings->Create(lockA.GetBody(), lockB.GetBody()));
@@ -609,11 +658,312 @@ ConstraintHandle JoltPhysicsBackend::create_swing_twist_constraint(const SwingTw
     return handle;
 }
 
+bool JoltPhysicsBackend::set_swing_twist_motor(ConstraintHandle constraint,
+                                               bool motorOn, float frequency,
+                                               float damping,
+                                               const glm::quat& target) {
+    const auto it = impl_->constraints_.find(constraint);
+    if (it == impl_->constraints_.end()) return false;
+    JPH::SwingTwistConstraint* joint =
+        static_cast<JPH::SwingTwistConstraint*>(it->second.ptr);
+    if (joint == nullptr) return false;
+    const JPH::SpringSettings spring(
+        JPH::ESpringMode::FrequencyAndDamping,
+        glm::clamp(frequency, 0.01f, 1000.0f),
+        glm::clamp(damping, 0.01f, 1000.0f));
+    joint->GetSwingMotorSettings().mSpringSettings = spring;
+    joint->GetTwistMotorSettings().mSpringSettings = spring;
+    joint->SetSwingMotorState(motorOn ? JPH::EMotorState::Position
+                                      : JPH::EMotorState::Off);
+    joint->SetTwistMotorState(motorOn ? JPH::EMotorState::Position
+                                      : JPH::EMotorState::Off);
+    // Same convention as create: target is the relative orientation of body B
+    // in body A's frame (see findings #100 — CS would rotate it by the frame).
+    joint->SetTargetOrientationBS(to_jolt(target));
+    return true;
+}
+
 bool JoltPhysicsBackend::destroy_constraint(ConstraintHandle constraint) {
     const auto it = impl_->constraints_.find(constraint);
     if (it == impl_->constraints_.end()) return false;
     impl_->physicsSystem->RemoveConstraint(it->second.ptr);
     impl_->constraints_.erase(it);
+    return true;
+}
+
+VehicleHandle JoltPhysicsBackend::create_vehicle(const VehicleDesc& description) {
+    const auto chassisIt = impl_->bodies_.find(description.chassis);
+    if (chassisIt == impl_->bodies_.end() || description.wheels.empty()) return InvalidVehicle;
+    // Tracked vehicles need two tracks (left/right).
+    if (description.kind == VehicleKind::Tracked &&
+        (description.tracks.empty() || description.tracks.size() != 2)) {
+        return InvalidVehicle;
+    }
+
+    // VehicleConstraint needs the chassis Body& to bind the constraint.
+    const JPH::BodyLockWrite lock(impl_->physicsSystem->GetBodyLockInterface(), chassisIt->second.id);
+    if (!lock.Succeeded()) return InvalidVehicle;
+
+    auto settings = std::make_unique<JPH::VehicleConstraintSettings>();
+    settings->mUp = to_jolt(glm::normalize(description.up));
+    settings->mForward = to_jolt(glm::normalize(description.forward));
+
+    // Tracked wheels are friction-only (WheelSettingsTV); wheeled/motorcycle
+    // wheels carry suspension + tire curves (WheelSettingsWV).
+    const bool tracked = description.kind == VehicleKind::Tracked;
+    for (std::size_t wi = 0; wi < description.wheels.size(); ++wi) {
+        const WheelDesc& wheel = description.wheels[wi];
+        if (tracked) {
+            auto ws = new JPH::WheelSettingsTV();
+            ws->mPosition = to_jolt(wheel.localPosition);
+            ws->mRadius = std::max(0.05f, wheel.radius);
+            ws->mWheelForward = to_jolt(glm::normalize(description.forward));
+            // Suspension is handled by the track (the wheels ride the track);
+            // keep a small fixed drop so the tester ray reaches the ground.
+            ws->mSuspensionMinLength = 0.05f;
+            ws->mSuspensionMaxLength = 0.05f;
+            ws->mLongitudinalFriction = 2.0f;
+            ws->mLateralFriction = 1.5f;
+            settings->mWheels.push_back(ws);
+            continue;
+        }
+        auto ws = new JPH::WheelSettingsWV();
+        ws->mPosition = to_jolt(wheel.localPosition);
+        // The tire pushes along the WHEEL's forward (default +Z), not the
+        // constraint's mForward — set it to the engine forward (-Z) so the
+        // vehicle drives the direction the engine's speed() reports.
+        ws->mWheelForward = to_jolt(glm::normalize(description.forward));
+        ws->mRadius = std::max(0.05f, wheel.radius);
+        ws->mSuspensionMinLength = std::max(0.0f, wheel.suspensionRestLength - wheel.suspensionTravel);
+        ws->mSuspensionMaxLength = wheel.suspensionRestLength + wheel.suspensionTravel;
+        // The legacy raycast model's spring/damper coefficients map directly
+        // to Jolt's stiffness/damping suspension spring.
+        ws->mSuspensionSpring = JPH::SpringSettings(JPH::ESpringMode::StiffnessAndDamping,
+                                                    std::max(0.0f, wheel.springStrength),
+                                                    std::max(0.0f, wheel.damperStrength));
+        ws->mMaxSteerAngle = wheel.steering
+            ? glm::clamp(std::abs(wheel.maxSteerAngle), 0.0f, JPH::DegreesToRadians(75.0f))
+            : 0.0f;
+        const float brakeTorque = wheel.maxBrakeForce * ws->mRadius;
+        ws->mMaxBrakeTorque = brakeTorque;
+        ws->mMaxHandBrakeTorque = brakeTorque;
+        // Flat-ish tire friction curves centered on the grip coefficient.
+        ws->mLongitudinalFriction.AddPoint(0.0f, wheel.tireGrip);
+        ws->mLongitudinalFriction.AddPoint(0.3f, wheel.tireGrip * 0.98f);
+        ws->mLongitudinalFriction.AddPoint(1.0f, wheel.tireGrip * 0.9f);
+        ws->mLateralFriction.AddPoint(0.0f, wheel.tireGrip);
+        ws->mLateralFriction.AddPoint(30.0f, wheel.tireGrip * 0.8f);
+        ws->mLateralFriction.AddPoint(90.0f, wheel.tireGrip * 0.5f);
+        settings->mWheels.push_back(ws);
+    }
+
+    if (tracked) {
+        // Tracked: one engine + transmission driving two tracks; each track
+        // lists its wheels (the driven wheel is the one with max drive force).
+        auto controller = std::make_unique<JPH::TrackedVehicleControllerSettings>();
+        controller->mEngine.mMaxTorque = std::max(1.0f, description.engineMaxTorque);
+        controller->mEngine.mMinRPM = std::max(1.0f, description.engineMinRPM);
+        controller->mEngine.mMaxRPM = std::max(controller->mEngine.mMinRPM + 1.0f, description.engineMaxRPM);
+        controller->mEngine.mNormalizedTorque.AddPoint(0.0f, 1.0f);
+        controller->mEngine.mNormalizedTorque.AddPoint(0.25f, 0.95f);
+        controller->mEngine.mNormalizedTorque.AddPoint(0.7f, 0.85f);
+        controller->mEngine.mNormalizedTorque.AddPoint(1.0f, 0.65f);
+        controller->mTransmission.mMode = JPH::ETransmissionMode::Auto;
+        controller->mTransmission.mGearRatios.clear();
+        for (const float ratio : description.gearRatios) {
+            if (ratio > 0.0f) controller->mTransmission.mGearRatios.push_back(ratio);
+        }
+        if (controller->mTransmission.mGearRatios.empty()) {
+            controller->mTransmission.mGearRatios.push_back(1.0f);
+        }
+        for (std::size_t side = 0; side < 2; ++side) {
+            const VehicleDesc::TrackSide& track = description.tracks[side];
+            if (track.wheelIndices.empty()) {
+                return InvalidVehicle;
+            }
+            JPH::VehicleTrackSettings ts;
+            ts.mWheels.clear();
+            std::size_t driven = track.wheelIndices.front();
+            float maxForce = -1.0f;
+            for (const std::size_t idx : track.wheelIndices) {
+                if (idx >= description.wheels.size()) return InvalidVehicle;
+                ts.mWheels.push_back(static_cast<JPH::uint>(idx));
+                if (description.wheels[idx].maxDriveForce > maxForce) {
+                    maxForce = description.wheels[idx].maxDriveForce;
+                    driven = idx;
+                }
+            }
+            ts.mDrivenWheel = static_cast<JPH::uint>(driven);
+            ts.mDifferentialRatio = std::max(0.01f, description.differentialRatio);
+            ts.mInertia = 8.0f;
+            ts.mAngularDamping = 0.5f;
+            const float radius = std::max(0.05f, description.wheels[driven].radius);
+            ts.mMaxBrakeTorque = std::max(1.0f, description.wheels[driven].maxBrakeForce) * radius;
+            controller->mTracks[side] = ts;
+        }
+        settings->mController = controller.release();
+    } else {
+        // Wheeled / Motorcycle: engine + transmission + one differential per
+        // driven axle (left/right pair), torque split evenly across axles.
+        std::unique_ptr<JPH::WheeledVehicleControllerSettings> controller;
+        if (description.kind == VehicleKind::Motorcycle) {
+            auto moto = std::make_unique<JPH::MotorcycleControllerSettings>();
+            moto->mMaxLeanAngle = JPH::DegreesToRadians(35.0f);
+            moto->mLeanSpringConstant = 5000.0f;
+            moto->mLeanSpringDamping = 1000.0f;
+            controller = std::move(moto);
+        } else {
+            controller = std::make_unique<JPH::WheeledVehicleControllerSettings>();
+        }
+        controller->mEngine.mMaxTorque = std::max(1.0f, description.engineMaxTorque);
+        controller->mEngine.mMinRPM = std::max(1.0f, description.engineMinRPM);
+        controller->mEngine.mMaxRPM = std::max(controller->mEngine.mMinRPM + 1.0f, description.engineMaxRPM);
+        controller->mEngine.mNormalizedTorque.AddPoint(0.0f, 1.0f);
+        controller->mEngine.mNormalizedTorque.AddPoint(0.25f, 0.95f);
+        controller->mEngine.mNormalizedTorque.AddPoint(0.7f, 0.85f);
+        controller->mEngine.mNormalizedTorque.AddPoint(1.0f, 0.65f);
+        controller->mTransmission.mMode = JPH::ETransmissionMode::Auto;
+        controller->mTransmission.mGearRatios.clear();
+        for (const float ratio : description.gearRatios) {
+            if (ratio > 0.0f) controller->mTransmission.mGearRatios.push_back(ratio);
+        }
+        if (controller->mTransmission.mGearRatios.empty()) {
+            controller->mTransmission.mGearRatios.push_back(1.0f);
+        }
+
+        std::vector<std::size_t> driven;
+        for (std::size_t i = 0; i < description.wheels.size(); ++i) {
+            if (description.wheels[i].driven) driven.push_back(i);
+        }
+        std::stable_sort(driven.begin(), driven.end(), [&](std::size_t a, std::size_t b) {
+            const float za = description.wheels[a].localPosition.z;
+            const float zb = description.wheels[b].localPosition.z;
+            if (za != zb) return za < zb;
+            return description.wheels[a].localPosition.x < description.wheels[b].localPosition.x;
+        });
+        std::size_t i = 0;
+        while (i < driven.size()) {
+            std::size_t j = i + 1;
+            while (j < driven.size() &&
+                   description.wheels[driven[j]].localPosition.z ==
+                       description.wheels[driven[i]].localPosition.z) {
+                ++j;
+            }
+            std::size_t left = driven[i], right = driven[i];
+            for (std::size_t k = i; k < j; ++k) {
+                if (description.wheels[driven[k]].localPosition.x <
+                    description.wheels[left].localPosition.x) {
+                    left = driven[k];
+                }
+                if (description.wheels[driven[k]].localPosition.x >
+                    description.wheels[right].localPosition.x) {
+                    right = driven[k];
+                }
+            }
+            JPH::VehicleDifferentialSettings diff;
+            diff.mLeftWheel = static_cast<int>(left);
+            diff.mRightWheel = right == left ? -1 : static_cast<int>(right);
+            diff.mDifferentialRatio = std::max(0.01f, description.differentialRatio);
+            diff.mLeftRightSplit = 0.5f;
+            controller->mDifferentials.push_back(diff);
+            i = j;
+        }
+        const float perAxle = controller->mDifferentials.empty()
+            ? 1.0f
+            : 1.0f / static_cast<float>(controller->mDifferentials.size());
+        for (JPH::VehicleDifferentialSettings& diff : controller->mDifferentials) {
+            diff.mEngineTorqueRatio = perAxle;
+        }
+        settings->mController = controller.release();
+    }
+
+    JPH::VehicleConstraint* vehicle = new JPH::VehicleConstraint(lock.GetBody(), *settings);
+    if (vehicle == nullptr) return InvalidVehicle;
+    // Without a collision tester the constraint's wheel queries dereference a
+    // null Ref in OnStep (the samples always install one). Layer 1 is the
+    // engine wildcard combo ({layer 1, mask ~0}) that collides with everything
+    // — the default drivable semantics (drivableLayers == ~0).
+    vehicle->SetVehicleCollisionTester(new JPH::VehicleCollisionTesterRay(1));
+
+    impl_->physicsSystem->AddStepListener(vehicle);
+    impl_->physicsSystem->AddConstraint(vehicle);
+
+    const VehicleHandle handle = impl_->nextVehicleHandle_++;
+    impl_->vehicles_[handle] = {vehicle, description.chassis, description.wheels, description.kind};
+    return handle;
+}
+
+bool JoltPhysicsBackend::destroy_vehicle(VehicleHandle vehicle) {
+    const auto it = impl_->vehicles_.find(vehicle);
+    if (it == impl_->vehicles_.end()) return false;
+    impl_->physicsSystem->RemoveStepListener(it->second.constraint);
+    impl_->physicsSystem->RemoveConstraint(it->second.constraint);
+    impl_->vehicles_.erase(it);
+    return true;
+}
+
+bool JoltPhysicsBackend::set_vehicle_input(VehicleHandle vehicle, const VehicleInput& input) {
+    const auto it = impl_->vehicles_.find(vehicle);
+    if (it == impl_->vehicles_.end()) return false;
+
+    const float throttle = glm::clamp(input.throttle, -1.0f, 1.0f);
+    const float steering = glm::clamp(input.steering, -1.0f, 1.0f);
+    const float brake = glm::clamp(input.brake, 0.0f, 1.0f);
+    const float handbrake = glm::clamp(input.handbrake, 0.0f, 1.0f);
+
+    if (it->second.kind == VehicleKind::Tracked) {
+        // Tank steering: the tracks turn at differential ratios. Full lock
+        // (steering == +-1) spins one track forward and the other backward
+        // (pivot); smaller steering drives one side faster than the other.
+        auto* controller =
+            static_cast<JPH::TrackedVehicleController*>(it->second.constraint->GetController());
+        if (controller == nullptr) return false;
+        const float left = 1.0f + steering;
+        const float right = 1.0f - steering;
+        // JPH asserts the ratios are non-zero (pivot uses opposite signs).
+        controller->SetDriverInput(throttle,
+                                   left == 0.0f ? 0.01f : left,
+                                   right == 0.0f ? 0.01f : right,
+                                   brake);
+    } else {
+        auto* controller =
+            static_cast<JPH::WheeledVehicleController*>(it->second.constraint->GetController());
+        if (controller == nullptr) return false;
+        // Motorcycle reuses the wheeled input; the lean spring keeps the
+        // chassis upright (no extra input needed).
+        controller->SetDriverInput(throttle, steering, brake, handbrake);
+    }
+
+    // A settled chassis may be asleep (parked car); driver input must wake it
+    // or the throttle/brake have no effect (the old raycast model woke on
+    // every impulse).
+    if (input.throttle != 0.0f || input.steering != 0.0f || input.brake != 0.0f ||
+        input.handbrake != 0.0f) {
+        const auto chassis = impl_->bodies_.find(it->second.chassis);
+        if (chassis != impl_->bodies_.end()) {
+            impl_->physicsSystem->GetBodyInterface().ActivateBody(chassis->second.id);
+        }
+    }
+    return true;
+}
+
+bool JoltPhysicsBackend::vehicle_wheel_state(VehicleHandle vehicle, std::size_t index, WheelState& out) const {
+    const auto it = impl_->vehicles_.find(vehicle);
+    if (it == impl_->vehicles_.end() || index >= it->second.wheels.size()) return false;
+    const JPH::Wheel* wheel = it->second.constraint->GetWheel(static_cast<JPH::uint>(index));
+    if (wheel == nullptr) return false;
+    out.grounded = wheel->HasContact();
+    out.contactPoint = out.grounded ? to_glm(wheel->GetContactPosition()) : glm::vec3(0.0f);
+    out.contactNormal = out.grounded ? to_glm(wheel->GetContactNormal()) : glm::vec3(0.0f, 1.0f, 0.0f);
+    out.suspensionLength = wheel->GetSuspensionLength();
+    const WheelDesc& desc = it->second.wheels[index];
+    out.compression = (desc.suspensionRestLength + desc.suspensionTravel) - out.suspensionLength;
+    out.rotation = wheel->GetRotationAngle();
+    out.angularSpeed = wheel->GetAngularVelocity();
+    out.steerAngle = wheel->GetSteerAngle();
+    out.groundBody = out.grounded
+        ? impl_->to_engine_handle(wheel->GetContactBodyID().GetIndexAndSequenceNumber())
+        : InvalidBody;
     return true;
 }
 

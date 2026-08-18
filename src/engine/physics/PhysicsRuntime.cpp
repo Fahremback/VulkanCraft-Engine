@@ -177,6 +177,20 @@ void PhysicsRuntime::set_transform(BodyHandle handle, const glm::vec3& position,
     }
 }
 
+void PhysicsRuntime::set_velocity(BodyHandle handle, const glm::vec3& linearVelocity,
+                                  const glm::vec3& angularVelocity) {
+    RigidBody* value = body(handle);
+    if (!value) return;
+    value->linearVelocity = linearVelocity;
+    value->angularVelocity = angularVelocity;
+    value->sleeping = false;
+    value->sleepTimer = 0.0f;
+    if (external_) {
+        const BodyHandle backend = to_backend_handle(handle);
+        if (backend != InvalidBody) external_->set_velocity(backend, linearVelocity, angularVelocity);
+    }
+}
+
 ConstraintHandle PhysicsRuntime::create_distance_constraint(const DistanceConstraintDesc& description) {
     if (!body(description.bodyA) || !body(description.bodyB) || description.bodyA == description.bodyB) return InvalidConstraint;
     ConstraintHandle handle;
@@ -229,8 +243,83 @@ ConstraintHandle PhysicsRuntime::create_swing_twist_constraint(const SwingTwistC
     return value.handle;
 }
 
+bool PhysicsRuntime::set_swing_twist_motor(ConstraintHandle constraint,
+                                           bool motorOn, float frequency,
+                                           float damping,
+                                           const glm::quat& target) {
+    if (!external_ || !external_->supports_swing_twist()) return false;
+    if (constraint < kSwingTwistHandleOffset) return false;  // distance space
+    const std::size_t index =
+        static_cast<std::size_t>(constraint - kSwingTwistHandleOffset);
+    if (index >= swingTwistConstraints_.size() ||
+        !swingTwistConstraints_[index]) {
+        return false;
+    }
+    if (index >= backendSwingTwist_.size() ||
+        backendSwingTwist_[index] == InvalidConstraint) {
+        return false;
+    }
+    SwingTwistConstraint& value = *swingTwistConstraints_[index];
+    value.motorOn = motorOn;
+    value.motorFrequency = frequency;
+    value.motorDamping = damping;
+    value.motorTarget = target;
+    return external_->set_swing_twist_motor(backendSwingTwist_[index], motorOn,
+                                            frequency, damping, target);
+}
+
 bool PhysicsRuntime::supports_swing_twist() const noexcept {
     return external_ != nullptr && external_->supports_swing_twist();
+}
+
+bool PhysicsRuntime::supports_vehicles() const noexcept {
+    return external_ != nullptr && external_->supports_vehicles();
+}
+
+VehicleHandle PhysicsRuntime::create_vehicle(const VehicleDesc& description) {
+    if (!external_ || !external_->supports_vehicles()) return InvalidVehicle;
+    if (description.chassis == InvalidBody || !body(description.chassis)) return InvalidVehicle;
+    if (description.wheels.empty()) return InvalidVehicle;
+    VehicleHandle handle;
+    if (!freeVehicles_.empty()) {
+        handle = freeVehicles_.back();
+        freeVehicles_.pop_back();
+    } else {
+        handle = static_cast<VehicleHandle>(backendVehicles_.size() + 1);
+        backendVehicles_.push_back(InvalidVehicle);
+    }
+    const VehicleHandle backendHandle = external_->create_vehicle(description);
+    if (backendHandle == InvalidVehicle) {
+        backendVehicles_[handle - 1] = InvalidVehicle;
+        freeVehicles_.push_back(handle);
+        return InvalidVehicle;
+    }
+    backendVehicles_[handle - 1] = backendHandle;
+    return handle;
+}
+
+bool PhysicsRuntime::destroy_vehicle(VehicleHandle handle) {
+    if (handle == InvalidVehicle || handle > backendVehicles_.size()) return false;
+    const VehicleHandle backendHandle = backendVehicles_[handle - 1];
+    if (backendHandle == InvalidVehicle) return false;
+    if (!external_ || !external_->destroy_vehicle(backendHandle)) return false;
+    backendVehicles_[handle - 1] = InvalidVehicle;
+    freeVehicles_.push_back(handle);
+    return true;
+}
+
+bool PhysicsRuntime::set_vehicle_input(VehicleHandle handle, const VehicleInput& input) {
+    if (handle == InvalidVehicle || handle > backendVehicles_.size()) return false;
+    const VehicleHandle backendHandle = backendVehicles_[handle - 1];
+    if (backendHandle == InvalidVehicle || !external_) return false;
+    return external_->set_vehicle_input(backendHandle, input);
+}
+
+bool PhysicsRuntime::vehicle_wheel_state(VehicleHandle handle, std::size_t index, WheelState& out) const {
+    if (handle == InvalidVehicle || handle > backendVehicles_.size()) return false;
+    const VehicleHandle backendHandle = backendVehicles_[handle - 1];
+    if (backendHandle == InvalidVehicle || !external_) return false;
+    return external_->vehicle_wheel_state(backendHandle, index, out);
 }
 
 bool PhysicsRuntime::destroy_constraint(ConstraintHandle handle) {

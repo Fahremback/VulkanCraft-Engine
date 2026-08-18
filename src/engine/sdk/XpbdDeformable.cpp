@@ -35,6 +35,9 @@ namespace Engine::Deformable {
 namespace {
 
 constexpr float kEpsilon = 1.0e-6f;
+// Compliance of a separated edge (stiffness 0 via set_edge_stiffness): large
+// enough that the XPBD correction is negligible — the constraint is inert.
+constexpr float kSeparatedAlpha = 1.0e9f;
 
 bool DeformableConfig_validate(const DeformableConfig& config,
                                std::string& errorOut) {
@@ -82,6 +85,7 @@ struct Edge {
     std::uint32_t a{ 0 };
     std::uint32_t b{ 0 };
     float restLength{ 1.0f };
+    float alpha{ 0.0f };              // compliance (1-k)/k; per-edge override
     float lambda{ 0.0f };             // XPBD Lagrange multiplier (persists)
 };
 
@@ -165,9 +169,19 @@ public:
             errorOut = "deformable: fixed flags must match the node count";
             return InvalidDeformableBody;
         }
+        if (!desc.stiffness.empty() && desc.stiffness.size() != desc.edges.size()) {
+            errorOut = "deformable: per-edge stiffness must match the edge count";
+            return InvalidDeformableBody;
+        }
         for (const auto& edge : desc.edges) {
             if (edge.first >= desc.nodes.size() || edge.second >= desc.nodes.size()) {
                 errorOut = "deformable: edge references an invalid node index";
+                return InvalidDeformableBody;
+            }
+        }
+        for (const float k : desc.stiffness) {
+            if (!(k > 0.0f) || k > 1.0f) {
+                errorOut = "deformable: per-edge stiffness must be in (0, 1]";
                 return InvalidDeformableBody;
             }
         }
@@ -180,12 +194,19 @@ public:
             if (!desc.fixed.empty() && desc.fixed[i]) body.nodes[i].inverseMass = 0.0f;
         }
         body.edges.reserve(desc.edges.size());
-        for (const auto& edge : desc.edges) {
+        const float defaultAlpha = (1.0f - config_.stiffness) / config_.stiffness;
+        for (std::size_t i = 0; i < desc.edges.size(); ++i) {
+            const auto& edge = desc.edges[i];
             Edge e;
             e.a = edge.first;
             e.b = edge.second;
             e.restLength = glm::distance(body.nodes[e.a].position,
                                          body.nodes[e.b].position);
+            // Per-edge stiffness override (node/beam chassis, §17 item 4);
+            // empty list = the config stiffness for every edge.
+            e.alpha = desc.stiffness.empty()
+                ? defaultAlpha
+                : (1.0f - desc.stiffness[i]) / desc.stiffness[i];
             body.edges.push_back(e);
         }
         body.handle = ++nextHandle_;
@@ -206,6 +227,20 @@ public:
         found->second.nodes[node].force += force;
     }
 
+    void set_edge_stiffness(DeformableBodyHandle body, std::uint32_t edgeIndex,
+                            float stiffness) override {
+        const auto found = bodies_.find(body);
+        if (found == bodies_.end() || edgeIndex >= found->second.edges.size())
+            return;
+        Edge& edge = found->second.edges[edgeIndex];
+        // stiffness == 0 = fully compliant (constraint deactivated — the part
+        // separated); (0, 1] maps to the same alpha as create_body. A huge
+        // alpha makes the XPBD correction ~0 without touching the persistence
+        // of the Lagrange multiplier.
+        const float k = glm::clamp(stiffness, 0.0f, 1.0f);
+        edge.alpha = k <= 0.0f ? kSeparatedAlpha : (1.0f - k) / k;
+    }
+
     void step(float dt) override {
         if (!(dt > 0.0f) || !std::isfinite(dt)) return;
         const float substep = dt / static_cast<float>(config_.substeps);
@@ -214,11 +249,10 @@ public:
         // solver's behavior must not depend on the caller's substep choice.
         // (The XPBD dt^2 convention makes constraints absurdly soft at 60 Hz:
         // alpha ~= 758 for k=0.95, so a hanging chain stretches unboundedly.)
-        const float alpha = (1.0f - config_.stiffness) / config_.stiffness;
         for (auto& entry : bodies_) {
             Body& body = entry.second;
             for (int s = 0; s < config_.substeps; ++s) {
-                integrate_substep(body, substep, alpha);
+                integrate_substep(body, substep);
             }
             // Forces are accumulated until the END of the step() call (they
             // persist across all substeps), then cleared.
@@ -260,7 +294,7 @@ public:
     }
 
 private:
-    void integrate_substep(Body& body, float dt, float alpha) {
+    void integrate_substep(Body& body, float dt) {
         // 1. Integrate: velocity update + predicted position. Forces persist
         //    across ALL substeps of the step() call (cleared in step()).
         for (Node& node : body.nodes) {
@@ -274,7 +308,7 @@ private:
         // 2. XPBD distance-constraint solve (fixed iteration order).
         for (int iteration = 0; iteration < config_.solverIterations; ++iteration) {
             for (Edge& edge : body.edges) {
-                solve_edge(body, edge, alpha);
+                solve_edge(body, edge);
             }
         }
 
@@ -300,7 +334,7 @@ private:
         }
     }
 
-    static void solve_edge(Body& body, Edge& edge, float alpha) {
+    static void solve_edge(Body& body, Edge& edge) {
         Node& a = body.nodes[edge.a];
         Node& b = body.nodes[edge.b];
         const float wSum = a.inverseMass + b.inverseMass;
@@ -317,9 +351,9 @@ private:
         }
 
         const float constraint = length - edge.restLength;
-        const float denominator = wSum + alpha;
+        const float denominator = wSum + edge.alpha;
         if (denominator <= kEpsilon) return;
-        const float dLambda = (-constraint - alpha * edge.lambda) / denominator;
+        const float dLambda = (-constraint - edge.alpha * edge.lambda) / denominator;
         edge.lambda += dLambda;
 
         a.predicted -= direction * (a.inverseMass * dLambda);

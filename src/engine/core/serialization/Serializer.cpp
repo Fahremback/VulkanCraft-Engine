@@ -378,6 +378,42 @@ SerializationResult Serializer::serialize_scene(
         if (auto hier = scene.hierarchyComponents.find(id); hier != scene.hierarchyComponents.end() && hier->second.parentID.is_valid()) {
             out << ",\n      \"Hierarchy\":{\"parent_id\":\"" << hier->second.parentID.to_string() << "\"}";
         }
+        // Wicked-port components (frontend; PORTS.md). Compact field names keep
+        // the scene file small; the read side mirrors them.
+        if (auto cl = scene.colliderComponents.find(id); cl != scene.colliderComponents.end()) {
+            const auto& v=cl->second;out<<",\n      \"Collider\":{\"shape\":"<<static_cast<int>(v.shape)<<",\"sx\":"<<v.size.x<<",\"sy\":"<<v.size.y<<",\"sz\":"<<v.size.z<<",\"radius\":"<<v.radius<<",\"height\":"<<v.height<<",\"ox\":"<<v.offset.x<<",\"oy\":"<<v.offset.y<<",\"oz\":"<<v.offset.z<<",\"trigger\":"<<(v.isTrigger?"true":"false")<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
+        }
+        if (auto cn = scene.constraintComponents.find(id); cn != scene.constraintComponents.end()) {
+            const auto& v=cn->second;out<<",\n      \"Constraint\":{\"type\":"<<static_cast<int>(v.type)<<",\"other\":\""<<v.otherEntity.to_string()<<"\",\"ax\":"<<v.anchor.x<<",\"ay\":"<<v.anchor.y<<",\"az\":"<<v.anchor.z<<",\"dx\":"<<v.axis.x<<",\"dy\":"<<v.axis.y<<",\"dz\":"<<v.axis.z<<",\"breakForce\":"<<v.breakForce<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
+        }
+        if (auto sb = scene.softBodyComponents.find(id); sb != scene.softBodyComponents.end()) {
+            const auto& v=sb->second;out<<",\n      \"SoftBody\":{\"detail\":"<<v.detail<<",\"mass\":"<<v.mass<<",\"friction\":"<<v.friction<<",\"restitution\":"<<v.restitution<<",\"pressure\":"<<v.pressure<<",\"vertexRadius\":"<<v.vertexRadius<<",\"wind\":"<<(v.wind?"true":"false")<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
+        }
+        if (auto sp = scene.springComponents.find(id); sp != scene.springComponents.end()) {
+            const auto& v=sp->second;out<<",\n      \"Spring\":{\"stiffness\":"<<v.stiffness<<",\"drag\":"<<v.drag<<",\"wind\":"<<v.wind<<",\"gravity\":"<<v.gravity<<",\"hitRadius\":"<<v.hitRadius<<",\"disabled\":"<<(v.disabled?"true":"false")<<",\"useGravity\":"<<(v.useGravity?"true":"false")<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
+        }
+        if (auto dc = scene.decalComponents.find(id); dc != scene.decalComponents.end()) {
+            const auto& v=dc->second;out<<",\n      \"Decal\":{\"texture\":\""<<escape_json(v.texturePath)<<"\",\"r\":"<<v.color.r<<",\"g\":"<<v.color.g<<",\"b\":"<<v.color.b<<",\"slope\":"<<v.slopeBlendPower<<",\"static\":"<<(v.projectOnStatic?"true":"false")<<",\"onlyAlpha\":"<<(v.onlyAlpha?"true":"false")<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
+        }
+        if (auto sl = scene.splineComponents.find(id); sl != scene.splineComponents.end()) {
+            const auto& v=sl->second;out<<",\n      \"Spline\":{\"looped\":"<<(v.looped?"true":"false")<<",\"filled\":"<<(v.filled?"true":"false")<<",\"width\":"<<v.width<<",\"rot\":"<<v.rotation<<",\"subdiv\":"<<v.subdiv<<",\"points\":[";
+            for (size_t pi = 0; pi < v.points.size(); ++pi) {
+                out << (pi ? "," : "") << "[" << v.points[pi].x << "," << v.points[pi].y << "," << v.points[pi].z << "]";
+            }
+            out << "]}";
+        }
+        if (auto ff = scene.forceFieldComponents.find(id); ff != scene.forceFieldComponents.end()) {
+            const auto& v=ff->second;out<<",\n      \"ForceField\":{\"type\":"<<static_cast<int>(v.type)<<",\"strength\":"<<v.strength<<",\"range\":"<<v.range<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
+        }
+        if (auto ep = scene.envProbeComponents.find(id); ep != scene.envProbeComponents.end()) {
+            const auto& v=ep->second;out<<",\n      \"EnvProbe\":{\"realtime\":"<<(v.realTime?"true":"false")<<",\"viewDistance\":"<<v.viewDistance<<",\"resolution\":"<<v.resolution<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
+        }
+        if (auto wt = scene.weatherComponents.find(id); wt != scene.weatherComponents.end()) {
+            const auto& v=wt->second;out<<",\n      \"Weather\":{\"sr\":"<<v.sunColor.r<<",\"sg\":"<<v.sunColor.g<<",\"sb\":"<<v.sunColor.b<<",\"fogDensity\":"<<v.fogDensity<<",\"fogStart\":"<<v.fogStart<<",\"skyExposure\":"<<v.skyExposure<<",\"skyRotation\":"<<v.skyRotation<<",\"windSpeed\":"<<v.windSpeed<<",\"rainAmount\":"<<v.rainAmount<<",\"rainLength\":"<<v.rainLength<<",\"heightFog\":"<<(v.heightFog?"true":"false")<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
+        }
+        if (auto hp = scene.hairParticleComponents.find(id); hp != scene.hairParticleComponents.end()) {
+            const auto& v=hp->second;out<<",\n      \"HairParticle\":{\"mesh\":\""<<escape_json(v.meshPath)<<"\",\"count\":"<<v.count<<",\"length\":"<<v.length<<",\"width\":"<<v.width<<",\"stiffness\":"<<v.stiffness<<",\"drag\":"<<v.drag<<",\"gravityPower\":"<<v.gravityPower<<",\"randomness\":"<<v.randomness<<",\"segments\":"<<v.segments<<",\"seed\":"<<v.seed<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
+        }
         out << "\n    }" << (++emitted < scene.m_entities.size() ? "," : "") << '\n';
     }
     out << "  ]\n}\n";
@@ -482,6 +518,57 @@ SerializationResult Serializer::deserialize_scene(
         }
         if (const auto voxel = object_field(object, "VoxelVolume")) {
             VoxelVolumeComponent v;v.chunkBudget=static_cast<int>(number_field(*voxel,"chunkBudget").value_or(1024));v.seed=static_cast<int>(number_field(*voxel,"seed").value_or(1337));v.seaLevel=static_cast<float>(number_field(*voxel,"seaLevel").value_or(26));v.enableFarLod=bool_field(*voxel,"enableFarLod").value_or(true);loaded.voxelVolumeComponents[entityId]=v;
+        }
+        // Wicked-port components (frontend; PORTS.md) — mirror of the writer.
+        if (const auto cl = object_field(object, "Collider")) {
+            ColliderComponent v;v.shape=static_cast<ColliderShape>(static_cast<int>(number_field(*cl,"shape").value_or(0)));v.size={static_cast<float>(number_field(*cl,"sx").value_or(1)),static_cast<float>(number_field(*cl,"sy").value_or(1)),static_cast<float>(number_field(*cl,"sz").value_or(1))};v.radius=static_cast<float>(number_field(*cl,"radius").value_or(.5));v.height=static_cast<float>(number_field(*cl,"height").value_or(1));v.offset={static_cast<float>(number_field(*cl,"ox").value_or(0)),static_cast<float>(number_field(*cl,"oy").value_or(0)),static_cast<float>(number_field(*cl,"oz").value_or(0))};v.isTrigger=bool_field(*cl,"trigger").value_or(false);v.enabled=bool_field(*cl,"enabled").value_or(true);loaded.colliderComponents[entityId]=v;
+        }
+        if (const auto cn = object_field(object, "Constraint")) {
+            ConstraintComponent v;v.type=static_cast<ConstraintType>(static_cast<int>(number_field(*cn,"type").value_or(0)));v.otherEntity=UUID::from_string(string_field(*cn,"other").value_or(""));v.anchor={static_cast<float>(number_field(*cn,"ax").value_or(0)),static_cast<float>(number_field(*cn,"ay").value_or(0)),static_cast<float>(number_field(*cn,"az").value_or(0))};v.axis={static_cast<float>(number_field(*cn,"dx").value_or(0)),static_cast<float>(number_field(*cn,"dy").value_or(1)),static_cast<float>(number_field(*cn,"dz").value_or(0))};v.breakForce=static_cast<float>(number_field(*cn,"breakForce").value_or(0));v.enabled=bool_field(*cn,"enabled").value_or(true);loaded.constraintComponents[entityId]=v;
+        }
+        if (const auto sb = object_field(object, "SoftBody")) {
+            SoftBodyComponent v;v.detail=static_cast<uint32_t>(number_field(*sb,"detail").value_or(8));v.mass=static_cast<float>(number_field(*sb,"mass").value_or(1));v.friction=static_cast<float>(number_field(*sb,"friction").value_or(.5));v.restitution=static_cast<float>(number_field(*sb,"restitution").value_or(.1));v.pressure=static_cast<float>(number_field(*sb,"pressure").value_or(0));v.vertexRadius=static_cast<float>(number_field(*sb,"vertexRadius").value_or(.05));v.wind=bool_field(*sb,"wind").value_or(true);v.enabled=bool_field(*sb,"enabled").value_or(true);loaded.softBodyComponents[entityId]=v;
+        }
+        if (const auto sp = object_field(object, "Spring")) {
+            SpringComponent v;v.stiffness=static_cast<float>(number_field(*sp,"stiffness").value_or(.5));v.drag=static_cast<float>(number_field(*sp,"drag").value_or(.1));v.wind=static_cast<float>(number_field(*sp,"wind").value_or(0));v.gravity=static_cast<float>(number_field(*sp,"gravity").value_or(1));v.hitRadius=static_cast<float>(number_field(*sp,"hitRadius").value_or(.5));v.disabled=bool_field(*sp,"disabled").value_or(false);v.useGravity=bool_field(*sp,"useGravity").value_or(true);v.enabled=bool_field(*sp,"enabled").value_or(true);loaded.springComponents[entityId]=v;
+        }
+        if (const auto dc = object_field(object, "Decal")) {
+            DecalComponent v;v.texturePath=string_field(*dc,"texture").value_or("");v.color={static_cast<float>(number_field(*dc,"r").value_or(1)),static_cast<float>(number_field(*dc,"g").value_or(1)),static_cast<float>(number_field(*dc,"b").value_or(1))};v.slopeBlendPower=static_cast<float>(number_field(*dc,"slope").value_or(1));v.projectOnStatic=bool_field(*dc,"static").value_or(true);v.onlyAlpha=bool_field(*dc,"onlyAlpha").value_or(false);v.enabled=bool_field(*dc,"enabled").value_or(true);loaded.decalComponents[entityId]=v;
+        }
+        if (const auto sl = object_field(object, "Spline")) {
+            SplineComponent v;v.looped=bool_field(*sl,"looped").value_or(false);v.filled=bool_field(*sl,"filled").value_or(false);v.width=static_cast<float>(number_field(*sl,"width").value_or(1));v.rotation=static_cast<float>(number_field(*sl,"rot").value_or(0));v.subdiv=static_cast<uint32_t>(number_field(*sl,"subdiv").value_or(16));v.points.clear();
+            // "points":[[x,y,z],...] — minimal parser (JsonMini has no array helper).
+            const std::string_view src = *sl;
+            const auto arrBegin = src.find("points\"");
+            const auto colon = (arrBegin != std::string_view::npos) ? src.find(':', arrBegin) : std::string_view::npos;
+            if (colon != std::string_view::npos) {
+                size_t pos = src.find('[', colon);
+                while (pos != std::string_view::npos) {
+                    const auto open = src.find('[', pos + 1);
+                    if (open == std::string_view::npos) break;
+                    const auto close = src.find(']', open);
+                    if (close == std::string_view::npos) break;
+                    const std::string_view triple = src.substr(open + 1, close - open - 1);
+                    float x = 0.0f, y = 0.0f, z = 0.0f;
+                    if (std::sscanf(std::string(triple).c_str(), "%f,%f,%f", &x, &y, &z) == 3) {
+                        v.points.push_back({x, y, z});
+                    }
+                    pos = close;
+                }
+            }
+            loaded.splineComponents[entityId]=v;
+        }
+        if (const auto ff = object_field(object, "ForceField")) {
+            ForceFieldComponent v;v.type=static_cast<ForceFieldType>(static_cast<int>(number_field(*ff,"type").value_or(0)));v.strength=static_cast<float>(number_field(*ff,"strength").value_or(1));v.range=static_cast<float>(number_field(*ff,"range").value_or(10));v.enabled=bool_field(*ff,"enabled").value_or(true);loaded.forceFieldComponents[entityId]=v;
+        }
+        if (const auto ep = object_field(object, "EnvProbe")) {
+            EnvProbeComponent v;v.realTime=bool_field(*ep,"realtime").value_or(false);v.viewDistance=static_cast<float>(number_field(*ep,"viewDistance").value_or(100));v.resolution=static_cast<uint32_t>(number_field(*ep,"resolution").value_or(256));v.enabled=bool_field(*ep,"enabled").value_or(true);loaded.envProbeComponents[entityId]=v;
+        }
+        if (const auto wt = object_field(object, "Weather")) {
+            WeatherComponent v;v.sunColor={static_cast<float>(number_field(*wt,"sr").value_or(1)),static_cast<float>(number_field(*wt,"sg").value_or(.95)),static_cast<float>(number_field(*wt,"sb").value_or(.85))};v.fogDensity=static_cast<float>(number_field(*wt,"fogDensity").value_or(.001));v.fogStart=static_cast<float>(number_field(*wt,"fogStart").value_or(100));v.skyExposure=static_cast<float>(number_field(*wt,"skyExposure").value_or(1));v.skyRotation=static_cast<float>(number_field(*wt,"skyRotation").value_or(0));v.windSpeed=static_cast<float>(number_field(*wt,"windSpeed").value_or(5));v.rainAmount=static_cast<float>(number_field(*wt,"rainAmount").value_or(0));v.rainLength=static_cast<float>(number_field(*wt,"rainLength").value_or(1));v.heightFog=bool_field(*wt,"heightFog").value_or(false);v.enabled=bool_field(*wt,"enabled").value_or(true);loaded.weatherComponents[entityId]=v;
+        }
+        if (const auto hp = object_field(object, "HairParticle")) {
+            HairParticleComponent v;v.meshPath=string_field(*hp,"mesh").value_or("");v.count=static_cast<uint32_t>(number_field(*hp,"count").value_or(1000));v.length=static_cast<float>(number_field(*hp,"length").value_or(.3));v.width=static_cast<float>(number_field(*hp,"width").value_or(.01));v.stiffness=static_cast<float>(number_field(*hp,"stiffness").value_or(.5));v.drag=static_cast<float>(number_field(*hp,"drag").value_or(.1));v.gravityPower=static_cast<float>(number_field(*hp,"gravityPower").value_or(1));v.randomness=static_cast<float>(number_field(*hp,"randomness").value_or(.2));v.segments=static_cast<uint32_t>(number_field(*hp,"segments").value_or(8));v.seed=static_cast<uint32_t>(number_field(*hp,"seed").value_or(0));v.enabled=bool_field(*hp,"enabled").value_or(true);loaded.hairParticleComponents[entityId]=v;
         }
         if (const auto hier = object_field(object, "Hierarchy")) {
             if (const auto parentIdText = string_field(*hier, "parent_id")) {

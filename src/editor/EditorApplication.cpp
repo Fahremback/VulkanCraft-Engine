@@ -1,4 +1,13 @@
 #include "EditorApplication.hpp"
+// Frontend port from the Wicked Engine Editor (MIT, commit 2aa9fdf…): Font
+// Awesome 6 icon font + codepoint macros, and the Liberation Sans UI font
+// (zstd-compressed, same font Wicked ships). See frontend/PORTS.md.
+#include "frontend/FontAwesomeV6.h"
+#include "frontend/IconsFontAwesome6.h"
+#include "frontend/liberation_sans.h"
+#include "frontend/ForgeTheme.hpp"
+#include "frontend/ForgeWidgets.hpp"
+#include "engine/compression/ICompressionProvider.hpp"
 #include "../engine/assets/GltfGeometry.hpp"
 #include "../engine/animation/AnimationAssets.hpp"
 #include "../engine/rendering/vulkan/MaterialPipeline.hpp"
@@ -9,23 +18,30 @@
 #include "../engine/gameplay/MissionSystem.hpp"
 #include "engine/navigation/INavigationProvider.hpp"
 #include <array>
+#include <cctype>
 #include <cstdlib>
+#include <sstream>
 #include <filesystem>
 #include <iostream>
 #include <type_traits>
 #include <stdexcept>
 #include <algorithm>
+#include <functional>
 #include <unordered_set>
 #include <cstddef>
 #include <cstring>
 #include <cmath>
 #include <fstream>
+#include <chrono>
+#include <ctime>
 
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
 #include <VkBootstrap.h>
+#include <miniaudio.h>
+#include <thread>
 
 // PlayNavAgent — the public provider's path follower (mirrors the legacy
 // NavigationAgent stepping so the Fase 8 behavior is preserved).
@@ -67,115 +83,27 @@ void PlayNavAgent::update(float deltaTime) {
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <commdlg.h>
+#include <shlobj.h>
+#include <wincodec.h>
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
-#include <wincodec.h>
 #include <wrl/client.h>
 using Microsoft::WRL::ComPtr;
-static HANDLE g_hGameProcess = NULL;
-static DWORD g_gameProcessId = 0;
-static HWND g_hGameWindow = NULL;
-
-namespace {
-struct GameWindowSearch {
-    DWORD processId{ 0 };
-    HWND window{ NULL };
-};
-
-BOOL CALLBACK find_game_window(HWND window, LPARAM parameter) {
-    auto* search = reinterpret_cast<GameWindowSearch*>(parameter);
-    DWORD processId = 0;
-    GetWindowThreadProcessId(window, &processId);
-    if (processId != search->processId || GetWindow(window, GW_OWNER) != NULL ||
-        !IsWindowVisible(window)) return TRUE;
-    search->window = window;
-    return FALSE;
-}
-
-void stop_external_game() {
-    if (g_hGameWindow != NULL && IsWindow(g_hGameWindow)) SetParent(g_hGameWindow, NULL);
-    g_hGameWindow = NULL;
-    g_gameProcessId = 0;
-    if (g_hGameProcess == NULL) return;
-    DWORD exitCode = 0;
-    if (GetExitCodeProcess(g_hGameProcess, &exitCode) && exitCode == STILL_ACTIVE)
-        TerminateProcess(g_hGameProcess, 0);
-    CloseHandle(g_hGameProcess);
-    g_hGameProcess = NULL;
-}
-
-bool launch_external_game() {
-    stop_external_game();
-    const std::filesystem::path executable =
-        std::filesystem::path(VULKANCRAFT_SOURCE_DIR).parent_path() /
-        "1.5/build/Release/vulkan_craft.exe";
-    if (!std::filesystem::exists(executable)) {
-        std::cerr << "[Editor] Embedded game executable not found: "
-                  << executable.string() << '\n';
-        return false;
-    }
-
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    PROCESS_INFORMATION process{};
-    std::wstring application = executable.wstring();
-    std::wstring workingDirectory = executable.parent_path().wstring();
-    if (!CreateProcessW(application.c_str(), nullptr, nullptr, nullptr, FALSE, 0,
-                        nullptr, workingDirectory.c_str(), &startup, &process)) {
-        std::cerr << "[Editor] Failed to launch embedded game (Win32 error "
-                  << GetLastError() << ")\n";
-        return false;
-    }
-    g_hGameProcess = process.hProcess;
-    g_gameProcessId = process.dwProcessId;
-    CloseHandle(process.hThread);
-    std::cout << "[Editor] Game 1.5 launched for embedded viewport preview\n";
-    return true;
-}
-
-void update_embedded_game(GLFWwindow* editorWindow, const ImVec2& screenPosition,
-                          const ImVec2& size) {
-    if (g_hGameProcess == NULL || editorWindow == nullptr) return;
-    DWORD exitCode = 0;
-    if (!GetExitCodeProcess(g_hGameProcess, &exitCode) || exitCode != STILL_ACTIVE) {
-        stop_external_game();
-        return;
-    }
-    if (g_hGameWindow == NULL || !IsWindow(g_hGameWindow)) {
-        GameWindowSearch search{ g_gameProcessId, NULL };
-        EnumWindows(find_game_window, reinterpret_cast<LPARAM>(&search));
-        g_hGameWindow = search.window;
-        if (g_hGameWindow == NULL) return;
-
-        HWND editorNative = glfwGetWin32Window(editorWindow);
-        SetParent(g_hGameWindow, editorNative);
-        LONG_PTR style = GetWindowLongPtrW(g_hGameWindow, GWL_STYLE);
-        style &= ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX |
-                   WS_MAXIMIZEBOX | WS_SYSMENU);
-        style |= WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
-        SetWindowLongPtrW(g_hGameWindow, GWL_STYLE, style);
-        SetWindowPos(g_hGameWindow, HWND_TOP, 0, 0, 1, 1,
-                     SWP_FRAMECHANGED | SWP_NOACTIVATE);
-        std::cout << "[Editor] Game 1.5 attached to Scene Viewport\n";
-    }
-
-    // ImGui coordinates in this single-platform-window editor are already in
-    // the GLFW client coordinate space. Calling the screen-to-client
-    // conversion here caused the editor window position to be subtracted a
-    // second time, making the child game appear pinned to the desktop when the
-    // editor was dragged.
-    const int clientX = static_cast<int>(std::lround(screenPosition.x));
-    const int clientY = static_cast<int>(std::lround(screenPosition.y));
-    MoveWindow(g_hGameWindow, clientX, clientY,
-               std::max(1, static_cast<int>(std::lround(size.x))),
-               std::max(1, static_cast<int>(std::lround(size.y))), TRUE);
-}
-} // namespace
 #endif
 
 namespace Engine {
 
 EditorApplication::EditorApplication() {
+    // Loopback HTTP control API: drive the editor from a terminal or an agent
+    // via curl http://127.0.0.1:8321/{play,pause,resume,stop,step,state}.
+    m_controlApi.start(8321);
+
+    // Playback sink for the play-in-editor mixer (audio previews + play-mode
+    // audio components). Before this the Mixer rendered into a buffer that was
+    // never sent to a device, so nothing produced sound.
+    init_audio_output();
+
     const std::filesystem::path registryPath =
         std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db";
     if (std::filesystem::exists(registryPath) && !m_assetRegistry.load(registryPath)) {
@@ -200,6 +128,9 @@ EditorApplication::EditorApplication() {
 }
 
 EditorApplication::~EditorApplication() {
+    // Stop the loopback control API first so its thread never outlives the
+    // main loop / teardown (it only talks to 127.0.0.1).
+    m_controlApi.stop();
     cleanup();
 }
 
@@ -262,6 +193,8 @@ int EditorApplication::run() {
         init_scene_pipeline();
         init_geometry_buffers();
         init_default_scene();
+        // Persisted editor preferences (language, VSync, shadows, theme).
+        load_settings();
 
         // VC_EDITOR_TEST_RENDERGRAPH=1: exercise the render graph executor on
         // the real device — a two-pass graph (Scene → Composite) is recorded
@@ -293,6 +226,20 @@ void EditorApplication::init_window() {
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     m_window = glfwCreateWindow(m_windowWidth, m_windowHeight, tr("Vulkan Engine 1.5 - Gerenciador de Jogos", "Vulkan Engine 1.5 - Game Launcher"), nullptr, nullptr);
     if (!m_window) throw std::runtime_error("Failed to create GLFW window");
+    // Own scroll callback (chained by the ImGui backend, which stores it as its
+    // previous callback and forwards events). The camera consumes the delta
+    // when the 3D view is hovered; io.MouseWheel alone is useless there because
+    // ImGui clears it at the end of NewFrame, after the camera update.
+    glfwSetWindowUserPointer(m_window, this);
+    glfwSetScrollCallback(m_window, [](GLFWwindow* win, double /*xoff*/, double yoff) {
+        if (auto* app = static_cast<EditorApplication*>(glfwGetWindowUserPointer(win))) {
+            app->m_scrollAccum += yoff;
+        }
+    });
+    // Seed the mouse position so the first camera frame has no fake jump.
+    double mx = 0.0, my = 0.0;
+    glfwGetCursorPos(m_window, &mx, &my);
+    m_lastMousePos = glm::vec2(static_cast<float>(mx), static_cast<float>(my));
 }
 
 void EditorApplication::init_vulkan() {
@@ -323,6 +270,9 @@ void EditorApplication::init_vulkan() {
     if (!phys_ret) throw std::runtime_error("Failed to select physical GPU");
     vkb::PhysicalDevice vkb_gpu = phys_ret.value();
     m_physicalDevice = vkb_gpu.physical_device;
+    VkPhysicalDeviceProperties deviceProps{};
+    vkGetPhysicalDeviceProperties(m_physicalDevice, &deviceProps);
+    m_gpuName = deviceProps.deviceName ? deviceProps.deviceName : "Unknown GPU";
 
     vkb::DeviceBuilder device_builder{ vkb_gpu };
     auto dev_ret = device_builder.build();
@@ -455,41 +405,42 @@ void EditorApplication::init_imgui() {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
-    io.FontGlobalScale = 1.15f; // Typography readability scale
+    io.FontGlobalScale = 1.0f; // Forge design system: roomy, not oversized
 
-    // Apply Premium Modern Dark Slate & Indigo Palette
-    ImGui::StyleColorsDark();
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 6.0f;
-    style.FrameRounding = 5.0f;
-    style.PopupRounding = 6.0f;
-    style.GrabRounding = 4.0f;
-    style.TabRounding = 5.0f;
-    style.WindowBorderSize = 1.0f;
-    style.FrameBorderSize = 1.0f;
+    // Frontend port (Wicked Editor, MIT): the base UI font is Liberation Sans
+    // (the same font the Wicked editor ships, embedded zstd-compressed here),
+    // decompressed through the public compression provider. Static storage
+    // keeps the TTF alive for the atlas; the atlas must NOT take ownership.
+    {
+        auto provider = ::engine::compression::create_zstd_compression_provider();
+        std::string uiFontData = provider->decompress(std::string(
+            reinterpret_cast<const char*>(liberation_sans_zstd), sizeof(liberation_sans_zstd)));
+        if (!uiFontData.empty()) {
+            static std::string s_uiFont = std::move(uiFontData);
+            ImFontConfig baseConfig{};
+            baseConfig.FontDataOwnedByAtlas = false;
+            io.Fonts->AddFontFromMemoryTTF(const_cast<char*>(s_uiFont.data()),
+                                           static_cast<int>(s_uiFont.size()), 15.0f,
+                                           &baseConfig, io.Fonts->GetGlyphRangesDefault());
+        } else {
+            io.Fonts->AddFontDefault();
+        }
+    }
+    // Merge the Font Awesome 6 Solid icon font into the base font so ICON_FA_*
+    // strings render inline. Glyph range from IconsFontAwesome6.h (0xe005–0xf8ff).
+    static const ImWchar s_iconRanges[] = { ICON_MIN_FA, ICON_MAX_16_FA, 0 };
+    ImFontConfig iconConfig{};
+    iconConfig.MergeMode = true;
+    iconConfig.GlyphMinAdvanceX = 16.0f;
+    iconConfig.GlyphOffset = ImVec2(0.0f, 1.0f);
+    iconConfig.FontDataOwnedByAtlas = false;
+    io.Fonts->AddFontFromMemoryTTF(const_cast<uint8_t*>(font_awesome_v6),
+                                   static_cast<int>(sizeof(font_awesome_v6)), 15.0f,
+                                   &iconConfig, s_iconRanges);
 
-    // High Contrast Dark Obsidian Colors
-    style.Colors[ImGuiCol_Text] = ImVec4(0.95f, 0.96f, 0.98f, 1.00f);            // Pure White Text
-    style.Colors[ImGuiCol_TextDisabled] = ImVec4(0.55f, 0.60f, 0.70f, 1.00f);    // High contrast grey
-    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.09f, 0.12f, 1.00f);        // Deep Pitch Obsidian #14171F
-    style.Colors[ImGuiCol_ChildBg] = ImVec4(0.10f, 0.11f, 0.15f, 1.00f);         // Container Background #1A1D26
-    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.12f, 0.13f, 0.18f, 0.98f);
-    style.Colors[ImGuiCol_Border] = ImVec4(0.20f, 0.23f, 0.32f, 1.00f);          // Crisp Border #333B52
-    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.14f, 0.16f, 0.22f, 1.00f);         // Inputs #242938
-    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.22f, 0.25f, 0.35f, 1.00f);
-    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.28f, 0.32f, 0.45f, 1.00f);
-    style.Colors[ImGuiCol_TitleBg] = ImVec4(0.06f, 0.07f, 0.10f, 1.00f);
-    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.12f, 0.14f, 0.20f, 1.00f);
-    style.Colors[ImGuiCol_MenuBarBg] = ImVec4(0.09f, 0.10f, 0.14f, 1.00f);
-    style.Colors[ImGuiCol_Header] = ImVec4(0.18f, 0.21f, 0.30f, 1.00f);         // Selected Items
-    style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.28f, 0.32f, 0.45f, 1.00f);
-    style.Colors[ImGuiCol_HeaderActive] = ImVec4(0.39f, 0.40f, 0.95f, 1.00f);     // Active Indigo Glow #6366F1
-    style.Colors[ImGuiCol_Button] = ImVec4(0.16f, 0.19f, 0.28f, 1.00f);         // Buttons
-    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.39f, 0.40f, 0.95f, 1.00f);  // Indigo Glow Hover
-    style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.31f, 0.27f, 0.79f, 1.00f);
-    style.Colors[ImGuiCol_Tab] = ImVec4(0.10f, 0.11f, 0.15f, 1.00f);
-    style.Colors[ImGuiCol_TabHovered] = ImVec4(0.28f, 0.32f, 0.45f, 1.00f);
-    style.Colors[ImGuiCol_TabActive] = ImVec4(0.39f, 0.40f, 0.95f, 1.00f);       // Tab Highlight Indigo #6366F1
+    // Forge design system (light, product-grade). WindowMinSize (no panel can
+    // shrink below this) is set inside applyForgeTheme.
+    UI::applyForgeTheme();
 
     ImGui_ImplGlfw_InitForVulkan(m_window, true);
     ImGui_ImplVulkan_InitInfo init_info = {};
@@ -507,6 +458,22 @@ void EditorApplication::init_imgui() {
     init_info.PipelineInfoMain.Subpass = 0;
     init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     ImGui_ImplVulkan_Init(&init_info);
+
+    // Diagnostic (post-atlas-build): which console glyphs are missing?
+    {
+        const char* probe = "Português (Brasil) | Memória RAM | Placa de Vídeo | çãõéêáíóúâôàü";
+        std::string missing;
+        for (const unsigned char* p = reinterpret_cast<const unsigned char*>(probe); *p; ++p) {
+            if (*p < 0x20) continue;
+            ImFont* font = io.Fonts->Fonts.empty() ? nullptr : io.Fonts->Fonts[0];
+            if (!font || !font->IsGlyphInFont(*p)) {
+                char b[16];
+                snprintf(b, sizeof(b), "U+%04X ", *p);
+                missing += b;
+            }
+        }
+        std::cout << "[Font] " << (missing.empty() ? "All console glyphs covered" : ("Missing glyphs: " + missing)) << std::endl;
+    }
 }
 
 void EditorApplication::init_default_scene() {
@@ -524,6 +491,15 @@ void EditorApplication::init_default_scene() {
     m_editorGui.init(m_editorScene.get(), &m_undo);
     m_editorGui.set_asset_registry(&m_assetRegistry);
     m_editorGui.select_entity(m_selectedEntity);
+    // Disable the EditorGUI's own (English, undocked) panels: the real panels
+    // are the Portuguese ones drawn by EditorApplication. Keeping the flags
+    // false prevents duplicate floating windows ("World Outliner", "Inspector"...).
+    m_editorGui.showOutliner = false;
+    m_editorGui.showInspector = false;
+    m_editorGui.showContentBrowser = false;
+    m_editorGui.showConsole = false;
+    m_editorGui.showVoxelTools = false;
+    m_editorGui.showProfiler = false;
 
     if (std::getenv("VC_EDITOR_SKIP_LAUNCHER") != nullptr) {
         m_inLauncherMode = false;
@@ -533,6 +509,9 @@ void EditorApplication::init_default_scene() {
     // VC_EDITOR_TEST_MATERIAL=1: exercise the material-graph viewport path
     // (graph → GLSL → glslc → pipeline → per-entity UBO → draw) headlessly.
     if (std::getenv("VC_EDITOR_TEST_MATERIAL") != nullptr) {
+        // The material graph pipeline is built by the viewport pass, which
+        // only runs outside the launcher hub — leave the hub for this test.
+        m_inLauncherMode = false;
         m_materialTestMatId = UUID();
         m_materialTestMeshId = UUID();
         Entity matCube = m_editorScene->create_entity("Material Test Cube");
@@ -578,6 +557,10 @@ void EditorApplication::init_default_scene() {
     // world; the test asserts gravity moved it down while the viewport renders
     // the play scene.
     if (std::getenv("VC_EDITOR_TEST_PLAY") != nullptr) {
+        // The play world only ticks outside the launcher hub (main_loop gates
+        // tick_play_runtime on !m_inLauncherMode), so leave the hub for this
+        // headless verification of the in-engine game.
+        m_inLauncherMode = false;
         Entity fallingCube = m_editorScene->create_entity("Falling Cube");
         m_editorScene->transformComponents[fallingCube.get_id()].position = glm::vec3(0.0f, 5.0f, 0.0f);
         m_editorScene->rigidbodyComponents[fallingCube.get_id()] =
@@ -623,6 +606,39 @@ void EditorApplication::setup_play_runtime() {
         }
         const Physics::BodyHandle handle = m_playPhysics.create_body(desc);
         if (handle != Physics::InvalidBody) m_playBodies[id] = handle;
+    }
+
+    // Wicked-port runtime (formerly TODO(frontend-port)): constraints run as
+    // soft force-based constraints — the runtime solver exposes no rigid-joint
+    // API (PhysicsWorld's joints are a separate, unintegrated world). Each
+    // constraint stores the world anchors captured at play start; the tick
+    // applies spring forces to keep the anchors together (see
+    // tick_play_runtime). Springs just record a rest anchor.
+    for (const auto& [id, cn] : playScene->constraintComponents) {
+        if (!cn.enabled) continue;
+        if (!m_playBodies.contains(id)) continue;
+        const auto tit = playScene->transformComponents.find(id);
+        const glm::vec3 baseA = (tit != playScene->transformComponents.end())
+                                    ? tit->second.position
+                                    : glm::vec3(0.0f);
+        ConstraintRest rest;
+        rest.anchorA = baseA + cn.anchor;
+        rest.anchorB = baseA + cn.anchor; // refined when the other body exists
+        if (const auto bodyBIt = m_playBodies.find(cn.otherEntity); bodyBIt != m_playBodies.end()) {
+            if (Physics::RigidBody* bodyB = m_playPhysics.body(bodyBIt->second)) {
+                rest.anchorB = bodyB->position + cn.anchor;
+            }
+        }
+        rest.restLength = glm::length(rest.anchorB - rest.anchorA);
+        m_constraintRests[id] = rest;
+    }
+    for (const auto& [id, sp] : playScene->springComponents) {
+        if (sp.disabled || !sp.enabled) continue;
+        if (!m_playBodies.contains(id)) continue;
+        const auto tit = playScene->transformComponents.find(id);
+        m_springRests[id] = (tit != playScene->transformComponents.end())
+                                ? tit->second.position
+                                : glm::vec3(0.0f);
     }
 
     // Play particles (Fase 8): one ParticleSimulation emitter per
@@ -945,6 +961,102 @@ void EditorApplication::tick_play_runtime(float deltaTime) {
     if (state != PlayState::Play && state != PlayState::Simulate) return;
     Scene* playScene = m_playMode.get_active_scene();
     if (!playScene) return;
+
+    // Wicked-port runtime: force fields push/pull bodies within range;
+    // springs pull their body back toward the authored rest anchor. Both run
+    // before the solver step so the forces feed this frame's simulation.
+    for (const auto& [id, ff] : playScene->forceFieldComponents) {
+        if (!ff.enabled) continue;
+        const auto fit = playScene->transformComponents.find(id);
+        const glm::vec3 center = (fit != playScene->transformComponents.end())
+                                     ? fit->second.position
+                                     : glm::vec3(0.0f);
+        glm::vec3 forward(0.0f, 0.0f, 1.0f);
+        if (fit != playScene->transformComponents.end()) {
+            forward = glm::quat(glm::radians(fit->second.rotation)) * glm::vec3(0.0f, 0.0f, 1.0f);
+        }
+        for (const auto& [bid, handle] : m_playBodies) {
+            Physics::RigidBody* body = m_playPhysics.body(handle);
+            if (!body || !body->dynamic()) continue;
+            const glm::vec3 delta = body->position - center;
+            const float dist = glm::length(delta);
+            if (dist > ff.range) continue;
+            const float falloff = 1.0f - (ff.range > 0.01f ? dist / ff.range : 0.0f);
+            glm::vec3 force(0.0f);
+            switch (ff.type) {
+                case ForceFieldType::Gravity:
+                    force = glm::vec3(0.0f, -ff.strength * 9.81f, 0.0f);
+                    break;
+                case ForceFieldType::Push:
+                    force = forward * (ff.strength * 40.0f);
+                    break;
+                case ForceFieldType::Wind:
+                    force = forward * (ff.strength * 15.0f);
+                    break;
+                case ForceFieldType::Vortex: {
+                    const glm::vec3 tangent = glm::normalize(glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), delta));
+                    force = tangent * (ff.strength * 30.0f) + glm::vec3(0.0f, ff.strength * 2.0f, 0.0f);
+                    break;
+                }
+            }
+            m_playPhysics.add_force(handle, force * falloff);
+        }
+    }
+    for (const auto& [id, sp] : playScene->springComponents) {
+        if (sp.disabled || !sp.enabled) continue;
+        const auto restIt = m_springRests.find(id);
+        const auto bodyIt = m_playBodies.find(id);
+        if (restIt == m_springRests.end() || bodyIt == m_playBodies.end()) continue;
+        Physics::RigidBody* body = m_playPhysics.body(bodyIt->second);
+        if (!body || !body->dynamic()) continue;
+        const glm::vec3 force = (restIt->second - body->position) * (12.0f * sp.stiffness)
+                              - body->linearVelocity * (2.0f * sp.drag);
+        m_playPhysics.add_force(bodyIt->second, force);
+    }
+    // Wicked-port runtime: constraints as soft point-to-point springs between
+    // the entity's anchor and the target body's anchor (fixed when the other
+    // entity is missing). Broken when the required force exceeds breakForce.
+    for (const auto& [id, cn] : playScene->constraintComponents) {
+        if (!cn.enabled) continue;
+        auto restIt = m_constraintRests.find(id);
+        const auto bodyIt = m_playBodies.find(id);
+        if (restIt == m_constraintRests.end() || bodyIt == m_playBodies.end()) continue;
+        ConstraintRest& rest = restIt->second;
+        if (rest.broken) continue;
+        Physics::RigidBody* bodyA = m_playPhysics.body(bodyIt->second);
+        if (!bodyA || !bodyA->dynamic()) continue;
+        Physics::RigidBody* bodyB = nullptr;
+        Physics::BodyHandle bodyBHandle = Physics::InvalidBody;
+        if (const auto bodyBIt = m_playBodies.find(cn.otherEntity); bodyBIt != m_playBodies.end()) {
+            bodyB = m_playPhysics.body(bodyBIt->second);
+            bodyBHandle = bodyBIt->second;
+        }
+        const glm::vec3 anchorA = bodyA->position + cn.anchor;
+        glm::vec3 anchorB = rest.anchorB;
+        if (bodyB && bodyB->dynamic()) anchorB = bodyB->position + cn.anchor;
+        const glm::vec3 delta = anchorB - anchorA;
+        const float dist = glm::length(delta);
+        glm::vec3 force(0.0f);
+        if (dist > 1e-5f) {
+            const glm::vec3 dir = delta / dist;
+            if (cn.type == ConstraintType::Spring) {
+                force = dir * ((dist - rest.restLength) * 25.0f);
+            } else {
+                // Fixed / Hinge / Point: pull the anchors together (stiff).
+                force = dir * (dist * 40.0f);
+            }
+        }
+        force -= bodyA->linearVelocity * 0.8f; // axial damping, no ringing
+        if (cn.breakForce > 0.0f && glm::length(force) > cn.breakForce) {
+            rest.broken = true;
+            continue;
+        }
+        m_playPhysics.add_force(bodyIt->second, force);
+        if (bodyB && bodyB->dynamic() && bodyBHandle != Physics::InvalidBody) {
+            m_playPhysics.add_force(bodyBHandle, -force);
+        }
+    }
+
     m_playPhysics.step(deltaTime);
     for (const auto& [id, handle] : m_playBodies) {
         Physics::RigidBody* body = m_playPhysics.body(handle);
@@ -953,6 +1065,49 @@ void EditorApplication::tick_play_runtime(float deltaTime) {
         if (tit == playScene->transformComponents.end()) continue;
         tit->second.position = body->position;
         tit->second.rotation = glm::degrees(glm::eulerAngles(body->rotation));
+    }
+
+    // Wicked-port runtime: spline followers drive their entity along the
+    // Catmull-Rom path (looped) in play mode; kinematic bodies follow too.
+    for (const auto& [id, sp] : playScene->splineComponents) {
+        if (!sp.enabled || sp.points.size() < 2) continue;
+        auto tit = playScene->transformComponents.find(id);
+        if (tit == playScene->transformComponents.end()) continue;
+        auto [progIt, inserted] = m_splineProgress.try_emplace(id, 0.0f);
+        (void)inserted;
+        float total = 0.0f;
+        for (size_t i = 1; i < sp.points.size(); ++i) {
+            total += glm::length(sp.points[i] - sp.points[i - 1]);
+        }
+        if (total < 1e-4f) continue;
+        constexpr float kSplineSpeed = 2.0f; // m/s
+        progIt->second += kSplineSpeed * deltaTime / total;
+        if (sp.looped) {
+            progIt->second -= std::floor(progIt->second);
+        } else {
+            progIt->second = glm::clamp(progIt->second, 0.0f, 1.0f);
+        }
+        const float t = progIt->second * static_cast<float>(sp.points.size() - 1);
+        const size_t i = std::min<size_t>(static_cast<size_t>(t), sp.points.size() - 2);
+        const float f = t - static_cast<float>(i);
+        const glm::vec3& p0 = sp.points[i > 0 ? i - 1 : i];
+        const glm::vec3& p1 = sp.points[i];
+        const glm::vec3& p2 = sp.points[i + 1];
+        const glm::vec3& p3 = sp.points[std::min(i + 2, sp.points.size() - 1)];
+        const float f2 = f * f, f3 = f2 * f;
+        const glm::vec3 pos = 0.5f * ((2.0f * p1) + (-p0 + p2) * f
+            + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * f2
+            + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * f3);
+        tit->second.position = pos;
+        const auto bodyIt = m_playBodies.find(id);
+        if (bodyIt != m_playBodies.end()) {
+            Physics::RigidBody* body = m_playPhysics.body(bodyIt->second);
+            if (body) {
+                body->position = pos;
+                body->linearVelocity = glm::vec3(0.0f);
+                body->angularVelocity = glm::vec3(0.0f);
+            }
+        }
     }
 
     // Hot reload: recompile + swap the program when the .script changes on
@@ -1085,7 +1240,6 @@ void EditorApplication::tick_play_runtime(float deltaTime) {
         auto ac = playScene->audioComponents.find(id);
         if (ac != playScene->audioComponents.end()) ac->second.playing = m_playAudio.is_active(voice);
     }
-    m_playAudio.render(1024);
 
     // Play destructibles (Fase 8): weapon hits from this frame apply radial
     // damage (chunks detach with an impulse) and the destroyed flag syncs.
@@ -1146,6 +1300,9 @@ void EditorApplication::tick_play_runtime(float deltaTime) {
 }
 
 void EditorApplication::teardown_play_runtime() {
+    m_constraintRests.clear();
+    m_springRests.clear();
+    m_splineProgress.clear();
     for (const auto& [id, handle] : m_playBodies) {
         (void)id;
         m_playPhysics.destroy_body(handle);
@@ -1389,11 +1546,110 @@ void EditorApplication::main_loop() {
         m_fps = 1.0f / std::max(deltaTime, 0.001f);
         m_frameTimeMs = deltaTime * 1000.0f;
 
+        // Graphics changes (Opções Gráficas) are deferred to here — before
+        // acquire, with nothing in flight — so the swapchain and shadow map
+        // can be recreated safely.
+        if (m_recreateSwapchain) {
+            m_recreateSwapchain = false;
+            recreate_swapchain();
+        }
+        if (m_recreateShadowMap) {
+            m_recreateShadowMap = false;
+            const uint32_t newSize = shadow_size_from_quality(m_shadowQuality);
+            if (m_shadowMap.size != newSize) {
+                vkDeviceWaitIdle(m_device);
+                m_shadowMap.size = newSize;
+                create_shadow_map();
+            }
+        }
+
         if (!m_inLauncherMode) {
+            // Control API: execute queued commands (play/pause/resume/stop/step)
+            // from the loopback HTTP server, then publish live state for /state.
+            {
+                for (const std::string& cmd : m_controlApi.drain_commands()) handle_control_command(cmd);
+            }
+            {
+                EditorApiState api;
+                switch (m_playMode.get_state()) {
+                    case PlayState::Play: api.state = "play"; break;
+                    case PlayState::Pause: api.state = "pause"; break;
+                    case PlayState::Simulate: api.state = "simulate"; break;
+                    default: break;
+                }
+                Scene* s = m_playMode.get_active_scene();
+                api.fps = m_fps;
+                api.entities = s ? s->get_entities().size() : 0u;
+                api.orbitDistance = m_editorCamera.orbitDistance;
+                api.viewportHovered = m_viewportHovered;
+                api.imageHovered = m_viewportImageHovered;
+                ImGuiIO& io = ImGui::GetIO();
+                api.keyboardCapture = io.WantCaptureKeyboard;
+                api.typing = io.WantTextInput;
+                api.camX = m_editorCamera.position.x;
+                api.camY = m_editorCamera.position.y;
+                api.camZ = m_editorCamera.position.z;
+                api.yaw = m_editorCamera.yaw;
+                api.pitch = m_editorCamera.pitch;
+                api.vsync = m_vsyncEnabled;
+                api.shadowQuality = m_shadowQuality;
+                api.terrainValid = m_terrainValid;
+                if (m_terrainValid) {
+                    const int seg = m_terrainParams.segments;
+                    api.terrainVertices = static_cast<std::size_t>(seg + 1) * (seg + 1);
+                    api.terrainTriangles = m_terrainIndexCount / 3;
+                }
+                api.meshEdited = m_meshEdited;
+                api.settingsPath = m_settingsPath;
+                api.selectedEntity = m_selectedEntity.is_valid()
+                    ? m_selectedEntity.get_id().to_string() : std::string();
+                switch (m_gizmoMode) {
+                    case GizmoMode::Select: api.gizmoMode = "select"; break;
+                    case GizmoMode::Translate: api.gizmoMode = "translate"; break;
+                    case GizmoMode::Rotate: api.gizmoMode = "rotate"; break;
+                    case GizmoMode::Scale: api.gizmoMode = "scale"; break;
+                }
+                if (m_gizmoLocal) api.gizmoMode += ":local";
+                api.snap = m_snapTranslate;
+                api.camTargetX = m_editorCamera.orbitTarget.x;
+                api.camTargetY = m_editorCamera.orbitTarget.y;
+                api.camTargetZ = m_editorCamera.orbitTarget.z;
+                api.lastSelfTest = m_lastSelfTestResult;
+                switch (m_playScript.status()) {
+                    case VMStatus::Idle: api.scriptState = "idle"; break;
+                    case VMStatus::Running: api.scriptState = "running"; break;
+                    case VMStatus::Waiting: api.scriptState = "waiting"; break;
+                    case VMStatus::Paused: api.scriptState = "paused"; break;
+                    case VMStatus::Completed: api.scriptState = "completed"; break;
+                    case VMStatus::Error: api.scriptState = "error"; break;
+                }
+                m_controlApi.publish_state(api);
+            }
             update_editor_camera(deltaTime);
             process_viewport_input();
+            if (m_stepRequested && m_playMode.get_state() == PlayState::Pause) {
+                // Advance the play world a single frame (Pause → Play → tick →
+                // Pause) so the PASSO button works.
+                m_stepRequested = false;
+                m_playMode.set_state(PlayState::Play);
+                tick_play_runtime(deltaTime);
+                m_playMode.set_state(PlayState::Pause);
+            } else {
+                m_stepRequested = false;
+            }
             tick_play_runtime(deltaTime);
         }
+
+        // Audio preview: pick up background decodes and start the requested
+        // voice. Must run every frame in EVERY mode (the asset browser is used
+        // in edit mode, where tick_play_runtime early-returns). The miniaudio
+        // device drives the mixer in real time when available; without a
+        // device we still advance it so voice state (▶/⏸) stays truthful.
+        pump_audio_preview_decodes();
+        if (!m_audioDeviceStarted) m_playAudio.render(1024);
+
+        // 3D asset thumbnails (mesh + block cubes): a few renders per frame.
+        pump_asset_thumbnails(4);
 
         render_frame();
 
@@ -1502,9 +1758,11 @@ void EditorApplication::render_frame() {
     vkBeginCommandBuffer(cmd, &beginInfo);
 
     if (!m_inLauncherMode) {
+        // Size the offscreen to the panel (not the fitted image) so its aspect
+        // ratio tracks the panel instead of locking onto its own previous size.
         recreate_offscreen_if_needed(
-            static_cast<uint32_t>(std::max(1.0f, m_viewportImageSize.x)),
-            static_cast<uint32_t>(std::max(1.0f, m_viewportImageSize.y)));
+            static_cast<uint32_t>(std::max(1.0f, m_viewportPanelSize.x)),
+            static_cast<uint32_t>(std::max(1.0f, m_viewportPanelSize.y)));
         if (m_offscreen.framebuffer != VK_NULL_HANDLE) {
             render_scene_to_offscreen(cmd);
         }
@@ -1530,18 +1788,25 @@ void EditorApplication::render_frame() {
     if (m_inLauncherMode) {
         draw_project_launcher();
     } else {
-        m_editorGui.update(0.0f);
-        draw_dockspace();
+        // Ctrl+K: focus the global search box (the command palette).
+        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_K)) {
+            m_focusGlobalSearch = true;
+        }
+
+        // Draw order matters for the shell: main menu bar on top, then the
+        // app bar, then the dockspace fills the remaining area (each positioned
+        // from viewport->Pos/Size, so nothing is double-offset).
         draw_menu_bar();
-        draw_toolbar();
-        draw_hierarchy_panel();
-        draw_inspector_panel();
-        draw_viewport_panel();
-        draw_content_browser_panel();
+        draw_app_bar();
+        draw_dockspace();
+        if (m_showHierarchy) draw_hierarchy_panel();
+        if (m_showInspector) draw_inspector_panel();
+        if (m_showViewport) draw_viewport_panel();
+        if (m_showContentBrowser) draw_content_browser_panel();
 #if VC_ENABLE_VOXEL_PLUGIN
-        draw_voxel_tool_panel();
+        if (m_showVoxelTools) draw_voxel_tool_panel();
 #endif
-        draw_console_panel();
+        if (m_showConsole) draw_console_panel();
         if (m_showScriptDebugger) draw_script_debugger_panel();
         if (m_showScriptCanvas) { if (!m_scriptCanvasLoaded) load_script_canvas(); draw_script_canvas_panel(); }
         {
@@ -1557,6 +1822,71 @@ void EditorApplication::render_frame() {
         if (!activeScene) activeScene = m_editorScene.get();
         m_specializedEditors.set_scene_context(activeScene, m_selectedEntity.get_id());
         m_specializedEditors.draw();
+        {
+            // Wicked-port tool windows: refresh the live context every frame.
+            m_wickedTools.set_context(activeScene, m_selectedEntity.get_id(), &m_currentLanguage);
+            m_wickedTools.set_asset_registry(&m_assetRegistry);
+            m_wickedTools.set_open_specialized_editors(&m_specializedEditors.open);
+            m_wickedTools.set_on_entity_deleted([this](UUID doomed) {
+                // A tool panel deleted the entity: clear the editor selection so
+                // the Inspector/hierarchy don't keep a dangling reference.
+                if (m_selectedEntity.is_valid() && m_selectedEntity.get_id() == doomed) {
+                    m_selectedEntity = Entity();
+                    m_editorGui.select_entity(m_selectedEntity);
+                }
+            });
+            m_wickedTools.set_create_project_callback([this](const std::string& name,
+                                                             const std::string& folder) -> std::string {
+                return create_project(name, folder);
+            });
+            m_wickedTools.set_terrain_callback([this](float scale, int octaves, float amount, float falloff) {
+                generate_terrain_mesh(TerrainParams{ scale, octaves, amount, falloff });
+            });
+            m_wickedTools.set_graphics_callback([this](bool vsync, int quality) {
+                apply_graphics_settings(vsync, quality);
+            });
+            m_wickedTools.set_save_settings_callback([this]() { save_settings(); });
+            m_wickedTools.set_mesh_callback([this](int mode) -> std::string { return apply_mesh_normals(mode); });
+            // Dev panel: route Control-API commands through the same handler the
+            // HTTP API uses, and run headless self-tests on demand.
+            m_wickedTools.set_control_command_callback([this](const std::string& cmd) {
+                handle_control_command(cmd);
+            });
+            m_wickedTools.set_self_test_callback([this](int which) -> std::string {
+                return run_editor_self_test(which);
+            });
+            m_wickedTools.set_package_assets_callback([this]() -> std::string {
+                return package_assets_only();
+            });
+            m_wickedTools.set_hot_reload_status_callback([this]() -> std::string {
+                if (!m_assetHotReload) return tr("inativo", "inactive");
+                const size_t watched = m_assetRegistry.snapshot().size();
+                return tr("ativo — vigia ", "active — watches ") + std::to_string(watched) +
+                       tr(" asset(s) e reimporta mudanças nos arquivos de origem",
+                          " asset(s) and reimports source-file changes");
+            });
+            m_wickedTools.set_play_state(static_cast<int>(m_playMode.get_state()));
+            // Profiler: feed frame stats every frame for the graph window.
+            m_wickedTools.set_frame_stats(m_fps, m_frameTimeMs);
+            m_wickedTools.set_import_asset_callback([this](const std::string& requested) -> std::string {
+                // "" = ask for a file via the editor's Windows dialog.
+                std::string path = requested;
+                if (path.empty()) {
+                    if (!pick_file_dialog(path, L"Modelos (*.gltf;*.fbx;*.obj;*.ply)\0*.gltf;*.fbx;*.obj;*.ply\0Todos (*.*)\0*.*\0",
+                                           L"Importar Modelo", nullptr)) {
+                        return std::string();
+                    }
+                }
+                if (!m_assetPipeline) return "Sem pipeline de assets.";
+                const std::filesystem::path cookedRoot =
+                    std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "DerivedDataCache";
+                const ImportResult result = m_assetPipeline->import({ path, cookedRoot, 1 });
+                if (!result) return "Falha: " + result.error;
+                std::cout << "[Editor] Modelo importado: " << path << " (" << result.asset.id.to_string() << ")" << std::endl;
+                return "OK: " + result.asset.sourcePath.filename().string();
+            });
+            m_wickedTools.draw();
+        }
     }
 
     ImGui::Render();
@@ -1652,7 +1982,18 @@ void EditorApplication::recreate_swapchain() {
     createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     createInfo.preTransform = capabilities.currentTransform;
     createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    createInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    // VSync (Opções Gráficas): FIFO when on; MAILBOX (preferred) or IMMEDIATE
+    // when off — queried from the surface so unsupported modes never break.
+    createInfo.presentMode = m_vsyncEnabled ? VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_IMMEDIATE_KHR;
+    if (!m_vsyncEnabled) {
+        uint32_t modeCount = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(m_physicalDevice, m_surface, &modeCount, nullptr);
+        std::vector<VkPresentModeKHR> modes(modeCount);
+        vkGetPhysicalDeviceSurfacePresentModesKHR(m_physicalDevice, m_surface, &modeCount, modes.data());
+        for (const VkPresentModeKHR mode : modes) {
+            if (mode == VK_PRESENT_MODE_MAILBOX_KHR) { createInfo.presentMode = mode; break; }
+        }
+    }
     createInfo.clipped = VK_TRUE;
     createInfo.oldSwapchain = oldSwapchain;
     if (vkCreateSwapchainKHR(m_device, &createInfo, nullptr, &m_swapchain) != VK_SUCCESS) {
@@ -1724,18 +2065,15 @@ void EditorApplication::draw_project_launcher() {
     ImGui::Separator();
     ImGui::Spacing();
 
-    struct ProjectItem {
-        std::string name;
-        std::string path;
-        std::string preset;
-        std::string badge;
-        ImVec4 badgeColor;
-        std::string lastModified;
-    };
+    // Scan Projects/ for real project folders (no hardcoded list).
+    std::vector<LauncherProject> projects;
+    scan_projects(projects);
 
-    static const std::vector<ProjectItem> projects = {
-        { "EmptyProject", "Projects/EmptyProject", tr("Projeto vazio reutilizável", "Reusable empty project"), tr("[GENÉRICO]", "[GENERIC]"), ImVec4(0.4f, 0.7f, 1.0f, 1.0f), tr("Novo", "New") }
-    };
+    if (projects.empty()) {
+        ImGui::TextDisabled("%s", tr("Nenhum projeto encontrado em Projects/ — crie um novo acima.",
+                                      "No projects found in Projects/ — create one above."));
+        ImGui::Spacing();
+    }
 
     for (int i = 0; i < static_cast<int>(projects.size()); ++i) {
         const auto& proj = projects[i];
@@ -1755,10 +2093,11 @@ void EditorApplication::draw_project_launcher() {
         ImGui::BeginGroup();
         ImGui::TextColored(isSelected ? ImVec4(0.4f, 0.7f, 1.0f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "[JOGO]  %s", proj.name.c_str());
         ImGui::SameLine();
-        ImGui::TextColored(proj.badgeColor, "%s", proj.badge.c_str());
+        ImGui::TextColored(proj.hasScene ? ImVec4(0.20f, 0.82f, 0.60f, 1.0f) : ImVec4(0.4f, 0.7f, 1.0f, 1.0f),
+                           proj.hasScene ? tr("[TEM CENA]", "[HAS SCENE]") : tr("[VAZIO]", "[EMPTY]"));
 
         ImGui::TextDisabled("Pasta: %s", proj.path.c_str());
-        ImGui::Text("Tipo: %s  |  Modificado: %s", proj.preset.c_str(), proj.lastModified.c_str());
+        ImGui::TextDisabled("%s: %s", tr("Modificado", "Last modified"), proj.lastModified.c_str());
         ImGui::EndGroup();
 
         ImGui::PopID();
@@ -1785,7 +2124,16 @@ void EditorApplication::draw_project_launcher() {
         glfwSetWindowTitle(m_window, "Vulkan Engine Studio 1.5 - [Novo Jogo]");
     }
     ImGui::SameLine();
-    if (ImGui::Button(tr("Procurar Pasta...", "Browse Folder..."), ImVec2(220, 44))) {}
+    if (ImGui::Button(tr("Procurar Pasta...", "Browse Folder..."), ImVec2(220, 44))) {
+        std::string folder;
+        if (pick_folder_dialog(folder, L"Escolher pasta do projeto")) {
+            // Enter the editor scoped to the chosen project folder.
+            m_currentProjectName = std::filesystem::path(folder).filename().string();
+            if (m_currentProjectName.empty()) m_currentProjectName = "Projeto";
+            m_inLauncherMode = false;
+            glfwSetWindowTitle(m_window, ("Vulkan Engine Studio 1.5 - [" + m_currentProjectName + "]").c_str());
+        }
+    }
 
     ImGui::End();
 }
@@ -1795,9 +2143,13 @@ void EditorApplication::draw_dockspace() {
     ImGuiID dockspace_id = ImGui::GetID("VulkanEngineStudioDockspace");
 
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    float toolbarHeight = 36.0f;
-    ImVec2 dockPos = ImVec2(viewport->WorkPos.x, viewport->WorkPos.y + toolbarHeight);
-    ImVec2 dockSize = ImVec2(viewport->WorkSize.x, viewport->WorkSize.y - toolbarHeight);
+    // Dock area starts below the main menu bar + the 56 px app bar. Base the
+    // math on viewport->Pos/Size (not WorkPos/WorkSize, which already accounts
+    // for the menu bar) so the offset is applied exactly once.
+    const float menuBarHeight = ImGui::GetFrameHeight();
+    const float appBarHeight = 56.0f;
+    ImVec2 dockPos = ImVec2(viewport->Pos.x, viewport->Pos.y + menuBarHeight + appBarHeight);
+    ImVec2 dockSize = ImVec2(viewport->Size.x, viewport->Size.y - menuBarHeight - appBarHeight);
 
     ImGui::SetNextWindowPos(dockPos);
     ImGui::SetNextWindowSize(dockSize);
@@ -1805,14 +2157,16 @@ void EditorApplication::draw_dockspace() {
 
     ImGuiWindowFlags host_window_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
-        ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_MenuBar;
+        ImGuiWindowFlags_NoNavFocus;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    // No global WindowMinSize may inflate the shell (it fills the remaining area).
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1.0f, 1.0f));
 
     ImGui::Begin("Vulkan Engine Studio Shell", nullptr, host_window_flags);
-    ImGui::PopStyleVar(3);
+    ImGui::PopStyleVar(4);
 
     ImGuiDockNodeFlags dockspace_flags = ImGuiDockNodeFlags_PassthruCentralNode;
     ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dockspace_flags);
@@ -1824,17 +2178,21 @@ void EditorApplication::draw_dockspace() {
         ImGui::DockBuilderSetNodeSize(dockspace_id, dockSize);
 
         ImGuiID dock_main_id = dockspace_id;
-        ImGuiID dock_left = ImGui::DockBuilderSplitNode(dock_main_id, ImGuiDir_Left, 0.22f, nullptr, &dock_main_id);
+        ImGuiID dock_left = ImGui::DockBuilderSplitNode(dock_main_id, ImGuiDir_Left, 0.20f, nullptr, &dock_main_id);
+        // The left column is split vertically: Scene (always visible) on top,
+        // the voxel sculpting tools below it — never a competing tab that hides
+        // the scene hierarchy.
+        ImGuiID dock_left_bottom = ImGui::DockBuilderSplitNode(dock_left, ImGuiDir_Down, 0.30f, nullptr, &dock_left);
         ImGuiID dock_right = ImGui::DockBuilderSplitNode(dock_main_id, ImGuiDir_Right, 0.25f, nullptr, &dock_main_id);
-        ImGuiID dock_bottom = ImGui::DockBuilderSplitNode(dock_main_id, ImGuiDir_Down, 0.32f, nullptr, &dock_main_id);
+        ImGuiID dock_bottom = ImGui::DockBuilderSplitNode(dock_main_id, ImGuiDir_Down, 0.25f, nullptr, &dock_main_id);
 
-        ImGui::DockBuilderDockWindow(tr("Objetos do Jogo", "World Hierarchy"), dock_left);
-        ImGui::DockBuilderDockWindow(tr("Propriedades do Objeto", "Inspector"), dock_right);
-        ImGui::DockBuilderDockWindow(tr("Visualização 3D", "Scene Viewport"), dock_main_id);
-        ImGui::DockBuilderDockWindow(tr("Arquivos do Projeto", "Project Content Browser"), dock_bottom);
-        ImGui::DockBuilderDockWindow(tr("Mensagens do Sistema", "Console & Profiler"), dock_bottom);
+        ImGui::DockBuilderDockWindow(tr("Cena", "Scene"), dock_left);
+        ImGui::DockBuilderDockWindow(tr("Inspector", "Inspector"), dock_right);
+        ImGui::DockBuilderDockWindow(tr("Viewport", "Viewport"), dock_main_id);
+        ImGui::DockBuilderDockWindow(tr("Assets", "Assets"), dock_bottom);
+        ImGui::DockBuilderDockWindow(tr("Console", "Console"), dock_bottom);
 #if VC_ENABLE_VOXEL_PLUGIN
-        ImGui::DockBuilderDockWindow(tr("Escultura de Blocos", "Voxel Sculpting Tools"), dock_left);
+        ImGui::DockBuilderDockWindow(tr("Escultura de Blocos", "Voxel Sculpting Tools"), dock_left_bottom);
 #endif
 
         ImGui::DockBuilderFinish(dockspace_id);
@@ -1852,12 +2210,21 @@ void EditorApplication::draw_menu_bar() {
             }
             ImGui::Separator();
             if (ImGui::MenuItem(tr("Novo Jogo", "New Scene"), "Ctrl+N")) {
-                m_editorScene = std::make_unique<Scene>("Untitled Scene");
-                init_default_scene();
+                // Ask whether to save the current scene before discarding it.
+                m_pendingNewSceneConfirm = true;
             }
-            if (ImGui::MenuItem(tr("Abrir Jogo...", "Open Scene..."), "Ctrl+O")) {}
+            if (ImGui::MenuItem(tr("Abrir Jogo...", "Open Scene..."), "Ctrl+O")) {
+                std::string scenePath;
+                if (pick_file_dialog(scenePath, L"Cenas Vulkan Engine (*.scene)\0*.scene\0Todos (*.*)\0*.*\0",
+                                     L"Abrir Cena", L"scene")) {
+                    load_scene_file(scenePath);
+                }
+            }
             if (ImGui::MenuItem(tr("Salvar Jogo", "Save Scene"), "Ctrl+S")) {
-                if (m_editorScene) m_editorScene->save_to_file("assets/scenes/active_world.scene");
+                save_current_scene();
+            }
+            if (ImGui::MenuItem(tr("Salvar Como...", "Save Scene As..."))) {
+                save_scene_as();
             }
             ImGui::Separator();
             if (ImGui::MenuItem(tr("Exportar Jogo Pronto (.exe)", "Export Executable Game Build..."))) {
@@ -1950,139 +2317,553 @@ void EditorApplication::draw_menu_bar() {
         }
 
         if (ImGui::BeginMenu(tr("Janelas", "Window"))) {
-            ImGui::MenuItem(tr("Visualização 3D", "Scene Viewport"), nullptr, nullptr);
-            ImGui::MenuItem(tr("Objetos do Jogo", "World Hierarchy"), nullptr, nullptr);
-            ImGui::MenuItem(tr("Propriedades do Objeto", "Inspector"), nullptr, nullptr);
-            ImGui::MenuItem(tr("Arquivos do Projeto", "Project Content Browser"), nullptr, nullptr);
+            ImGui::MenuItem(tr("Viewport", "Viewport"), nullptr, &m_showViewport);
+            ImGui::MenuItem(tr("Cena", "Scene"), nullptr, &m_showHierarchy);
+            ImGui::MenuItem(tr("Inspector", "Inspector"), nullptr, &m_showInspector);
+            ImGui::MenuItem(tr("Assets", "Assets"), nullptr, &m_showContentBrowser);
 #if VC_ENABLE_VOXEL_PLUGIN
-            ImGui::MenuItem(tr("Escultura de Blocos", "Voxel Sculpting Tools"), nullptr, nullptr);
+            ImGui::MenuItem(tr("Escultura de Blocos", "Voxel Sculpting Tools"), nullptr, &m_showVoxelTools);
 #endif
-            ImGui::MenuItem(tr("Mensagens do Sistema", "Console & Profiler"), nullptr, nullptr);
+            ImGui::MenuItem(tr("Console", "Console"), nullptr, &m_showConsole);
             ImGui::MenuItem(tr("Debugger de Scripts", "Script Debugger"), nullptr, &m_showScriptDebugger);
             ImGui::MenuItem(tr("Canvas de Scripts", "Script Canvas"), nullptr, &m_showScriptCanvas);
             ImGui::Separator();
             ImGui::MenuItem(tr("Editores Especializados", "Specialized Editors"), nullptr, &m_specializedEditors.open);
+            m_wickedTools.draw_tools_menu();
             ImGui::EndMenu();
         }
 
         if (ImGui::BeginMenu(tr("Ajuda", "Help"))) {
-            if (ImGui::MenuItem(tr("Manual da Engine", "Vulkan Engine Documentation"))) {}
-            if (ImGui::MenuItem(tr("Sobre a Engine", "About Vulkan Engine Studio 1.5"))) {}
+            if (ImGui::MenuItem(tr("Como Usar (Guia)", "How to Use (Guide)"))) {
+                m_wickedTools.showGuideWindow = !m_wickedTools.showGuideWindow;
+            }
+            if (ImGui::MenuItem(tr("Painel de Desenvolvimento", "Developer Panel"))) {
+                m_wickedTools.showDevWindow = !m_wickedTools.showDevWindow;
+            }
+            if (ImGui::MenuItem(tr("Manual da Engine", "Vulkan Engine Documentation"))) {
+                // Open the docs folder in Explorer (best effort).
+                std::string docsDir = "docs";
+                if (std::filesystem::exists("docs")) {
+                    ShellExecuteW(nullptr, L"open", L"docs", nullptr, nullptr, SW_SHOWNORMAL);
+                } else if (std::filesystem::exists("../docs")) {
+                    ShellExecuteW(nullptr, L"open", L"..\\docs", nullptr, nullptr, SW_SHOWNORMAL);
+                }
+            }
+            if (ImGui::MenuItem(tr("Sobre a Engine", "About Vulkan Engine Studio 1.5"))) {
+                m_showAboutDialog = true;
+            }
             ImGui::EndMenu();
+        }
+
+        // Sobre — modal simples.
+        if (m_showAboutDialog) {
+            ImGui::OpenPopup(tr("Sobre a Engine", "About"));
+            m_showAboutDialog = false;
+        }
+        if (ImGui::BeginPopupModal(tr("Sobre a Engine", "About"), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("Vulkan Engine Studio 1.5.0");
+            ImGui::Separator();
+            ImGui::TextWrapped("%s", tr(
+                "Engine de jogos em Vulkan 1.3 (renderer, cena, ECS, física, "
+                "assets, voxel, navegação, áudio, scripting). Frontend do editor "
+                "inspirado/portado do Wicked Engine (MIT) — ver "
+                "src/editor/frontend/PORTS.md.",
+                "Vulkan game engine on Vulkan 1.3 (renderer, scene, ECS, physics, "
+                "assets, voxel, navigation, audio, scripting). Editor frontend "
+                "ported/inspired by Wicked Engine (MIT) — see "
+                "src/editor/frontend/PORTS.md."));
+            if (ImGui::Button(tr("Fechar", "Close"))) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
+        // Novo Jogo: confirm before discarding the current scene + name it.
+        if (m_pendingNewSceneConfirm) {
+            ImGui::OpenPopup(tr("Novo Jogo", "New Scene"));
+            m_pendingNewSceneConfirm = false;
+        }
+        if (ImGui::BeginPopupModal(tr("Novo Jogo", "New Scene"), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextWrapped("%s", tr("Criar uma nova cena? A cena atual será descartada.",
+                                          "Create a new scene? The current scene will be discarded."));
+            ImGui::Separator();
+            ImGui::InputText(tr("Nome da Cena", "Scene Name"), m_newSceneName, sizeof(m_newSceneName));
+            ImGui::Spacing();
+            if (ImGui::Button(tr("Salvar e Criar", "Save & Create"), ImVec2(150, 0))) {
+                save_current_scene();
+                create_new_scene();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(tr("Criar Sem Salvar", "Create Without Saving"), ImVec2(180, 0))) {
+                create_new_scene();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(tr("Cancelar", "Cancel"), ImVec2(110, 0))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
         }
 
         ImGui::EndMainMenuBar();
     }
 }
 
-void EditorApplication::draw_toolbar() {
+void EditorApplication::draw_app_bar() {
     ImGuiViewport* viewport = ImGui::GetMainViewport();
+    constexpr float kBarHeight = 56.0f;
 
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x, viewport->WorkPos.y + ImGui::GetFrameHeight()));
-    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, 36.0f));
+    // Position from viewport->Pos/Size: the menu bar occupies the first
+    // frame height, the app bar sits right below it (no WorkPos double-offset).
+    const float menuBarHeight = ImGui::GetFrameHeight();
+    ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x, viewport->Pos.y + menuBarHeight));
+    ImGui::SetNextWindowSize(ImVec2(viewport->Size.x, kBarHeight), ImGuiCond_Always);
 
-    ImGuiWindowFlags toolbarFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
-        ImGuiWindowFlags_NoDocking;
+        ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 4.0f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.09f, 0.10f, 0.14f, 1.00f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f, 10.0f));
+    // No global WindowMinSize may inflate this fixed 56 px bar.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1.0f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, UI::Colors::Surface);
 
-    ImGui::Begin("##TopSimulationToolbarPanel", nullptr, toolbarFlags);
+    ImGui::Begin("##AppBar", nullptr, flags);
     ImGui::PopStyleColor();
-    ImGui::PopStyleVar(3);
+    ImGui::PopStyleVar(4);
 
-    float btnWidth = 145.0f;
-    float btnHeight = 28.0f;
-    float totalWidth = (btnWidth * 3) + (ImGui::GetStyle().ItemSpacing.x * 2.0f);
+    // Search state is shared with the command palette drawn below the table.
+    static char search[128]{};
+    ImVec2 searchMin{ 0.0f, 0.0f };
+    ImVec2 searchMax{ 0.0f, 0.0f };
 
-    ImGui::SetCursorPosX((viewport->WorkSize.x - totalWidth) * 0.5f);
-    ImGui::SetCursorPosY(4.0f);
+    // 3-column responsive shell: Left (logo + actions) | Center (PLAY) |
+    // Right (search + config). The stretch columns absorb the window width so
+    // nothing is hard-positioned by fixed viewport math, and the table clips
+    // cell content instead of letting any element overflow the bar.
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(8.0f, 0.0f));
+    if (ImGui::BeginTable("##AppBarLayout", 3,
+                          ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
+        ImGui::TableSetupColumn("Left", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Center", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+        ImGui::TableSetupColumn("Right", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableNextRow();
 
-    PlayState state = m_playMode.get_state();
-
-    if (state == PlayState::Edit) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.06f, 0.72f, 0.50f, 1.00f)); // Emerald Green #10B981
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.82f, 0.60f, 1.00f));
-        if (ImGui::Button(tr("[ > TESTAR JOGO ]", "[ > PLAY ]"), ImVec2(btnWidth, btnHeight))) {
-            m_playMode.start_play(m_editorScene.get());
-            setup_play_runtime();
-#ifdef _WIN32
-            launch_external_game();
-#endif
+        // Left: logo + product name + New Scene / Import / Save.
+        ImGui::TableSetColumnIndex(0);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(UI::Colors::Accent, "%s", ICON_FA_CUBES);
+        ImGui::SameLine();
+        ImGui::TextUnformatted("VulkanCraft");
+        ImGui::SameLine();
+        if (ImGui::Button(tr(ICON_FA_PLUS "  Nova Cena", ICON_FA_PLUS "  New Scene"), ImVec2(122, 36))) {
+            m_pendingNewSceneConfirm = true;
         }
-        ImGui::PopStyleColor(2);
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.93f, 0.26f, 0.26f, 1.00f)); // Crimson Red #EF4444
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.98f, 0.40f, 0.40f, 1.00f));
-        if (ImGui::Button(tr("[ [] PARAR ]", "[ [] STOP ]"), ImVec2(btnWidth, btnHeight))) {
+        ImGui::SameLine();
+        if (ImGui::Button(tr(ICON_FA_FILE_IMPORT "  Importar", ICON_FA_FILE_IMPORT "  Import"), ImVec2(108, 36))) {
+            std::string path;
+            if (pick_file_dialog(path, L"Assets (*.*)\0*.*\0", L"Importar Asset", nullptr)) {
+                if (m_assetPipeline) {
+                    const std::filesystem::path cookedRoot =
+                        std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "DerivedDataCache";
+                    const ImportResult result = m_assetPipeline->import({ path, cookedRoot, 1 });
+                    if (result) {
+                        std::cout << "[Editor] Asset importado: " << result.asset.sourcePath.filename().string() << std::endl;
+                    } else {
+                        std::cout << "[Editor] Falha ao importar: " << result.error << std::endl;
+                    }
+                }
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(tr(ICON_FA_FLOPPY_DISK "  Salvar", ICON_FA_FLOPPY_DISK "  Save"), ImVec2(96, 36))) {
+            save_current_scene();
+        }
+        ImGui::SameLine();
+        // [Build] — the fundamental action lives in the app bar, not buried in
+        // Arquivo > Exportar.
+        if (ImGui::Button(tr(ICON_FA_HAMMER "  Build", ICON_FA_HAMMER "  Build"), ImVec2(96, 36))) {
+            run_game_build();
+        }
+
+        // Center: the single play button (green to start/resume, amber to
+        // pause; right-click while playing = PARAR), centered in its column.
+        ImGui::TableSetColumnIndex(1);
+        const float btnWidth = 150.0f;
+        const float btnHeight = 36.0f;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             ImMax(0.0f, (ImGui::GetContentRegionAvail().x - btnWidth) * 0.5f));
+
+        const PlayState state = m_playMode.get_state();
+        const bool inPlay = state != PlayState::Edit;
+        const bool paused = state == PlayState::Pause;
+        const std::string playLabel = std::string(" " ICON_FA_PLAY "  ") + tr("TESTAR JOGO", "PLAY");
+        const std::string resumeLabel = std::string(" " ICON_FA_PLAY "  ") + tr("CONTINUAR", "RESUME");
+        const std::string pauseLabel = std::string(" " ICON_FA_PAUSE "  ") + tr("PAUSAR", "PAUSE");
+
+        if (inPlay && !paused) {
+            ImGui::PushStyleColor(ImGuiCol_Button, UI::Colors::Warning);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.00f, 0.72f, 0.25f, 1.0f));
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, UI::Colors::Success);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.78f, 0.45f, 1.0f));
+        }
+        const char* playBtnLabel = paused ? resumeLabel.c_str() : (inPlay ? pauseLabel.c_str() : playLabel.c_str());
+        if (ImGui::Button(playBtnLabel, ImVec2(btnWidth, btnHeight))) {
+            if (!inPlay) {
+                m_playMode.start_play(m_editorScene.get());
+                setup_play_runtime();
+            } else {
+                m_playMode.pause_play();
+            }
+        }
+        // IsItemHovered() is false while the tooltip popup is open, so use the
+        // raw rect test for the right-click stop.
+        if (inPlay && ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
+            ImGui::IsMouseHoveringRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax())) {
             teardown_play_runtime();
             m_playMode.stop_play();
-#ifdef _WIN32
-            stop_external_game();
-#endif
+            m_selectedEntity = Entity();
+            m_editorGui.select_entity(m_selectedEntity);
         }
         ImGui::PopStyleColor(2);
-    }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", inPlay
+                ? tr("Clique: PAUSAR/CONTINUAR • Clique direito: PARAR o jogo",
+                     "Click: PAUSE/RESUME • Right-click: STOP the game")
+                : tr("Inicia o jogo interno (Play In Editor) — física, scripts, partículas e armas rodam no viewport",
+                     "Starts the in-engine game (Play In Editor) — physics, scripts, particles and weapons run in the viewport"));
+        }
+        // PASSO: single-frame step while paused (was Control-API-only).
+        if (paused) {
+            ImGui::SameLine();
+            if (ImGui::Button(tr(" PASSO ", " STEP "), ImVec2(0, btnHeight))) {
+                m_stepRequested = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", tr("Avança um único frame do jogo pausado (equivalente ao comando 'step' da Control API)", "Advances the paused game a single frame (same as the 'step' Control API command)"));
+            }
+        }
 
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.96f, 0.62f, 0.04f, 1.00f)); // Amber Gold #F59E0B
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.98f, 0.72f, 0.20f, 1.00f));
-    if (ImGui::Button(tr("[ || PAUSAR ]", "[ || PAUSE ]"), ImVec2(btnWidth, btnHeight))) {
-        m_playMode.pause_play();
-    }
-    ImGui::PopStyleColor(2);
+        // Right: search (stretches) + help + settings. The search box doubles
+        // as a real command palette (Ctrl+K focuses it; see below).
+        ImGui::TableSetColumnIndex(2);
+        const float iconArea = 2.0f * 26.0f + 2.0f * ImGui::GetStyle().ItemSpacing.x;
+        ImGui::SetNextItemWidth(ImMax(80.0f, ImGui::GetContentRegionAvail().x - iconArea));
+        if (m_focusGlobalSearch) {
+            ImGui::SetKeyboardFocusHere();
+            m_focusGlobalSearch = false;
+        }
+        ImGui::InputTextWithHint("##GlobalSearch", ICON_FA_MAGNIFYING_GLASS "  Buscar (Ctrl+K)", search, sizeof(search));
+        const ImVec2 searchMin = ImGui::GetItemRectMin();
+        const ImVec2 searchMax = ImGui::GetItemRectMax();
+        ImGui::SameLine();
+        if (UI::iconButton(ICON_FA_CIRCLE_QUESTION, tr("Ajuda", "Help"))) {
+            m_showAboutDialog = true;
+        }
+        ImGui::SameLine();
+        if (UI::iconButton(ICON_FA_GEAR, tr("Configurações", "Settings"))) {
+            m_wickedTools.showGeneralWindow = !m_wickedTools.showGeneralWindow;
+        }
 
-    ImGui::SameLine();
-    if (ImGui::Button(tr("[ >> PASSO ]", "[ >> STEP ]"), ImVec2(btnWidth, btnHeight))) {}
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleVar();
+
+    // Command palette: typing in the search box filters real commands, Enter
+    // runs the first match, Esc closes. Drawn outside the table (a floating
+    // window anchored below the search field).
+    if (search[0] != '\0') {
+        const float paletteW = ImMax(260.0f, searchMax.x - searchMin.x);
+        ImGui::SetNextWindowPos(ImVec2(searchMin.x, searchMax.y + 6.0f), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(paletteW, 0.0f), ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 8.0f));
+        ImGui::Begin("##CommandPalette", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+        ImGui::PopStyleVar();
+
+        std::string query = search;
+        std::transform(query.begin(), query.end(), query.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        struct PaletteCmd { const char* label; std::function<void()> run; };
+        const std::vector<PaletteCmd> cmds = {
+            { tr("Novo Jogo...", "New Scene..."), [this]() { m_pendingNewSceneConfirm = true; } },
+            { tr("Abrir Cena...", "Open Scene..."), [this]() {
+                std::string p;
+                if (pick_file_dialog(p, L"Cenas Vulkan Engine (*.scene)\0*.scene\0Todos (*.*)\0*.*\0", L"Abrir Cena", L"scene")) load_scene_file(p);
+            } },
+            { tr("Salvar Cena", "Save Scene"), [this]() { save_current_scene(); } },
+            { tr("Salvar Como...", "Save Scene As..."), [this]() { save_scene_as(); } },
+            { tr("Build / Exportar Jogo (.exe)", "Build / Export Executable"), [this]() { run_game_build(); } },
+            { tr("Importar Asset...", "Import Asset..."), [this]() {
+                std::string path;
+                if (pick_file_dialog(path, L"Assets (*.*)\0*.*\0", L"Importar Asset", nullptr)) {
+                    if (m_assetPipeline) {
+                        const std::filesystem::path cookedRoot =
+                            std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "DerivedDataCache";
+                        const ImportResult result = m_assetPipeline->import({ path, cookedRoot, 1 });
+                        if (!result) std::cerr << "[Editor] " << result.error << std::endl;
+                    }
+                }
+            } },
+            { tr("Adicionar Cubo", "Add Cube"), [this]() {
+                if (m_editorScene) {
+                    Entity e = m_editorScene->create_entity(tr("Cubo 3D", "Cube"));
+                    m_editorScene->meshRendererComponents[e.get_id()] = MeshRendererComponent{};
+                    m_selectedEntity = e;
+                }
+            } },
+            { tr("Adicionar Objeto Vazio", "Add Empty Object"), [this]() {
+                if (m_editorScene) m_selectedEntity = m_editorScene->create_entity(tr("Novo Objeto", "New Entity"));
+            } },
+            { tr("Adicionar Luz do Sol", "Add Directional Light"), [this]() {
+                if (m_editorScene) {
+                    Entity e = m_editorScene->create_entity(tr("Luz do Sol", "Directional Light"));
+                    m_editorScene->lightComponents[e.get_id()] = LightComponent{};
+                    m_selectedEntity = e;
+                }
+            } },
+            { tr("Testar Jogo / Parar", "Play / Stop"), [this]() {
+                if (m_playMode.get_state() == PlayState::Edit) {
+                    m_playMode.start_play(m_editorScene.get());
+                    setup_play_runtime();
+                } else {
+                    teardown_play_runtime();
+                    m_playMode.stop_play();
+                    m_selectedEntity = Entity();
+                    m_editorGui.select_entity(m_selectedEntity);
+                }
+            } },
+            { tr("Abrir Guia de Uso", "Open How-to-Use Guide"), [this]() { m_wickedTools.showGuideWindow = true; } },
+            { tr("Abrir Painel de Desenvolvimento", "Open Developer Panel"), [this]() { m_wickedTools.showDevWindow = true; } },
+            { tr("Desfazer", "Undo"), [this]() { m_undo.undo(); } },
+            { tr("Refazer", "Redo"), [this]() { m_undo.redo(); } },
+            { tr("Alternar Viewport", "Toggle Viewport"), [this]() { m_showViewport = !m_showViewport; } },
+            { tr("Alternar Cena", "Toggle Scene"), [this]() { m_showHierarchy = !m_showHierarchy; } },
+            { tr("Alternar Inspector", "Toggle Inspector"), [this]() { m_showInspector = !m_showInspector; } },
+            { tr("Alternar Assets", "Toggle Assets"), [this]() { m_showContentBrowser = !m_showContentBrowser; } },
+            { tr("Alternar Console", "Toggle Console"), [this]() { m_showConsole = !m_showConsole; } },
+            { tr("Alternar Grid", "Toggle Grid"), [this]() { m_showGrid = !m_showGrid; } },
+            { tr("Alternar Gizmos", "Toggle Gizmos"), [this]() { m_showGizmos = !m_showGizmos; } },
+            { tr("Alternar Colliders", "Toggle Colliders"), [this]() { m_showColliders = !m_showColliders; } },
+            { tr("Idioma: PT / EN", "Language: PT / EN"), [this]() {
+                m_currentLanguage = (m_currentLanguage == EngineLanguage::PT_BR) ? EngineLanguage::EN_US : EngineLanguage::PT_BR;
+            } },
+            { tr("Configurações", "Settings"), [this]() { m_wickedTools.showGeneralWindow = !m_wickedTools.showGeneralWindow; } },
+            { tr("Sobre a Engine", "About"), [this]() { m_showAboutDialog = true; } },
+        };
+
+        int shown = 0;
+        PaletteCmd firstMatch{ nullptr, nullptr };
+        for (const auto& c : cmds) {
+            std::string label = c.label;
+            std::transform(label.begin(), label.end(), label.begin(),
+                           [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            if (label.find(query) == std::string::npos) continue;
+            if (!firstMatch.run) firstMatch = c;
+            if (shown < 8) {
+                if (ImGui::Selectable(c.label)) {
+                    c.run();
+                    search[0] = '\0';
+                }
+                ++shown;
+            }
+        }
+        if (shown == 0) {
+            ImGui::TextDisabled("%s", tr("Nenhum comando encontrado", "No matching commands"));
+        }
+        if (firstMatch.run && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
+            firstMatch.run();
+            search[0] = '\0';
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            search[0] = '\0';
+        }
+
+        ImGui::End();
+    }
 
     ImGui::End();
 }
 
 void EditorApplication::draw_hierarchy_panel() {
-    ImGui::Begin(tr("Objetos do Jogo", "World Hierarchy"));
+    // Local minimum only (see draw_app_bar note about the global style).
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(240.0f, 180.0f));
+    ImGui::Begin(tr("Cena", "Scene"));
+    ImGui::PopStyleVar();
 
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.39f, 0.40f, 0.95f, 1.00f));
-    if (ImGui::Button(tr("+ Adicionar Objeto", "+ Add Entity"), ImVec2(160, 28))) {
-        if (m_editorScene) {
-            Entity ent = m_editorScene->create_entity(tr("Novo Objeto", "New Entity"));
-            m_selectedEntity = ent;
+    // Search + Add row: a real-time filter and the full entity creation menu.
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 52.0f);
+    ImGui::InputTextWithHint("##SceneSearch", ICON_FA_MAGNIFYING_GLASS "  Buscar na cena...", m_hierarchySearch, sizeof(m_hierarchySearch));
+    ImGui::SameLine();
+    if (ImGui::Button(ICON_FA_PLUS, ImVec2(40, 0))) ImGui::OpenPopup("##AddEntityMenu");
+
+    const auto createSel = [this](const std::string& name) -> Entity {
+        if (!m_editorScene) return Entity();
+        Entity e = m_editorScene->create_entity(name);
+        m_selectedEntity = e;
+        return e;
+    };
+    if (ImGui::BeginPopup("##AddEntityMenu")) {
+        ImGui::TextDisabled("%s", tr("BÁSICO", "BASIC"));
+        if (ImGui::MenuItem(tr("Objeto Vazio", "Empty Object"))) createSel(tr("Novo Objeto", "New Entity"));
+        if (ImGui::MenuItem(tr("Cubo 3D", "Cube"))) {
+            Entity e = createSel(tr("Cubo 3D", "Cube"));
+            if (e.is_valid()) m_editorScene->meshRendererComponents[e.get_id()] = MeshRendererComponent{};
         }
+        if (ImGui::MenuItem(tr("Câmera", "Camera"))) {
+            Entity e = createSel(tr("Câmera", "Camera"));
+            if (e.is_valid()) m_editorScene->cameraComponents[e.get_id()] = CameraComponent{};
+        }
+        ImGui::Separator();
+        ImGui::TextDisabled("%s", tr("ILUMINAÇÃO", "LIGHTING"));
+        if (ImGui::MenuItem(tr("Luz do Sol", "Directional Light"))) {
+            Entity e = createSel(tr("Luz do Sol", "Directional Light"));
+            if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{};
+        }
+        if (ImGui::MenuItem(tr("Luz de Lâmpada", "Point Light"))) {
+            Entity e = createSel(tr("Luz de Lâmpada", "Point Light"));
+            if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(1.0f, 0.8f, 0.4f), 5000.0f, 15.0f, true };
+        }
+        if (ImGui::MenuItem(tr("Luz Spot", "Spot Light"))) {
+            Entity e = createSel(tr("Luz Spot", "Spot Light"));
+            if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(0.2f, 0.5f, 1.0f), 4000.0f, 18.0f, true, LightType::Spot };
+        }
+        if (ImGui::MenuItem(tr("Luz de Área", "Area Light"))) {
+            Entity e = createSel(tr("Luz de Área", "Area Light"));
+            if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(1.0f, 0.4f, 0.9f), 1500.0f, 20.0f, true, LightType::Area };
+        }
+        ImGui::Separator();
+        ImGui::TextDisabled("%s", tr("EFEITOS", "EFFECTS"));
+        if (ImGui::MenuItem(tr("Emissor de Partículas", "Particle Emitter"))) {
+            Entity e = createSel(tr("Emissor de Partículas", "Particle Emitter"));
+            if (e.is_valid()) m_editorScene->particleEmitterComponents[e.get_id()] = ParticleEmitterComponent{};
+        }
+        if (ImGui::MenuItem(tr("Fonte de Áudio", "Audio Source"))) {
+            Entity e = createSel(tr("Fonte de Áudio", "Audio Source"));
+            if (e.is_valid()) m_editorScene->audioComponents[e.get_id()] = AudioComponent{};
+        }
+        ImGui::Separator();
+        ImGui::TextDisabled("%s", tr("FÍSICA / GAMEPLAY", "PHYSICS / GAMEPLAY"));
+        if (ImGui::MenuItem(tr("Corpo Rígido", "Rigidbody Object"))) {
+            Entity e = createSel(tr("Corpo Rígido", "Rigidbody Object"));
+            if (e.is_valid()) m_editorScene->rigidbodyComponents[e.get_id()] = RigidbodyComponent{};
+        }
+        if (ImGui::MenuItem(tr("Veículo", "Vehicle"))) {
+            Entity e = createSel(tr("Veículo", "Vehicle"));
+            if (e.is_valid()) m_editorScene->vehicleComponents[e.get_id()] = VehicleComponent{};
+        }
+        if (ImGui::MenuItem(tr("Destrutível", "Destructible"))) {
+            Entity e = createSel(tr("Destrutível", "Destructible"));
+            if (e.is_valid()) m_editorScene->destructionComponents[e.get_id()] = DestructionComponent{};
+        }
+        if (ImGui::MenuItem(tr("Agente de Navegação", "Navigation Agent"))) {
+            Entity e = createSel(tr("Agente de Navegação", "Navigation Agent"));
+            if (e.is_valid()) m_editorScene->navigationComponents[e.get_id()] = NavigationComponent{};
+        }
+        if (ImGui::MenuItem(tr("Missão", "Mission"))) {
+            Entity e = createSel(tr("Missão", "Mission"));
+            if (e.is_valid()) m_editorScene->missionComponents[e.get_id()] = MissionComponent{};
+        }
+        if (ImGui::MenuItem(tr("Diálogo", "Dialogue"))) {
+            Entity e = createSel(tr("Diálogo", "Dialogue"));
+            if (e.is_valid()) m_editorScene->dialogueComponents[e.get_id()] = DialogueComponent{};
+        }
+#if VC_ENABLE_VOXEL_PLUGIN
+        ImGui::Separator();
+        ImGui::TextDisabled("%s", tr("MUNDO", "WORLD"));
+        if (ImGui::MenuItem(tr("Mundo de Blocos", "Voxel Volume"))) {
+            Entity e = createSel(tr("Mundo de Blocos", "Voxel Volume"));
+            if (e.is_valid()) m_editorScene->voxelVolumeComponents[e.get_id()] = VoxelVolumeComponent{};
+        }
+#endif
+        ImGui::EndPopup();
     }
-    ImGui::PopStyleColor();
     ImGui::Separator();
 
     Scene* scene = m_playMode.get_active_scene();
-    if (scene) {
+    if (!scene) scene = m_editorScene.get();
+    if (!scene) {
+        ImGui::TextDisabled("%s", tr("Nenhuma cena aberta", "No scene open"));
+        ImGui::End();
+        return;
+    }
+
+    const std::string filter = m_hierarchySearch;
+    static const char* kEntityDrag = "VC_ENTITY";
+
+    // Recursive node renderer: real parent/child tree (roots first), with
+    // drag-to-reparent (cycle-safe) and a delete context menu.
+    std::function<void(UUID)> drawNode = [&](UUID id) {
+        const Entity* ent = scene->find_entity_by_id_const(id);
+        if (!ent) return;
+        const std::vector<UUID> children = scene->get_children(id);
+        const bool hasChildren = !children.empty();
+
+        ImGuiTreeNodeFlags flags = ((m_selectedEntity.is_valid() && m_selectedEntity.get_id() == id) ? ImGuiTreeNodeFlags_Selected : 0) |
+                                   ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
+                                   (hasChildren ? 0 : (ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen));
+
+        ImVec4 iconColor = ImVec4(0.60f, 0.60f, 0.68f, 1.0f);
+        if (scene->cameraComponents.contains(id)) iconColor = ImVec4(0.37f, 0.64f, 0.98f, 1.0f);
+        else if (scene->lightComponents.contains(id)) iconColor = ImVec4(0.98f, 0.75f, 0.14f, 1.0f);
+        else if (scene->voxelVolumeComponents.contains(id)) iconColor = ImVec4(0.20f, 0.82f, 0.60f, 1.0f);
+        else if (scene->meshRendererComponents.contains(id)) iconColor = ImVec4(0.45f, 0.55f, 0.85f, 1.0f);
+        else if (scene->particleEmitterComponents.contains(id)) iconColor = ImVec4(0.95f, 0.45f, 0.25f, 1.0f);
+
+        ImGui::TextColored(iconColor, "%s", UI::entityIcon(scene, id));
+        ImGui::SameLine();
+
+        const bool open = ImGui::TreeNodeEx(reinterpret_cast<void*>(id.get_high() ^ id.get_low()),
+                                            flags, "%s", ent->get_name().c_str());
+        if (ImGui::IsItemClicked()) {
+            m_selectedEntity = *ent;
+        }
+
+        // Drag source: pick this entity up to reparent it.
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoHoldToOpenOthers)) {
+            ImGui::SetDragDropPayload(kEntityDrag, &id, sizeof(UUID));
+            ImGui::TextUnformatted(ent->get_name().c_str());
+            ImGui::EndDragDropSource();
+        }
+        // Drop target: drop another entity here to make it a child.
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kEntityDrag)) {
+                UUID dragged;
+                std::memcpy(&dragged, payload->Data, sizeof(UUID));
+                if (dragged != id) scene->set_parent(dragged, id); // cycle-safe
+            }
+            ImGui::EndDragDropTarget();
+        }
+
+        if (ImGui::BeginPopupContextItem()) {
+            if (ImGui::MenuItem(tr("Deletar Objeto", "Delete Entity"))) {
+                scene->destroy_entity(id);
+                if (m_selectedEntity.is_valid() && m_selectedEntity.get_id() == id) m_selectedEntity = Entity();
+            }
+            ImGui::EndPopup();
+        }
+
+        if (hasChildren && open) {
+            for (const UUID& child : children) drawNode(child);
+            ImGui::TreePop();
+        }
+    };
+
+    if (filter.empty()) {
+        // Real hierarchy: roots first, then their children recursively.
         for (const auto& [id, entity] : scene->get_entities()) {
-            ImGuiTreeNodeFlags flags = ((m_selectedEntity == entity) ? ImGuiTreeNodeFlags_Selected : 0) | ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
-
-            std::string icon = "[Objeto]";
-            ImVec4 iconColor = ImVec4(0.7f, 0.7f, 0.8f, 1.0f);
-            if (scene->cameraComponents.contains(id)) { icon = "[Visão]"; iconColor = ImVec4(0.37f, 0.64f, 0.98f, 1.0f); }
-            else if (scene->lightComponents.contains(id)) { icon = "[Luz]"; iconColor = ImVec4(0.98f, 0.75f, 0.14f, 1.0f); }
-            else if (scene->voxelVolumeComponents.contains(id)) { icon = "[Blocos]"; iconColor = ImVec4(0.20f, 0.82f, 0.60f, 1.0f); }
-
-            ImGui::TextColored(iconColor, "%s", icon.c_str());
-            ImGui::SameLine();
-
-            bool opened = ImGui::TreeNodeEx(reinterpret_cast<void*>(id.get_high() ^ id.get_low()), flags, "%s", entity.get_name().c_str());
-
-            if (ImGui::IsItemClicked()) {
-                m_selectedEntity = entity;
-            }
-
-            if (ImGui::BeginPopupContextItem()) {
-                if (ImGui::MenuItem(tr("Deletar Objeto", "Delete Entity"))) {
-                    scene->destroy_entity(id);
-                    if (m_selectedEntity == entity) m_selectedEntity = Entity();
-                }
-                ImGui::EndPopup();
-            }
-
-            if (opened) ImGui::TreePop();
+            (void)entity;
+            if (!scene->get_parent(id).is_valid()) drawNode(id);
+        }
+    } else {
+        // Search mode: flat list of matches (a parent may not match the query).
+        for (const auto& [id, entity] : scene->get_entities()) {
+            if (entity.get_name().find(filter) != std::string::npos) drawNode(id);
         }
     }
 
@@ -2090,7 +2871,10 @@ void EditorApplication::draw_hierarchy_panel() {
 }
 
 void EditorApplication::draw_inspector_panel() {
-    ImGui::Begin(tr("Propriedades do Objeto", "Inspector"));
+    // Local minimum only (see draw_app_bar note about the global style).
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(300.0f, 200.0f));
+    ImGui::Begin(tr("Inspector", "Inspector"));
+    ImGui::PopStyleVar();
 
     if (!m_selectedEntity.is_valid()) {
         ImGui::TextDisabled("%s", tr("Nenhum objeto selecionado", "No Object Selected"));
@@ -2106,238 +2890,51 @@ void EditorApplication::draw_inspector_panel() {
 
     UUID id = m_selectedEntity.get_id();
 
-    // Entity Header
+    // Entity header: name + advanced-mode toggle (Forge design). The UUID and
+    // technical fields are hidden unless advanced mode is on.
     char nameBuf[256];
     strncpy(nameBuf, m_selectedEntity.get_name().c_str(), sizeof(nameBuf));
-    if (ImGui::InputText(tr("Nome do Objeto", "Object Name"), nameBuf, sizeof(nameBuf))) {
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 40.0f);
+    if (ImGui::InputText("##EntityName", nameBuf, sizeof(nameBuf))) {
         m_selectedEntity.set_name(nameBuf);
     }
-    ImGui::TextDisabled("Código Único: %s", id.to_string().c_str());
+    ImGui::SameLine();
+    UI::toggle("##AdvancedToggle", &m_advancedInspector,
+               tr("Mostrar propriedades avançadas", "Show advanced properties"));
+    if (m_advancedInspector) {
+        ImGui::TextDisabled("Código Único: %s", id.to_string().c_str());
+    }
     ImGui::Separator();
 
-    // Transform Component
+    // Transform Component — card with collapse + vec3 rows.
     if (scene->transformComponents.contains(id)) {
-        ImGui::TextColored(ImVec4(0.22f, 0.74f, 0.97f, 1.0f), "%s", tr("Posição, Rotação e Tamanho", "Transform Component"));
-        ImGui::Separator();
-        auto& t = scene->transformComponents[id];
-
-        ImGui::TextColored(ImVec4(0.93f, 0.26f, 0.26f, 1.0f), "X"); ImGui::SameLine();
-        ImGui::DragFloat("##PosX", &t.position.x, 0.1f); ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.20f, 0.82f, 0.60f, 1.0f), "Y"); ImGui::SameLine();
-        ImGui::DragFloat("##PosY", &t.position.y, 0.1f); ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.23f, 0.55f, 0.98f, 1.0f), "Z"); ImGui::SameLine();
-        ImGui::DragFloat("##PosZ", &t.position.z, 0.1f);
-
-        ImGui::DragFloat3(tr("Rotação (Ângulo)", "Rotation"), &t.rotation.x, 1.0f);
-        ImGui::DragFloat3(tr("Tamanho (Escala)", "Scale"), &t.scale.x, 0.1f, 0.01f, 100.0f);
-        ImGui::Spacing();
+        if (UI::sectionHeader(ICON_FA_ARROWS_UP_DOWN_LEFT_RIGHT, tr("Transform", "Transform"))) {
+            auto& t = scene->transformComponents[id];
+            UI::vec3Property(tr("Posição", "Position"), &t.position.x, 0.1f);
+            UI::vec3Property(tr("Rotação", "Rotation"), &t.rotation.x, 1.0f);
+            UI::vec3Property(tr("Escala", "Scale"), &t.scale.x, 0.1f);
+            ImGui::Spacing();
+        }
     }
 
-    // Light Component
-    if (scene->lightComponents.contains(id)) {
-        ImGui::TextColored(ImVec4(0.98f, 0.75f, 0.14f, 1.0f), "%s", tr("Iluminação e Luz", "Light Component"));
-        ImGui::Separator();
-        auto& l = scene->lightComponents[id];
-        ImGui::ColorEdit3(tr("Cor da Luz", "Light Color"), &l.color.r);
-        ImGui::DragFloat(tr("Brilho (Intensidade)", "Intensity"), &l.intensity, 100.0f, 0.0f, 100000.0f);
-        ImGui::DragFloat(tr("Alcance da Luz", "Range"), &l.range, 0.5f, 0.1f, 1000.0f);
-        ImGui::Checkbox(tr("Projetar Sombras", "Cast Shadows"), &l.castShadows);
+    // Semantic sections (Inspector): components are grouped by role —
+    // Appearance / Physics / Gameplay / Effects & World. Each group header is
+    // emitted once, before the first component of that group that exists.
+    bool inspectorGroupEmitted[4] = { false, false, false, false };
+    const auto beginInspectorGroup = [&](int group, const char* title) {
+        if (inspectorGroupEmitted[group]) return;
+        inspectorGroupEmitted[group] = true;
         ImGui::Spacing();
-    }
-
-    // Camera Component
-    if (scene->cameraComponents.contains(id)) {
-        ImGui::TextColored(ImVec4(0.65f, 0.55f, 0.98f, 1.0f), "%s", tr("Câmera de Visão", "Camera Component"));
+        ImGui::PushStyleColor(ImGuiCol_Text, UI::Colors::Accent);
+        ImGui::TextUnformatted(title);
+        ImGui::PopStyleColor();
         ImGui::Separator();
-        auto& c = scene->cameraComponents[id];
-        ImGui::SliderFloat(tr("Campo de Visão (FOV)", "Field of View (FOV)"), &c.fov, 10.0f, 160.0f);
-        ImGui::DragFloat(tr("Visão Próxima", "Near Plane"), &c.nearPlane, 0.01f, 0.001f, 10.0f);
-        ImGui::DragFloat(tr("Visão Distante", "Far Plane"), &c.farPlane, 10.0f, 10.0f, 10000.0f);
-        ImGui::Checkbox(tr("Câmera Principal do Jogo", "Primary Camera"), &c.isPrimary);
-        ImGui::Spacing();
-    }
-
-    // Rigidbody Component
-    if (scene->rigidbodyComponents.contains(id)) {
-        ImGui::TextColored(ImVec4(0.98f, 0.57f, 0.24f, 1.0f), "%s", tr("Física e Gravidade", "Rigidbody Component"));
-        ImGui::Separator();
-        auto& r = scene->rigidbodyComponents[id];
-        ImGui::DragFloat(tr("Peso (kg)", "Mass (kg)"), &r.mass, 0.5f, 0.01f, 10000.0f);
-        ImGui::SliderFloat(tr("Deslize (Fricção)", "Friction"), &r.friction, 0.0f, 1.0f);
-        ImGui::SliderFloat(tr("Quique (Elasticidade)", "Restitution"), &r.restitution, 0.0f, 1.0f);
-        ImGui::Checkbox(tr("Física Fixa (Sem Mover)", "Is Kinematic"), &r.isKinematic);
-        ImGui::Checkbox(tr("Ativar Gravidade", "Use Gravity"), &r.useGravity);
-        ImGui::Spacing();
-    }
-
-    // Weapon Component (authored in the Weapon panel; the play world fires it).
-    if (scene->weaponComponents.contains(id)) {
-        ImGui::TextColored(ImVec4(0.93f, 0.35f, 0.55f, 1.0f), "%s", tr("Arma (Hitscan)", "Weapon Component"));
-        ImGui::Separator();
-        auto& w = scene->weaponComponents[id];
-        ImGui::DragFloat(tr("Dano", "Damage"), &w.damage, 0.5f, 0.0f, 10000.0f);
-        ImGui::DragFloat(tr("Tiros/min", "Rounds Per Minute"), &w.roundsPerMinute, 5.0f, 1.0f, 5000.0f);
-        ImGui::DragInt(tr("Pente", "Magazine Size"), reinterpret_cast<int*>(&w.magazineSize), 1, 1, 1000);
-        ImGui::DragInt(tr("Reserva", "Reserve Ammo"), reinterpret_cast<int*>(&w.reserveAmmo), 1, 0, 10000);
-        ImGui::Checkbox(tr("Automática", "Automatic"), &w.automatic);
-        ImGui::SliderFloat(tr("Espalhamento (graus)", "Spread (degrees)"), &w.spreadDegrees, 0.0f, 20.0f);
-        ImGui::Checkbox(tr("Hitscan", "Hitscan"), &w.hitscan);
-        if (ImGui::Button(tr("Remover Arma", "Remove Weapon"))) scene->weaponComponents.erase(id);
-        ImGui::Spacing();
-    }
-
-    // Particle Emitter Component (authored in the Particle panel; the play
-    // world instantiates a ParticleSimulation emitter at the entity origin).
-    if (scene->particleEmitterComponents.contains(id)) {
-        ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.55f, 1.0f), "%s", tr("Emissor de Partículas", "Particle Emitter Component"));
-        ImGui::Separator();
-        auto& p = scene->particleEmitterComponents[id];
-        ImGui::DragFloat3(tr("Posição (local)", "Position (local)"), &p.position.x, 0.05f);
-        ImGui::DragFloat3(tr("Direção", "Direction"), &p.direction.x, 0.05f);
-        ImGui::SliderFloat(tr("Cone (rad)", "Cone (rad)"), &p.coneAngle, 0.0f, 1.5f);
-        ImGui::DragFloat(tr("Taxa (part/s)", "Rate (part/s)"), &p.rate, 1.0f, 0.0f, 10000.0f);
-        ImGui::DragFloat(tr("Vel. min", "Speed Min"), &p.speedMin, 0.1f, 0.0f, 100.0f);
-        ImGui::DragFloat(tr("Vel. máx", "Speed Max"), &p.speedMax, 0.1f, 0.0f, 100.0f);
-        ImGui::DragFloat(tr("Vida min (s)", "Lifetime Min"), &p.lifetimeMin, 0.05f, 0.01f, 60.0f);
-        ImGui::DragFloat(tr("Vida máx (s)", "Lifetime Max"), &p.lifetimeMax, 0.05f, 0.01f, 60.0f);
-        ImGui::DragFloat(tr("Tamanho inicial", "Size Start"), &p.sizeStart, 0.01f, 0.0f, 10.0f);
-        ImGui::DragFloat(tr("Tamanho final", "Size End"), &p.sizeEnd, 0.01f, 0.0f, 10.0f);
-        ImGui::ColorEdit4(tr("Cor inicial", "Start Color"), &p.colorStart.x);
-        ImGui::ColorEdit4(tr("Cor final", "End Color"), &p.colorEnd.x);
-        ImGui::DragFloat3(tr("Aceleração", "Acceleration"), &p.acceleration.x, 0.1f);
-        ImGui::DragFloat(tr("Arrasto", "Drag"), &p.drag, 0.01f, 0.0f, 1.0f);
-        ImGui::DragInt(tr("Rajada no início", "Burst on start"), reinterpret_cast<int*>(&p.burstCount), 1, 0, 100000);
-        ImGui::Checkbox(tr("Colide com física", "Collides with physics"), &p.collide);
-        ImGui::Checkbox(tr("Emitindo", "Emitting"), &p.emitting);
-        if (ImGui::Button(tr("Remover Emissor", "Remove Emitter"))) scene->particleEmitterComponents.erase(id);
-        ImGui::Spacing();
-    }
-
-    // Vehicle Component (authored in the Vehicle panel; the play world builds
-    // a chassis body + four wheels and drives it with a VehicleRuntime).
-    if (scene->vehicleComponents.contains(id)) {
-        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.30f, 1.0f), "%s", tr("Veículo", "Vehicle Component"));
-        ImGui::Separator();
-        auto& v = scene->vehicleComponents[id];
-        ImGui::DragFloat(tr("Potência do motor", "Engine Power"), &v.enginePower, 100.0f, 0.0f, 100000.0f);
-        ImGui::SliderFloat(tr("Ângulo máx. de direção (rad)", "Max Steer Angle"), &v.maxSteerAngle, 0.0f, 1.2f);
-        ImGui::DragFloat(tr("Força de freio", "Brake Force"), &v.brakeForce, 100.0f, 0.0f, 100000.0f);
-        ImGui::DragFloat(tr("Raio da roda", "Wheel Radius"), &v.wheelRadius, 0.01f, 0.05f, 2.0f);
-        ImGui::DragFloat(tr("Suspensão (descanso)", "Suspension Rest"), &v.suspensionRest, 0.01f, 0.0f, 2.0f);
-        ImGui::DragFloat(tr("Distância entre eixos", "Wheel Base"), &v.wheelBase, 0.05f, 0.5f, 20.0f);
-        ImGui::DragFloat(tr("Bitola (largura)", "Track Width"), &v.trackWidth, 0.05f, 0.2f, 10.0f);
-        ImGui::DragFloat(tr("Massa", "Mass"), &v.mass, 50.0f, 10.0f, 20000.0f);
-        ImGui::Checkbox(tr("Tração dianteira", "Front Wheel Drive"), &v.frontWheelDrive);
-        ImGui::Checkbox(tr("Habilitado", "Enabled"), &v.enabled);
-        if (ImGui::Button(tr("Remover Veículo", "Remove Vehicle"))) scene->vehicleComponents.erase(id);
-        ImGui::Spacing();
-    }
-
-    // Ragdoll Component (authored in the Ragdoll panel; the play world builds
-    // physics bodies per bone from the skin skeleton when fromSkeleton is set).
-    if (scene->ragdollComponents.contains(id)) {
-        ImGui::TextColored(ImVec4(0.55f, 0.9f, 0.35f, 1.0f), "%s", tr("Ragdoll", "Ragdoll Component"));
-        ImGui::Separator();
-        auto& rg = scene->ragdollComponents[id];
-        ImGui::Checkbox(tr("Habilitado", "Enabled"), &rg.enabled);
-        ImGui::SliderFloat(tr("Blend da física", "Physics Blend"), &rg.blendWeight, 0.0f, 1.0f);
-        ImGui::Checkbox(tr("Da esqueleto (skin)", "From skeleton (skin)"), &rg.fromSkeleton);
-        ImGui::DragFloat(tr("Massa por osso", "Mass per bone"), &rg.massPerBone, 0.1f, 0.1f, 100.0f);
-        ImGui::DragFloat3(tr("Deslocamento de spawn", "Spawn Offset"), &rg.spawnOffset.x, 0.1f);
-        if (ImGui::Button(tr("Remover Ragdoll", "Remove Ragdoll"))) scene->ragdollComponents.erase(id);
-        ImGui::Spacing();
-    }
-
-    // Mission Component (the play world registers a Mission that the
-    // completeEvent — a script EmitEvent — finishes).
-    if (scene->missionComponents.contains(id)) {
-        ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.0f, 1.0f), "%s", tr("Missão", "Mission Component"));
-        ImGui::Separator();
-        auto& m = scene->missionComponents[id];
-        char missionBuf[128]; std::snprintf(missionBuf, sizeof(missionBuf), "%s", m.missionId.c_str());
-        if (ImGui::InputText(tr("ID", "ID"), missionBuf, sizeof(missionBuf))) m.missionId = missionBuf;
-        char objBuf[256]; std::snprintf(objBuf, sizeof(objBuf), "%s", m.objectiveText.c_str());
-        if (ImGui::InputText(tr("Objetivo", "Objective"), objBuf, sizeof(objBuf))) m.objectiveText = objBuf;
-        ImGui::DragInt(tr("Alvo", "Target"), reinterpret_cast<int*>(&m.objectiveTarget), 1, 1, 100000);
-        char evBuf[128]; std::snprintf(evBuf, sizeof(evBuf), "%s", m.completeEvent.c_str());
-        if (ImGui::InputText(tr("Evento de conclusão", "Complete Event"), evBuf, sizeof(evBuf))) m.completeEvent = evBuf;
-        ImGui::Checkbox(tr("Início automático", "Auto Start"), &m.autoStart);
-        ImGui::TextDisabled("%s: %s", tr("Estado", "State"), m.active ? tr("ativa", "active") : tr("inativa", "inactive"));
-        if (ImGui::Button(tr("Remover Missão", "Remove Mission"))) scene->missionComponents.erase(id);
-        ImGui::Spacing();
-    }
-
-    // Dialogue Component (a one-node graph with a line and one choice).
-    if (scene->dialogueComponents.contains(id)) {
-        ImGui::TextColored(ImVec4(0.9f, 0.6f, 0.95f, 1.0f), "%s", tr("Diálogo", "Dialogue Component"));
-        ImGui::Separator();
-        auto& d = scene->dialogueComponents[id];
-        char dgBuf[128]; std::snprintf(dgBuf, sizeof(dgBuf), "%s", d.dialogueId.c_str());
-        if (ImGui::InputText("ID", dgBuf, sizeof(dgBuf))) d.dialogueId = dgBuf;
-        char chBuf[128]; std::snprintf(chBuf, sizeof(chBuf), "%s", d.character.c_str());
-        if (ImGui::InputText(tr("Personagem", "Character"), chBuf, sizeof(chBuf))) d.character = chBuf;
-        char lineBuf[256]; std::snprintf(lineBuf, sizeof(lineBuf), "%s", d.line.c_str());
-        if (ImGui::InputText(tr("Fala", "Line"), lineBuf, sizeof(lineBuf))) d.line = lineBuf;
-        char choiceBuf[128]; std::snprintf(choiceBuf, sizeof(choiceBuf), "%s", d.choiceText.c_str());
-        if (ImGui::InputText(tr("Escolha", "Choice"), choiceBuf, sizeof(choiceBuf))) d.choiceText = choiceBuf;
-        char nextBuf[128]; std::snprintf(nextBuf, sizeof(nextBuf), "%s", d.nextDialogueId.c_str());
-        if (ImGui::InputText(tr("Próximo diálogo", "Next Dialogue"), nextBuf, sizeof(nextBuf))) d.nextDialogueId = nextBuf;
-        ImGui::Checkbox(tr("Tocar ao iniciar", "Play On Start"), &d.playOnStart);
-        if (ImGui::Button(tr("Remover Diálogo", "Remove Dialogue"))) scene->dialogueComponents.erase(id);
-        ImGui::Spacing();
-    }
-
-    // Destruction Component (a destructible of chunkCount boxes; weapon hits
-    // within damageRadius detach chunks in play).
-    if (scene->destructionComponents.contains(id)) {
-        ImGui::TextColored(ImVec4(0.95f, 0.5f, 0.3f, 1.0f), "%s", tr("Destrutível", "Destruction Component"));
-        ImGui::Separator();
-        auto& ds = scene->destructionComponents[id];
-        ImGui::DragFloat3(tr("Tamanho do pedaço", "Chunk Size"), &ds.chunkSize.x, 0.05f, 0.05f, 10.0f);
-        ImGui::DragInt(tr("Nº de pedaços", "Chunk Count"), reinterpret_cast<int*>(&ds.chunkCount), 1, 1, 1000);
-        ImGui::DragFloat(tr("Vida do pedaço", "Chunk Health"), &ds.chunkHealth, 1.0f, 1.0f, 100000.0f);
-        ImGui::DragFloat(tr("Raio de dano", "Damage Radius"), &ds.damageRadius, 0.1f, 0.1f, 100.0f);
-        ImGui::DragFloat(tr("Impulso do dano", "Damage Impulse"), &ds.damageImpulse, 0.5f, 0.0f, 1000.0f);
-        ImGui::Checkbox(tr("Habilitado", "Enabled"), &ds.enabled);
-        if (ImGui::Button(tr("Remover Destrutível", "Remove Destruction"))) scene->destructionComponents.erase(id);
-        ImGui::Spacing();
-    }
-
-    // Navigation Component (a baked grid + an agent toward the camera).
-    if (scene->navigationComponents.contains(id)) {
-        ImGui::TextColored(ImVec4(0.5f, 0.95f, 0.85f, 1.0f), "%s", tr("Navegação", "Navigation Component"));
-        ImGui::Separator();
-        auto& nav = scene->navigationComponents[id];
-        ImGui::DragInt(tr("Largura do grid", "Grid Width"), &nav.gridWidth, 1, 4, 512);
-        ImGui::DragInt(tr("Altura do grid", "Grid Height"), &nav.gridHeight, 1, 4, 512);
-        ImGui::DragFloat(tr("Tamanho da célula", "Cell Size"), &nav.cellSize, 0.1f, 0.1f, 20.0f);
-        ImGui::DragFloat(tr("Velocidade do agente", "Agent Speed"), &nav.agentSpeed, 0.1f, 0.1f, 50.0f);
-        ImGui::Checkbox(tr("Habilitado", "Enabled"), &nav.enabled);
-        if (ImGui::Button(tr("Remover Navegação", "Remove Navigation"))) scene->navigationComponents.erase(id);
-        ImGui::Spacing();
-    }
-
-    // Audio Component (an OGG source played through the play Mixer).
-    if (scene->audioComponents.contains(id)) {
-        ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "%s", tr("Fonte de Áudio", "Audio Component"));
-        ImGui::Separator();
-        auto& au = scene->audioComponents[id];
-        char clipBuf[256]; std::snprintf(clipBuf, sizeof(clipBuf), "%s", au.clipPath.c_str());
-        if (ImGui::InputText(".ogg", clipBuf, sizeof(clipBuf))) au.clipPath = clipBuf;
-        ImGui::DragFloat(tr("Volume", "Volume"), &au.volume, 0.01f, 0.0f, 4.0f);
-        ImGui::DragFloat(tr("Pitch", "Pitch"), &au.pitch, 0.01f, 0.1f, 4.0f);
-        ImGui::Checkbox(tr("Espacial", "Spatial"), &au.spatial);
-        ImGui::SameLine();
-        ImGui::Checkbox(tr("Em loop", "Looping"), &au.looping);
-        ImGui::Checkbox(tr("Tocar ao iniciar", "Play On Start"), &au.playOnStart);
-        if (ImGui::Button(tr("Remover Áudio", "Remove Audio"))) scene->audioComponents.erase(id);
-        ImGui::Spacing();
-    }
+    };
 
     // Mesh Renderer Component
     if (scene->meshRendererComponents.contains(id)) {
-        ImGui::TextColored(ImVec4(0.55f, 0.45f, 0.98f, 1.0f), "%s", tr("Renderizador de Malha", "Mesh Renderer Component"));
-        ImGui::Separator();
+        beginInspectorGroup(0, tr("APARÊNCIA", "APPEARANCE"));
+        UI::sectionHeader(ICON_FA_CUBE, tr("Malha", "Mesh Renderer"));
         auto& mr = scene->meshRendererComponents[id];
         // Mesh asset picker (from the project asset registry).
         std::vector<std::pair<UUID, std::string>> meshAssets;
@@ -2402,9 +2999,213 @@ void EditorApplication::draw_inspector_panel() {
         ImGui::Spacing();
     }
 
+    // Rigidbody Component
+    if (scene->rigidbodyComponents.contains(id)) {
+        beginInspectorGroup(1, tr("FÍSICA", "PHYSICS"));
+        UI::sectionHeader(ICON_FA_WEIGHT_HANGING, tr("Física", "Rigidbody"));
+        auto& r = scene->rigidbodyComponents[id];
+        ImGui::DragFloat(tr("Peso (kg)", "Mass (kg)"), &r.mass, 0.5f, 0.01f, 10000.0f);
+        ImGui::SliderFloat(tr("Deslize (Fricção)", "Friction"), &r.friction, 0.0f, 1.0f);
+        ImGui::SliderFloat(tr("Quique (Elasticidade)", "Restitution"), &r.restitution, 0.0f, 1.0f);
+        ImGui::Checkbox(tr("Física Fixa (Sem Mover)", "Is Kinematic"), &r.isKinematic);
+        ImGui::Checkbox(tr("Ativar Gravidade", "Use Gravity"), &r.useGravity);
+        ImGui::Spacing();
+    }
+
+    // Destruction Component (a destructible of chunkCount boxes; weapon hits
+    // within damageRadius detach chunks in play).
+    if (scene->destructionComponents.contains(id)) {
+        beginInspectorGroup(1, tr("FÍSICA", "PHYSICS"));
+        UI::sectionHeader(ICON_FA_EXPLOSION, tr("Destrutível", "Destruction"));
+        auto& ds = scene->destructionComponents[id];
+        ImGui::DragFloat3(tr("Tamanho do pedaço", "Chunk Size"), &ds.chunkSize.x, 0.05f, 0.05f, 10.0f);
+        ImGui::DragInt(tr("Nº de pedaços", "Chunk Count"), reinterpret_cast<int*>(&ds.chunkCount), 1, 1, 1000);
+        ImGui::DragFloat(tr("Vida do pedaço", "Chunk Health"), &ds.chunkHealth, 1.0f, 1.0f, 100000.0f);
+        ImGui::DragFloat(tr("Raio de dano", "Damage Radius"), &ds.damageRadius, 0.1f, 0.1f, 100.0f);
+        ImGui::DragFloat(tr("Impulso do dano", "Damage Impulse"), &ds.damageImpulse, 0.5f, 0.0f, 1000.0f);
+        ImGui::Checkbox(tr("Habilitado", "Enabled"), &ds.enabled);
+        if (ImGui::Button(tr("Remover Destrutível", "Remove Destruction"))) scene->destructionComponents.erase(id);
+        ImGui::Spacing();
+    }
+
+    // Weapon Component (authored in the Weapon panel; the play world fires it).
+    if (scene->weaponComponents.contains(id)) {
+        beginInspectorGroup(2, tr("JOGABILIDADE", "GAMEPLAY"));
+        UI::sectionHeader(ICON_FA_GUN, tr("Arma", "Weapon"));
+        auto& w = scene->weaponComponents[id];
+        ImGui::DragFloat(tr("Dano", "Damage"), &w.damage, 0.5f, 0.0f, 10000.0f);
+        ImGui::DragFloat(tr("Tiros/min", "Rounds Per Minute"), &w.roundsPerMinute, 5.0f, 1.0f, 5000.0f);
+        ImGui::DragInt(tr("Pente", "Magazine Size"), reinterpret_cast<int*>(&w.magazineSize), 1, 1, 1000);
+        ImGui::DragInt(tr("Reserva", "Reserve Ammo"), reinterpret_cast<int*>(&w.reserveAmmo), 1, 0, 10000);
+        ImGui::Checkbox(tr("Automática", "Automatic"), &w.automatic);
+        ImGui::SliderFloat(tr("Espalhamento (graus)", "Spread (degrees)"), &w.spreadDegrees, 0.0f, 20.0f);
+        ImGui::Checkbox(tr("Hitscan", "Hitscan"), &w.hitscan);
+        if (ImGui::Button(tr("Remover Arma", "Remove Weapon"))) scene->weaponComponents.erase(id);
+        ImGui::Spacing();
+    }
+
+    // Vehicle Component (authored in the Vehicle panel; the play world builds
+    // a chassis body + four wheels and drives it with a VehicleRuntime).
+    if (scene->vehicleComponents.contains(id)) {
+        beginInspectorGroup(2, tr("JOGABILIDADE", "GAMEPLAY"));
+        UI::sectionHeader(ICON_FA_CAR, tr("Veículo", "Vehicle"));
+        auto& v = scene->vehicleComponents[id];
+        ImGui::DragFloat(tr("Potência do motor", "Engine Power"), &v.enginePower, 100.0f, 0.0f, 100000.0f);
+        ImGui::SliderFloat(tr("Ângulo máx. de direção (rad)", "Max Steer Angle"), &v.maxSteerAngle, 0.0f, 1.2f);
+        ImGui::DragFloat(tr("Força de freio", "Brake Force"), &v.brakeForce, 100.0f, 0.0f, 100000.0f);
+        ImGui::DragFloat(tr("Raio da roda", "Wheel Radius"), &v.wheelRadius, 0.01f, 0.05f, 2.0f);
+        ImGui::DragFloat(tr("Suspensão (descanso)", "Suspension Rest"), &v.suspensionRest, 0.01f, 0.0f, 2.0f);
+        ImGui::DragFloat(tr("Distância entre eixos", "Wheel Base"), &v.wheelBase, 0.05f, 0.5f, 20.0f);
+        ImGui::DragFloat(tr("Bitola (largura)", "Track Width"), &v.trackWidth, 0.05f, 0.2f, 10.0f);
+        ImGui::DragFloat(tr("Massa", "Mass"), &v.mass, 50.0f, 10.0f, 20000.0f);
+        ImGui::Checkbox(tr("Tração dianteira", "Front Wheel Drive"), &v.frontWheelDrive);
+        ImGui::Checkbox(tr("Habilitado", "Enabled"), &v.enabled);
+        if (ImGui::Button(tr("Remover Veículo", "Remove Vehicle"))) scene->vehicleComponents.erase(id);
+        ImGui::Spacing();
+    }
+
+    // Ragdoll Component (authored in the Ragdoll panel; the play world builds
+    // physics bodies per bone from the skin skeleton when fromSkeleton is set).
+    if (scene->ragdollComponents.contains(id)) {
+        beginInspectorGroup(2, tr("JOGABILIDADE", "GAMEPLAY"));
+        UI::sectionHeader(ICON_FA_USER, tr("Ragdoll", "Ragdoll"));
+        auto& rg = scene->ragdollComponents[id];
+        ImGui::Checkbox(tr("Habilitado", "Enabled"), &rg.enabled);
+        ImGui::SliderFloat(tr("Blend da física", "Physics Blend"), &rg.blendWeight, 0.0f, 1.0f);
+        ImGui::Checkbox(tr("Da esqueleto (skin)", "From skeleton (skin)"), &rg.fromSkeleton);
+        ImGui::DragFloat(tr("Massa por osso", "Mass per bone"), &rg.massPerBone, 0.1f, 0.1f, 100.0f);
+        ImGui::DragFloat3(tr("Deslocamento de spawn", "Spawn Offset"), &rg.spawnOffset.x, 0.1f);
+        if (ImGui::Button(tr("Remover Ragdoll", "Remove Ragdoll"))) scene->ragdollComponents.erase(id);
+        ImGui::Spacing();
+    }
+
+    // Mission Component (the play world registers a Mission that the
+    // completeEvent — a script EmitEvent — finishes).
+    if (scene->missionComponents.contains(id)) {
+        beginInspectorGroup(2, tr("JOGABILIDADE", "GAMEPLAY"));
+        UI::sectionHeader(ICON_FA_FLAG, tr("Missão", "Mission"));
+        auto& m = scene->missionComponents[id];
+        char missionBuf[128]; std::snprintf(missionBuf, sizeof(missionBuf), "%s", m.missionId.c_str());
+        if (ImGui::InputText(tr("ID", "ID"), missionBuf, sizeof(missionBuf))) m.missionId = missionBuf;
+        char objBuf[256]; std::snprintf(objBuf, sizeof(objBuf), "%s", m.objectiveText.c_str());
+        if (ImGui::InputText(tr("Objetivo", "Objective"), objBuf, sizeof(objBuf))) m.objectiveText = objBuf;
+        ImGui::DragInt(tr("Alvo", "Target"), reinterpret_cast<int*>(&m.objectiveTarget), 1, 1, 100000);
+        char evBuf[128]; std::snprintf(evBuf, sizeof(evBuf), "%s", m.completeEvent.c_str());
+        if (ImGui::InputText(tr("Evento de conclusão", "Complete Event"), evBuf, sizeof(evBuf))) m.completeEvent = evBuf;
+        ImGui::Checkbox(tr("Início automático", "Auto Start"), &m.autoStart);
+        ImGui::TextDisabled("%s: %s", tr("Estado", "State"), m.active ? tr("ativa", "active") : tr("inativa", "inactive"));
+        if (ImGui::Button(tr("Remover Missão", "Remove Mission"))) scene->missionComponents.erase(id);
+        ImGui::Spacing();
+    }
+
+    // Dialogue Component (a one-node graph with a line and one choice).
+    if (scene->dialogueComponents.contains(id)) {
+        beginInspectorGroup(2, tr("JOGABILIDADE", "GAMEPLAY"));
+        UI::sectionHeader(ICON_FA_COMMENT, tr("Diálogo", "Dialogue"));
+        auto& d = scene->dialogueComponents[id];
+        char dgBuf[128]; std::snprintf(dgBuf, sizeof(dgBuf), "%s", d.dialogueId.c_str());
+        if (ImGui::InputText("ID", dgBuf, sizeof(dgBuf))) d.dialogueId = dgBuf;
+        char chBuf[128]; std::snprintf(chBuf, sizeof(chBuf), "%s", d.character.c_str());
+        if (ImGui::InputText(tr("Personagem", "Character"), chBuf, sizeof(chBuf))) d.character = chBuf;
+        char lineBuf[256]; std::snprintf(lineBuf, sizeof(lineBuf), "%s", d.line.c_str());
+        if (ImGui::InputText(tr("Fala", "Line"), lineBuf, sizeof(lineBuf))) d.line = lineBuf;
+        char choiceBuf[128]; std::snprintf(choiceBuf, sizeof(choiceBuf), "%s", d.choiceText.c_str());
+        if (ImGui::InputText(tr("Escolha", "Choice"), choiceBuf, sizeof(choiceBuf))) d.choiceText = choiceBuf;
+        char nextBuf[128]; std::snprintf(nextBuf, sizeof(nextBuf), "%s", d.nextDialogueId.c_str());
+        if (ImGui::InputText(tr("Próximo diálogo", "Next Dialogue"), nextBuf, sizeof(nextBuf))) d.nextDialogueId = nextBuf;
+        ImGui::Checkbox(tr("Tocar ao iniciar", "Play On Start"), &d.playOnStart);
+        if (ImGui::Button(tr("Remover Diálogo", "Remove Dialogue"))) scene->dialogueComponents.erase(id);
+        ImGui::Spacing();
+    }
+
+    // Navigation Component (a baked grid + an agent toward the camera).
+    if (scene->navigationComponents.contains(id)) {
+        beginInspectorGroup(2, tr("JOGABILIDADE", "GAMEPLAY"));
+        UI::sectionHeader(ICON_FA_LOCATION_CROSSHAIRS, tr("Navegação", "Navigation"));
+        auto& nav = scene->navigationComponents[id];
+        ImGui::DragInt(tr("Largura do grid", "Grid Width"), &nav.gridWidth, 1, 4, 512);
+        ImGui::DragInt(tr("Altura do grid", "Grid Height"), &nav.gridHeight, 1, 4, 512);
+        ImGui::DragFloat(tr("Tamanho da célula", "Cell Size"), &nav.cellSize, 0.1f, 0.1f, 20.0f);
+        ImGui::DragFloat(tr("Velocidade do agente", "Agent Speed"), &nav.agentSpeed, 0.1f, 0.1f, 50.0f);
+        ImGui::Checkbox(tr("Habilitado", "Enabled"), &nav.enabled);
+        if (ImGui::Button(tr("Remover Navegação", "Remove Navigation"))) scene->navigationComponents.erase(id);
+        ImGui::Spacing();
+    }
+
+    // Audio Component (an OGG source played through the play Mixer).
+    if (scene->audioComponents.contains(id)) {
+        beginInspectorGroup(3, tr("EFEITOS & MUNDO", "EFFECTS & WORLD"));
+        UI::sectionHeader(ICON_FA_VOLUME_HIGH, tr("Áudio", "Audio"));
+        auto& au = scene->audioComponents[id];
+        char clipBuf[256]; std::snprintf(clipBuf, sizeof(clipBuf), "%s", au.clipPath.c_str());
+        if (ImGui::InputText(".ogg", clipBuf, sizeof(clipBuf))) au.clipPath = clipBuf;
+        ImGui::DragFloat(tr("Volume", "Volume"), &au.volume, 0.01f, 0.0f, 4.0f);
+        ImGui::DragFloat(tr("Pitch", "Pitch"), &au.pitch, 0.01f, 0.1f, 4.0f);
+        ImGui::Checkbox(tr("Espacial", "Spatial"), &au.spatial);
+        ImGui::SameLine();
+        ImGui::Checkbox(tr("Em loop", "Looping"), &au.looping);
+        ImGui::Checkbox(tr("Tocar ao iniciar", "Play On Start"), &au.playOnStart);        if (ImGui::Button(tr("Remover Áudio", "Remove Audio"))) scene->audioComponents.erase(id);
+        ImGui::Spacing();
+    }
+
+    // Light Component
+    if (scene->lightComponents.contains(id)) {
+        beginInspectorGroup(3, tr("EFEITOS & MUNDO", "EFFECTS & WORLD"));
+        UI::sectionHeader(ICON_FA_SUN, tr("Luz", "Light"));
+        auto& l = scene->lightComponents[id];
+        ImGui::ColorEdit3(tr("Cor da Luz", "Light Color"), &l.color.r);
+        ImGui::DragFloat(tr("Brilho (Intensidade)", "Intensity"), &l.intensity, 100.0f, 0.0f, 100000.0f);
+        ImGui::DragFloat(tr("Alcance da Luz", "Range"), &l.range, 0.5f, 0.1f, 1000.0f);
+        ImGui::Checkbox(tr("Projetar Sombras", "Cast Shadows"), &l.castShadows);
+        ImGui::Spacing();
+    }
+
+    // Camera Component — near/far planes are advanced-only fields.
+    if (scene->cameraComponents.contains(id)) {
+        beginInspectorGroup(3, tr("EFEITOS & MUNDO", "EFFECTS & WORLD"));
+        UI::sectionHeader(ICON_FA_CAMERA, tr("Câmera", "Camera"));
+        auto& c = scene->cameraComponents[id];
+        ImGui::SliderFloat(tr("Campo de Visão (FOV)", "Field of View (FOV)"), &c.fov, 10.0f, 160.0f);
+        if (m_advancedInspector) {
+            ImGui::DragFloat(tr("Visão Próxima", "Near Plane"), &c.nearPlane, 0.01f, 0.001f, 10.0f);
+            ImGui::DragFloat(tr("Visão Distante", "Far Plane"), &c.farPlane, 10.0f, 10.0f, 10000.0f);
+        }
+        ImGui::Checkbox(tr("Câmera Principal do Jogo", "Primary Camera"), &c.isPrimary);
+        ImGui::Spacing();
+    }
+
+    // Particle Emitter Component (authored in the Particle panel; the play
+    // world instantiates a ParticleSimulation emitter at the entity origin).
+    if (scene->particleEmitterComponents.contains(id)) {
+        beginInspectorGroup(3, tr("EFEITOS & MUNDO", "EFFECTS & WORLD"));
+        UI::sectionHeader(ICON_FA_FIRE, tr("Partículas", "Particle Emitter"));
+        auto& p = scene->particleEmitterComponents[id];
+        ImGui::DragFloat3(tr("Posição (local)", "Position (local)"), &p.position.x, 0.05f);
+        ImGui::DragFloat3(tr("Direção", "Direction"), &p.direction.x, 0.05f);
+        ImGui::SliderFloat(tr("Cone (rad)", "Cone (rad)"), &p.coneAngle, 0.0f, 1.5f);
+        ImGui::DragFloat(tr("Taxa (part/s)", "Rate (part/s)"), &p.rate, 1.0f, 0.0f, 10000.0f);
+        ImGui::DragFloat(tr("Vel. min", "Speed Min"), &p.speedMin, 0.1f, 0.0f, 100.0f);
+        ImGui::DragFloat(tr("Vel. máx", "Speed Max"), &p.speedMax, 0.1f, 0.0f, 100.0f);
+        ImGui::DragFloat(tr("Vida min (s)", "Lifetime Min"), &p.lifetimeMin, 0.05f, 0.01f, 60.0f);
+        ImGui::DragFloat(tr("Vida máx (s)", "Lifetime Max"), &p.lifetimeMax, 0.05f, 0.01f, 60.0f);
+        ImGui::DragFloat(tr("Tamanho inicial", "Size Start"), &p.sizeStart, 0.01f, 0.0f, 10.0f);
+        ImGui::DragFloat(tr("Tamanho final", "Size End"), &p.sizeEnd, 0.01f, 0.0f, 10.0f);
+        ImGui::ColorEdit4(tr("Cor inicial", "Start Color"), &p.colorStart.x);
+        ImGui::ColorEdit4(tr("Cor final", "End Color"), &p.colorEnd.x);
+        ImGui::DragFloat3(tr("Aceleração", "Acceleration"), &p.acceleration.x, 0.1f);
+        ImGui::DragFloat(tr("Arrasto", "Drag"), &p.drag, 0.01f, 0.0f, 1.0f);
+        ImGui::DragInt(tr("Rajada no início", "Burst on start"), reinterpret_cast<int*>(&p.burstCount), 1, 0, 100000);
+        ImGui::Checkbox(tr("Colide com física", "Collides with physics"), &p.collide);
+        ImGui::Checkbox(tr("Emitindo", "Emitting"), &p.emitting);
+        if (ImGui::Button(tr("Remover Emissor", "Remove Emitter"))) scene->particleEmitterComponents.erase(id);
+        ImGui::Spacing();
+    }
+
 #if VC_ENABLE_VOXEL_PLUGIN
+
     // Voxel Volume Component
     if (scene->voxelVolumeComponents.contains(id)) {
+        beginInspectorGroup(3, tr("EFEITOS & MUNDO", "EFFECTS & WORLD"));
         ImGui::TextColored(ImVec4(0.20f, 0.82f, 0.60f, 1.0f), "%s", tr("Mundo de Terreno em Blocos", "Voxel Terrain Volume"));
         ImGui::Separator();
         auto& v = scene->voxelVolumeComponents[id];
@@ -2424,21 +3225,47 @@ void EditorApplication::draw_inspector_panel() {
     ImGui::PopStyleColor();
 
     if (ImGui::BeginPopup("AddComponentPopup")) {
-        if (ImGui::MenuItem(tr("Iluminação e Luz", "Light Component"))) scene->lightComponents[id] = LightComponent{};
-        if (ImGui::MenuItem(tr("Câmera de Visão", "Camera Component"))) scene->cameraComponents[id] = CameraComponent{};
-        if (ImGui::MenuItem(tr("Física e Gravidade", "Rigidbody Component"))) scene->rigidbodyComponents[id] = RigidbodyComponent{};
-        if (ImGui::MenuItem(tr("Arma (Hitscan)", "Weapon Component"))) scene->weaponComponents[id] = WeaponComponent{};
-        if (ImGui::MenuItem(tr("Emissor de Partículas", "Particle Emitter Component"))) scene->particleEmitterComponents[id] = ParticleEmitterComponent{};
-        if (ImGui::MenuItem(tr("Veículo", "Vehicle Component"))) scene->vehicleComponents[id] = VehicleComponent{};
-        if (ImGui::MenuItem(tr("Ragdoll", "Ragdoll Component"))) scene->ragdollComponents[id] = RagdollComponent{};
-        if (ImGui::MenuItem(tr("Missão", "Mission Component"))) scene->missionComponents[id] = MissionComponent{};
-        if (ImGui::MenuItem(tr("Diálogo", "Dialogue Component"))) scene->dialogueComponents[id] = DialogueComponent{};
-        if (ImGui::MenuItem(tr("Destrutível", "Destruction Component"))) scene->destructionComponents[id] = DestructionComponent{};
-        if (ImGui::MenuItem(tr("Navegação", "Navigation Component"))) scene->navigationComponents[id] = NavigationComponent{};
-        if (ImGui::MenuItem(tr("Fonte de Áudio", "Audio Component"))) scene->audioComponents[id] = AudioComponent{};
-        if (ImGui::MenuItem(tr("Modelo 3D (Mesh)", "Mesh Renderer"))) scene->meshRendererComponents[id] = MeshRendererComponent{};
+        static char compSearch[64]{};
+        ImGui::SetNextItemWidth(240.0f);
+        ImGui::InputTextWithHint("##CompSearch", tr("Buscar componentes...", "Search components..."), compSearch, sizeof(compSearch));
+        ImGui::Separator();
+
+        const std::string cq = compSearch;
+        const auto match = [&](const char* label) {
+            if (cq.empty()) return true;
+            std::string l = label;
+            std::transform(l.begin(), l.end(), l.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            std::string q = cq;
+            std::transform(q.begin(), q.end(), q.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            return l.find(q) != std::string::npos;
+        };
+        const auto section = [&](const char* title) {
+            if (cq.empty()) ImGui::TextDisabled("%s", title);
+        };
+
+        section(tr("COMUM", "COMMON"));
+        if (match(tr("Iluminação e Luz", "Light"))) { if (ImGui::MenuItem(tr("Iluminação e Luz", "Light Component"))) scene->lightComponents[id] = LightComponent{}; }
+        if (match(tr("Câmera de Visão", "Camera"))) { if (ImGui::MenuItem(tr("Câmera de Visão", "Camera Component"))) scene->cameraComponents[id] = CameraComponent{}; }
+        if (match(tr("Modelo 3D (Mesh)", "Mesh Renderer"))) { if (ImGui::MenuItem(tr("Modelo 3D (Mesh)", "Mesh Renderer"))) scene->meshRendererComponents[id] = MeshRendererComponent{}; }
+        if (match(tr("Material", "Material"))) { if (ImGui::MenuItem(tr("Material", "Material Component"))) scene->materialComponents[id] = MaterialComponent{}; }
+        ImGui::Separator();
+        section(tr("FÍSICA / GAMEPLAY", "PHYSICS / GAMEPLAY"));
+        if (match(tr("Física e Gravidade", "Rigidbody"))) { if (ImGui::MenuItem(tr("Física e Gravidade", "Rigidbody Component"))) scene->rigidbodyComponents[id] = RigidbodyComponent{}; }
+        if (match(tr("Arma (Hitscan)", "Weapon"))) { if (ImGui::MenuItem(tr("Arma (Hitscan)", "Weapon Component"))) scene->weaponComponents[id] = WeaponComponent{}; }
+        if (match(tr("Veículo", "Vehicle"))) { if (ImGui::MenuItem(tr("Veículo", "Vehicle Component"))) scene->vehicleComponents[id] = VehicleComponent{}; }
+        if (match(tr("Ragdoll", "Ragdoll"))) { if (ImGui::MenuItem(tr("Ragdoll", "Ragdoll Component"))) scene->ragdollComponents[id] = RagdollComponent{}; }
+        if (match(tr("Destrutível", "Destructible"))) { if (ImGui::MenuItem(tr("Destrutível", "Destruction Component"))) scene->destructionComponents[id] = DestructionComponent{}; }
+        if (match(tr("Navegação", "Navigation"))) { if (ImGui::MenuItem(tr("Navegação", "Navigation Component"))) scene->navigationComponents[id] = NavigationComponent{}; }
+        ImGui::Separator();
+        section(tr("EFEITOS / NARRATIVA", "EFFECTS / NARRATIVE"));
+        if (match(tr("Emissor de Partículas", "Particle"))) { if (ImGui::MenuItem(tr("Emissor de Partículas", "Particle Emitter Component"))) scene->particleEmitterComponents[id] = ParticleEmitterComponent{}; }
+        if (match(tr("Fonte de Áudio", "Audio"))) { if (ImGui::MenuItem(tr("Fonte de Áudio", "Audio Component"))) scene->audioComponents[id] = AudioComponent{}; }
+        if (match(tr("Missão", "Mission"))) { if (ImGui::MenuItem(tr("Missão", "Mission Component"))) scene->missionComponents[id] = MissionComponent{}; }
+        if (match(tr("Diálogo", "Dialogue"))) { if (ImGui::MenuItem(tr("Diálogo", "Dialogue Component"))) scene->dialogueComponents[id] = DialogueComponent{}; }
 #if VC_ENABLE_VOXEL_PLUGIN
-        if (ImGui::MenuItem(tr("Mundo de Blocos", "Voxel Terrain Volume"))) scene->voxelVolumeComponents[id] = VoxelVolumeComponent{};
+        ImGui::Separator();
+        section(tr("MUNDO", "WORLD"));
+        if (match(tr("Mundo de Blocos", "Voxel"))) { if (ImGui::MenuItem(tr("Mundo de Blocos", "Voxel Terrain Volume"))) scene->voxelVolumeComponents[id] = VoxelVolumeComponent{}; }
 #endif
         ImGui::EndPopup();
     }
@@ -2447,16 +3274,103 @@ void EditorApplication::draw_inspector_panel() {
 }
 
 void EditorApplication::draw_viewport_panel() {
-    ImGui::Begin(tr("Visualização 3D", "Scene Viewport"));
+    // No scrollbar: the viewport must fill the allowed area 1:1. The offscreen
+    // target is sized to the image area (content minus the header) so the
+    // rendered image exactly matches the panel — nothing overflows.
+    ImGui::Begin(tr("Viewport", "Viewport"), nullptr,
+                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     const ImVec2 panelSize = ImGui::GetContentRegionAvail();
 
-    // Viewport Top Toolbar Info
-    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%s", tr("Visualização 3D em Tempo Real", "Real-Time 3D Preview")); ImGui::SameLine();
-    ImGui::TextDisabled(" |  %s: %dx%d", tr("Resolução", "Resolution"), static_cast<int>(panelSize.x), static_cast<int>(panelSize.y));
-    ImGui::TextDisabled("  |  W/E/R: %s", tr("Mover/Rotar/Escalar", "Translate/Rotate/Scale"));
+    // Viewport toolbar: gizmo mode (Move/Rotate/Scale), the camera label and
+    // the live play-mode badge. Responsive: secondary info drops first as the
+    // panel narrows (panel size → camera label); the gizmo buttons and the
+    // play badge always remain (badge = status, buttons = actions).
+    const float toolbarWidth = panelSize.x;
+    // Select / Move / Rotate / Scale (Q/W/E/R). Select hides the gizmo and
+    // only picks entities.
+    if (UI::iconButton(ICON_FA_HAND_POINTER, tr("Selecionar (Q)", "Select (Q)"),
+                       m_gizmoMode == GizmoMode::Select)) m_gizmoMode = GizmoMode::Select;
     ImGui::SameLine();
-    ImGui::TextDisabled("  |  Ctrl: %s", tr("Snap", "Snap"));
+    if (UI::iconButton(ICON_FA_ARROWS_UP_DOWN_LEFT_RIGHT, tr("Mover (W)", "Move (W)"),
+                       m_gizmoMode == GizmoMode::Translate)) m_gizmoMode = GizmoMode::Translate;
+    ImGui::SameLine();
+    if (UI::iconButton(ICON_FA_ROTATE, tr("Rotar (E)", "Rotate (E)"),
+                       m_gizmoMode == GizmoMode::Rotate)) m_gizmoMode = GizmoMode::Rotate;
+    ImGui::SameLine();
+    if (UI::iconButton(ICON_FA_UP_DOWN_LEFT_RIGHT, tr("Escalar (R)", "Scale (R)"),
+                       m_gizmoMode == GizmoMode::Scale)) m_gizmoMode = GizmoMode::Scale;
+    if (toolbarWidth > 420.0f) {
+        // World/Local gizmo space: Local rotates the drag axes with the entity.
+        ImGui::SameLine();
+        if (UI::iconButton(m_gizmoLocal ? ICON_FA_CUBE : ICON_FA_GLOBE,
+                           m_gizmoLocal ? tr("Local", "Local") : tr("Mundo", "World"),
+                           m_gizmoLocal)) {
+            m_gizmoLocal = !m_gizmoLocal;
+        }
+        // Snap step used by Ctrl-drag (translate); 0 disables snapping.
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(70.0f);
+        const char* snapLabels[] = { "Snap 0", "Snap 0.1", "Snap 0.5", "Snap 1", "Snap 2", "Snap 5" };
+        const float snapValues[] = { 0.0f, 0.1f, 0.5f, 1.0f, 2.0f, 5.0f };
+        int snapIdx = 2;
+        for (int i = 0; i < IM_ARRAYSIZE(snapValues); ++i) {
+            if (std::abs(m_snapTranslate - snapValues[i]) < 1e-4f) snapIdx = i;
+        }
+        if (ImGui::BeginCombo("##SnapStep", snapLabels[snapIdx], ImGuiComboFlags_NoArrowButton)) {
+            for (int i = 0; i < IM_ARRAYSIZE(snapValues); ++i) {
+                if (ImGui::Selectable(snapLabels[i], i == snapIdx)) m_snapTranslate = snapValues[i];
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", tr("Passo de snap ao segurar Ctrl ao arrastar o gizmo", "Snap step when holding Ctrl while dragging the gizmo"));
+        }
+    }
+    if (toolbarWidth > 350.0f) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", tr("Perspectiva", "Perspective"));
+    }
+    // Live play-mode state in the header: the scene looks identical while the
+    // in-engine game runs, so the mode must be explicit.
+    const PlayState headerState = m_playMode.get_state();
+    if (headerState != PlayState::Edit) {
+        const bool paused = headerState == PlayState::Pause;
+        const std::string stateTag = std::string(paused ? ICON_FA_PAUSE
+                                                        : (headerState == PlayState::Simulate ? ICON_FA_ARROWS_ROTATE : ICON_FA_PLAY)) +
+            "  " + (paused ? tr("PAUSADO", "PAUSED")
+                           : (headerState == PlayState::Simulate ? tr("SIMULANDO", "SIMULATING")
+                                                                 : tr("JOGO EM EXECUÇÃO", "PLAYING")));
+        ImGui::SameLine();
+        ImGui::TextColored(paused ? ImVec4(0.96f, 0.62f, 0.04f, 1.0f) : ImVec4(0.30f, 0.90f, 0.60f, 1.0f),
+                           "%s", stateTag.c_str());
+    }
+    if (toolbarWidth > 500.0f) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("|  %dx%d", static_cast<int>(panelSize.x), static_cast<int>(panelSize.y));
+    }
+    // Overflow menu: display toggles that used to be hidden in Janelas.
+    ImGui::SameLine();
+    if (UI::iconButton(ICON_FA_ELLIPSIS_VERTICAL, tr("Opções do Viewport", "Viewport Options"))) {
+        ImGui::OpenPopup("##ViewportOptions");
+    }
+    if (ImGui::BeginPopup("##ViewportOptions")) {
+        ImGui::MenuItem(tr("Grid", "Grid"), nullptr, &m_showGrid);
+        ImGui::MenuItem(tr("Gizmos", "Gizmos"), nullptr, &m_showGizmos);
+        ImGui::MenuItem(tr("Colliders (wireframe)", "Collider Wireframes"), nullptr, &m_showColliders);
+        ImGui::Separator();
+        ImGui::TextDisabled("%s", tr("Segure Ctrl ao arrastar o gizmo para usar snap", "Hold Ctrl while dragging the gizmo to snap"));
+        ImGui::EndPopup();
+    }
     ImGui::Separator();
+
+    // The image area is what remains BELOW the header. Measure it AFTER the
+    // header is drawn — the header is two lines + separator, so estimating it
+    // from a single frame height overflowed and the mouse wheel scrolled the
+    // panel (the NoScrollbar flag hides the bar but does NOT stop the wheel).
+    const ImVec2 imageAvail = ImGui::GetContentRegionAvail();
+    const float availW = std::max(1.0f, imageAvail.x);
+    const float availH = std::max(1.0f, imageAvail.y);
+    m_viewportPanelSize = imageAvail;
 
     m_viewportHovered = ImGui::IsWindowHovered();
     m_viewportFocused = ImGui::IsWindowFocused();
@@ -2467,16 +3381,17 @@ void EditorApplication::draw_viewport_panel() {
         return;
     }
 
-    // Fit the offscreen texture into the panel, preserving aspect ratio.
+    // Fit the offscreen texture into the remaining image area, preserving the
+    // aspect ratio: fills 100% of the allowed space, centered, no overflow.
     const float texAspect = static_cast<float>(m_offscreen.width) / std::max(1u, m_offscreen.height);
-    float dispW = std::max(1.0f, panelSize.x);
+    float dispW = availW;
     float dispH = dispW / texAspect;
-    if (dispH > std::max(1.0f, panelSize.y)) {
-        dispH = std::max(1.0f, panelSize.y);
+    if (dispH > availH) {
+        dispH = availH;
         dispW = dispH * texAspect;
     }
     const ImVec2 cursorPos = ImGui::GetCursorScreenPos();
-    const ImVec2 dispPos(cursorPos.x + std::max(0.0f, (panelSize.x - dispW) * 0.5f), cursorPos.y);
+    const ImVec2 dispPos(cursorPos.x + std::max(0.0f, (availW - dispW) * 0.5f), cursorPos.y);
     m_viewportImagePos = dispPos;
     m_viewportImageSize = ImVec2(dispW, dispH);
     m_viewportImageHovered = ImGui::IsMouseHoveringRect(dispPos, ImVec2(dispPos.x + dispW, dispPos.y + dispH));
@@ -2484,14 +3399,46 @@ void EditorApplication::draw_viewport_panel() {
     ImGui::SetCursorScreenPos(dispPos);
     // Vulkan images are top-down; flip V so the world appears upright.
     ImGui::Image(m_offscreen.imguiTextureID, ImVec2(dispW, dispH), ImVec2(0.0f, 1.0f), ImVec2(1.0f, 0.0f));
-#ifdef _WIN32
-    // The editor render target may be square, but an embedded running game is
-    // a native swapchain and must occupy the complete Scene Viewport panel.
-    // Keeping it tied to dispW/dispH left half of widescreen panels uncovered.
-    update_embedded_game(m_window, dispPos,
-                         ImVec2(std::max(1.0f, panelSize.x),
-                                std::max(1.0f, panelSize.y)));
-#endif
+
+    // Play-mode feedback overlay: while the in-engine game runs, draw a colored
+    // border + state badge over the viewport so the mode is unmistakable (the
+    // rendered scene itself is identical to edit mode). When the play world has
+    // nothing that animates, show a hint instead of silence — the most common
+    // "o botão não fez nada" confusion is an empty scene.
+    const PlayState playState = m_playMode.get_state();
+    if (playState != PlayState::Edit) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const bool paused = playState == PlayState::Pause;
+        const ImU32 accent = paused ? IM_COL32(245, 158, 11, 235) : IM_COL32(16, 185, 129, 235);
+        dl->AddRect(dispPos, ImVec2(dispPos.x + dispW, dispPos.y + dispH), accent, 0.0f, 0, 3.0f);
+
+        const std::string badge = std::string(paused ? ICON_FA_PAUSE : ICON_FA_PLAY) + "  " +
+            (paused ? tr("PAUSADO", "PAUSED") : tr("JOGO EM EXECUÇÃO", "PLAYING"));
+        const ImVec2 badgeSize = ImGui::CalcTextSize(badge.c_str());
+        const ImVec2 badgePos(dispPos.x + 10.0f, dispPos.y + 10.0f);
+        dl->AddRectFilled(badgePos,
+                          ImVec2(badgePos.x + badgeSize.x + 16.0f, badgePos.y + badgeSize.y + 8.0f),
+                          IM_COL32(0, 0, 0, 175), 4.0f);
+        dl->AddText(ImVec2(badgePos.x + 8.0f, badgePos.y + 4.0f), accent, badge.c_str());
+
+        Scene* playScene = m_playMode.get_active_scene();
+        if (playScene) {
+            const bool hasMotion = !playScene->rigidbodyComponents.empty() ||
+                                   !playScene->particleEmitterComponents.empty() ||
+                                   !playScene->weaponComponents.empty() || m_playScriptLoaded;
+            if (!hasMotion) {
+                const char* hint = tr("Nada muda aqui — adicione um Corpo Rígido, Partícula ou Script e veja o Play agir",
+                                      "Nothing moves here — add a Rigid Body, Particle or Script to see Play in action");
+                const ImVec2 hintSize = ImGui::CalcTextSize(hint);
+                const ImVec2 hintPos(dispPos.x + dispW * 0.5f - hintSize.x * 0.5f - 8.0f,
+                                     dispPos.y + dispH - hintSize.y - 14.0f);
+                dl->AddRectFilled(hintPos,
+                                  ImVec2(hintPos.x + hintSize.x + 16.0f, hintPos.y + hintSize.y + 8.0f),
+                                  IM_COL32(0, 0, 0, 195), 4.0f);
+                dl->AddText(ImVec2(hintPos.x + 8.0f, hintPos.y + 4.0f), IM_COL32(235, 235, 240, 255), hint);
+            }
+        }
+    }
 
     // Drag & drop de assets (Content Browser → cena): mesh cria uma entidade
     // em frente à câmera; material aplica na entidade selecionada.
@@ -2510,8 +3457,9 @@ void EditorApplication::draw_viewport_panel() {
 
     if (m_viewportImageHovered) {
         // Left click: grab the gizmo axis first, otherwise pick the entity.
+        // Select mode has no gizmo — clicks always pick.
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !m_gizmoDragging) {
-            if (gizmo_axis_hit_test(mouse)) {
+            if (m_gizmoMode != GizmoMode::Select && gizmo_axis_hit_test(mouse)) {
                 m_activeAxis = m_hoveredAxis;
                 start_gizmo_drag(mouse);
             } else {
@@ -2531,7 +3479,7 @@ void EditorApplication::draw_viewport_panel() {
             m_gizmoDragging = false;
             m_activeAxis = GizmoAxis::None;
         }
-    } else if (m_viewportImageHovered && !ImGui::IsAnyMouseDown()) {
+    } else if (m_viewportImageHovered && !ImGui::IsAnyMouseDown() && m_gizmoMode != GizmoMode::Select) {
         gizmo_axis_hit_test(mouse); // hover highlight
     }
 
@@ -2555,6 +3503,12 @@ void EditorApplication::handle_asset_drop(const UUID& assetId) {
         m_selectedEntity = ent;
         std::cout << "[Viewport] Dropped mesh '" << asset.sourcePath.filename().string()
                   << "' -> spawned entity '" << ent.get_name() << "'\n";
+    } else if (asset.type == AssetType::Block) {
+        // Block model: spawn as a textured cube in front of the camera (the
+        // renderer builds the cube mesh + texture pipeline on demand).
+        spawn_block_entity(asset.id, m_editorCamera.position + m_editorCamera.get_front() * 2.0f);
+        std::cout << "[Viewport] Dropped block '" << asset.sourcePath.filename().string()
+                  << "' -> spawned block entity\n";
     } else if (asset.type == AssetType::Material) {
         if (m_selectedEntity.is_valid()) {
             const auto it = scene->meshRendererComponents.find(m_selectedEntity.get_id());
@@ -2570,7 +3524,10 @@ void EditorApplication::handle_asset_drop(const UUID& assetId) {
 }
 
 void EditorApplication::draw_content_browser_panel() {
-    ImGui::Begin(tr("Arquivos do Projeto", "Project Content Browser"));
+    // Local minimum only (see draw_app_bar note about the global style).
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(260.0f, 180.0f));
+    ImGui::Begin(tr("Assets", "Assets"));
+    ImGui::PopStyleVar();
 
     static bool indexed = false;
     static char search[256]{};
@@ -2601,23 +3558,35 @@ void EditorApplication::draw_content_browser_panel() {
         indexed = true;
     }
 
-    ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f), "%s: %s",
-        tr("Pasta do Jogo", "Game Directory"), sourceRoot.string().c_str());
+    ImGui::TextDisabled("%s: %s", tr("Pasta do Jogo", "Game Directory"), sourceRoot.string().c_str());
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 96.0f);
     ImGui::InputTextWithHint("##AssetSearch", tr("Pesquisar assets...", "Search assets..."), search, sizeof(search));
     ImGui::SameLine();
-    const char* filters[] = { "All", "Texture", "Mesh", "Material", "Audio", "Scene", "Animation", "Unused" };
-    ImGui::Combo("##AssetType", &typeFilter, filters, IM_ARRAYSIZE(filters));
-    ImGui::SameLine();
-    if (ImGui::Button(tr("Empacotar", "Package"))) {
-        std::vector<UUID> roots;
-        for (const AssetMetadata& candidate : m_assetRegistry.snapshot())
-            if (candidate.type == AssetType::Scene) roots.push_back(candidate.id);
-        const std::filesystem::path packageOutput = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) /
-            "Packages" / m_currentProjectName;
-        const AssetPackageResult packaged = AssetPackager::package(m_assetRegistry, roots, packageOutput);
-        if (!packaged) std::cerr << "[AssetPackager] " << packaged.error << std::endl;
-        else std::cout << "[AssetPackager] Packaged " << packaged.assets.size()
-                       << " assets to " << packageOutput << std::endl;
+    if (ImGui::Button(tr(ICON_FA_FILE_IMPORT "  Importar", ICON_FA_FILE_IMPORT "  Import"), ImVec2(88, 0))) {
+        std::string importPath;
+        if (pick_file_dialog(importPath, L"Assets (*.*)\0*.*\0", L"Importar Asset", nullptr)) {
+            if (m_assetPipeline) {
+                const std::filesystem::path cookedRoot =
+                    std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "DerivedDataCache";
+                const ImportResult result = m_assetPipeline->import({ importPath, cookedRoot, 1 });
+                if (!result) std::cerr << "[ContentBrowser] " << result.error << std::endl;
+            }
+        }
+    }
+    // Type filter tabs (the old Combo row could not fit when the dock shrank).
+    // "Modelos" groups every 3D/model asset: industry meshes (glTF), block
+    // models assembled from Minecraft-style PNGs, and voxel structures.
+    const char* filtersPt[] = { "Tudo", "Texturas", "Malhas", "Modelos", "Materiais", "Áudio", "Cenas", "Animações", "Não Usados" };
+    const char* filtersEn[] = { "All", "Textures", "Meshes", "Models", "Materials", "Audio", "Scenes", "Animations", "Unused" };
+    const float tabAvail = ImGui::GetContentRegionAvail().x;
+    const float tabW = ImMax(1.0f, tabAvail / IM_ARRAYSIZE(filtersEn));
+    for (int i = 0; i < IM_ARRAYSIZE(filtersEn); ++i) {
+        const bool selected = (typeFilter == i);
+        if (ImGui::Selectable((m_currentLanguage == EngineLanguage::PT_BR) ? filtersPt[i] : filtersEn[i],
+                              selected, 0, ImVec2(tabW, 0))) {
+            typeFilter = i;
+        }
+        if (i + 1 < IM_ARRAYSIZE(filtersEn)) ImGui::SameLine();
     }
     ImGui::Separator();
 
@@ -2625,16 +3594,23 @@ void EditorApplication::draw_content_browser_panel() {
     switch (typeFilter) {
         case 1: selectedType = AssetType::Texture; break;
         case 2: selectedType = AssetType::Mesh; break;
-        case 3: selectedType = AssetType::Material; break;
-        case 4: selectedType = AssetType::Audio; break;
-        case 5: selectedType = AssetType::Scene; break;
-        case 6: selectedType = AssetType::Animation; break;
+        case 4: selectedType = AssetType::Material; break;
+        case 5: selectedType = AssetType::Audio; break;
+        case 6: selectedType = AssetType::Scene; break;
+        case 7: selectedType = AssetType::Animation; break;
         default: break;
     }
 
     AssetBrowserModel browser(m_assetRegistry);
     std::vector<AssetMetadata> assets = browser.query(search, selectedType);
-    if (typeFilter == 7) {
+    if (typeFilter == 3) {
+        // Modelos: meshes + block models + voxel structures.
+        assets.erase(std::remove_if(assets.begin(), assets.end(), [&](const AssetMetadata& candidate) {
+            return candidate.type != AssetType::Mesh && candidate.type != AssetType::Block &&
+                   candidate.type != AssetType::VoxelStructure;
+        }), assets.end());
+    }
+    if (typeFilter == 8) {
         std::vector<UUID> roots;
         for (const AssetMetadata& candidate : m_assetRegistry.snapshot())
             if (candidate.type == AssetType::Scene) roots.push_back(candidate.id);
@@ -2644,15 +3620,94 @@ void EditorApplication::draw_content_browser_panel() {
             return !unusedSet.contains(candidate.id);
         }), assets.end());
     }
+    const auto assetIcon = [](AssetType t) -> const char* {
+        switch (t) {
+            case AssetType::Texture: return ICON_FA_IMAGE;
+            case AssetType::Mesh: return ICON_FA_CUBE;
+            case AssetType::Material: return ICON_FA_PAINTBRUSH;
+            case AssetType::Audio: return ICON_FA_MUSIC;
+            case AssetType::Skeleton: return ICON_FA_SITEMAP;
+            case AssetType::Animation: return ICON_FA_FILM;
+            case AssetType::Scene: return ICON_FA_CLAPPERBOARD;
+            case AssetType::VoxelStructure: return ICON_FA_CUBES;
+            case AssetType::Block: return ICON_FA_CUBES;
+            default: return ICON_FA_FILE;
+        }
+    };
+    const auto assetTypeName = [this](AssetType t) -> const char* {
+        switch (t) {
+            case AssetType::Texture: return tr("Textura", "Texture");
+            case AssetType::Mesh: return tr("Malha", "Mesh");
+            case AssetType::Material: return tr("Material", "Material");
+            case AssetType::Audio: return tr("Áudio", "Audio");
+            case AssetType::Skeleton: return tr("Esqueleto", "Skeleton");
+            case AssetType::Animation: return tr("Animação", "Animation");
+            case AssetType::Scene: return tr("Cena", "Scene");
+            case AssetType::VoxelStructure: return tr("Voxel", "Voxel");
+            case AssetType::Block: return tr("Bloco", "Block");
+            default: return "?";
+        }
+    };
+
     const float cellSize = 150.0f;
     int columns = std::max(1, static_cast<int>(ImGui::GetContentRegionAvail().x / cellSize));
+    // Cap GPU thumbnail uploads per frame: a folder with hundreds of textures
+    // fills the cache progressively instead of stalling one frame / all VRAM.
+    int thumbnailBudget = 48;
     ImGui::Columns(columns, "AssetGrid", false);
     for (const AssetMetadata& asset : assets) {
         const std::string filename = asset.sourcePath.filename().string();
         ImGui::PushID(asset.id.to_string().c_str());
-        if (ImGui::Button(filename.c_str(), ImVec2(135, 65))) {
-            selectedAssetId = asset.id;
-            editedImportSettings = asset.importSettings;
+
+        // Real previews: cooked textures show the actual image (lazy, cached);
+        // meshes and blocks render a true 3D thumbnail (rendered offscreen);
+        // audio tiles carry a single active ▶/⏸ preview voice.
+        const bool isTexture = (asset.type == AssetType::Texture);
+        const bool isAudio = (asset.type == AssetType::Audio);
+        const bool isModel = (asset.type == AssetType::Mesh || asset.type == AssetType::Block);
+        VkDescriptorSet thumb = VK_NULL_HANDLE;
+        if (isTexture && thumbnailBudget > 0) {
+            thumb = get_asset_thumbnail(asset);
+            if (thumb) --thumbnailBudget;
+        } else if (isModel) {
+            const auto thumbIt = m_asset3dThumbnails.find(asset.id);
+            if (thumbIt != m_asset3dThumbnails.end()) {
+                thumb = thumbIt->second;
+            } else {
+                request_3d_thumbnail(asset.id); // rendered by pump_asset_thumbnails
+            }
+        }
+        if (thumb != VK_NULL_HANDLE) {
+            if (ImGui::ImageButton("##thumb", thumb, ImVec2(135, 48))) {
+                selectedAssetId = asset.id;
+                editedImportSettings = asset.importSettings;
+            }
+        } else {
+            if (ImGui::Button(assetIcon(asset.type), ImVec2(135, 48))) {
+                selectedAssetId = asset.id;
+                editedImportSettings = asset.importSettings;
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s\n%s", filename.c_str(), assetTypeName(asset.type));
+        }
+        // Double-click opens the matching editor (industry convention).
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            switch (asset.type) {
+                case AssetType::Material: m_specializedEditors.open_editor("Material"); break;
+                case AssetType::Animation: m_specializedEditors.open_editor("Animation"); break;
+                case AssetType::Audio: m_specializedEditors.open_editor("Audio"); break;
+                case AssetType::Mesh: m_wickedTools.showMeshWindow = true; break;
+                default: break;
+            }
+        }
+        if (isAudio) {
+            const bool playing = m_audioPreviewAsset == asset.id && m_audioPreviewVoice != 0 &&
+                                 m_playAudio.is_active(m_audioPreviewVoice);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (135.0f - 42.0f) * 0.5f);
+            if (ImGui::Button(playing ? ICON_FA_PAUSE : ICON_FA_PLAY, ImVec2(42, 24))) {
+                toggle_audio_preview(asset);
+            }
         }
         if (ImGui::BeginPopupContextItem("AssetContext")) {
             if (ImGui::MenuItem(tr("Duplicar", "Duplicate"))) {
@@ -2684,6 +3739,20 @@ void EditorApplication::draw_content_browser_panel() {
                         std::cerr << "[AssetRegistry] Could not persist asset deletion" << std::endl;
                 }
             }
+            // Minecraft-style recognition: a small square POT texture can be
+            // assembled into a block model — offer that as a real action.
+            if (asset.type == AssetType::Texture && looks_like_block_texture(asset)) {
+                if (ImGui::MenuItem(tr("Criar Modelo de Bloco (Minecraft)", "Create Block Model (Minecraft)"))) {
+                    create_block_asset(asset);
+                }
+            }
+            // Block model: spawn it as a textured cube in the scene (the
+            // missing button — blocks used to live only as assets with previews).
+            if (asset.type == AssetType::Block) {
+                if (ImGui::MenuItem(tr("Criar Entidade de Bloco na Cena", "Spawn Block in Scene"))) {
+                    spawn_block_entity(asset.id, m_editorCamera.orbitTarget);
+                }
+            }
             const auto referencers = m_assetRegistry.referencers_of(asset.id);
             if (!referencers.empty()) {
                 ImGui::Separator();
@@ -2697,7 +3766,13 @@ void EditorApplication::draw_content_browser_panel() {
             ImGui::TextUnformatted(filename.c_str());
             ImGui::EndDragDropSource();
         }
-        ImGui::TextDisabled("%s", asset.isCooked ? "Cooked" : "Source");
+        ImGui::TextColored(UI::Colors::TextSecondary, "%s", assetTypeName(asset.type));
+        if (asset.type == AssetType::Texture && looks_like_block_texture(asset)) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.30f, 0.75f, 0.95f, 1.0f), "%s", tr("Bloco", "Block"));
+        }
+        ImGui::SameLine();
+        if (asset.isCooked) ImGui::TextColored(UI::Colors::Success, "%s", ICON_FA_CIRCLE_CHECK);
         ImGui::TextWrapped("%s", filename.c_str());
         ImGui::PopID();
         ImGui::NextColumn();
@@ -2861,6 +3936,7 @@ void EditorApplication::draw_script_canvas_panel() {
         ImGui::End();
         return;
     }
+    clamp_floating_window_on_screen();
 
     // Toolbar.
     if (ImGui::Button(tr("Salvar", "Save"))) save_script_canvas();
@@ -3097,6 +4173,7 @@ void EditorApplication::draw_script_canvas_panel() {
 void EditorApplication::draw_script_debugger_panel() {
     using namespace Engine::Scripting;
     ImGui::Begin(tr("Debugger de Scripts", "Script Debugger"));
+    clamp_floating_window_on_screen();
     const bool playing = m_playMode.get_state() == PlayState::Play ||
                          m_playMode.get_state() == PlayState::Simulate;
     if (!m_playScriptLoaded || !playing) {
@@ -3222,33 +4299,94 @@ void EditorApplication::draw_script_debugger_panel() {
 
 void EditorApplication::draw_voxel_tool_panel() {
 #if VC_ENABLE_VOXEL_PLUGIN
+    // Local minimum only: this panel never shrinks below a readable width
+    // (the global WindowMinSize stays small so the app bar/shell stay exact).
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(290.0f, 160.0f));
     ImGui::Begin(tr("Escultura de Blocos", "Voxel Sculpting Tools"));
+    ImGui::PopStyleVar();
 
+    // Responsive rows: label | control when wide, stacked when narrow. The
+    // brush settings are written straight into m_activeVoxelBrush (the real
+    // operation consumed by paint_voxel_ray) on every change.
     static int shapeIdx = 0;
-    const char* shapesPt[] = { "Esfera", "Cubo", "Cilindro", "Carimbo" };
-    const char* shapesEn[] = { "Sphere", "Cube", "Cylinder", "Stamp" };
-    ImGui::Combo(tr("Formato do Pincel", "Brush Shape"), &shapeIdx, (m_currentLanguage == EngineLanguage::PT_BR) ? shapesPt : shapesEn, 4);
+    const char* shapesPt[] = { "Esfera", "Cubo" };
+    const char* shapesEn[] = { "Sphere", "Cube" };
+    {
+        const bool table = UI::beginPropertyRow(tr("Formato do Pincel", "Brush Shape"));
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::Combo("##BrushShape", &shapeIdx, (m_currentLanguage == EngineLanguage::PT_BR) ? shapesPt : shapesEn, 2)) {
+            m_activeVoxelBrush.shape = static_cast<VoxelBrushShape>(shapeIdx);
+        }
+        UI::endPropertyRow(table);
+    }
 
     static int modeIdx = 0;
-    const char* modesPt[] = { "Colocar Blocos", "Destruir Blocos", "Substituir Blocos", "Pintar Material" };
-    const char* modesEn[] = { "Add Voxels", "Remove Voxels", "Replace Voxels", "Paint Material" };
-    ImGui::Combo(tr("Modo de Ação", "Brush Mode"), &modeIdx, (m_currentLanguage == EngineLanguage::PT_BR) ? modesPt : modesEn, 4);
+    const char* modesPt[] = { "Colocar Blocos", "Destruir Blocos", "Substituir Blocos" };
+    const char* modesEn[] = { "Add Voxels", "Remove Voxels", "Replace Voxels" };
+    {
+        const bool table = UI::beginPropertyRow(tr("Modo de Ação", "Brush Mode"));
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::Combo("##BrushMode", &modeIdx, (m_currentLanguage == EngineLanguage::PT_BR) ? modesPt : modesEn, 3)) {
+            m_activeVoxelBrush.mode = static_cast<VoxelBrushMode>(modeIdx);
+        }
+        UI::endPropertyRow(table);
+    }
 
-    ImGui::SliderFloat(tr("Tamanho do Pincel", "Brush Radius"), &m_activeVoxelBrush.radius, 0.5f, 25.0f);
+    {
+        const bool table = UI::beginPropertyRow(tr("Tamanho do Pincel", "Brush Radius"));
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SliderFloat("##BrushRadius", &m_activeVoxelBrush.radius, 0.5f, 25.0f);
+        UI::endPropertyRow(table);
+    }
 
     static int voxelTypeIdx = 1;
-    const char* materialsPt[] = { "Ar", "Grama", "Terra", "Pedra", "Areia", "Madeira", "Vidro", "Pedregulho", "Obsidiana", "Basalto" };
-    const char* materialsEn[] = { "Air", "Grass", "Dirt", "Stone", "Sand", "Wood", "Glass", "Cobblestone", "Obsidian", "Basalt" };
-    ImGui::Combo(tr("Tipo de Bloco", "Voxel Material"), &voxelTypeIdx, (m_currentLanguage == EngineLanguage::PT_BR) ? materialsPt : materialsEn, 10);
+    const char* materialsPt[] = { "Grama", "Terra", "Pedra", "Areia", "Madeira", "Vidro", "Pedregulho", "Obsidiana", "Basalto", "Neve" };
+    const char* materialsEn[] = { "Grass", "Dirt", "Stone", "Sand", "Wood", "Glass", "Cobblestone", "Obsidian", "Basalt", "Snow" };
+    {
+        const bool table = UI::beginPropertyRow(tr("Tipo de Bloco", "Voxel Material"));
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::Combo("##VoxelType", &voxelTypeIdx, (m_currentLanguage == EngineLanguage::PT_BR) ? materialsPt : materialsEn, 10)) {
+            m_activeVoxelBrush.voxelType = static_cast<uint16_t>(voxelTypeIdx);
+        }
+        UI::endPropertyRow(table);
+    }
 
     ImGui::Separator();
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.82f, 0.60f, 1.00f));
-    if (ImGui::Button(tr("Aplicar Pincel", "Apply Brush"), ImVec2(220, 32))) {
-        m_activeVoxelBrush.shape = static_cast<VoxelBrushShape>(shapeIdx);
-        m_activeVoxelBrush.mode = static_cast<VoxelBrushMode>(modeIdx);
-        m_activeVoxelBrush.voxelType = static_cast<uint16_t>(voxelTypeIdx);
+    // Paint mode: click/drag in the viewport paints on the selected voxel
+    // volume (right button removes). The old "Aplicar Pincel" button used to
+    // write settings nobody consumed — painting is now live.
+    ImGui::Checkbox(tr("Pintar no viewport (arraste; botão direito remove)", "Paint in viewport (drag; right button removes)"), &m_voxelPaintMode);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", tr("Com um Mundo de Blocos selecionado, arraste no viewport para esculpir. A ferramenta Select (Q) é usada enquanto o modo de pintura está desligado.", "With a Voxel World selected, drag in the viewport to sculpt. The Select tool (Q) is used while paint mode is off."));
     }
-    ImGui::PopStyleColor();
+
+    // Volume actions: generate the terrain from the seed, or clear everything.
+    const UUID selectedVolume = (m_selectedEntity.is_valid() && m_editorScene &&
+                                 m_editorScene->voxelVolumeComponents.contains(m_selectedEntity.get_id()))
+                                    ? m_selectedEntity.get_id()
+                                    : UUID{ 0, 0 };
+    if (selectedVolume.is_valid()) {
+        auto& vol = m_editorScene->voxelVolumeComponents[selectedVolume];
+        if (ImGui::Button(tr("Gerar Terreno (semente)", "Generate Terrain (seed)"), ImVec2(-FLT_MIN, 28))) {
+            m_voxelStructures.erase(selectedVolume);
+            ensure_voxel_volume(selectedVolume, vol.seed, vol.seaLevel);
+            m_voxelMeshesDirty.insert(selectedVolume);
+        }
+        if (ImGui::Button(tr("Limpar Volume", "Clear Volume"), ImVec2(-FLT_MIN, 28))) {
+            const auto gridIt = m_voxelStructures.find(selectedVolume);
+            if (gridIt != m_voxelStructures.end()) {
+                const auto& size = gridIt->second->size();
+                for (int x = 0; x < size.x; ++x)
+                    for (int y = 0; y < size.y; ++y)
+                        for (int z = 0; z < size.z; ++z)
+                            gridIt->second->set(Engine::Voxel::Int3{ x, y, z }, Engine::Voxel::VoxelValue::air());
+                m_voxelMeshesDirty.insert(selectedVolume);
+            }
+        }
+        ImGui::TextDisabled("%s", tr("Selecione o Mundo de Blocos para esculpir", "Select the Voxel World entity to sculpt"));
+    } else {
+        ImGui::TextDisabled("%s", tr("Selecione uma entidade 'Mundo de Blocos' (ou crie pelo +Add) para esculpir", "Select a Voxel World entity (or create one via +Add) to sculpt"));
+    }
 
     ImGui::End();
 #endif
@@ -3342,7 +4480,7 @@ void EditorApplication::run_game_build() {
 }
 
 void EditorApplication::draw_console_panel() {
-    ImGui::Begin(tr("Mensagens do Sistema", "Console & Profiler"));
+    ImGui::Begin(tr("Console", "Console"));
 
     ImGui::TextColored(ImVec4(0.39f, 0.40f, 0.95f, 1.00f), "%s", tr("Vulkan Engine Studio 1.5.0 - Português (Brasil)", "Vulkan Engine Studio 1.5.0 - English (US)"));
     ImGui::Text(tr("Velocidade: %.1f FPS  |  Tempo por Quadro: %.2f ms  |  Memória RAM: %zu MB", "Speed: %.1f FPS  |  Frame Time: %.2f ms  |  RAM: %zu MB"), m_fps, m_frameTimeMs, m_ramUsageMb);
@@ -3356,9 +4494,38 @@ void EditorApplication::draw_console_panel() {
         ImGui::Separator();
     }
 
-    ImGui::TextColored(ImVec4(0.20f, 0.82f, 0.60f, 1.0f), "%s", tr("[INFO] Placa de Vídeo Vulkan 1.3 Inicializada: NVIDIA GeForce RTX 3060", "[INFO] Vulkan 1.3 Device Initialized: NVIDIA GeForce RTX 3060"));
-    ImGui::TextColored(ImVec4(0.20f, 0.82f, 0.60f, 1.0f), "%s", tr("[INFO] Mundo de Blocos Carregado. 1024 chunks ativos na memória.", "[INFO] VoxelWorldPlugin loaded. 1024 active chunks in memory."));
-    ImGui::TextColored(ImVec4(0.98f, 0.75f, 0.14f, 1.0f), "%s", tr("[AVISO] 12 imagens PNG não otimizadas encontradas na pasta Assets.", "[WARN] 12 Uncooked PNG assets found in Assets folder."));
+    // Real device status (queried from the physical device at init).
+    // NOTE: the translated string carries its own format specifier, so it must
+    // be formatted with snprintf BEFORE ImGui::TextColored (passing it as the
+    // "%s" arg would leave the inner %s/%zu literals unexpanded).
+    {
+        char gpuMsg[512];
+        snprintf(gpuMsg, sizeof(gpuMsg), tr("[INFO] Placa de Vídeo Vulkan 1.3 Inicializada: %s", "[INFO] Vulkan 1.3 Device Initialized: %s"), m_gpuName.c_str());
+        ImGui::TextColored(ImVec4(0.20f, 0.82f, 0.60f, 1.0f), "%s", gpuMsg);
+    }
+
+    // Real scene status: the edited scene and the play world (if playing).
+    if (m_editorScene) {
+        const size_t entityCount = m_editorScene->get_entities().size();
+        char sceneMsg[256];
+        snprintf(sceneMsg, sizeof(sceneMsg), tr("[INFO] Cena carregada: %zu entidades", "[INFO] Scene loaded: %zu entities"), entityCount);
+        ImGui::TextColored(ImVec4(0.20f, 0.82f, 0.60f, 1.0f), "%s", sceneMsg);
+    }
+    const PlayState state = m_playMode.get_state();
+    if (state == PlayState::Play || state == PlayState::Simulate) {
+        ImGui::TextColored(ImVec4(0.20f, 0.82f, 0.60f, 1.0f), "%s", tr("[INFO] Jogo interno em execução (Play In Editor)", "[INFO] In-engine game running (Play In Editor)"));
+    }
+
+    // Real asset status from the registry.
+    {
+        size_t cooked = 0;
+        for (const AssetMetadata& asset : m_assetRegistry.snapshot()) {
+            if (asset.isCooked) ++cooked;
+        }
+        char assetMsg[256];
+        snprintf(assetMsg, sizeof(assetMsg), tr("[INFO] Registro de assets: %zu total, %zu cozidos", "[INFO] Asset registry: %zu total, %zu cooked"), m_assetRegistry.size(), cooked);
+        ImGui::TextColored(ImVec4(0.20f, 0.82f, 0.60f, 1.0f), "%s", assetMsg);
+    }
 
     ImGui::End();
 }
@@ -3403,7 +4570,10 @@ VkShaderModule make_module(VkDevice device, const std::vector<uint32_t>& spirv) 
 
 VkPipeline create_scene_pipeline(VkDevice device, VkRenderPass renderPass, VkPipelineLayout layout,
                                  VkShaderModule vert, VkShaderModule frag,
-                                 bool wireframe, bool depthTest, bool cull, bool withUv = false) {
+                                 bool wireframe, bool depthTest, bool cull, bool withUv = false,
+                                 bool noVertexInput = false, bool blend = false,
+                                 bool lessOrEqualDepth = false, bool depthBias = false,
+                                 bool depthWrite = true) {
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -3424,10 +4594,10 @@ VkPipeline create_scene_pipeline(VkDevice device, VkRenderPass renderPass, VkPip
     attrs[2] = { 2, 0, VK_FORMAT_R32G32B32_SFLOAT, static_cast<uint32_t>(offsetof(EditorVertex, color)) };
     attrs[3] = { 3, 0, VK_FORMAT_R32G32_SFLOAT, static_cast<uint32_t>(offsetof(EditorVertex, uv)) };
     VkPipelineVertexInputStateCreateInfo vertexInput{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-    vertexInput.vertexBindingDescriptionCount = 1;
-    vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = withUv ? 4u : 3u;
-    vertexInput.pVertexAttributeDescriptions = attrs;
+    vertexInput.vertexBindingDescriptionCount = noVertexInput ? 0u : 1u;
+    vertexInput.pVertexBindingDescriptions = noVertexInput ? nullptr : &binding;
+    vertexInput.vertexAttributeDescriptionCount = noVertexInput ? 0u : (withUv ? 4u : 3u);
+    vertexInput.pVertexAttributeDescriptions = noVertexInput ? nullptr : attrs;
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
     inputAssembly.topology = wireframe ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -3444,7 +4614,14 @@ VkPipeline create_scene_pipeline(VkDevice device, VkRenderPass renderPass, VkPip
     rasterizer.lineWidth = 1.0f;
     rasterizer.cullMode = cull ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rasterizer.depthBiasEnable = VK_FALSE;
+    rasterizer.depthBiasEnable = depthBias ? VK_TRUE : VK_FALSE;
+    if (depthBias) {
+        // Push the grid slightly away so geometry sitting on the plane
+        // (y = 0) wins the depth test instead of z-fighting.
+        rasterizer.depthBiasConstantFactor = 4.0f;
+        rasterizer.depthBiasSlopeFactor = 1.0f;
+        rasterizer.depthBiasClamp = 0.0f;
+    }
 
     VkPipelineMultisampleStateCreateInfo multisampling{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
     multisampling.sampleShadingEnable = VK_FALSE;
@@ -3452,12 +4629,24 @@ VkPipeline create_scene_pipeline(VkDevice device, VkRenderPass renderPass, VkPip
 
     VkPipelineDepthStencilStateCreateInfo depthStencil{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
     depthStencil.depthTestEnable = depthTest ? VK_TRUE : VK_FALSE;
-    depthStencil.depthWriteEnable = depthTest ? VK_TRUE : VK_FALSE;
-    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    depthStencil.depthWriteEnable = (depthTest && depthWrite) ? VK_TRUE : VK_FALSE;
+    depthStencil.depthCompareOp = lessOrEqualDepth ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS;
 
     VkPipelineColorBlendAttachmentState blendAttachment{};
     blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    if (blend) {
+        // Premultiplied alpha (the grid is the only blended pipeline; its
+        // shader writes vec4(col * alpha, alpha)): ONE / 1-SRC_ALPHA keeps the
+        // AA edges clean with no dark fringes and an exact alpha channel.
+        blendAttachment.blendEnable = VK_TRUE;
+        blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+        blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+    }
     VkPipelineColorBlendStateCreateInfo colorBlending{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
     colorBlending.attachmentCount = 1;
     colorBlending.pAttachments = &blendAttachment;
@@ -3770,7 +4959,6 @@ Rendering::MaterialGraph material_graph_from_asset(const MaterialAsset& mat) {
     graph.define_parameter({ "Metallic", Rendering::MaterialValueType::Float, mat.metallic, true });
     graph.define_parameter({ "Emissive", Rendering::MaterialValueType::Vec3,
                              mat.emissiveColor * mat.emissiveIntensity, true });
-    const auto albedo = graph.add_parameter("Albedo");
     const auto roughness = graph.add_parameter("Roughness");
     const auto metallic = graph.add_parameter("Metallic");
     const auto emissive = graph.add_parameter("Emissive");
@@ -3778,7 +4966,17 @@ Rendering::MaterialGraph material_graph_from_asset(const MaterialAsset& mat) {
     const auto roughOut = graph.add_output("Roughness", Rendering::MaterialValueType::Float);
     const auto metalOut = graph.add_output("Metallic", Rendering::MaterialValueType::Float);
     const auto emisOut = graph.add_output("Emissive", Rendering::MaterialValueType::Vec3);
-    (void)graph.connect(albedo, baseOut, 0);
+    if (mat.albedoMapID.is_valid()) {
+        // Albedo map: a TextureSample drives BaseColor (RGBA→RGB at the sink,
+        // same path the Material editor uses). The pipeline binds the texture
+        // by asset UUID, so any cooked texture works.
+        const auto tex = graph.add_texture_sample("Albedo Map");
+        if (auto* node = graph.find_node(tex)) node->value = mat.albedoMapID.to_string();
+        (void)graph.connect(tex, baseOut, 0);
+    } else {
+        const auto albedo = graph.add_parameter("Albedo");
+        (void)graph.connect(albedo, baseOut, 0);
+    }
     (void)graph.connect(roughness, roughOut, 0);
     (void)graph.connect(metallic, metalOut, 0);
     (void)graph.connect(emissive, emisOut, 0);
@@ -3858,6 +5056,12 @@ void EditorApplication::create_buffer(VkDeviceSize size, VkBufferUsageFlags usag
         throw std::runtime_error("Failed to allocate buffer memory");
     }
     vkBindBufferMemory(m_device, buffer, memory, 0);
+}
+
+void EditorApplication::destroy_buffer(GPUBuffer& buffer) {
+    if (buffer.buffer != VK_NULL_HANDLE) vkDestroyBuffer(m_device, buffer.buffer, nullptr);
+    if (buffer.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, buffer.memory, nullptr);
+    buffer = GPUBuffer{};
 }
 
 void EditorApplication::transition_image_layout(VkCommandBuffer cmd, VkImage image,
@@ -3992,6 +5196,8 @@ void EditorApplication::init_offscreen_target() {
 
     create_offscreen_buffers(800, 600);
     create_shadow_map();
+    init_thumbnail_target();
+    init_block_cube();
 }
 
 // Creates the size-dependent resources (images, views, framebuffers, staging).
@@ -4337,6 +5543,58 @@ void EditorApplication::init_scene_pipeline() {
     if (!m_scenePipeline || !m_wireframePipeline || !m_gizmoPipeline || !m_pickPipeline) {
         throw std::runtime_error("Failed to create viewport pipelines");
     }
+
+    // Analytic infinite grid: fullscreen triangle, no vertex buffer. Per-family
+    // X/Z screen-density filtering with constant screen-space line widths,
+    // premultiplied alpha output; tests depth (LEQUAL) but does not write it.
+    m_gridVertShader = make_module(m_device, read_spv("editor_grid.vert.spv"));
+    m_gridFragShader = make_module(m_device, read_spv("editor_grid.frag.spv"));
+    if (!m_gridVertShader || !m_gridFragShader) {
+        throw std::runtime_error("Grid shaders failed to compile (run the compile_shaders target)");
+    }
+    VkPushConstantRange gridRange{};
+    gridRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    gridRange.offset = 0;
+    gridRange.size = sizeof(GridPushConstants);
+    VkPipelineLayoutCreateInfo gridLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    gridLayoutInfo.pushConstantRangeCount = 1;
+    gridLayoutInfo.pPushConstantRanges = &gridRange;
+    if (vkCreatePipelineLayout(m_device, &gridLayoutInfo, nullptr, &m_gridPipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create grid pipeline layout");
+    }
+    m_gridPipeline = create_scene_pipeline(m_device, m_offscreen.renderPass, m_gridPipelineLayout,
+                                           m_gridVertShader, m_gridFragShader,
+                                           false /*wireframe*/, true /*depthTest*/, false /*cull*/,
+                                           false /*withUv*/, true /*noVertexInput*/, true /*blend*/,
+                                           true /*lessOrEqualDepth*/, true /*depthBias*/,
+                                           false /*depthWrite*/);
+    if (!m_gridPipeline) {
+        throw std::runtime_error("Failed to create grid pipeline");
+    }
+
+    // Sky pass (Clima panel): the engine's procedural day/night sky, drawn as
+    // the first fullscreen layer of the viewport. Push constants: mvp +
+    // cameraPos + sunDirection + sunColor + environment = 128 bytes exactly.
+    m_skyVertShader = make_module(m_device, read_spv("sky.vert.spv"));
+    m_skyFragShader = make_module(m_device, read_spv("sky.frag.spv"));
+    if (m_skyVertShader && m_skyFragShader) {
+        VkPushConstantRange skyRange{};
+        skyRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        skyRange.offset = 0;
+        skyRange.size = sizeof(SkyPushConstants);
+        VkPipelineLayoutCreateInfo skyLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        skyLayoutInfo.pushConstantRangeCount = 1;
+        skyLayoutInfo.pPushConstantRanges = &skyRange;
+        if (vkCreatePipelineLayout(m_device, &skyLayoutInfo, nullptr, &m_skyPipelineLayout) == VK_SUCCESS) {
+            // Depth test LEQUAL against the cleared depth (1.0), no depth write,
+            // opaque — entities and the grid draw over it with LESS.
+            m_skyPipeline = create_scene_pipeline(m_device, m_offscreen.renderPass, m_skyPipelineLayout,
+                                                  m_skyVertShader, m_skyFragShader,
+                                                  false /*wireframe*/, true /*depthTest*/, false /*cull*/,
+                                                  false /*withUv*/, true /*noVertexInput*/, false /*blend*/,
+                                                  true /*lessOrEqualDepth*/, false /*depthBias*/);
+        }
+    }
 }
 
 void EditorApplication::init_geometry_buffers() {
@@ -4359,16 +5617,8 @@ void EditorApplication::init_geometry_buffers() {
     std::memcpy(data, cubeIndices.data(), static_cast<size_t>(cubeIBsize));
     vkUnmapMemory(m_device, m_cubeIB.memory);
 
-    // Grid (XZ plane)
-    std::vector<EditorVertex> gridVerts;
-    generate_grid_geometry(gridVerts, 60.0f, 1.0f);
-    m_gridVertexCount = static_cast<uint32_t>(gridVerts.size());
-    VkDeviceSize gridSize = sizeof(EditorVertex) * gridVerts.size();
-    create_buffer(gridSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                  m_gridVB.buffer, m_gridVB.memory);
-    vkMapMemory(m_device, m_gridVB.memory, 0, gridSize, 0, &data);
-    std::memcpy(data, gridVerts.data(), static_cast<size_t>(gridSize));
-    vkUnmapMemory(m_device, m_gridVB.memory);
+    // (No grid vertex buffer: the grid is now analytic — a fullscreen
+    // triangle rasterized by editor_grid.vert/frag with fwidth AA.)
 
     // Light icon (octahedron edges)
     std::vector<EditorVertex> lightVerts;
@@ -4398,21 +5648,6 @@ void EditorApplication::init_geometry_buffers() {
 
 void EditorApplication::generate_cube_geometry(std::vector<EditorVertex>& verts, std::vector<uint32_t>& indices) {
     build_cube(verts, indices);
-}
-
-void EditorApplication::generate_grid_geometry(std::vector<EditorVertex>& verts, float extent, float step) {
-    verts.clear();
-    const int halfLines = static_cast<int>(extent / step);
-    for (int i = -halfLines; i <= halfLines; ++i) {
-        const float pos = static_cast<float>(i) * step;
-        const glm::vec3 color = (i % 5 == 0) ? glm::vec3(0.42f, 0.46f, 0.58f) : glm::vec3(0.28f, 0.30f, 0.40f);
-        EditorVertex a, b;
-        a.pos = { -extent, 0.0f, pos }; a.normal = { 0, 1, 0 }; a.color = color;
-        b.pos = {  extent, 0.0f, pos }; b.normal = { 0, 1, 0 }; b.color = color;
-        verts.push_back(a); verts.push_back(b);
-        a.pos = { pos, 0.0f, -extent }; b.pos = { pos, 0.0f, extent };
-        verts.push_back(a); verts.push_back(b);
-    }
 }
 
 void EditorApplication::generate_light_icon(std::vector<EditorVertex>& verts) {
@@ -4547,6 +5782,12 @@ void draw_line_list(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer
     vkCmdDraw(cmd, vertexCount, 1, 0, 0);
 }
 
+void draw_indexed_editor_mesh(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb,
+                              const VkBuffer& ib, uint32_t indexCount, const glm::mat4& mvp,
+                              const glm::vec4& color) {
+    draw_indexed_cube(cmd, layout, vb, ib, indexCount, mvp, color);
+}
+
 } // namespace
 
 void EditorApplication::record_shadow_pass(VkCommandBuffer cmd, const Scene* scene) {
@@ -4679,10 +5920,68 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
     const float aspect = static_cast<float>(m_offscreen.width) / std::max(1u, m_offscreen.height);
     const glm::mat4 viewProj = m_editorCamera.get_projection_matrix(aspect) * m_editorCamera.get_view_matrix();
 
-    // Grid (wireframe overlay).
-    if (m_gridVB.buffer != VK_NULL_HANDLE) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_wireframePipeline);
-        draw_line_list(cmd, m_scenePipelineLayout, m_gridVB.buffer, m_gridVertexCount, viewProj, glm::vec4(1.0f));
+    // Sky pass (Clima panel): procedural sky driven by the scene's first
+    // WeatherComponent and directional sun (fallbacks: warm white sun at noon).
+    if (m_skyPipeline != VK_NULL_HANDLE) {
+        glm::vec3 sunColor(1.0f, 0.95f, 0.85f);
+        glm::vec3 sunDir(0.0f, -1.0f, 0.0f);
+        float windSpeed = 5.0f;
+        if (renderScene) {
+            for (const auto& [id, w] : renderScene->weatherComponents) {
+                (void)id;
+                sunColor = w.sunColor;
+                windSpeed = w.windSpeed;
+                break;
+            }
+            for (const auto& [id, light] : renderScene->lightComponents) {
+                if (!is_directional_sun(light)) continue;
+                const auto tit = renderScene->transformComponents.find(id);
+                if (tit != renderScene->transformComponents.end()) {
+                    const float yaw = glm::radians(tit->second.rotation.y);
+                    const float pitch = glm::radians(tit->second.rotation.x);
+                    sunDir = glm::normalize(glm::vec3(
+                        std::cos(pitch) * std::sin(yaw), std::sin(pitch),
+                        std::cos(pitch) * std::cos(yaw)));
+                }
+                break;
+            }
+        }
+        m_skyTime += 0.016f; // ~one frame; cloud drift driven by windSpeed below
+        const SkyPushConstants skyPC{
+            viewProj,
+            glm::vec4(m_editorCamera.position, 1.0f),
+            glm::vec4(sunDir, 0.0f),
+            glm::vec4(sunColor, 0.0f),
+            glm::vec4(m_skyTime * windSpeed * 0.02f, sunDir.y > -0.08f ? 1.0f : 0.0f, 0.0f, 0.0f),
+        };
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_skyPipeline);
+        vkCmdPushConstants(cmd, m_skyPipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(SkyPushConstants), &skyPC);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+
+    // Terrain (Terreno panel): procedural heightmap mesh on the ground.
+    if (m_terrainValid && m_terrainVB.buffer != VK_NULL_HANDLE) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
+        const glm::mat4 model(1.0f);
+        draw_indexed_editor_mesh(cmd, m_scenePipelineLayout, m_terrainVB.buffer, m_terrainIB.buffer,
+                                 m_terrainIndexCount, viewProj * model, glm::vec4(1.0f));
+    }
+
+    // Voxel sculpting volumes (colored cubes, paintable in the viewport).
+    draw_voxel_volumes(cmd, viewProj, renderScene);
+
+    // Analytic infinite grid (fullscreen triangle, fwidth AA, distance fade).
+    // Gated by the viewport ⋯ menu (m_showGrid).
+    if (m_showGrid && m_gridPipeline != VK_NULL_HANDLE) {
+        const GridPushConstants gridPC{ m_editorCamera.get_view_matrix(),
+                                        m_editorCamera.get_projection_matrix(aspect) };
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_gridPipeline);
+        vkCmdPushConstants(cmd, m_gridPipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(GridPushConstants), &gridPC);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 
     // Scene entities (renderScene resolved at the top of this function).
@@ -4730,6 +6029,34 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                                 m_liveGraphHash = liveHash;
                             }
                             gmp = m_liveGraphPipeline.valid ? &m_liveGraphPipeline : nullptr;
+                        } else if (const auto blockMeta = m_assetRegistry.find(meshComp->second.meshAssetID);
+                                   blockMeta && blockMeta->type == AssetType::Block) {
+                            // Block model in the scene: a textured cube. The
+                            // pipeline binds the block texture (TextureSample,
+                            // same path as the Material editor), cached per
+                            // block UUID and rebuilt if the texture changes.
+                            const UUID blockId = meshComp->second.meshAssetID;
+                            const UUID texId = resolve_block_texture(blockId);
+                            auto bit = m_blockGraphPipelines.find(blockId);
+                            if (texId.is_valid()) {
+                                Rendering::MaterialGraph graph;
+                                const auto texNode = graph.add_texture_sample("Block Texture");
+                                if (auto* node = graph.find_node(texNode)) node->value = texId.to_string();
+                                const auto baseOut = graph.add_output("BaseColor", Rendering::MaterialValueType::Vec3);
+                                (void)graph.connect(texNode, baseOut, 0);
+                                const uint64_t graphHash = hash_material_graph(graph);
+                                if (bit == m_blockGraphPipelines.end() ||
+                                    !bit->second.valid || bit->second.graphHash != graphHash) {
+                                    if (bit != m_blockGraphPipelines.end()) destroy_graph_pipeline(bit->second);
+                                    GraphMaterialPipeline built;
+                                    built.graphHash = graphHash;
+                                    if (!build_graph_pipeline(graph, built)) {
+                                        std::cerr << "[Editor] Block pipeline: " << built.lastError << std::endl;
+                                    }
+                                    bit = m_blockGraphPipelines.insert_or_assign(blockId, std::move(built)).first;
+                                }
+                                if (bit->second.valid) gmp = &bit->second;
+                            }
                         } else if (meshComp->second.materialAssetID.is_valid() &&
                                    load_material_asset(meshComp->second.materialAssetID)) {
                             const UUID matId = meshComp->second.materialAssetID;
@@ -4803,15 +6130,18 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                                            : glm::vec4(0.35f, 0.38f, 0.50f, 1.0f));
             }
 
-            if (renderScene->rigidbodyComponents.contains(id)) {
+            if (m_showColliders && renderScene->rigidbodyComponents.contains(id)) {
                 draw_collider_wireframe(cmd, viewProj, t, selected);
             }
         }
     }
 
     // Gizmo on the selected entity (drawn every frame; the active axis is
-    // highlighted while dragging).
-    draw_gizmo_overlay(cmd, viewProj);
+    // highlighted while dragging). Gated by the viewport ⋯ menu (m_showGizmos)
+    // and hidden entirely in Select mode.
+    if (m_showGizmos && m_gizmoMode != GizmoMode::Select) {
+        draw_gizmo_overlay(cmd, viewProj);
+    }
 }
 
 void EditorApplication::draw_light_icon(VkCommandBuffer cmd, const glm::mat4& viewProj,
@@ -4857,7 +6187,12 @@ void EditorApplication::draw_gizmo_overlay(VkCommandBuffer cmd, const glm::mat4&
     const UUID id = m_selectedEntity.get_id();
     const auto it = m_editorScene->transformComponents.find(id);
     if (it == m_editorScene->transformComponents.end()) return;
-    const glm::mat4 gizmoModel = glm::translate(glm::mat4(1.0f), it->second.position);
+    // World/Local: in local mode the whole gizmo rotates with the entity so
+    // the axes follow its orientation.
+    glm::mat4 gizmoModel = glm::translate(glm::mat4(1.0f), it->second.position);
+    if (m_gizmoLocal) {
+        gizmoModel = gizmoModel * glm::mat4_cast(glm::quat(glm::radians(it->second.rotation)));
+    }
 
     const glm::vec4 highlight(1.0f, 0.85f, 0.30f, 1.0f);
     const glm::vec4 normal(1.0f);
@@ -4983,8 +6318,534 @@ void EditorApplication::perform_pick_readback() {
 // Camera and gizmo interaction
 // ===========================================================================
 
+// Shared executor for Control API commands — used both by the loopback HTTP
+// server and by the Control Console window buttons.
+void EditorApplication::handle_control_command(const std::string& cmd) {
+    if (cmd == "play" && m_playMode.get_state() == PlayState::Edit) {
+        m_playMode.start_play(m_editorScene.get());
+        setup_play_runtime();
+        std::cout << "[ControlApi] play started" << std::endl;
+    } else if (cmd == "pause" && m_playMode.get_state() == PlayState::Play) {
+        m_playMode.pause_play();
+        std::cout << "[ControlApi] paused" << std::endl;
+    } else if (cmd == "resume" && m_playMode.get_state() == PlayState::Pause) {
+        m_playMode.pause_play();
+        std::cout << "[ControlApi] resumed" << std::endl;
+    } else if (cmd == "step" && m_playMode.get_state() == PlayState::Pause) {
+        m_stepRequested = true;
+        std::cout << "[ControlApi] step" << std::endl;
+    } else if (cmd == "stop" && m_playMode.get_state() != PlayState::Edit) {
+        teardown_play_runtime();
+        m_playMode.stop_play();
+        m_selectedEntity = Entity();
+        m_editorGui.select_entity(m_selectedEntity);
+        std::cout << "[ControlApi] stopped" << std::endl;
+    } else if (cmd.rfind("zoom ", 0) == 0) {
+        const float amount = std::stof(cmd.substr(5));
+        m_editorCamera.orbitDistance =
+            glm::clamp(m_editorCamera.orbitDistance * (1.0f - amount), 0.5f, 5000.0f);
+        recompute_editor_camera_position();
+        std::cout << "[ControlApi] zoom " << amount << " -> " << m_editorCamera.orbitDistance << std::endl;
+    } else if (cmd.rfind("move ", 0) == 0) {
+        float fx = 0.0f, ry = 0.0f, uz = 0.0f;
+        std::istringstream ss(cmd.substr(5));
+        ss >> fx >> ry >> uz;
+        m_editorCamera.orbitTarget +=
+            m_editorCamera.get_front() * fx +
+            m_editorCamera.get_right() * ry +
+            m_editorCamera.get_up() * uz;
+        recompute_editor_camera_position();
+        std::cout << "[ControlApi] move " << fx << " " << ry << " " << uz << std::endl;
+    } else if (cmd.rfind("turn ", 0) == 0) {
+        float yawDeg = 0.0f, pitchDeg = 0.0f;
+        std::istringstream ss(cmd.substr(5));
+        ss >> yawDeg >> pitchDeg;
+        m_editorCamera.yaw += yawDeg;
+        m_editorCamera.pitch = glm::clamp(m_editorCamera.pitch + pitchDeg, -89.0f, 89.0f);
+        recompute_editor_camera_position();
+        std::cout << "[ControlApi] turn " << yawDeg << " " << pitchDeg << std::endl;
+    } else if (cmd.rfind("terrain ", 0) == 0) {
+        float scale = 1.0f, amount = 0.5f, falloff = 0.4f;
+        int octaves = 4;
+        std::istringstream ss(cmd.substr(8));
+        ss >> scale >> octaves >> amount >> falloff;
+        generate_terrain_mesh(TerrainParams{ scale, octaves, amount, falloff });
+        std::cout << "[ControlApi] terrain scale=" << scale << " octaves=" << octaves
+                  << " amount=" << amount << " falloff=" << falloff << std::endl;
+    } else if (cmd.rfind("graphics ", 0) == 0) {
+        int vsyncInt = 1, quality = 2;
+        std::istringstream ss(cmd.substr(9));
+        ss >> vsyncInt >> quality;
+        apply_graphics_settings(vsyncInt != 0, quality);
+        std::cout << "[ControlApi] graphics vsync=" << vsyncInt << " quality=" << quality << std::endl;
+    } else if (cmd == "save-settings") {
+        save_settings();
+        std::cout << "[ControlApi] save-settings" << std::endl;
+    } else if (cmd.rfind("project ", 0) == 0) {
+        const std::string result = create_project(cmd.substr(8), "");
+        std::cout << "[ControlApi] project -> " << result << std::endl;
+    } else if (cmd.rfind("mesh ", 0) == 0) {
+        int mode = 0;
+        std::istringstream ss(cmd.substr(5));
+        ss >> mode;
+        const std::string result = apply_mesh_normals(mode);
+        std::cout << "[ControlApi] mesh " << mode << " -> " << result << std::endl;
+    } else if (cmd == "simulate" && m_playMode.get_state() == PlayState::Edit) {
+        m_playMode.start_simulate(m_editorScene.get());
+        setup_play_runtime();
+        std::cout << "[ControlApi] simulate started" << std::endl;
+    } else if (cmd == "new-scene") {
+        init_default_scene();
+        std::cout << "[ControlApi] new scene" << std::endl;
+    } else if (cmd.rfind("open-scene ", 0) == 0) {
+        load_scene_file(cmd.substr(11));
+        std::cout << "[ControlApi] open scene '" << cmd.substr(11) << "'" << std::endl;
+    } else if (cmd == "save-scene") {
+        // API-safe: never open a blocking native dialog from the HTTP thread
+        // path (that would wedge the main loop). If there is no active scene
+        // path yet, fall back to a timestamped file in the scenes folder.
+        if (!m_editorScene) {
+            std::cout << "[ControlApi] save-scene: no scene" << std::endl;
+        } else if (!m_activeScenePath.empty()) {
+            if (m_editorScene->save_to_file(m_activeScenePath)) {
+                std::cout << "[ControlApi] scene saved: " << m_activeScenePath << std::endl;
+            } else {
+                std::cerr << "[ControlApi] save-scene failed: " << m_activeScenePath << std::endl;
+            }
+        } else {
+            const auto scenesDir = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "assets" / "scenes";
+            std::error_code ec;
+            std::filesystem::create_directories(scenesDir, ec);
+            const std::string stamp = std::to_string(static_cast<long long>(std::time(nullptr)));
+            const std::filesystem::path fallback = scenesDir / ("api_" + stamp + ".scene");
+            if (m_editorScene->save_to_file(fallback.string())) {
+                m_activeScenePath = fallback.string();
+                std::cout << "[ControlApi] scene saved (new): " << m_activeScenePath << std::endl;
+            } else {
+                std::cerr << "[ControlApi] save-scene failed: " << fallback << std::endl;
+            }
+        }
+    } else if (cmd.rfind("focus ", 0) == 0) {
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        std::istringstream ss(cmd.substr(6));
+        ss >> x >> y >> z;
+        m_editorCamera.orbitTarget = glm::vec3(x, y, z);
+        recompute_editor_camera_position();
+        std::cout << "[ControlApi] focus " << x << " " << y << " " << z << std::endl;
+    } else if (cmd.rfind("add-entity ", 0) == 0) {
+        if (!m_editorScene) { std::cout << "[ControlApi] no scene" << std::endl; return; }
+        const std::string type = cmd.substr(11);
+        const auto create = [&](const char* name) {
+            Entity e = m_editorScene->create_entity(name);
+            m_selectedEntity = e;
+            m_editorGui.select_entity(e);
+            return e;
+        };
+        Entity e;
+        if (type == "empty") e = create("Novo Objeto");
+        else if (type == "cube") { e = create("Cubo 3D"); if (e.is_valid()) m_editorScene->meshRendererComponents[e.get_id()] = MeshRendererComponent{}; }
+        else if (type == "camera") { e = create("Câmera"); if (e.is_valid()) m_editorScene->cameraComponents[e.get_id()] = CameraComponent{}; }
+        else if (type == "sun") { e = create("Luz do Sol"); if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{}; }
+        else if (type == "point") { e = create("Luz de Lâmpada"); if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(1.0f, 0.8f, 0.4f), 5000.0f, 15.0f, true }; }
+        else if (type == "spot") { e = create("Luz Spot"); if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(0.2f, 0.5f, 1.0f), 4000.0f, 18.0f, true, LightType::Spot }; }
+        else if (type == "area") { e = create("Luz de Área"); if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(1.0f, 0.4f, 0.9f), 1500.0f, 20.0f, true, LightType::Area }; }
+        else if (type == "particles") { e = create("Emissor de Partículas"); if (e.is_valid()) m_editorScene->particleEmitterComponents[e.get_id()] = ParticleEmitterComponent{}; }
+        else if (type == "audio") { e = create("Fonte de Áudio"); if (e.is_valid()) m_editorScene->audioComponents[e.get_id()] = AudioComponent{}; }
+        else if (type == "rigidbody") { e = create("Corpo Rígido"); if (e.is_valid()) m_editorScene->rigidbodyComponents[e.get_id()] = RigidbodyComponent{}; }
+        else if (type == "vehicle") { e = create("Veículo"); if (e.is_valid()) m_editorScene->vehicleComponents[e.get_id()] = VehicleComponent{}; }
+        else if (type == "destructible") { e = create("Destrutível"); if (e.is_valid()) m_editorScene->destructionComponents[e.get_id()] = DestructionComponent{}; }
+        else if (type == "navagent") { e = create("Agente de Navegação"); if (e.is_valid()) m_editorScene->navigationComponents[e.get_id()] = NavigationComponent{}; }
+        else if (type == "mission") { e = create("Missão"); if (e.is_valid()) m_editorScene->missionComponents[e.get_id()] = MissionComponent{}; }
+        else if (type == "dialogue") { e = create("Diálogo"); if (e.is_valid()) m_editorScene->dialogueComponents[e.get_id()] = DialogueComponent{}; }
+#if VC_ENABLE_VOXEL_PLUGIN
+        else if (type == "voxelworld") { e = create("Mundo de Blocos"); if (e.is_valid()) m_editorScene->voxelVolumeComponents[e.get_id()] = VoxelVolumeComponent{}; }
+#endif
+        std::cout << "[ControlApi] add-entity '" << type << "' -> "
+                  << (e.is_valid() ? e.get_id().to_string() : "unknown type") << std::endl;
+    } else if (cmd.rfind("add-component ", 0) == 0) {
+        std::istringstream ss(cmd.substr(14));
+        std::string uuidStr, type;
+        ss >> uuidStr >> type;
+        const UUID id = UUID::from_string(uuidStr);
+        if (!m_editorScene || !m_editorScene->get_entities().contains(id)) {
+            std::cout << "[ControlApi] add-component: entity not found" << std::endl;
+            return;
+        }
+        Scene* scene = m_editorScene.get();
+        if (type == "light") scene->lightComponents[id] = LightComponent{};
+        else if (type == "camera") scene->cameraComponents[id] = CameraComponent{};
+        else if (type == "mesh") scene->meshRendererComponents[id] = MeshRendererComponent{};
+        else if (type == "material") scene->materialComponents[id] = MaterialComponent{};
+        else if (type == "rigidbody") scene->rigidbodyComponents[id] = RigidbodyComponent{};
+        else if (type == "weapon") scene->weaponComponents[id] = WeaponComponent{};
+        else if (type == "vehicle") scene->vehicleComponents[id] = VehicleComponent{};
+        else if (type == "ragdoll") scene->ragdollComponents[id] = RagdollComponent{};
+        else if (type == "destructible") scene->destructionComponents[id] = DestructionComponent{};
+        else if (type == "navigation") scene->navigationComponents[id] = NavigationComponent{};
+        else if (type == "particle") scene->particleEmitterComponents[id] = ParticleEmitterComponent{};
+        else if (type == "audio") scene->audioComponents[id] = AudioComponent{};
+        else if (type == "mission") scene->missionComponents[id] = MissionComponent{};
+        else if (type == "dialogue") scene->dialogueComponents[id] = DialogueComponent{};
+#if VC_ENABLE_VOXEL_PLUGIN
+        else if (type == "voxel") scene->voxelVolumeComponents[id] = VoxelVolumeComponent{};
+#endif
+        else { std::cout << "[ControlApi] add-component: unknown type '" << type << "'" << std::endl; return; }
+        std::cout << "[ControlApi] add-component " << type << " on " << uuidStr << std::endl;
+    } else if (cmd.rfind("delete-entity ", 0) == 0) {
+        const UUID id = UUID::from_string(cmd.substr(14));
+        if (m_editorScene && m_editorScene->get_entities().contains(id)) {
+            m_editorScene->destroy_entity(id);
+            if (m_selectedEntity.is_valid() && m_selectedEntity.get_id() == id) m_selectedEntity = Entity();
+            std::cout << "[ControlApi] deleted entity" << std::endl;
+        } else {
+            std::cout << "[ControlApi] delete-entity: not found" << std::endl;
+        }
+    } else if (cmd.rfind("rename-entity ", 0) == 0) {
+        std::istringstream ss(cmd.substr(14));
+        std::string uuidStr, name;
+        ss >> uuidStr;
+        std::getline(ss, name);
+        while (!name.empty() && name.front() == ' ') name.erase(name.begin());
+        const UUID id = UUID::from_string(uuidStr);
+        if (m_editorScene && m_editorScene->get_entities().contains(id) && !name.empty()) {
+            m_editorScene->rename_entity(id, name);
+            std::cout << "[ControlApi] renamed to '" << name << "'" << std::endl;
+        } else {
+            std::cout << "[ControlApi] rename-entity: not found or empty name" << std::endl;
+        }
+    } else if (cmd.rfind("select ", 0) == 0) {
+        const UUID id = UUID::from_string(cmd.substr(7));
+        if (m_editorScene && m_editorScene->get_entities().contains(id)) {
+            m_selectedEntity = Entity();
+            m_selectedEntity = m_editorScene->get_entities().at(id);
+            m_editorGui.select_entity(m_selectedEntity);
+            std::cout << "[ControlApi] selected " << id.to_string() << std::endl;
+        } else {
+            std::cout << "[ControlApi] select: entity not found" << std::endl;
+        }
+    } else if (cmd.rfind("select-name ", 0) == 0) {
+        if (!m_editorScene) return;
+        const std::string name = cmd.substr(12);
+        for (const auto& [id, entity] : m_editorScene->get_entities()) {
+            if (entity.get_name() == name || entity.get_name().find(name) != std::string::npos) {
+                m_selectedEntity = Entity();
+                m_selectedEntity = m_editorScene->get_entities().at(id);
+                m_editorGui.select_entity(m_selectedEntity);
+                std::cout << "[ControlApi] selected '" << entity.get_name() << "'" << std::endl;
+                return;
+            }
+        }
+        std::cout << "[ControlApi] select-name: no match" << std::endl;
+    } else if (cmd.rfind("set-transform ", 0) == 0) {
+        std::istringstream ss(cmd.substr(14));
+        std::string uuidStr;
+        ss >> uuidStr;
+        const UUID id = UUID::from_string(uuidStr);
+        std::vector<float> values;
+        float v;
+        while (ss >> v) values.push_back(v);
+        auto it = m_editorScene ? m_editorScene->transformComponents.find(id) : m_editorScene->transformComponents.end();
+        if (it == m_editorScene->transformComponents.end()) {
+            std::cout << "[ControlApi] set-transform: entity not found" << std::endl;
+        } else {
+            if (values.size() >= 3) it->second.position = glm::vec3(values[0], values[1], values[2]);
+            if (values.size() >= 6) it->second.rotation = glm::vec3(values[3], values[4], values[5]);
+            if (values.size() >= 9) it->second.scale = glm::vec3(values[6], values[7], values[8]);
+            std::cout << "[ControlApi] transform set (" << values.size() << " floats)" << std::endl;
+        }
+    } else if (cmd.rfind("gizmo ", 0) == 0) {
+        const std::string mode = cmd.substr(6);
+        if (mode == "select") m_gizmoMode = GizmoMode::Select;
+        else if (mode == "move") m_gizmoMode = GizmoMode::Translate;
+        else if (mode == "rotate") m_gizmoMode = GizmoMode::Rotate;
+        else if (mode == "scale") m_gizmoMode = GizmoMode::Scale;
+        std::cout << "[ControlApi] gizmo " << mode << std::endl;
+    } else if (cmd.rfind("gizmo-space ", 0) == 0) {
+        m_gizmoLocal = cmd.substr(12) == "local";
+        std::cout << "[ControlApi] gizmo-space " << (m_gizmoLocal ? "local" : "world") << std::endl;
+    } else if (cmd.rfind("snap ", 0) == 0) {
+        m_snapTranslate = std::max(0.0f, std::stof(cmd.substr(5)));
+        std::cout << "[ControlApi] snap " << m_snapTranslate << std::endl;
+    } else if (cmd.rfind("import ", 0) == 0) {
+        if (m_assetPipeline) {
+            const std::filesystem::path cookedRoot =
+                std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "DerivedDataCache";
+            const ImportResult result = m_assetPipeline->import({ cmd.substr(7), cookedRoot, 1 });
+            std::cout << "[ControlApi] import -> " << (result ? "ok" : result.error) << std::endl;
+        }
+    } else if (cmd.rfind("block-model ", 0) == 0) {
+        const UUID texId = UUID::from_string(cmd.substr(12));
+        const auto meta = m_assetRegistry.find(texId);
+        if (meta && meta->type == AssetType::Texture) {
+            create_block_asset(*meta);
+            std::cout << "[ControlApi] block model created" << std::endl;
+        } else {
+            std::cout << "[ControlApi] block-model: texture not found" << std::endl;
+        }
+    } else if (cmd.rfind("spawn-block ", 0) == 0) {
+        const UUID blockId = UUID::from_string(cmd.substr(12));
+        spawn_block_entity(blockId, m_editorCamera.position + m_editorCamera.get_front() * 2.0f);
+        std::cout << "[ControlApi] spawn-block " << blockId.to_string() << std::endl;
+    } else if (cmd.rfind("asset-duplicate ", 0) == 0) {
+        const UUID id = UUID::from_string(cmd.substr(16));
+        const auto meta = m_assetRegistry.find(id);
+        if (meta) {
+            const std::filesystem::path dup = meta->sourcePath.parent_path() /
+                (meta->sourcePath.stem().string() + "_copy" + meta->sourcePath.extension().string());
+            AssetBrowserModel browser{ m_assetRegistry };
+            const auto result = browser.duplicate_asset(id, dup);
+            m_assetRegistry.save(std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db");
+            std::cout << "[ControlApi] asset-duplicate -> " << (result ? "ok" : result.error) << std::endl;
+        }
+    } else if (cmd.rfind("asset-delete ", 0) == 0) {
+        const UUID id = UUID::from_string(cmd.substr(13));
+        AssetBrowserModel browser{ m_assetRegistry };
+        const auto result = browser.delete_asset(id);
+        m_assetRegistry.save(std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db");
+        std::cout << "[ControlApi] asset-delete -> " << (result ? "ok" : result.error) << std::endl;
+    } else if (cmd.rfind("reimport ", 0) == 0) {
+        const UUID id = UUID::from_string(cmd.substr(9));
+        const auto meta = m_assetRegistry.find(id);
+        if (meta && m_assetPipeline) {
+            const std::filesystem::path cookedRoot =
+                std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "DerivedDataCache";
+            const ImportResult result = m_assetPipeline->import({
+                .source = meta->sourcePath, .cookedDirectory = cookedRoot,
+                .importerVersion = meta->importerVersion, .settings = meta->importSettings });
+            m_assetRegistry.save(std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db");
+            std::cout << "[ControlApi] reimport -> " << (result ? "ok" : result.error) << std::endl;
+        }
+    } else if (cmd.rfind("voxel-generate ", 0) == 0) {
+        std::istringstream ss(cmd.substr(15));
+        std::string uuidStr; uint32_t seed = 1337; float seaLevel = 24.0f;
+        ss >> uuidStr; if (ss >> seed) {} if (ss >> seaLevel) {}
+        const UUID id = UUID::from_string(uuidStr);
+        m_voxelStructures.erase(id);
+        ensure_voxel_volume(id, seed, seaLevel);
+        m_voxelMeshesDirty.insert(id);
+        std::cout << "[ControlApi] voxel-generate " << uuidStr << " seed=" << seed << std::endl;
+    } else if (cmd.rfind("voxel-clear ", 0) == 0) {
+        const UUID id = UUID::from_string(cmd.substr(12));
+        const auto gridIt = m_voxelStructures.find(id);
+        if (gridIt != m_voxelStructures.end()) {
+            const auto& size = gridIt->second->size();
+            for (int x = 0; x < size.x; ++x)
+                for (int y = 0; y < size.y; ++y)
+                    for (int z = 0; z < size.z; ++z)
+                        gridIt->second->set(Engine::Voxel::Int3{ x, y, z }, Engine::Voxel::VoxelValue::air());
+            m_voxelMeshesDirty.insert(id);
+            std::cout << "[ControlApi] voxel-clear " << id.to_string() << std::endl;
+        }
+    } else if (cmd.rfind("voxel-paint ", 0) == 0) {
+        std::istringstream ss(cmd.substr(12));
+        std::string uuidStr; int x = 0, y = 0, z = 0, type = 1, mode = 0;
+        ss >> uuidStr >> x >> y >> z >> type >> mode;
+        const UUID id = UUID::from_string(uuidStr);
+        const auto gridIt = m_voxelStructures.find(id);
+        if (gridIt == m_voxelStructures.end()) {
+            std::cout << "[ControlApi] voxel-paint: volume not generated yet" << std::endl;
+        } else {
+            if (mode == 1) gridIt->second->set(Engine::Voxel::Int3{ x, y, z }, Engine::Voxel::VoxelValue::air());
+            else gridIt->second->set(Engine::Voxel::Int3{ x, y, z }, Engine::Voxel::VoxelValue{ static_cast<uint16_t>(type), 0, 255 });
+            m_voxelMeshesDirty.insert(id);
+            std::cout << "[ControlApi] voxel-paint " << uuidStr << " (" << x << "," << y << "," << z << ") type=" << type << " mode=" << mode << std::endl;
+        }
+    } else if (cmd.rfind("script-event ", 0) == 0) {
+        const std::string ev = cmd.substr(13);
+        if (m_playScript.start_event(ev)) std::cout << "[ControlApi] script-event '" << ev << "'" << std::endl;
+        else std::cout << "[ControlApi] script-event: no such event handler" << std::endl;
+    } else if (cmd == "script-pause") {
+        m_scriptPauseRequested = true;
+        std::cout << "[ControlApi] script paused" << std::endl;
+    } else if (cmd == "script-continue") {
+        m_scriptPauseRequested = false;
+        if (m_playScript.status() == VMStatus::Paused) m_scriptDebugger.continue_run(10000, 0.0f);
+        std::cout << "[ControlApi] script resumed" << std::endl;
+    } else if (cmd == "script-step") {
+        m_scriptPauseRequested = true;
+        if (m_playScript.status() == VMStatus::Paused) m_scriptDebugger.step_into(0.0f);
+        std::cout << "[ControlApi] script step" << std::endl;
+    } else if (cmd.rfind("editor ", 0) == 0) {
+        std::string tab = cmd.substr(7);
+        if (tab == "render-graph" || tab == "render graph") tab = "Render Graph";
+        else if (!tab.empty()) tab[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(tab[0])));
+        m_specializedEditors.open_editor(tab);
+        std::cout << "[ControlApi] editor tab '" << tab << "'" << std::endl;
+    } else if (cmd.rfind("window ", 0) == 0) {
+        const std::string w = cmd.substr(7);
+        const auto toggle = [](bool& flag) { flag = !flag; };
+        if (w == "viewport") toggle(m_showViewport);
+        else if (w == "scene") toggle(m_showHierarchy);
+        else if (w == "inspector") toggle(m_showInspector);
+        else if (w == "assets") toggle(m_showContentBrowser);
+        else if (w == "console") toggle(m_showConsole);
+        else if (w == "dev") toggle(m_wickedTools.showDevWindow);
+        else if (w == "guide") toggle(m_wickedTools.showGuideWindow);
+        else if (w == "name") toggle(m_wickedTools.showNameWindow);
+        else if (w == "layers") toggle(m_wickedTools.showLayerWindow);
+        else if (w == "object") toggle(m_wickedTools.showObjectWindow);
+        else if (w == "light") toggle(m_wickedTools.showLightWindow);
+        else if (w == "camera") toggle(m_wickedTools.showCameraWindow);
+        else if (w == "material") toggle(m_wickedTools.showMaterialWindow);
+        else if (w == "sound") toggle(m_wickedTools.showSoundWindow);
+        else if (w == "rigidbody") toggle(m_wickedTools.showRigidBodyWindow);
+        else if (w == "collider") toggle(m_wickedTools.showColliderWindow);
+        else if (w == "constraint") toggle(m_wickedTools.showConstraintWindow);
+        else if (w == "softbody") toggle(m_wickedTools.showSoftBodyWindow);
+        else if (w == "spring") toggle(m_wickedTools.showSpringWindow);
+        else if (w == "decal") toggle(m_wickedTools.showDecalWindow);
+        else if (w == "emitter") toggle(m_wickedTools.showEmitterWindow);
+        else if (w == "hair") toggle(m_wickedTools.showHairParticleWindow);
+        else if (w == "spline") toggle(m_wickedTools.showSplineWindow);
+        else if (w == "forcefield") toggle(m_wickedTools.showForceFieldWindow);
+        else if (w == "envprobe") toggle(m_wickedTools.showEnvProbeWindow);
+        else if (w == "weather") toggle(m_wickedTools.showWeatherWindow);
+        else if (w == "animation-tools") toggle(m_wickedTools.showAnimationWindow);
+        else if (w == "armature") toggle(m_wickedTools.showArmatureWindow);
+        else if (w == "humanoid") toggle(m_wickedTools.showHumanoidWindow);
+        else if (w == "ik-tools") toggle(m_wickedTools.showIKWindow);
+        else if (w == "expression") toggle(m_wickedTools.showExpressionWindow);
+        else if (w == "terrain") toggle(m_wickedTools.showTerrainWindow);
+        else if (w == "paint") toggle(m_wickedTools.showPaintToolWindow);
+        else if (w == "mesh") toggle(m_wickedTools.showMeshWindow);
+        else if (w == "importer") toggle(m_wickedTools.showModelImporterWindow);
+        else if (w == "video") toggle(m_wickedTools.showVideoWindow);
+        else if (w == "gaussian") toggle(m_wickedTools.showGaussianSplatWindow);
+        else if (w == "theme") toggle(m_wickedTools.showThemeEditorWindow);
+        else if (w == "project-creator") toggle(m_wickedTools.showProjectCreatorWindow);
+        else if (w == "general") toggle(m_wickedTools.showGeneralWindow);
+        else if (w == "graphics") toggle(m_wickedTools.showGraphicsWindow);
+        else if (w == "profiler") toggle(m_wickedTools.showProfilerWindow);
+        else { std::cout << "[ControlApi] window: unknown '" << w << "'" << std::endl; return; }
+        std::cout << "[ControlApi] window toggled '" << w << "'" << std::endl;
+    } else if (cmd.rfind("theme ", 0) == 0) {
+        float r = 0.1f, g = 0.11f, b = 0.14f, pr = 0.2f, pg = 0.2f, pb = 0.2f;
+        std::istringstream ss(cmd.substr(6));
+        ss >> r >> g >> b >> pr >> pg >> pb;
+        m_wickedTools.set_theme(glm::vec3(r, g, b), glm::vec3(pr, pg, pb));
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.Colors[ImGuiCol_WindowBg] = ImVec4(r, g, b, 1.0f);
+        style.Colors[ImGuiCol_ChildBg] = ImVec4(pr, pg, pb, 1.0f);
+        style.Colors[ImGuiCol_PopupBg] = ImVec4(pr, pg, pb, 1.0f);
+        style.Colors[ImGuiCol_MenuBarBg] = ImVec4(pr, pg, pb, 1.0f);
+        const float lift = 0.08f;
+        style.Colors[ImGuiCol_FrameBg] = ImVec4(pr + lift, pg + lift, pb + lift, 1.0f);
+        style.Colors[ImGuiCol_Button] = ImVec4(pr + lift, pg + lift, pb + lift, 1.0f);
+        std::cout << "[ControlApi] theme applied" << std::endl;
+    } else if (cmd.rfind("weather ", 0) == 0) {
+        float sunR = 1.0f, sunG = 0.9f, sunB = 0.7f, fogDensity = 0.0f, fogStart = 0.0f, skyExposure = 1.0f, rain = 0.0f;
+        std::istringstream ss(cmd.substr(8));
+        ss >> sunR >> sunG >> sunB >> fogDensity >> fogStart >> skyExposure >> rain;
+        if (m_editorScene) {
+            UUID weatherId{ 0, 0 };
+            for (const auto& [id, entity] : m_editorScene->get_entities()) {
+                (void)entity;
+                if (m_editorScene->weatherComponents.contains(id)) { weatherId = id; break; }
+            }
+            if (!weatherId.is_valid()) {
+                Entity w = m_editorScene->create_entity("Weather");
+                weatherId = w.get_id();
+                m_editorScene->weatherComponents[weatherId] = WeatherComponent{};
+            }
+            auto& w = m_editorScene->weatherComponents[weatherId];
+            w.sunColor = glm::vec3(sunR, sunG, sunB);
+            w.fogDensity = fogDensity; w.fogStart = fogStart; w.skyExposure = skyExposure; w.rainAmount = rain;
+            std::cout << "[ControlApi] weather applied" << std::endl;
+        }
+    } else if (cmd.rfind("selftest ", 0) == 0) {
+        const int which = std::stoi(cmd.substr(9));
+        m_lastSelfTestResult = run_editor_self_test(which);
+        std::cout << "[ControlApi] selftest " << which << " -> " << m_lastSelfTestResult << std::endl;
+    } else if (cmd == "package") {
+        const std::string result = package_assets_only();
+        std::cout << "[ControlApi] package -> " << result << std::endl;
+    } else if (cmd == "hot-reload") {
+        if (m_assetHotReload) m_assetHotReload->watch_registered_assets();
+        const auto reloaded = m_assetHotReload ? m_assetHotReload->poll() : std::vector<AssetMetadata>{};
+        std::cout << "[ControlApi] hot-reload -> " << reloaded.size() << " asset(s) reimported" << std::endl;
+    } else {
+        std::cout << "[ControlApi] ignored '" << cmd << "' (state="
+                  << static_cast<int>(m_playMode.get_state()) << ")" << std::endl;
+    }
+}
+
+std::string EditorApplication::run_editor_self_test(int which) {
+    static const char* kTestEnv[] = {
+        "VC_EDITOR_TEST_RENDERGRAPH",
+        "VC_EDITOR_TEST_HDR",
+        "VC_EDITOR_TEST_MATERIAL",
+        "VC_EDITOR_TEST_PLAY",
+        "VC_EDITOR_TEST_BUILD",
+    };
+    if (which < 0 || which >= 5) return "Erro: teste inválido";
+#ifdef _WIN32
+    char exePath[MAX_PATH] = {};
+    if (GetModuleFileNameA(nullptr, exePath, MAX_PATH) == 0) {
+        return "Erro: não foi possível localizar o executável";
+    }
+    // The child inherits the environment at creation time; set the test flag
+    // only for the duration of the spawn (the parent never re-reads it after
+    // startup). CREATE_NO_WINDOW keeps the headless run out of the user's way.
+    SetEnvironmentVariableA(kTestEnv[which], "1");
+    STARTUPINFOA si{ sizeof(si) };
+    PROCESS_INFORMATION pi{};
+    std::string cmdLine = std::string("\"") + exePath + "\"";
+    if (!CreateProcessA(exePath, cmdLine.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        SetEnvironmentVariableA(kTestEnv[which], nullptr);
+        return std::string("Erro: falha ao iniciar o teste (code ") +
+               std::to_string(GetLastError()) + ")";
+    }
+    // Never wait forever: a hung headless child would wedge the editor's main
+    // loop (and with it the Control API). 120s is generous for any build test.
+    const DWORD waitMs = 120000;
+    const DWORD waitResult = WaitForSingleObject(pi.hProcess, waitMs);
+    DWORD code = 0;
+    if (waitResult == WAIT_OBJECT_0) {
+        GetExitCodeProcess(pi.hProcess, &code);
+    } else {
+        TerminateProcess(pi.hProcess, 1);
+        code = 1;
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    SetEnvironmentVariableA(kTestEnv[which], nullptr);
+    return code == 0 ? "PASS" : ("FAIL (exit " + std::to_string(code) + ")");
+#else
+    // Non-Windows fallback: spawn via shell and read the exit status.
+    const std::string cmd =
+        std::string(kTestEnv[which]) + "=1 ./VulkanEngineEditor >/dev/null 2>&1";
+    const int rc = std::system(cmd.c_str());
+    return rc == 0 ? "PASS" : ("FAIL (exit " + std::to_string(rc) + ")");
+#endif
+}
+
+std::string EditorApplication::package_assets_only() {
+    std::vector<UUID> roots;
+    for (const AssetMetadata& asset : m_assetRegistry.snapshot()) {
+        if (asset.isCooked) roots.push_back(asset.id);
+    }
+    if (roots.empty()) {
+        return tr("Erro: nenhum asset cozido para empacotar (importe assets primeiro).",
+                  "Error: no cooked assets to package (import assets first).");
+    }
+    const std::filesystem::path out =
+        std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "Package";
+    const AssetPackageResult packaged = AssetPackager::package(m_assetRegistry, roots, out);
+    if (!packaged) {
+        return std::string(tr("Erro: ", "Error: ")) + packaged.error;
+    }
+    std::cout << "[Editor] standalone package: " << packaged.assets.size()
+              << " asset(s) -> " << out.string() << std::endl;
+    return tr("OK: ", "OK: ") + std::to_string(packaged.assets.size()) +
+           tr(" asset(s) empacotados em ", " asset(s) packaged to ") + out.string();
+}
+
 void EditorApplication::update_editor_camera(float deltaTime) {
-    if (!m_viewportFocused) return;
+    // Respond to the mouse over the rendered image, not to ImGui window focus:
+    // focus can go stale (another panel taking it), which made the viewport
+    // appear to stop answering the mouse entirely.
+    if (!m_viewportImageHovered) return;
 
     double mx = 0.0, my = 0.0;
     glfwGetCursorPos(m_window, &mx, &my);
@@ -4996,6 +6857,13 @@ void EditorApplication::update_editor_camera(float deltaTime) {
     const glm::vec3 front = cam.get_front();
     const glm::vec3 right = cam.get_right();
     const glm::vec3 up = cam.get_up();
+
+    // Don't let camera keys fight the user typing in Inspector/text fields.
+    // NOTE: io.WantCaptureKeyboard is true whenever the mouse hovers ANY
+    // window, which would kill WASD the moment the cursor is over the 3D view;
+    // io.WantTextInput is true only while an actual text field is being typed.
+    ImGuiIO& io = ImGui::GetIO();
+    const bool keysFree = !io.WantTextInput;
 
     // Orbit (right drag) / pan (middle drag).
     const bool orbitHeld = glfwGetMouseButton(m_window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
@@ -5009,8 +6877,9 @@ void EditorApplication::update_editor_camera(float deltaTime) {
         cam.orbitTarget += (-right * mouseDelta.x + up * mouseDelta.y) * panScale;
     }
 
-    // Fly (WASD) while orbiting.
-    if (orbitHeld) {
+    // Fly (WASD): free-fly whenever the mouse is over the viewport and the
+    // keyboard is not captured by a text field — no right-button required.
+    if (keysFree) {
         const float speed = cam.speed * (glfwGetKey(m_window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ? 4.0f : 1.0f);
         glm::vec3 move(0.0f);
         if (glfwGetKey(m_window, GLFW_KEY_W) == GLFW_PRESS) move += front;
@@ -5024,24 +6893,43 @@ void EditorApplication::update_editor_camera(float deltaTime) {
         }
     }
 
-    // Scroll zoom (handled here so it applies even without a hovered ImGui widget).
-    if (m_viewportImageHovered) {
-        ImGuiIO& io = ImGui::GetIO();
-        if (io.MouseWheel != 0.0f) {
-            cam.orbitDistance = glm::clamp(cam.orbitDistance * (1.0f - io.MouseWheel * 0.1f), 0.5f, 5000.0f);
-            io.MouseWheel = 0.0f;
+    // Scroll zoom: the wheel inside the 3D view ALWAYS dollies toward/away
+    // from the orbit focus — it never scrolls any panel (the viewport is
+    // NoScrollbar|NoScrollWithMouse, and the delta is consumed here). The
+    // delta comes from our own GLFW callback accumulator, not io.MouseWheel,
+    // which ImGui zeroes at the end of NewFrame before we can read it. When
+    // the viewport is NOT hovered the accumulator is dropped so ImGui keeps
+    // scrolling other panels normally.
+    if (m_viewportHovered || m_viewportImageHovered) {
+        if (m_scrollAccum != 0.0) {
+            cam.orbitDistance = glm::clamp(
+                cam.orbitDistance * (1.0f - static_cast<float>(m_scrollAccum) * 0.1f), 0.5f, 5000.0f);
+            m_scrollAccum = 0.0;
         }
+    } else {
+        m_scrollAccum = 0.0;
     }
 
+    recompute_editor_camera_position();
+}
+
+void EditorApplication::recompute_editor_camera_position() {
     // Recompute the camera position from target + spherical offset.
-    cam.position = cam.orbitTarget - euler_direction(cam.yaw, cam.pitch) * cam.orbitDistance;
+    m_editorCamera.position = m_editorCamera.orbitTarget -
+                              euler_direction(m_editorCamera.yaw, m_editorCamera.pitch) *
+                              m_editorCamera.orbitDistance;
 }
 
 void EditorApplication::process_viewport_input() {
-    if (!m_viewportFocused) return;
+    // Gizmo keys work on hover (mouse over the 3D image), not on ImGui window
+    // focus — focus can sit on another panel and would freeze the keys.
+    if (!m_viewportImageHovered) return;
     ImGuiIO& io = ImGui::GetIO();
-    // Gizmo mode switching: W / E / R
+    // Gizmo mode switching: Q / W / E / R
     if (!io.WantCaptureKeyboard) {
+        if (glfwGetKey(m_window, GLFW_KEY_Q) == GLFW_PRESS && m_gizmoMode != GizmoMode::Select) {
+            m_gizmoMode = GizmoMode::Select;
+        }
         if (glfwGetKey(m_window, GLFW_KEY_W) == GLFW_PRESS && m_gizmoMode != GizmoMode::Translate) {
             m_gizmoMode = GizmoMode::Translate;
         }
@@ -5075,6 +6963,11 @@ bool EditorApplication::gizmo_axis_hit_test(glm::vec2 mouseScreen) {
     const auto it = m_editorScene->transformComponents.find(m_selectedEntity.get_id());
     if (it == m_editorScene->transformComponents.end()) return false;
     const glm::vec3 origin = it->second.position;
+    // World/Local hit test: axes rotate with the entity in local mode.
+    const glm::quat gizmoRotation = m_gizmoLocal
+        ? glm::quat(glm::radians(it->second.rotation))
+        : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    const auto axisWorld = [&](int axis) -> glm::vec3 { return gizmoRotation * kAxisDirs[axis]; };
 
     const float aspect = m_viewportImageSize.x / std::max(1.0f, m_viewportImageSize.y);
     const glm::mat4 viewProj = m_editorCamera.get_projection_matrix(aspect) * m_editorCamera.get_view_matrix();
@@ -5097,7 +6990,7 @@ bool EditorApplication::gizmo_axis_hit_test(glm::vec2 mouseScreen) {
             for (int s = 0; s < 48; ++s) {
                 const float a0 = glm::two_pi<float>() * static_cast<float>(s) / 48.0f;
                 const float a1 = glm::two_pi<float>() * static_cast<float>(s + 1) / 48.0f;
-                const glm::vec3 dir = kAxisDirs[axis];
+                const glm::vec3 dir = axisWorld(axis);
                 glm::vec3 u = glm::normalize(glm::cross(dir, std::abs(dir.y) < 0.9f ? glm::vec3(0, 1, 0) : glm::vec3(1, 0, 0)));
                 glm::vec3 v = glm::normalize(glm::cross(dir, u));
                 const glm::vec3 p0 = origin + u * (std::cos(a0) * gizmoLen) + v * (std::sin(a0) * gizmoLen);
@@ -5105,7 +6998,7 @@ bool EditorApplication::gizmo_axis_hit_test(glm::vec2 mouseScreen) {
                 dist = std::min(dist, dist_point_segment(mouseScreen, project(p0), project(p1)));
             }
         } else {
-            const glm::vec2 tipScreen = project(origin + kAxisDirs[axis] * gizmoLen);
+            const glm::vec2 tipScreen = project(origin + axisWorld(axis) * gizmoLen);
             dist = dist_point_segment(mouseScreen, originScreen, tipScreen);
         }
         if (dist < 14.0f && dist < bestDist) {
@@ -5127,7 +7020,12 @@ void EditorApplication::start_gizmo_drag(glm::vec2 mouseScreen) {
     m_gizmoDragEntityStart = t.position;
     m_gizmoDragRotStart = t.rotation;
     m_gizmoDragScaleStart = t.scale;
-    m_gizmoAxisWorld = kAxisDirs[static_cast<int>(m_activeAxis) - 1];
+    // World/Local: in local mode the drag axis follows the entity rotation.
+    if (m_gizmoLocal) {
+        m_gizmoAxisWorld = glm::quat(glm::radians(t.rotation)) * kAxisDirs[static_cast<int>(m_activeAxis) - 1];
+    } else {
+        m_gizmoAxisWorld = kAxisDirs[static_cast<int>(m_activeAxis) - 1];
+    }
     m_gizmoDragPlaneNormal = glm::normalize(m_editorCamera.orbitTarget - m_editorCamera.position);
     if (glm::length(m_gizmoDragPlaneNormal) < 1e-5f) m_gizmoDragPlaneNormal = glm::vec3(0, 0, 1);
 
@@ -5240,6 +7138,13 @@ bool EditorApplication::load_mesh_resource(const UUID& assetId) {
             v.color = glm::vec3(1.0f);
             v.uv = i < primitive.uvs.size() ? primitive.uvs[i] : glm::vec2(0.0f);
             verts.push_back(v);
+            if (!resource.hasBounds) {
+                resource.boundsMin = resource.boundsMax = v.pos;
+                resource.hasBounds = true;
+            } else {
+                resource.boundsMin = glm::min(resource.boundsMin, v.pos);
+                resource.boundsMax = glm::max(resource.boundsMax, v.pos);
+            }
         }
         if (primitive.indexed) {
             const uint32_t firstIndex = static_cast<uint32_t>(indices.size());
@@ -5278,9 +7183,68 @@ bool EditorApplication::load_mesh_resource(const UUID& assetId) {
 
 const EditorApplication::EditorMeshResource* EditorApplication::get_mesh_resource(const UUID& assetId) {
     if (!assetId.is_valid()) return nullptr;
+    // Block models: a Block asset is a textured cube — build the GPU mesh on
+    // demand so spawned block entities survive restarts (no asset file, the
+    // cube geometry is generated and uploaded here).
+    if (const auto blockFound = m_assetRegistry.find(assetId);
+        blockFound && blockFound->type == AssetType::Block) {
+        ensure_block_cube_resource(assetId);
+        const auto it = m_meshResources.find(assetId);
+        return (it != m_meshResources.end() && it->second.valid) ? &it->second : nullptr;
+    }
     if (!load_mesh_resource(assetId)) return nullptr;
     const auto found = m_meshResources.find(assetId);
     return (found != m_meshResources.end() && found->second.valid) ? &found->second : nullptr;
+}
+
+void EditorApplication::ensure_block_cube_resource(const UUID& blockId) {
+    const auto cached = m_meshResources.find(blockId);
+    if (cached != m_meshResources.end()) {
+        if (cached->second.valid) return;
+        if (cached->second.vb.buffer != VK_NULL_HANDLE) vkDestroyBuffer(m_device, cached->second.vb.buffer, nullptr);
+        if (cached->second.vb.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, cached->second.vb.memory, nullptr);
+        if (cached->second.ib.buffer != VK_NULL_HANDLE) vkDestroyBuffer(m_device, cached->second.ib.buffer, nullptr);
+        if (cached->second.ib.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, cached->second.ib.memory, nullptr);
+        m_meshResources.erase(cached);
+    }
+    std::vector<EditorVertex> verts;
+    std::vector<uint32_t> indices;
+    generate_cube_geometry(verts, indices);
+    EditorMeshResource cube;
+    cube.vertexCount = static_cast<uint32_t>(verts.size());
+    cube.ranges.push_back({ 0, static_cast<uint32_t>(indices.size()), 0, true });
+    const VkDeviceSize vbSize = sizeof(EditorVertex) * verts.size();
+    const VkDeviceSize ibSize = sizeof(uint32_t) * indices.size();
+    create_buffer(vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  cube.vb.buffer, cube.vb.memory);
+    create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  cube.ib.buffer, cube.ib.memory);
+    void* data = nullptr;
+    vkMapMemory(m_device, cube.vb.memory, 0, vbSize, 0, &data);
+    std::memcpy(data, verts.data(), static_cast<size_t>(vbSize));
+    vkUnmapMemory(m_device, cube.vb.memory);
+    vkMapMemory(m_device, cube.ib.memory, 0, ibSize, 0, &data);
+    std::memcpy(data, indices.data(), static_cast<size_t>(ibSize));
+    vkUnmapMemory(m_device, cube.ib.memory);
+    cube.valid = true;
+    m_meshResources[blockId] = std::move(cube);
+}
+
+void EditorApplication::spawn_block_entity(const UUID& blockId, const glm::vec3& position) {
+    if (!m_editorScene) return;
+    const auto meta = m_assetRegistry.find(blockId);
+    if (!meta || meta->type != AssetType::Block) return;
+    Entity e = m_editorScene->create_entity(meta->sourcePath.stem().string());
+    m_editorScene->transformComponents[e.get_id()].position = position;
+    // meshAssetID = the block asset: the renderer builds the textured cube on
+    // demand (see get_mesh_resource / the block material branch in the mesh
+    // draw loop). Persists with the scene; regenerated after restart.
+    m_editorScene->meshRendererComponents[e.get_id()] =
+        MeshRendererComponent{ blockId, UUID{ 0, 0 }, true, true };
+    m_selectedEntity = e;
+    m_editorGui.select_entity(e);
 }
 
 void EditorApplication::draw_mesh_resource(VkCommandBuffer cmd, const glm::mat4& mvp, const glm::vec4& color,
@@ -5353,6 +7317,120 @@ bool decode_png_rgba(const std::vector<uint8_t>& png, std::vector<uint8_t>& rgba
     rgba.resize(static_cast<size_t>(width) * height * 4);
     return SUCCEEDED(converter->CopyPixels(nullptr, width * 4, static_cast<UINT>(rgba.size()), rgba.data()));
 }
+
+// Box-downscale a single-level RGBA8 image so its longest side fits within
+// maxDim (aspect preserved). When already small enough, dst is left untouched
+// and the caller keeps the original (outW/outH are still set).
+void downscale_rgba8(const uint8_t* src, uint32_t w, uint32_t h, uint32_t maxDim,
+                     std::vector<uint8_t>& dst, uint32_t& outW, uint32_t& outH) {
+    const uint32_t longest = std::max(w, h);
+    if (longest <= maxDim) {
+        outW = w;
+        outH = h;
+        return;
+    }
+    outW = std::max(1u, static_cast<uint32_t>((static_cast<uint64_t>(w) * maxDim) / longest));
+    outH = std::max(1u, static_cast<uint32_t>((static_cast<uint64_t>(h) * maxDim) / longest));
+    dst.assign(static_cast<size_t>(outW) * outH * 4, 0);
+    for (uint32_t y = 0; y < outH; ++y) {
+        const uint32_t y0 = static_cast<uint32_t>((static_cast<uint64_t>(y) * h) / outH);
+        const uint32_t y1 = std::max(static_cast<uint32_t>((static_cast<uint64_t>(y + 1) * h) / outH), y0 + 1);
+        for (uint32_t x = 0; x < outW; ++x) {
+            const uint32_t x0 = static_cast<uint32_t>((static_cast<uint64_t>(x) * w) / outW);
+            const uint32_t x1 = std::max(static_cast<uint32_t>((static_cast<uint64_t>(x + 1) * w) / outW), x0 + 1);
+            uint64_t acc[4] = { 0, 0, 0, 0 };
+            for (uint32_t sy = y0; sy < y1; ++sy) {
+                const uint8_t* row = src + static_cast<size_t>(sy) * w * 4;
+                for (uint32_t sx = x0; sx < x1; ++sx) {
+                    const uint8_t* p = row + static_cast<size_t>(sx) * 4;
+                    acc[0] += p[0]; acc[1] += p[1]; acc[2] += p[2]; acc[3] += p[3];
+                }
+            }
+            const uint32_t n = (y1 - y0) * (x1 - x0);
+            uint8_t* d = dst.data() + (static_cast<size_t>(y) * outW + x) * 4;
+            d[0] = static_cast<uint8_t>(acc[0] / n); d[1] = static_cast<uint8_t>(acc[1] / n);
+            d[2] = static_cast<uint8_t>(acc[2] / n); d[3] = static_cast<uint8_t>(acc[3] / n);
+        }
+    }
+}
+
+float half_to_float(uint16_t h) {
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    const uint32_t exp = (h >> 10) & 0x1Fu;
+    const uint32_t mant = h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            int e = -14;
+            uint32_t m = mant;
+            while ((m & 0x400u) == 0) { m <<= 1; --e; }
+            m &= 0x3FFu;
+            bits = sign | (static_cast<uint32_t>(e + 127) << 23) | (m << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+uint16_t float_to_half(float f) {
+    uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    const int32_t exp = static_cast<int32_t>((bits >> 23) & 0xFFu) - 127 + 15;
+    const uint32_t mant = bits & 0x7FFFFFu;
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7C00u);
+    if (exp <= 0) {
+        if (exp < -10) return static_cast<uint16_t>(sign);
+        const uint32_t m = mant | 0x800000u;
+        const uint32_t shift = static_cast<uint32_t>(14 - exp);
+        const uint32_t rounded = (m >> shift) + 0x1FFu + ((m >> (shift + 1)) & 1u);
+        return static_cast<uint16_t>(sign | (rounded >> 13));
+    }
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13));
+}
+
+// Same box downscale for RGBA16F (HDR) thumbnails.
+void downscale_half4(const uint8_t* src, uint32_t w, uint32_t h, uint32_t maxDim,
+                     std::vector<uint8_t>& dst, uint32_t& outW, uint32_t& outH) {
+    const uint32_t longest = std::max(w, h);
+    if (longest <= maxDim) {
+        outW = w;
+        outH = h;
+        return;
+    }
+    outW = std::max(1u, static_cast<uint32_t>((static_cast<uint64_t>(w) * maxDim) / longest));
+    outH = std::max(1u, static_cast<uint32_t>((static_cast<uint64_t>(h) * maxDim) / longest));
+    dst.assign(static_cast<size_t>(outW) * outH * 8, 0);
+    for (uint32_t y = 0; y < outH; ++y) {
+        const uint32_t y0 = static_cast<uint32_t>((static_cast<uint64_t>(y) * h) / outH);
+        const uint32_t y1 = std::max(static_cast<uint32_t>((static_cast<uint64_t>(y + 1) * h) / outH), y0 + 1);
+        for (uint32_t x = 0; x < outW; ++x) {
+            const uint32_t x0 = static_cast<uint32_t>((static_cast<uint64_t>(x) * w) / outW);
+            const uint32_t x1 = std::max(static_cast<uint32_t>((static_cast<uint64_t>(x + 1) * w) / outW), x0 + 1);
+            float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            for (uint32_t sy = y0; sy < y1; ++sy) {
+                const uint16_t* row = reinterpret_cast<const uint16_t*>(src + static_cast<size_t>(sy) * w * 8);
+                for (uint32_t sx = x0; sx < x1; ++sx) {
+                    const uint16_t* p = row + static_cast<size_t>(sx) * 4;
+                    acc[0] += half_to_float(p[0]); acc[1] += half_to_float(p[1]);
+                    acc[2] += half_to_float(p[2]); acc[3] += half_to_float(p[3]);
+                }
+            }
+            const uint32_t n = (y1 - y0) * (x1 - x0);
+            uint16_t* d = reinterpret_cast<uint16_t*>(dst.data() + (static_cast<size_t>(y) * outW + x) * 8);
+            const float inv = 1.0f / static_cast<float>(n);
+            d[0] = float_to_half(acc[0] * inv); d[1] = float_to_half(acc[1] * inv);
+            d[2] = float_to_half(acc[2] * inv); d[3] = float_to_half(acc[3] * inv);
+        }
+    }
+}
 } // namespace
 
 void EditorApplication::destroy_graph_texture(GraphTexture& t) {
@@ -5363,7 +7441,946 @@ void EditorApplication::destroy_graph_texture(GraphTexture& t) {
     t = GraphTexture{};
 }
 
-bool EditorApplication::load_viewport_texture(const UUID& assetId, GraphTexture& out, std::string& error) {
+// ---------------------------------------------------------------------------
+// Asset previews (Content Browser)
+// ---------------------------------------------------------------------------
+
+// Lazy GPU thumbnail for a cooked texture: decoded once, cached forever. A
+// texture the pipeline already cooked goes straight to a small ImGui texture
+// (default sampler), so the card shows the real image instead of an icon.
+VkDescriptorSet EditorApplication::get_asset_thumbnail(const AssetMetadata& asset) {
+    const auto found = m_assetThumbnails.find(asset.id);
+    if (found != m_assetThumbnails.end()) return found->second.imguiId;
+    if (m_assetThumbnailFailed.contains(asset.id)) return VK_NULL_HANDLE;
+    if (asset.type != AssetType::Texture || asset.cookedPath.empty()) {
+        m_assetThumbnailFailed.insert(asset.id);
+        return VK_NULL_HANDLE;
+    }
+    GraphTexture gt;
+    std::string error;
+    // Thumbnail size: the grid card is ~135x48, so 192 px is more than enough
+    // and keeps VRAM + upload time flat regardless of source resolution.
+    if (!load_viewport_texture(asset.id, gt, error, 192)) {
+        m_assetThumbnailFailed.insert(asset.id);
+        return VK_NULL_HANDLE;
+    }
+    const VkDescriptorSet imguiId =
+        ImGui_ImplVulkan_AddTexture(gt.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    m_assetThumbnails[asset.id] = AssetThumbnail{ gt.image, gt.memory, gt.view, imguiId };
+    return imguiId;
+}
+
+// Single active audio preview: clicking ▶ on another asset stops the current
+// voice first, like a professional content browser. The decode itself is async
+// (worker thread + bounded LRU cache) so long clips never freeze the editor.
+void EditorApplication::toggle_audio_preview(const AssetMetadata& asset) {
+    const bool alreadyPlaying = m_audioPreviewAsset == asset.id && m_audioPreviewVoice != 0 &&
+                                m_playAudio.is_active(m_audioPreviewVoice);
+    if (alreadyPlaying) {
+        m_playAudio.stop(m_audioPreviewVoice);
+        m_audioPreviewVoice = 0;
+        m_audioPreviewAsset = UUID{ 0, 0 };
+        m_audioPreviewRequest = UUID{ 0, 0 };
+        return;
+    }
+    // Clicking again while this asset is still decoding cancels the request.
+    const bool pendingThis = m_audioPreviewRequest == asset.id && m_audioPreviewVoice == 0;
+    if (m_audioPreviewVoice != 0) m_playAudio.stop(m_audioPreviewVoice);
+    m_audioPreviewVoice = 0;
+    m_audioPreviewAsset = UUID{ 0, 0 };
+    if (pendingThis) {
+        m_audioPreviewRequest = UUID{ 0, 0 };
+        return;
+    }
+    m_audioPreviewRequest = UUID{ 0, 0 };
+    if (asset.cookedPath.empty()) return;
+    m_audioPreviewRequest = asset.id;
+
+    const auto cached = m_audioPreviewCache.find(asset.id);
+    if (cached != m_audioPreviewCache.end()) {
+        start_preview_voice(asset.id);
+        return;
+    }
+    // No cached decode: the per-frame pump (pump_audio_preview_decodes) sees
+    // the request and kicks the worker thread, then plays when it finishes.
+}
+
+// ---------------------------------------------------------------------------
+// Playback sink: a miniaudio pull-mode device whose data callback renders the
+// play-in-editor Mixer. The callback runs on miniaudio's thread; the Mixer
+// locks internally, and the main thread only touches it briefly (play/stop /
+// set_listener), so contention just produces an occasional underrun, never a
+// deadlock. If the device cannot open (no audio hardware / sandbox), the
+// editor falls back to silent rendering as before.
+// ---------------------------------------------------------------------------
+namespace {
+
+void editor_audio_data_callback(ma_device* device, void* pOutput, const void* pInput, ma_uint32 frameCount);
+
+class EditorAudioSink final {
+public:
+    EditorAudioSink() = default;
+    ~EditorAudioSink() { shutdown(); }
+
+    bool init(Engine::Audio::Mixer* mixer) {
+        mixer_ = mixer;
+        ma_device_config config = ma_device_config_init(ma_device_type_playback);
+        config.playback.format = ma_format_f32;
+        config.playback.channels = 2; // matches Mixer::outputChannels_ (default 2)
+        config.sampleRate = 48000;    // matches Mixer::sampleRate_ (default 48000)
+        config.dataCallback = editor_audio_data_callback;
+        config.pUserData = this;
+        device_ = new ma_device{};
+        if (ma_device_init(nullptr, &config, device_) != MA_SUCCESS) {
+            delete device_;
+            device_ = nullptr;
+            return false;
+        }
+        if (ma_device_start(device_) != MA_SUCCESS) {
+            ma_device_uninit(device_);
+            delete device_;
+            device_ = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    void shutdown() {
+        if (device_ != nullptr) {
+            ma_device_uninit(device_);
+            delete device_;
+            device_ = nullptr;
+        }
+    }
+
+    void render_output(void* output, unsigned int frameCount) {
+        const std::span<const float> samples = mixer_->render(frameCount);
+        std::memcpy(output, samples.data(), static_cast<std::size_t>(frameCount) * 2 * sizeof(float));
+    }
+
+private:
+    Engine::Audio::Mixer* mixer_{ nullptr };
+    ma_device* device_{ nullptr };
+};
+
+void editor_audio_data_callback(ma_device* device, void* pOutput, const void*, ma_uint32 frameCount) {
+    static_cast<EditorAudioSink*>(device->pUserData)->render_output(pOutput, frameCount);
+}
+
+} // namespace
+
+void EditorApplication::init_audio_output() {
+    if (m_audioDevice != nullptr) return;
+    auto* sink = new EditorAudioSink{};
+    if (!sink->init(&m_playAudio)) {
+        std::cerr << "[Audio] No playback device available; play-in-editor audio stays silent." << std::endl;
+        delete sink;
+        return;
+    }
+    m_audioDevice = sink;
+    m_audioDeviceStarted = true;
+}
+
+void EditorApplication::shutdown_audio_output() {
+    if (m_audioDevice != nullptr) {
+        delete static_cast<EditorAudioSink*>(m_audioDevice);
+        m_audioDevice = nullptr;
+    }
+    m_audioDeviceStarted = false;
+}
+
+// Picks up finished background decodes, plays the one that is still requested,
+// and kicks off a decode for any outstanding request not yet cached.
+void EditorApplication::pump_audio_preview_decodes() {
+    PendingAudioDecode ready;
+    bool haveReady = false;
+    {
+        std::lock_guard<std::mutex> lock(m_audioDecodeMutex);
+        if (m_audioDecodeReady) {
+            ready = std::move(*m_audioDecodeReady);
+            m_audioDecodeReady.reset();
+            haveReady = true;
+        }
+    }
+    if (haveReady) {
+        if (ready.buffer.valid()) {
+            cache_audio_preview(ready.assetId, ready.buffer);
+        } else {
+            // Corrupt/undecodable file: remember so we never retry it.
+            m_audioPreviewDecodeFailed.insert(ready.assetId);
+        }
+        if (ready.assetId == m_audioPreviewRequest && m_audioPreviewVoice == 0) {
+            start_preview_voice(ready.assetId);
+        }
+    }
+    if (m_audioPreviewRequest != UUID{ 0, 0 } && m_audioPreviewVoice == 0 &&
+        !m_audioPreviewCache.contains(m_audioPreviewRequest) &&
+        !m_audioPreviewDecodeFailed.contains(m_audioPreviewRequest) &&
+        !m_audioDecodeBusy.exchange(true)) {
+        const UUID id = m_audioPreviewRequest;
+        const auto meta = m_assetRegistry.find(id);
+        if (meta && !meta->cookedPath.empty()) {
+            std::thread([this, id, path = meta->cookedPath]() {
+                const auto decoded = Engine::Audio::OggDecoder::decode_file(path);
+                PendingAudioDecode pending;
+                pending.assetId = id;
+                if (decoded && decoded->valid()) {
+                    pending.buffer.sampleRate = decoded->sampleRate;
+                    pending.buffer.channels = decoded->channels;
+                    pending.buffer.samples = std::move(decoded->samples);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(m_audioDecodeMutex);
+                    m_audioDecodeReady = std::move(pending);
+                }
+                m_audioDecodeBusy.store(false);
+            }).detach();
+        } else {
+            m_audioDecodeBusy.store(false);
+            m_audioPreviewRequest = UUID{ 0, 0 };
+        }
+    }
+    // A failed asset must not keep a stale request alive.
+    if (m_audioPreviewDecodeFailed.contains(m_audioPreviewRequest)) {
+        m_audioPreviewRequest = UUID{ 0, 0 };
+    }
+}
+
+void EditorApplication::start_preview_voice(const UUID& assetId) {
+    const auto meta = m_assetRegistry.find(assetId);
+    const auto cached = m_audioPreviewCache.find(assetId);
+    if (!meta || cached == m_audioPreviewCache.end()) return;
+    if (m_audioPreviewVoice != 0) m_playAudio.stop(m_audioPreviewVoice);
+    m_audioPreviewVoice = 0;
+    auto clip = std::make_shared<Engine::Audio::AudioClip>(meta->sourcePath.stem().string());
+    Engine::Audio::AudioBuffer playable = *cached->second;
+    clip->hot_swap(std::move(playable));
+    Engine::Audio::VoiceDescription desc;
+    desc.clip = std::move(clip);
+    desc.bus = m_playAudio.master_bus();
+    desc.gain = 1.0f;
+    desc.looping = false;
+    desc.spatial = false;
+    m_audioPreviewVoice = m_playAudio.play(std::move(desc));
+    m_audioPreviewAsset = assetId;
+    m_audioPreviewRequest = UUID{ 0, 0 };
+}
+
+void EditorApplication::cache_audio_preview(const UUID& assetId, const Engine::Audio::AudioBuffer& buffer) {
+    // Bounded LRU: ~60s of stereo @48 kHz worth of decoded previews in memory.
+    constexpr std::size_t kMaxCachedFrames = 48000u * 60u * 2u;
+    const auto existing = m_audioPreviewCache.find(assetId);
+    if (existing != m_audioPreviewCache.end()) {
+        m_audioPreviewCacheFrames -= existing->second->frame_count();
+        m_audioPreviewCache.erase(existing);
+        std::erase(m_audioPreviewCacheOrder, assetId);
+    }
+    m_audioPreviewCache[assetId] = std::make_shared<Engine::Audio::AudioBuffer>(buffer);
+    m_audioPreviewCacheFrames += buffer.frame_count();
+    m_audioPreviewCacheOrder.push_back(assetId);
+    while (m_audioPreviewCacheFrames > kMaxCachedFrames && m_audioPreviewCacheOrder.size() > 1) {
+        const UUID oldest = m_audioPreviewCacheOrder.front();
+        m_audioPreviewCacheOrder.pop_front();
+        const auto it = m_audioPreviewCache.find(oldest);
+        if (it != m_audioPreviewCache.end()) {
+            m_audioPreviewCacheFrames -= it->second->frame_count();
+            m_audioPreviewCache.erase(it);
+        }
+    }
+}
+
+void EditorApplication::destroy_asset_thumbnails() {
+    if (m_device == VK_NULL_HANDLE) return;
+    if (m_audioPreviewVoice != 0)    m_playAudio.stop(m_audioPreviewVoice);
+    m_audioPreviewVoice = 0;
+    m_audioPreviewAsset = UUID{ 0, 0 };
+    m_audioPreviewRequest = UUID{ 0, 0 };
+    for (auto& [id, thumb] : m_assetThumbnails) {
+        (void)id;
+        if (thumb.imguiId != VK_NULL_HANDLE) ImGui_ImplVulkan_RemoveTexture(thumb.imguiId);
+        if (thumb.view != VK_NULL_HANDLE) vkDestroyImageView(m_device, thumb.view, nullptr);
+        if (thumb.image != VK_NULL_HANDLE) vkDestroyImage(m_device, thumb.image, nullptr);
+        if (thumb.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, thumb.memory, nullptr);
+    }
+    m_assetThumbnails.clear();
+    for (auto& [id, desc] : m_asset3dThumbnails) {
+        (void)id;
+        if (desc != VK_NULL_HANDLE) ImGui_ImplVulkan_RemoveTexture(desc);
+    }
+    m_asset3dThumbnails.clear();
+    m_assetThumbnailFailed.clear();
+}
+
+// ---------------------------------------------------------------------------
+// 3D asset thumbnails (Content Browser)
+// ---------------------------------------------------------------------------
+
+// Small dedicated offscreen (thumbSize x thumbSize) that reuses the viewport
+// render pass, so any viewport pipeline (scene / block) can render one asset
+// into it. The result becomes an ImGui texture cached in m_asset3dThumbnails.
+void EditorApplication::init_thumbnail_target() {
+    if (m_device == VK_NULL_HANDLE || m_offscreen.renderPass == VK_NULL_HANDLE) return;
+    if (m_thumbImage != VK_NULL_HANDLE) return;
+    const VkFormat colorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    const VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
+    create_image(m_thumbSize, m_thumbSize, colorFormat,
+                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_thumbImage, m_thumbMemory);
+    m_thumbView = create_image_view(m_thumbImage, colorFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+    create_image(m_thumbSize, m_thumbSize, depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_thumbDepthImage, m_thumbDepthMemory);
+    m_thumbDepthView = create_image_view(m_thumbDepthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
+    VkImageView attachments[2] = { m_thumbView, m_thumbDepthView };
+    VkFramebufferCreateInfo fbInfo{ VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+    fbInfo.renderPass = m_offscreen.renderPass;
+    fbInfo.attachmentCount = 2;
+    fbInfo.pAttachments = attachments;
+    fbInfo.width = m_thumbSize;
+    fbInfo.height = m_thumbSize;
+    fbInfo.layers = 1;
+    vkCreateFramebuffer(m_device, &fbInfo, nullptr, &m_thumbFramebuffer);
+}
+
+void EditorApplication::destroy_thumbnail_target() {
+    if (m_device == VK_NULL_HANDLE) return;
+    if (m_thumbFramebuffer != VK_NULL_HANDLE) { vkDestroyFramebuffer(m_device, m_thumbFramebuffer, nullptr); m_thumbFramebuffer = VK_NULL_HANDLE; }
+    if (m_thumbView != VK_NULL_HANDLE) { vkDestroyImageView(m_device, m_thumbView, nullptr); m_thumbView = VK_NULL_HANDLE; }
+    if (m_thumbImage != VK_NULL_HANDLE) { vkDestroyImage(m_device, m_thumbImage, nullptr); m_thumbImage = VK_NULL_HANDLE; }
+    if (m_thumbMemory != VK_NULL_HANDLE) { vkFreeMemory(m_device, m_thumbMemory, nullptr); m_thumbMemory = VK_NULL_HANDLE; }
+    if (m_thumbDepthView != VK_NULL_HANDLE) { vkDestroyImageView(m_device, m_thumbDepthView, nullptr); m_thumbDepthView = VK_NULL_HANDLE; }
+    if (m_thumbDepthImage != VK_NULL_HANDLE) { vkDestroyImage(m_device, m_thumbDepthImage, nullptr); m_thumbDepthImage = VK_NULL_HANDLE; }
+    if (m_thumbDepthMemory != VK_NULL_HANDLE) { vkFreeMemory(m_device, m_thumbDepthMemory, nullptr); m_thumbDepthMemory = VK_NULL_HANDLE; }
+}
+
+// Textured unit cube: the "block" pipeline used to assemble a Minecraft-style
+// block model from a PNG texture (thumbnail preview + scene preview).
+void EditorApplication::init_block_cube() {
+    if (m_device == VK_NULL_HANDLE || m_blockPipeline != VK_NULL_HANDLE) return;
+
+    // Unit cube with per-face UVs: 24 vertices / 36 indices.
+    struct BlockVert { glm::vec3 pos; glm::vec2 uv; };
+    const BlockVert verts[24] = {
+        { { -0.5f, -0.5f,  0.5f }, { 0, 0 } }, { {  0.5f, -0.5f,  0.5f }, { 1, 0 } },
+        { {  0.5f,  0.5f,  0.5f }, { 1, 1 } }, { { -0.5f,  0.5f,  0.5f }, { 0, 1 } }, // +Z
+        { {  0.5f, -0.5f, -0.5f }, { 0, 0 } }, { { -0.5f, -0.5f, -0.5f }, { 1, 0 } },
+        { { -0.5f,  0.5f, -0.5f }, { 1, 1 } }, { {  0.5f,  0.5f, -0.5f }, { 0, 1 } }, // -Z
+        { {  0.5f, -0.5f,  0.5f }, { 0, 0 } }, { {  0.5f, -0.5f, -0.5f }, { 1, 0 } },
+        { {  0.5f,  0.5f, -0.5f }, { 1, 1 } }, { {  0.5f,  0.5f,  0.5f }, { 0, 1 } }, // +X
+        { { -0.5f, -0.5f, -0.5f }, { 0, 0 } }, { { -0.5f, -0.5f,  0.5f }, { 1, 0 } },
+        { { -0.5f,  0.5f,  0.5f }, { 1, 1 } }, { { -0.5f,  0.5f, -0.5f }, { 0, 1 } }, // -X
+        { { -0.5f,  0.5f,  0.5f }, { 0, 0 } }, { {  0.5f,  0.5f,  0.5f }, { 1, 0 } },
+        { {  0.5f,  0.5f, -0.5f }, { 1, 1 } }, { { -0.5f,  0.5f, -0.5f }, { 0, 1 } }, // +Y
+        { { -0.5f, -0.5f, -0.5f }, { 0, 0 } }, { {  0.5f, -0.5f, -0.5f }, { 1, 0 } },
+        { {  0.5f, -0.5f,  0.5f }, { 1, 1 } }, { { -0.5f, -0.5f,  0.5f }, { 0, 1 } }, // -Y
+    };
+    const uint32_t indices[36] = {
+        0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 8, 9, 10, 8, 10, 11,
+        12, 13, 14, 12, 14, 15, 16, 17, 18, 16, 18, 19, 20, 21, 22, 20, 22, 23,
+    };
+    const VkDeviceSize vbSize = sizeof(BlockVert) * 24;
+    const VkDeviceSize ibSize = sizeof(uint32_t) * 36;
+    create_buffer(vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  m_blockCubeVB.buffer, m_blockCubeVB.memory);
+    create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  m_blockCubeIB.buffer, m_blockCubeIB.memory);
+    void* data = nullptr;
+    vkMapMemory(m_device, m_blockCubeVB.memory, 0, vbSize, 0, &data);
+    std::memcpy(data, verts, vbSize);
+    vkUnmapMemory(m_device, m_blockCubeVB.memory);
+    vkMapMemory(m_device, m_blockCubeIB.memory, 0, ibSize, 0, &data);
+    std::memcpy(data, indices, ibSize);
+    vkUnmapMemory(m_device, m_blockCubeIB.memory);
+    m_blockCubeIndexCount = 36;
+
+    VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+    vkCreateSampler(m_device, &samplerInfo, nullptr, &m_blockSampler);
+
+    VkDescriptorSetLayoutBinding binding{};
+    binding.binding = 0;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    binding.descriptorCount = 1;
+    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo descLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    descLayoutInfo.bindingCount = 1;
+    descLayoutInfo.pBindings = &binding;
+    vkCreateDescriptorSetLayout(m_device, &descLayoutInfo, nullptr, &m_blockDescSetLayout);
+
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushRange.offset = 0;
+    pushRange.size = 64; // mat4 mvp
+    VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &m_blockDescSetLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &pushRange;
+    vkCreatePipelineLayout(m_device, &layoutInfo, nullptr, &m_blockPipelineLayout);
+
+    m_blockVertShader = make_module(m_device, read_spv("block.vert.spv"));
+    m_blockFragShader = make_module(m_device, read_spv("block.frag.spv"));
+    if (!m_blockVertShader || !m_blockFragShader) {
+        std::cerr << "[Editor] block shaders missing (run compile_shaders)" << std::endl;
+        return;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = m_blockVertShader;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = m_blockFragShader;
+    stages[1].pName = "main";
+
+    VkVertexInputBindingDescription bindings[2]{};
+    bindings[0].binding = 0; bindings[0].stride = sizeof(BlockVert); bindings[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription attrs[2]{};
+    attrs[0].location = 0; attrs[0].binding = 0; attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[0].offset = 0;
+    attrs[1].location = 1; attrs[1].binding = 0; attrs[1].format = VK_FORMAT_R32G32_SFLOAT; attrs[1].offset = sizeof(glm::vec3);
+    VkPipelineVertexInputStateCreateInfo vertexInput{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    vertexInput.vertexBindingDescriptionCount = 1;
+    vertexInput.pVertexBindingDescriptions = bindings;
+    vertexInput.vertexAttributeDescriptionCount = 2;
+    vertexInput.pVertexAttributeDescriptions = attrs;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineRasterizationStateCreateInfo raster{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_BACK_BIT;
+    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo multisample{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo depth{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    depth.depthTestEnable = VK_TRUE;
+    depth.depthWriteEnable = VK_TRUE;
+    depth.depthCompareOp = VK_COMPARE_OP_LESS;
+    VkPipelineColorBlendAttachmentState blend{};
+    blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo colorBlend{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    colorBlend.attachmentCount = 1;
+    colorBlend.pAttachments = &blend;
+    VkPipelineViewportStateCreateInfo viewportState{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dynamic{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dyn;
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    pipelineInfo.stageCount = 2;
+    pipelineInfo.pStages = stages;
+    pipelineInfo.pVertexInputState = &vertexInput;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &raster;
+    pipelineInfo.pMultisampleState = &multisample;
+    pipelineInfo.pDepthStencilState = &depth;
+    pipelineInfo.pColorBlendState = &colorBlend;
+    pipelineInfo.pDynamicState = &dynamic;
+    pipelineInfo.layout = m_blockPipelineLayout;
+    pipelineInfo.renderPass = m_offscreen.renderPass;
+    pipelineInfo.subpass = 0;
+    vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_blockPipeline);
+}
+
+void EditorApplication::destroy_block_cube() {
+    if (m_device == VK_NULL_HANDLE) return;
+    for (auto& [id, gt] : m_blockTextures) {
+        (void)id;
+        destroy_graph_texture(gt);
+    }
+    m_blockTextures.clear();
+    m_blockDescriptors.clear();
+    if (m_blockPipeline != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_blockPipeline, nullptr); m_blockPipeline = VK_NULL_HANDLE; }
+    if (m_blockPipelineLayout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(m_device, m_blockPipelineLayout, nullptr); m_blockPipelineLayout = VK_NULL_HANDLE; }
+    if (m_blockDescSetLayout != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(m_device, m_blockDescSetLayout, nullptr); m_blockDescSetLayout = VK_NULL_HANDLE; }
+    if (m_blockSampler != VK_NULL_HANDLE) { vkDestroySampler(m_device, m_blockSampler, nullptr); m_blockSampler = VK_NULL_HANDLE; }
+    if (m_blockVertShader != VK_NULL_HANDLE) { vkDestroyShaderModule(m_device, m_blockVertShader, nullptr); m_blockVertShader = VK_NULL_HANDLE; }
+    if (m_blockFragShader != VK_NULL_HANDLE) { vkDestroyShaderModule(m_device, m_blockFragShader, nullptr); m_blockFragShader = VK_NULL_HANDLE; }
+    if (m_blockCubeVB.buffer != VK_NULL_HANDLE) { vkDestroyBuffer(m_device, m_blockCubeVB.buffer, nullptr); vkFreeMemory(m_device, m_blockCubeVB.memory, nullptr); m_blockCubeVB = GPUBuffer{}; }
+    if (m_blockCubeIB.buffer != VK_NULL_HANDLE) { vkDestroyBuffer(m_device, m_blockCubeIB.buffer, nullptr); vkFreeMemory(m_device, m_blockCubeIB.memory, nullptr); m_blockCubeIB = GPUBuffer{}; }
+}
+
+// Lazy descriptor set for a block texture (my layout, allocated from the ImGui
+// descriptor pool which carries COMBINED_IMAGE_SAMPLER).
+VkDescriptorSet EditorApplication::get_block_descriptor(const UUID& textureAsset) {
+    const auto cached = m_blockDescriptors.find(textureAsset);
+    if (cached != m_blockDescriptors.end()) return cached->second;
+    if (m_blockDescSetLayout == VK_NULL_HANDLE || m_blockSampler == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    GraphTexture gt;
+    std::string error;
+    if (!load_viewport_texture(textureAsset, gt, error, 192)) return VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo ai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    ai.descriptorPool = m_imguiDescriptorPool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &m_blockDescSetLayout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(m_device, &ai, &set) != VK_SUCCESS) {
+        destroy_graph_texture(gt);
+        return VK_NULL_HANDLE;
+    }
+    VkDescriptorImageInfo imageInfo{ m_blockSampler, gt.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    write.dstSet = set;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &imageInfo;
+    vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+    m_blockTextures[textureAsset] = gt; // keeps image/view alive
+    m_blockDescriptors[textureAsset] = set;
+    return set;
+}
+
+void EditorApplication::request_3d_thumbnail(const UUID& assetId) {
+    if (!assetId.is_valid()) return;
+    if (m_assetThumbnails.contains(assetId) || m_asset3dThumbnails.contains(assetId) ||
+        m_assetThumbnailFailed.contains(assetId) || m_thumbnailQueued.contains(assetId)) {
+        return;
+    }
+    m_thumbnailQueued.insert(assetId);
+    m_thumbnailQueue.push_back(assetId);
+}
+
+// Renders pending mesh/block thumbnails, a few per frame (each render is a
+// submit + wait, so the budget keeps the editor responsive).
+void EditorApplication::pump_asset_thumbnails(int budget) {
+    if (m_thumbFramebuffer == VK_NULL_HANDLE || m_device == VK_NULL_HANDLE) return;
+    while (budget-- > 0 && !m_thumbnailQueue.empty()) {
+        const UUID id = m_thumbnailQueue.front();
+        m_thumbnailQueue.pop_front();
+        m_thumbnailQueued.erase(id);
+        if (m_assetThumbnails.contains(id) || m_asset3dThumbnails.contains(id) ||
+            m_assetThumbnailFailed.contains(id)) {
+            continue;
+        }
+        const auto meta = m_assetRegistry.find(id);
+        if (!meta) { m_assetThumbnailFailed.insert(id); continue; }
+        if (meta->type == AssetType::Mesh) {
+            if (!load_mesh_resource(id)) { m_assetThumbnailFailed.insert(id); continue; }
+            const EditorMeshResource* mesh = get_mesh_resource(id);
+            if (!mesh || !mesh->valid) { m_assetThumbnailFailed.insert(id); continue; }
+            render_mesh_thumbnail(id, *mesh);
+        } else if (meta->type == AssetType::Block) {
+            const UUID tex = resolve_block_texture(id);
+            if (!tex.is_valid()) { m_assetThumbnailFailed.insert(id); continue; }
+            const VkDescriptorSet desc = get_block_descriptor(tex);
+            if (desc == VK_NULL_HANDLE) { m_assetThumbnailFailed.insert(id); continue; }
+            render_block_thumbnail(id, desc);
+        } else {
+            m_assetThumbnailFailed.insert(id);
+        }
+    }
+}
+
+// Renders a cooked mesh into the thumbnail offscreen with the scene pipeline
+// (neutral material color), framed from its bounds, and caches an ImGui
+// texture. The color image itself stays owned by the thumbnail target.
+void EditorApplication::render_mesh_thumbnail(const UUID& assetId, const EditorMeshResource& mesh) {
+    const glm::vec3 center = (mesh.boundsMin + mesh.boundsMax) * 0.5f;
+    const float radius = std::max(glm::length(mesh.boundsMax - mesh.boundsMin) * 0.5f, 1e-4f);
+    const float camDist = radius * 2.6f;
+    const glm::mat4 proj = glm::perspective(glm::radians(45.0f), 1.0f, 0.01f, camDist * 20.0f);
+    const glm::mat4 view = glm::lookAt(center + glm::vec3(0.75f, 0.60f, 0.90f) * camDist, center, glm::vec3(0, 1, 0));
+
+    VkCommandBuffer cmd = begin_single_time_commands();
+    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkRenderPassBeginInfo rp{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    rp.renderPass = m_offscreen.renderPass;
+    rp.framebuffer = m_thumbFramebuffer;
+    rp.renderArea = { { 0, 0 }, { m_thumbSize, m_thumbSize } };
+    const VkClearValue clears[2] = {
+        { { { 0.10f, 0.11f, 0.14f, 1.0f } } }, // surface background
+        { { 1.0f, 0 } },
+    };
+    rp.clearValueCount = 2;
+    rp.pClearValues = clears;
+    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    const VkViewport vp{ 0, 0, static_cast<float>(m_thumbSize), static_cast<float>(m_thumbSize), 0, 1 };
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    const VkRect2D sc{ { 0, 0 }, { m_thumbSize, m_thumbSize } };
+    vkCmdSetScissor(cmd, 0, 1, &sc);
+    draw_mesh_resource(cmd, proj * view, glm::vec4(0.62f, 0.66f, 0.75f, 1.0f), mesh);
+    vkCmdEndRenderPass(cmd);
+    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    end_single_time_commands(cmd);
+
+    m_asset3dThumbnails[assetId] =
+        ImGui_ImplVulkan_AddTexture(m_thumbView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+// Same, but a textured unit cube: the Minecraft-style block assembled from its
+// PNG face texture (block pipeline).
+void EditorApplication::render_block_thumbnail(const UUID& assetId, VkDescriptorSet textureDesc) {
+    if (m_blockPipeline == VK_NULL_HANDLE) return;
+    const glm::mat4 proj = glm::perspective(glm::radians(45.0f), 1.0f, 0.01f, 50.0f);
+    const glm::mat4 view = glm::lookAt(glm::vec3(2.2f, 1.8f, 2.6f), glm::vec3(0.0f), glm::vec3(0, 1, 0));
+    const glm::mat4 mvp = proj * view;
+
+    VkCommandBuffer cmd = begin_single_time_commands();
+    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkRenderPassBeginInfo rp{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    rp.renderPass = m_offscreen.renderPass;
+    rp.framebuffer = m_thumbFramebuffer;
+    rp.renderArea = { { 0, 0 }, { m_thumbSize, m_thumbSize } };
+    const VkClearValue clears[2] = {
+        { { { 0.10f, 0.11f, 0.14f, 1.0f } } },
+        { { 1.0f, 0 } },
+    };
+    rp.clearValueCount = 2;
+    rp.pClearValues = clears;
+    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    const VkViewport vp{ 0, 0, static_cast<float>(m_thumbSize), static_cast<float>(m_thumbSize), 0, 1 };
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    const VkRect2D sc{ { 0, 0 }, { m_thumbSize, m_thumbSize } };
+    vkCmdSetScissor(cmd, 0, 1, &sc);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_blockPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_blockPipelineLayout,
+                            0, 1, &textureDesc, 0, nullptr);
+    vkCmdPushConstants(cmd, m_blockPipelineLayout,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, &mvp);
+    const VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &m_blockCubeVB.buffer, &offset);
+    vkCmdBindIndexBuffer(cmd, m_blockCubeIB.buffer, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(cmd, m_blockCubeIndexCount, 1, 0, 0, 0);
+    vkCmdEndRenderPass(cmd);
+    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    end_single_time_commands(cmd);
+
+    m_asset3dThumbnails[assetId] =
+        ImGui_ImplVulkan_AddTexture(m_thumbView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+// ---------------------------------------------------------------------------
+// Minecraft-style block model assets
+// ---------------------------------------------------------------------------
+
+// Heuristic: small square power-of-two textures are the classic Minecraft
+// block face format (16/32/64/128/256). Not a guarantee — just a strong hint
+// that the Content Browser surfaces under "Modelos" with a block badge.
+bool EditorApplication::looks_like_block_texture(const AssetMetadata& meta) const {
+    if (meta.type != AssetType::Texture || meta.width == 0 || meta.height == 0) return false;
+    if (meta.width != meta.height) return false;
+    const uint32_t s = meta.width;
+    if (s < 8 || s > 256) return false;
+    return (s & (s - 1)) == 0;
+}
+
+// Writes a .vblock sidecar (JSON: texture UUID per face; all default to the
+// source texture) and registers it as an AssetType::Block asset.
+void EditorApplication::create_block_asset(const AssetMetadata& textureMeta) {
+    if (!textureMeta.id.is_valid() || textureMeta.type != AssetType::Texture) return;
+    std::filesystem::path blockPath = textureMeta.sourcePath.parent_path() /
+        (textureMeta.sourcePath.stem().string() + ".vblock");
+    unsigned suffix = 2;
+    while (std::filesystem::exists(blockPath)) {
+        blockPath = textureMeta.sourcePath.parent_path() /
+            (textureMeta.sourcePath.stem().string() + "_" + std::to_string(suffix++) + ".vblock");
+    }
+    {
+        std::ofstream out(blockPath);
+        out << "{\"texture\":\"" << textureMeta.id.to_string() << "\"}";
+    }
+    AssetMetadata meta;
+    meta.id = UUID();
+    meta.type = AssetType::Block;
+    meta.sourcePath = blockPath;
+    meta.cookedPath = blockPath;
+    meta.isCooked = true;
+    meta.contentHash = textureMeta.contentHash;
+    if (!m_assetRegistry.register_asset(meta)) {
+        std::cerr << "[ContentBrowser] Failed to register block asset " << blockPath.string() << std::endl;
+        return;
+    }
+    m_blockAssetCache[meta.id] = BlockAssetData{ textureMeta.id, textureMeta.id, textureMeta.id, textureMeta.id };
+    m_blockAssetFailed.erase(meta.id);
+    const auto registryPath = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db";
+    if (!m_assetRegistry.save(registryPath)) {
+        std::cerr << "[AssetRegistry] Could not persist block asset" << std::endl;
+    }
+}
+
+// Parses the .vblock sidecar (JSON is simple enough for a targeted string
+// scan — no JSON dependency needed).
+bool EditorApplication::load_block_asset(const UUID& blockAssetId, BlockAssetData& out) {
+    const auto cached = m_blockAssetCache.find(blockAssetId);
+    if (cached != m_blockAssetCache.end()) { out = cached->second; return true; }
+    if (m_blockAssetFailed.contains(blockAssetId)) return false;
+    const auto meta = m_assetRegistry.find(blockAssetId);
+    if (!meta || meta->type != AssetType::Block || meta->sourcePath.empty() ||
+        !std::filesystem::is_regular_file(meta->sourcePath)) {
+        m_blockAssetFailed.insert(blockAssetId);
+        return false;
+    }
+    std::ifstream in(meta->sourcePath);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    const std::string text = ss.str();
+    const auto grab = [&](const char* key) -> UUID {
+        const std::string needle = std::string("\"") + key + "\"";
+        const size_t p = text.find(needle);
+        if (p == std::string::npos) return UUID{ 0, 0 };
+        const size_t q = text.find('"', p + needle.size());
+        if (q == std::string::npos) return UUID{ 0, 0 };
+        const size_t r = text.find('"', q + 1);
+        if (r == std::string::npos) return UUID{ 0, 0 };
+        return UUID::from_string(text.substr(q + 1, r - q - 1));
+    };
+    BlockAssetData data;
+    data.texture = grab("texture");
+    data.top = grab("top");
+    data.bottom = grab("bottom");
+    data.side = grab("side");
+    if (!data.texture.is_valid() && !data.top.is_valid() && !data.side.is_valid() && !data.bottom.is_valid()) {
+        m_blockAssetFailed.insert(blockAssetId);
+        return false;
+    }
+    m_blockAssetCache[blockAssetId] = data;
+    return true;
+}
+
+UUID EditorApplication::resolve_block_texture(const UUID& blockAssetId) {
+    BlockAssetData data;
+    if (!load_block_asset(blockAssetId, data)) return UUID{ 0, 0 };
+    if (data.texture.is_valid()) return data.texture;
+    if (data.side.is_valid()) return data.side;
+    if (data.top.is_valid()) return data.top;
+    return data.bottom;
+}
+
+// ---------------------------------------------------------------------------
+// Voxel sculpting (Escultura de Blocos) — real grid, real rendering, real
+// painting. Each VoxelVolumeComponent entity owns an editable
+// Engine::Voxel::VoxelStructure (32x24x32 cells, 1 m each) rendered as colored
+// cubes; the brush panel paints into it via Engine::Voxel::VoxelTools.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int kVoxelSizeX = 32;
+constexpr int kVoxelSizeY = 24;
+constexpr int kVoxelSizeZ = 32;
+
+uint32_t voxel_hash2(int x, int z, uint32_t seed) {
+    uint32_t h = seed ^ (static_cast<uint32_t>(x) * 374761393u) ^ (static_cast<uint32_t>(z) * 668265263u);
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return (h ^ (h >> 16)) & 0xFFFFu;
+}
+
+glm::vec3 voxel_type_color(uint16_t type) {
+    switch (type) {
+        case 1: return glm::vec3(0.55f, 0.42f, 0.30f); // terra
+        case 2: return glm::vec3(0.30f, 0.72f, 0.30f); // grama
+        case 3: return glm::vec3(0.55f, 0.55f, 0.58f); // pedra
+        case 4: return glm::vec3(0.25f, 0.45f, 0.85f); // água
+        default: return glm::vec3(0.62f, 0.66f, 0.75f);
+    }
+}
+} // namespace
+
+void EditorApplication::ensure_voxel_volume(const UUID& entityId, uint32_t seed, float seaLevel) {
+    if (m_voxelStructures.contains(entityId)) return;
+    auto grid = std::make_unique<Engine::Voxel::VoxelStructure>(
+        Engine::Voxel::Int3{ kVoxelSizeX, kVoxelSizeY, kVoxelSizeZ }, "Voxel");
+    // Deterministic terrain from the volume seed (noise height per column).
+    const int sea = std::clamp(static_cast<int>(seaLevel), 0, kVoxelSizeY - 2);
+    for (int x = 0; x < kVoxelSizeX; ++x) {
+        for (int z = 0; z < kVoxelSizeZ; ++z) {
+            const uint32_t n = voxel_hash2(x, z, seed);
+            const float v = static_cast<float>(n) / 65535.0f;
+            const float hills = 6.0f * std::sin(x * 0.35f + seed * 0.001f) * std::cos(z * 0.28f);
+            const int height = std::clamp(static_cast<int>(8.0f + v * 9.0f + hills * 0.5f), 2, kVoxelSizeY - 1);
+            for (int y = 0; y < height; ++y) {
+                const uint16_t type = (y == height - 1) ? 2 : ((y > sea) ? 3 : 1);
+                grid->set(Engine::Voxel::Int3{ x, y, z }, Engine::Voxel::VoxelValue{ type, 0, 255 });
+            }
+            if (height < sea) {
+                for (int y = height; y < sea; ++y) {
+                    grid->set(Engine::Voxel::Int3{ x, y, z }, Engine::Voxel::VoxelValue{ 4, 0, 255 });
+                }
+            }
+        }
+    }
+    m_voxelStructures[entityId] = std::move(grid);
+    m_voxelMeshesDirty.insert(entityId);
+}
+
+void EditorApplication::rebuild_voxel_mesh(const UUID& entityId) {
+    const auto gridIt = m_voxelStructures.find(entityId);
+    if (gridIt == m_voxelStructures.end()) return;
+    const Engine::Voxel::VoxelStructure& grid = *gridIt->second;
+    const auto trIt = m_editorScene->transformComponents.find(entityId);
+    const glm::vec3 origin = (trIt != m_editorScene->transformComponents.end())
+                                 ? trIt->second.position
+                                 : glm::vec3(0.0f);
+
+    std::vector<EditorVertex> verts;
+    std::vector<uint32_t> indices;
+    verts.reserve(32768);
+    indices.reserve(49152);
+    auto& mesh = m_voxelMeshes[entityId];
+    if (mesh.valid) {
+        if (mesh.vb.buffer != VK_NULL_HANDLE) destroy_buffer(mesh.vb);
+        if (mesh.ib.buffer != VK_NULL_HANDLE) destroy_buffer(mesh.ib);
+        mesh = EditorVoxelMesh{};
+    }
+    for (int x = 0; x < kVoxelSizeX; ++x) {
+        for (int y = 0; y < kVoxelSizeY; ++y) {
+            for (int z = 0; z < kVoxelSizeZ; ++z) {
+                const Engine::Voxel::VoxelValue v = grid.get(Engine::Voxel::Int3{ x, y, z });
+                if (v.empty()) continue;
+                const glm::vec3 base = origin + glm::vec3(x - kVoxelSizeX / 2, y, z - kVoxelSizeZ / 2);
+                const glm::vec3 color = voxel_type_color(v.type);
+                const uint32_t first = static_cast<uint32_t>(verts.size());
+                // 8 corners, 12 triangles (indexed cubes with per-vertex color).
+                const glm::vec3 c[8] = {
+                    base + glm::vec3(0, 0, 0), base + glm::vec3(1, 0, 0),
+                    base + glm::vec3(1, 1, 0), base + glm::vec3(0, 1, 0),
+                    base + glm::vec3(0, 0, 1), base + glm::vec3(1, 0, 1),
+                    base + glm::vec3(1, 1, 1), base + glm::vec3(0, 1, 1),
+                };
+                for (const glm::vec3& p : c) {
+                    EditorVertex ev;
+                    ev.pos = p;
+                    ev.normal = glm::vec3(0, 1, 0);
+                    ev.color = color;
+                    ev.uv = glm::vec2(0.0f);
+                    verts.push_back(ev);
+                }
+                const uint32_t idx[36] = {
+                    0,1,2, 0,2,3, 4,5,6, 4,6,7, 0,1,5, 0,5,4, 2,3,7, 2,7,6,
+                    1,2,6, 1,6,5, 0,3,7, 0,7,4,
+                };
+                for (uint32_t i : idx) indices.push_back(first + i);
+            }
+        }
+    }
+    if (verts.empty()) return;
+    const VkDeviceSize vbSize = sizeof(EditorVertex) * verts.size();
+    const VkDeviceSize ibSize = sizeof(uint32_t) * indices.size();
+    create_buffer(vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  mesh.vb.buffer, mesh.vb.memory);
+    create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  mesh.ib.buffer, mesh.ib.memory);
+    void* data = nullptr;
+    vkMapMemory(m_device, mesh.vb.memory, 0, vbSize, 0, &data);
+    std::memcpy(data, verts.data(), static_cast<size_t>(vbSize));
+    vkUnmapMemory(m_device, mesh.vb.memory);
+    vkMapMemory(m_device, mesh.ib.memory, 0, ibSize, 0, &data);
+    std::memcpy(data, indices.data(), static_cast<size_t>(ibSize));
+    vkUnmapMemory(m_device, mesh.ib.memory);
+    mesh.indexCount = static_cast<uint32_t>(indices.size());
+    mesh.valid = true;
+}
+
+void EditorApplication::draw_voxel_volumes(VkCommandBuffer cmd, const glm::mat4& viewProj, Scene* scene) {
+    if (!scene || m_device == VK_NULL_HANDLE) return;
+    for (const auto& [id, vol] : scene->voxelVolumeComponents) {
+        (void)vol;
+        if (!scene->transformComponents.contains(id)) continue;
+        if (m_voxelMeshesDirty.erase(id) != 0 || !m_voxelMeshes[id].valid) {
+            ensure_voxel_volume(id, scene->voxelVolumeComponents[id].seed,
+                                scene->voxelVolumeComponents[id].seaLevel);
+            rebuild_voxel_mesh(id);
+        }
+        const auto& mesh = m_voxelMeshes[id];
+        if (!mesh.valid || mesh.vb.buffer == VK_NULL_HANDLE) continue;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
+        const VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vb.buffer, &offset);
+        vkCmdBindIndexBuffer(cmd, mesh.ib.buffer, 0, VK_INDEX_TYPE_UINT32);
+        push_constants(cmd, m_scenePipelineLayout, viewProj, glm::vec4(1.0f));
+        vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+    }
+}
+
+// Paints with the active brush along a world ray. The brush settings come from
+// the sculpt panel (m_activeVoxelBrush); right-drag forces Remove mode.
+void EditorApplication::paint_voxel_ray(const glm::vec3& origin, const glm::vec3& dir, bool remove) {
+    if (!m_editorScene) return;
+    Scene* scene = m_editorScene.get();
+    // Prefer the selected volume; otherwise the first one the ray hits.
+    UUID target{ 0, 0 };
+    if (m_selectedEntity.is_valid() && scene->voxelVolumeComponents.contains(m_selectedEntity.get_id())) {
+        target = m_selectedEntity.get_id();
+    }
+    const auto& vols = scene->voxelVolumeComponents;
+    if (!target.is_valid()) {
+        float bestT = 1e18f;
+        for (const auto& [id, vol] : vols) {
+            (void)vol;
+            const auto tit = scene->transformComponents.find(id);
+            if (tit == scene->transformComponents.end()) continue;
+            const glm::vec3 min = tit->second.position + glm::vec3(-kVoxelSizeX / 2, 0, -kVoxelSizeZ / 2);
+            const glm::vec3 max = tit->second.position + glm::vec3(kVoxelSizeX / 2, kVoxelSizeY, kVoxelSizeZ / 2);
+            const glm::vec3 inv = 1.0f / glm::max(glm::abs(dir), glm::vec3(1e-6f)) * glm::sign(dir);
+            float t0 = glm::dot((min - origin), inv);
+            float t1 = glm::dot((max - origin), inv);
+            if (t0 > t1) std::swap(t0, t1);
+            if (t0 <= t1 && t1 > 0.0f && t0 < bestT) {
+                bestT = std::max(t0, 0.0f);
+                target = id;
+            }
+        }
+    }
+    if (!target.is_valid()) return;
+    const auto gridIt = m_voxelStructures.find(target);
+    if (gridIt == m_voxelStructures.end()) return;
+    const auto tit = scene->transformComponents.find(target);
+    if (tit == scene->transformComponents.end()) return;
+
+    // Ray vs grid AABB (grid-local space).
+    const glm::vec3 gridMin(-kVoxelSizeX / 2, 0, -kVoxelSizeZ / 2);
+    const glm::vec3 gridMax(kVoxelSizeX / 2, kVoxelSizeY, kVoxelSizeZ / 2);
+    const glm::vec3 inv = 1.0f / glm::max(glm::abs(dir), glm::vec3(1e-6f)) * glm::sign(dir);
+    float t0 = glm::dot((gridMin - (origin - tit->second.position)), inv);
+    float t1 = glm::dot((gridMax - (origin - tit->second.position)), inv);
+    if (t0 > t1) std::swap(t0, t1);
+    if (t1 < 0.0f) return;
+    const float hitT = std::max(t0, 0.0f);
+    const glm::vec3 hitLocal = (origin - tit->second.position) + dir * hitT;
+    const int hx = std::clamp(static_cast<int>(std::floor(hitLocal.x + kVoxelSizeX / 2)), 0, kVoxelSizeX - 1);
+    const int hy = std::clamp(static_cast<int>(std::floor(hitLocal.y)), 0, kVoxelSizeY - 1);
+    const int hz = std::clamp(static_cast<int>(std::floor(hitLocal.z + kVoxelSizeZ / 2)), 0, kVoxelSizeZ - 1);
+
+    VoxelBrushOperation op = m_activeVoxelBrush;
+    op.position = glm::vec3(hx + 0.5f, hy + 0.5f, hz + 0.5f); // grid cell space
+    op.radius = std::max(m_activeVoxelBrush.radius, 0.5f);
+    if (remove) op.mode = VoxelBrushMode::Remove;
+    Engine::Voxel::VoxelTools::apply(*gridIt->second, op);
+    m_voxelMeshesDirty.insert(target);
+}
+
+void EditorApplication::destroy_voxel_editor_meshes() {
+    if (m_device == VK_NULL_HANDLE) return;
+    for (auto& [id, mesh] : m_voxelMeshes) {
+        (void)id;
+        if (mesh.vb.buffer != VK_NULL_HANDLE) destroy_buffer(mesh.vb);
+        if (mesh.ib.buffer != VK_NULL_HANDLE) destroy_buffer(mesh.ib);
+    }
+    m_voxelMeshes.clear();
+    m_voxelStructures.clear();
+    m_voxelMeshesDirty.clear();
+}
+
+bool EditorApplication::load_viewport_texture(const UUID& assetId, GraphTexture& out, std::string& error,
+                                              uint32_t maxDim) {
     const auto metaOpt = m_assetRegistry.find(assetId);
     if (!metaOpt) {
         error = "texture asset not found in registry";
@@ -5426,6 +8443,13 @@ bool EditorApplication::load_viewport_texture(const UUID& assetId, GraphTexture&
             return false;
         }
         // PNG stays a single level (raw payload); srgb is still applied.
+        // Thumbnails: box-downscale before upload so a full-res texture never
+        // gets copied to VRAM just to be shown at 135x48 in the asset grid.
+        if (maxDim > 0 && (width > maxDim || height > maxDim)) {
+            std::vector<uint8_t> thumb;
+            downscale_rgba8(rgba.data(), width, height, maxDim, thumb, width, height);
+            rgba = std::move(thumb);
+        }
         return upload_texture_pixels(width, height, rgba, 1, (flags & 1u) != 0, out, error);
     }
     // TGA/HDR importers store decoded pixels in the payload. Radiance HDR
@@ -5434,6 +8458,12 @@ bool EditorApplication::load_viewport_texture(const UUID& assetId, GraphTexture&
     // RGB/RGBA (w*h*3/4 bytes per level, mip chain when mipCount > 1).
     if (bitDepth == 32 && channels == 4 &&
         payload.size() == static_cast<size_t>(width) * height * 8) {
+        if (maxDim > 0 && (width > maxDim || height > maxDim)) {
+            std::vector<uint8_t> thumb;
+            uint32_t tw = width, th = height;
+            downscale_half4(payload.data(), width, height, maxDim, thumb, tw, th);
+            return upload_texture_half_pixels(tw, th, thumb, out, error);
+        }
         return upload_texture_half_pixels(width, height, payload, out, error);
     }
     uint64_t expectedTotal = 0;
@@ -5469,6 +8499,15 @@ bool EditorApplication::load_viewport_texture(const UUID& assetId, GraphTexture&
             return false;
         }
         offset += levelBytes;
+    }
+    if (maxDim > 0 && (width > maxDim || height > maxDim)) {
+        // Thumbnail: keep only level 0 (mip chain is irrelevant at 192 px) and
+        // box-downscale it before the upload.
+        std::vector<uint8_t> level0(rgba.begin(), rgba.begin() + static_cast<size_t>(width) * height * 4);
+        std::vector<uint8_t> thumb;
+        downscale_rgba8(level0.data(), width, height, maxDim, thumb, width, height);
+        rgba = std::move(thumb);
+        mipCount = 1;
     }
     return upload_texture_pixels(width, height, rgba, mipCount, (flags & 1u) != 0, out, error);
 }
@@ -5847,6 +8886,11 @@ void EditorApplication::destroy_graph_material_pipelines() {
         destroy_graph_pipeline(p);
     }
     m_graphMaterialPipelines.clear();
+    for (auto& [id, p] : m_blockGraphPipelines) {
+        (void)id;
+        destroy_graph_pipeline(p);
+    }
+    m_blockGraphPipelines.clear();
     destroy_graph_pipeline(m_liveGraphPipeline);
     m_liveGraphHash = 0;
 }
@@ -5963,14 +9007,16 @@ void EditorApplication::destroy_mesh_resources() {
 }
 
 void EditorApplication::cleanup() {
-#ifdef _WIN32
-    stop_external_game();
-#endif
+    shutdown_audio_output();
     if (m_device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(m_device);
 
         destroy_mesh_resources();
         destroy_graph_material_pipelines();
+        destroy_asset_thumbnails();
+        destroy_block_cube();
+        destroy_thumbnail_target();
+        destroy_voxel_editor_meshes();
         cleanup_offscreen_target();
 
         if (m_offscreen.renderPass != VK_NULL_HANDLE) {
@@ -5986,24 +9032,25 @@ void EditorApplication::cleanup() {
             m_offscreen.sampler = VK_NULL_HANDLE;
         }
 
-        const auto destroy_buffer = [&](GPUBuffer& buffer) {
-            if (buffer.buffer != VK_NULL_HANDLE) vkDestroyBuffer(m_device, buffer.buffer, nullptr);
-            if (buffer.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, buffer.memory, nullptr);
-            buffer = GPUBuffer{};
-        };
         destroy_buffer(m_cubeVB);
         destroy_buffer(m_cubeIB);
-        destroy_buffer(m_gridVB);
         destroy_buffer(m_lightIconVB);
         destroy_buffer(m_cameraIconVB);
         destroy_buffer(m_gizmoVB);
         destroy_buffer(m_gizmoIB);
+        destroy_buffer(m_terrainVB);
+        destroy_buffer(m_terrainIB);
+        m_terrainValid = false;
 
         if (m_pickPipeline != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_pickPipeline, nullptr); m_pickPipeline = VK_NULL_HANDLE; }
         if (m_gizmoPipeline != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_gizmoPipeline, nullptr); m_gizmoPipeline = VK_NULL_HANDLE; }
         if (m_wireframePipeline != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_wireframePipeline, nullptr); m_wireframePipeline = VK_NULL_HANDLE; }
         if (m_scenePipeline != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_scenePipeline, nullptr); m_scenePipeline = VK_NULL_HANDLE; }
         if (m_scenePipelineLayout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(m_device, m_scenePipelineLayout, nullptr); m_scenePipelineLayout = VK_NULL_HANDLE; }
+        if (m_gridPipeline != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_gridPipeline, nullptr); m_gridPipeline = VK_NULL_HANDLE; }
+        if (m_gridPipelineLayout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(m_device, m_gridPipelineLayout, nullptr); m_gridPipelineLayout = VK_NULL_HANDLE; }
+        if (m_gridFragShader != VK_NULL_HANDLE) { vkDestroyShaderModule(m_device, m_gridFragShader, nullptr); m_gridFragShader = VK_NULL_HANDLE; }
+        if (m_gridVertShader != VK_NULL_HANDLE) { vkDestroyShaderModule(m_device, m_gridVertShader, nullptr); m_gridVertShader = VK_NULL_HANDLE; }
         if (m_pickFragShader != VK_NULL_HANDLE) { vkDestroyShaderModule(m_device, m_pickFragShader, nullptr); m_pickFragShader = VK_NULL_HANDLE; }
         if (m_viewportFragShader != VK_NULL_HANDLE) { vkDestroyShaderModule(m_device, m_viewportFragShader, nullptr); m_viewportFragShader = VK_NULL_HANDLE; }
         if (m_viewportVertShader != VK_NULL_HANDLE) { vkDestroyShaderModule(m_device, m_viewportVertShader, nullptr); m_viewportVertShader = VK_NULL_HANDLE; }
@@ -6056,6 +9103,558 @@ void EditorApplication::cleanup() {
             glfwTerminate();
         }
     }
+}
+
+// ===========================================================================
+// File/folder pickers + scene loading (Abrir Jogo / Procurar Pasta).
+// ===========================================================================
+
+bool EditorApplication::pick_file_dialog(std::string& outPath, const wchar_t* filter,
+                                         const wchar_t* title, const wchar_t* defExt) {
+    wchar_t buf[MAX_PATH]{ 0 };
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = glfwGetWin32Window(m_window);
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = buf;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = title;
+    ofn.lpstrDefExt = defExt;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&ofn)) return false;
+    const int len = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return false;
+    std::string path(len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, buf, -1, path.data(), len, nullptr, nullptr);
+    outPath = path;
+    return true;
+}
+
+bool EditorApplication::pick_folder_dialog(std::string& outPath, const wchar_t* title) {
+    wchar_t buf[MAX_PATH]{ 0 };
+    BROWSEINFOW bi{};
+    bi.hwndOwner = glfwGetWin32Window(m_window);
+    bi.lpszTitle = title;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) return false;
+    if (!SHGetPathFromIDListW(pidl, buf)) {
+        CoTaskMemFree(pidl);
+        return false;
+    }
+    CoTaskMemFree(pidl);
+    const int len = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return false;
+    std::string path(len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, buf, -1, path.data(), len, nullptr, nullptr);
+    outPath = path;
+    return true;
+}
+
+void EditorApplication::load_scene_file(const std::string& path) {
+    auto scene = std::make_unique<Scene>("Untitled Scene");
+    if (!scene->load_from_file(path)) {
+        std::cerr << "[Editor] Falha ao abrir cena: " << path << std::endl;
+        return;
+    }
+    if (m_playMode.get_state() != PlayState::Edit) m_playMode.stop_play();
+    m_editorScene = std::move(scene);
+    m_activeScenePath = path;
+    m_editorGui.init(m_editorScene.get(), &m_undo);
+    m_editorGui.set_asset_registry(&m_assetRegistry);
+    m_selectedEntity = Entity();
+    m_editorGui.select_entity(m_selectedEntity);
+    // Give the scene a camera if it lacks one, so the viewport is usable.
+    bool hasCamera = false;
+    for (const auto& [id, ent] : m_editorScene->get_entities()) {
+        if (m_editorScene->cameraComponents.contains(id)) { hasCamera = true; break; }
+    }
+    if (!hasCamera) {
+        Entity cam = m_editorScene->create_entity(tr("Câmera Principal", "Main Camera"));
+        m_editorScene->transformComponents[cam.get_id()].position = glm::vec3(0.0f, 2.0f, 5.0f);
+        m_editorScene->cameraComponents[cam.get_id()] = CameraComponent{ 70.0f, 0.1f, 2000.0f, true };
+    }
+    std::cout << "[Editor] Cena carregada: " << path << " ("
+              << m_editorScene->get_entities().size() << " entidades)" << std::endl;
+}
+
+void EditorApplication::scan_projects(std::vector<LauncherProject>& out) const {
+    const std::filesystem::path projectsDir =
+        std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Projects";
+    std::error_code ec;
+    if (!std::filesystem::exists(projectsDir, ec)) return;
+    for (const auto& entry : std::filesystem::directory_iterator(projectsDir, ec)) {
+        if (!entry.is_directory()) continue;
+        LauncherProject proj;
+        proj.name = entry.path().filename().string();
+        proj.path = entry.path().string();
+        // Last write time of the folder tree, best-effort.
+        auto ftime = std::filesystem::last_write_time(entry.path(), ec);
+        if (!ec) {
+            const auto sys = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                ftime - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+            const std::time_t t = std::chrono::system_clock::to_time_t(sys);
+            char buf[64]{ 0 };
+            std::strftime(buf, sizeof(buf), "%d/%m/%Y %H:%M", std::localtime(&t));
+            proj.lastModified = buf;
+        } else {
+            proj.lastModified = "—";
+        }
+        // Does the project contain a .scene anywhere under it?
+        std::error_code subEc;
+        for (const auto& file : std::filesystem::recursive_directory_iterator(entry.path(), subEc)) {
+            if (file.is_regular_file() && file.path().extension() == ".scene") {
+                proj.hasScene = true;
+                break;
+            }
+        }
+        out.push_back(std::move(proj));
+    }
+    // Stable, predictable order.
+    std::sort(out.begin(), out.end(),
+              [](const LauncherProject& a, const LauncherProject& b) { return a.name < b.name; });
+}
+
+void EditorApplication::save_current_scene() {
+    if (!m_editorScene) return;
+    if (!m_activeScenePath.empty()) {
+        if (!m_editorScene->save_to_file(m_activeScenePath)) {
+            std::cerr << "[Editor] Falha ao salvar: " << m_activeScenePath << std::endl;
+        } else {
+            std::cout << "[Editor] Cena salva: " << m_activeScenePath << std::endl;
+        }
+        return;
+    }
+    // No path yet — behave like Salvar Como.
+    save_scene_as();
+}
+
+void EditorApplication::save_scene_as() {
+    if (!m_editorScene) return;
+    std::string path;
+    if (!pick_save_file_dialog(path, L"Cenas Vulkan Engine (*.scene)\0*.scene\0Todos (*.*)\0*.*\0",
+                               L"Salvar Cena Como", L"scene")) {
+        return;
+    }
+    if (!m_editorScene->save_to_file(path)) {
+        std::cerr << "[Editor] Falha ao salvar: " << path << std::endl;
+        return;
+    }
+    m_activeScenePath = path;
+    std::cout << "[Editor] Cena salva: " << path << std::endl;
+}
+
+void EditorApplication::create_new_scene() {
+    // Stop the play world first so it doesn't keep ticking the old scene.
+    if (m_playMode.get_state() != PlayState::Edit) {
+        teardown_play_runtime();
+        m_playMode.stop_play();
+    }
+    m_selectedEntity = Entity();
+    m_editorGui.select_entity(m_selectedEntity);
+    const std::string name = (m_newSceneName[0] != '\0') ? m_newSceneName : "Untitled Scene";
+    m_editorScene = std::make_unique<Scene>(name);
+    m_activeScenePath.clear();  // new scene has no file until Salvar
+    init_default_scene();
+    std::cout << "[Editor] Nova cena: " << name << std::endl;
+}
+
+bool EditorApplication::pick_save_file_dialog(std::string& outPath, const wchar_t* filter,
+                                              const wchar_t* title, const wchar_t* defExt) {
+    wchar_t buf[MAX_PATH]{ 0 };
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = glfwGetWin32Window(m_window);
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = buf;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = title;
+    ofn.lpstrDefExt = defExt;
+    // Default folder: the engine's scenes folder (works from any cwd).
+    const std::filesystem::path defaultDir =
+        std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "assets" / "scenes";
+    std::error_code ec;
+    std::filesystem::create_directories(defaultDir, ec);
+    std::wstring initialDir = defaultDir.wstring();
+    ofn.lpstrInitialDir = initialDir.c_str();
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!GetSaveFileNameW(&ofn)) return false;
+    const int len = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return false;
+    std::string path(len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, buf, -1, path.data(), len, nullptr, nullptr);
+    outPath = path;
+    return true;
+}
+
+// ===========================================================================
+// Terreno (Terrain panel): procedural heightmap mesh + static play body.
+// ===========================================================================
+void EditorApplication::generate_terrain_mesh(const TerrainParams& params) {
+    // Drop the previous GPU buffers before regenerating.
+    if (m_terrainVB.buffer != VK_NULL_HANDLE) { destroy_buffer(m_terrainVB); m_terrainVB = GPUBuffer{}; }
+    if (m_terrainIB.buffer != VK_NULL_HANDLE) { destroy_buffer(m_terrainIB); m_terrainIB = GPUBuffer{}; }
+    m_terrainValid = false;
+    m_terrainParams = params;
+    m_terrainIndexCount = 0;
+
+    // Hash-based value noise + fBm octaves (deterministic, no RNG state).
+    const auto hash2 = [](int x, int z) -> float {
+        uint32_t n = static_cast<uint32_t>(x) * 374761393u + static_cast<uint32_t>(z) * 668265263u;
+        n = (n ^ (n >> 13)) * 1274126177u;
+        n ^= (n >> 16);
+        return static_cast<float>(n & 0xFFFFu) / 65535.0f;
+    };
+    const auto smoothT = [](float t) { return t * t * (3.0f - 2.0f * t); };
+    const auto valueNoise = [&](float x, float z) {
+        const int xi = static_cast<int>(std::floor(x));
+        const int zi = static_cast<int>(std::floor(z));
+        const float xf = smoothT(x - std::floor(x));
+        const float zf = smoothT(z - std::floor(z));
+        const float a = hash2(xi, zi), b = hash2(xi + 1, zi);
+        const float c = hash2(xi, zi + 1), d = hash2(xi + 1, zi + 1);
+        return a + (b - a) * xf + (c - a) * zf + (a - b - c + d) * xf * zf;
+    };
+    const auto fbm = [&](float x, float z, int octaves) {
+        float amp = 1.0f, freq = 1.0f, sum = 0.0f, norm = 0.0f;
+        for (int o = 0; o < octaves; ++o) {
+            sum += amp * valueNoise(x * freq, z * freq);
+            norm += amp;
+            amp *= 0.5f;
+            freq *= 2.0f;
+        }
+        return sum / std::max(norm, 1e-6f);
+    };
+
+    const int segments = params.segments;
+    const float half = params.halfExtent;
+    const float step = (2.0f * half) / static_cast<float>(segments);
+
+    std::vector<EditorVertex> verts;
+    std::vector<uint32_t> indices;
+    verts.reserve(static_cast<size_t>(segments + 1) * (segments + 1));
+
+    // Height pass: y = fbm(x, z) with a radial falloff that pulls the border
+    // back to 0 so the sheet blends with the infinite grid.
+    const size_t cols = static_cast<size_t>(segments + 1);
+    for (int zi = 0; zi <= segments; ++zi) {
+        for (int xi = 0; xi <= segments; ++xi) {
+            const float x = -half + static_cast<float>(xi) * step;
+            const float z = -half + static_cast<float>(zi) * step;
+            const float dist = std::sqrt(x * x + z * z);
+            const float falloff = glm::clamp(1.0f - (dist / half) * params.falloff, 0.0f, 1.0f);
+            const float h = (fbm(x / params.scale, z / params.scale, params.octaves) - 0.5f)
+                            * 2.0f * params.amount * 20.0f * falloff;
+            EditorVertex v;
+            v.pos = glm::vec3(x, h, z);
+            v.normal = glm::vec3(0.0f, 1.0f, 0.0f);
+            v.color = glm::vec3(0.55f, 0.62f, 0.50f);
+            v.uv = glm::vec2((x + half) / (2.0f * half), (z + half) / (2.0f * half));
+            verts.push_back(v);
+        }
+    }
+    // Indexed grid: two triangles per cell.
+    for (int zi = 0; zi < segments; ++zi) {
+        for (int xi = 0; xi < segments; ++xi) {
+            const uint32_t a = static_cast<uint32_t>(zi) * static_cast<uint32_t>(cols) + static_cast<uint32_t>(xi);
+            const uint32_t b = a + 1;
+            const uint32_t c = a + static_cast<uint32_t>(cols);
+            const uint32_t d = c + 1;
+            indices.push_back(a); indices.push_back(c); indices.push_back(b);
+            indices.push_back(b); indices.push_back(c); indices.push_back(d);
+        }
+    }
+    // Smooth normals: area-weighted accumulation from the triangle faces.
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        const glm::vec3& p0 = verts[indices[i]].pos;
+        const glm::vec3& p1 = verts[indices[i + 1]].pos;
+        const glm::vec3& p2 = verts[indices[i + 2]].pos;
+        const glm::vec3 n = glm::cross(p1 - p0, p2 - p0);
+        verts[indices[i]].normal += n;
+        verts[indices[i + 1]].normal += n;
+        verts[indices[i + 2]].normal += n;
+    }
+    for (EditorVertex& v : verts) {
+        const float len = glm::length(v.normal);
+        v.normal = len > 1e-8f ? v.normal / len : glm::vec3(0.0f, 1.0f, 0.0f);
+    }
+
+    // GPU buffers (host-visible, same as the other editor meshes).
+    const VkDeviceSize vbSize = sizeof(EditorVertex) * verts.size();
+    const VkDeviceSize ibSize = sizeof(uint32_t) * indices.size();
+    create_buffer(vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  m_terrainVB.buffer, m_terrainVB.memory);
+    create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  m_terrainIB.buffer, m_terrainIB.memory);
+    m_terrainVB.size = vbSize;
+    m_terrainIB.size = ibSize;
+    void* data = nullptr;
+    vkMapMemory(m_device, m_terrainVB.memory, 0, vbSize, 0, &data);
+    std::memcpy(data, verts.data(), static_cast<size_t>(vbSize));
+    vkUnmapMemory(m_device, m_terrainVB.memory);
+    vkMapMemory(m_device, m_terrainIB.memory, 0, ibSize, 0, &data);
+    std::memcpy(data, indices.data(), static_cast<size_t>(ibSize));
+    vkUnmapMemory(m_device, m_terrainIB.memory);
+    m_terrainIndexCount = static_cast<uint32_t>(indices.size());
+    m_terrainValid = true;
+    std::cout << "[Editor] Terreno gerado: " << cols * cols << " vértices, "
+              << indices.size() / 3 << " triângulos" << std::endl;
+}
+
+// ===========================================================================
+// Criador de Projetos (Project Creator panel): folder + empty scene on disk.
+// ===========================================================================
+std::string EditorApplication::create_project(const std::string& name, const std::string& folder) {
+    if (name.empty()) return "Erro: nome do projeto vazio.";
+    // Sanitize into a folder-safe slug.
+    std::string slug = name;
+    for (char& c : slug) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') c = '_';
+    }
+    std::filesystem::path root;
+    if (!folder.empty()) {
+        root = std::filesystem::path(folder) / slug;
+    } else {
+        root = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Projects" / slug;
+    }
+    std::error_code ec;
+    if (std::filesystem::exists(root, ec)) return "Erro: a pasta já existe: " + root.string();
+
+    const std::filesystem::path scenesDir = root / "assets" / "scenes";
+    std::filesystem::create_directories(scenesDir, ec);
+    if (ec) return "Erro: não foi possível criar " + root.string();
+
+    // Fresh scene with the same defaults as the editor (camera + sun).
+    Scene scene(name);
+    Entity camera = scene.create_entity("Câmera Principal");
+    scene.transformComponents[camera.get_id()].position = glm::vec3(0.0f, 2.0f, 5.0f);
+    scene.cameraComponents[camera.get_id()] = CameraComponent{ 70.0f, 0.1f, 2000.0f, true };
+    Entity sun = scene.create_entity("Luz Direcional");
+    scene.lightComponents[sun.get_id()] = LightComponent{ glm::vec3(1.0f, 0.95f, 0.85f), 10000.0f, 1000.0f, true };
+    scene.transformComponents[sun.get_id()].rotation = glm::vec3(-45.0f, 30.0f, 0.0f);
+    const std::filesystem::path scenePath = scenesDir / "active_world.scene";
+    if (!scene.save_to_file(scenePath.string())) {
+        return "Erro: falha ao salvar a cena inicial.";
+    }
+
+    // Empty asset registry (Content Browser starts clean).
+    AssetRegistry reg;
+    const std::filesystem::path regPath = root / "Intermediate" / "AssetRegistry.db";
+    std::filesystem::create_directories(regPath.parent_path(), ec);
+    reg.save(regPath.string());
+
+    // README marker so the folder reads as a project at a glance.
+    std::ofstream readme(root / "README.md");
+    readme << "# " << name << "\n\nProjeto criado pelo Criador de Projetos do editor.\n";
+    readme.close();
+
+    std::cout << "[Editor] Projeto criado: " << root.string() << std::endl;
+    return "OK: " + root.string();
+}
+
+// ===========================================================================
+// Configurações (Opções Gerais / Tema): settings.json persistence.
+// ===========================================================================
+void EditorApplication::save_settings() {
+    if (m_settingsPath.empty()) {
+        m_settingsPath = (std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "settings.json").string();
+    }
+    std::ofstream out(m_settingsPath, std::ios::trunc);
+    if (!out) {
+        std::cerr << "[Editor] Não foi possível salvar " << m_settingsPath << std::endl;
+        return;
+    }
+    const glm::vec3 bg = m_wickedTools.theme_background();
+    const glm::vec3 panel = m_wickedTools.theme_panel();
+    out << "{\n";
+    out << "  \"language\": \"" << (m_currentLanguage == EngineLanguage::PT_BR ? "pt" : "en") << "\",\n";
+    out << "  \"vsync\": " << (m_vsyncEnabled ? "true" : "false") << ",\n";
+    out << "  \"shadowQuality\": " << m_shadowQuality << ",\n";
+    out << "  \"themeBg\": [" << bg.r << ", " << bg.g << ", " << bg.b << "],\n";
+    out << "  \"themePanel\": [" << panel.r << ", " << panel.g << ", " << panel.b << "]\n";
+    out << "}\n";
+    std::cout << "[Editor] Configurações salvas: " << m_settingsPath << std::endl;
+}
+
+void EditorApplication::load_settings() {
+    m_settingsPath = (std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "settings.json").string();
+    std::ifstream in(m_settingsPath);
+    if (!in) return;
+    const std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+    // Tiny hand-rolled key/value reader for our own settings format.
+    const auto findString = [&](const std::string& key) -> std::string {
+        const std::string token = "\"" + key + "\"";
+        const size_t pos = content.find(token);
+        if (pos == std::string::npos) return {};
+        const size_t colon = content.find(':', pos + token.size());
+        if (colon == std::string::npos) return {};
+        size_t start = colon + 1;
+        while (start < content.size() && std::isspace(static_cast<unsigned char>(content[start]))) ++start;
+        if (start >= content.size()) return {};
+        if (content[start] == '"') {
+            const size_t end = content.find('"', start + 1);
+            return end == std::string::npos ? std::string() : content.substr(start + 1, end - start - 1);
+        }
+        const size_t end = content.find_first_of(",}\n", start);
+        std::string val = content.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        while (!val.empty() && std::isspace(static_cast<unsigned char>(val.back()))) val.pop_back();
+        return val;
+    };
+    const auto findVec = [&](const std::string& key) -> glm::vec3 {
+        const std::string token = "\"" + key + "\"";
+        const size_t pos = content.find(token);
+        if (pos == std::string::npos) return glm::vec3(-1.0f);
+        const size_t lb = content.find('[', pos);
+        const size_t rb = lb == std::string::npos ? std::string::npos : content.find(']', lb);
+        if (lb == std::string::npos || rb == std::string::npos) return glm::vec3(-1.0f);
+        const std::string arr = content.substr(lb + 1, rb - lb - 1);
+        glm::vec3 v(0.0f);
+        size_t i = 0;
+        for (int comp = 0; comp < 3; ++comp) {
+            while (i < arr.size() && (arr[i] == ' ' || arr[i] == ',')) ++i;
+            const size_t start = i;
+            while (i < arr.size() && arr[i] != ',' && arr[i] != ' ') ++i;
+            if (i > start) v[static_cast<size_t>(comp)] = std::stof(arr.substr(start, i - start));
+        }
+        return v;
+    };
+
+    const std::string lang = findString("language");
+    if (lang == "en") m_currentLanguage = EngineLanguage::EN_US;
+    else if (lang == "pt") m_currentLanguage = EngineLanguage::PT_BR;
+    const std::string vsync = findString("vsync");
+    if (vsync == "false") m_vsyncEnabled = false;
+    else if (vsync == "true") m_vsyncEnabled = true;
+    const std::string quality = findString("shadowQuality");
+    if (!quality.empty()) m_shadowQuality = std::clamp(std::atoi(quality.c_str()), 1, 4);
+    // Theme colors are parsed but NOT reapplied on boot: the Forge light
+    // design system is the base theme, and the Theme Editor panel tunes the
+    // live style during the session (persisting it is a TODO(frontend-port)).
+    const glm::vec3 bg = findVec("themeBg");
+    const glm::vec3 panel = findVec("themePanel");
+    if (bg.x >= 0.0f && panel.x >= 0.0f) {
+        m_wickedTools.set_theme(bg, panel);
+    }
+    std::cout << "[Editor] Configurações carregadas: " << m_settingsPath << std::endl;
+}
+
+// ===========================================================================
+// Opções Gráficas: VSync (swapchain) + resolução do mapa de sombras.
+// ===========================================================================
+uint32_t EditorApplication::shadow_size_from_quality(int quality) const {
+    switch (std::clamp(quality, 1, 4)) {
+        case 1: return 512;
+        case 2: return 1024;
+        case 3: return 2048;
+        default: return 4096;
+    }
+}
+
+void EditorApplication::apply_graphics_settings(bool vsync, int quality) {
+    const bool vsyncChanged = m_vsyncEnabled != vsync;
+    m_vsyncEnabled = vsync;
+    m_shadowQuality = std::clamp(quality, 1, 4);
+    if (vsyncChanged) m_recreateSwapchain = true;
+    m_recreateShadowMap = true;
+    std::cout << "[Editor] Gráficas: vsync=" << (vsync ? "on" : "off")
+              << ", sombras=" << shadow_size_from_quality(m_shadowQuality) << std::endl;
+}
+
+// ===========================================================================
+// Malha (Mesh panel): recalc/flip normals on the selected entity's mesh asset.
+// ===========================================================================
+std::string EditorApplication::apply_mesh_normals(int mode) {
+    if (!m_selectedEntity.is_valid()) return "Nenhum objeto selecionado.";
+    Scene* scene = m_editorScene.get();
+    if (!scene) return "Sem cena aberta.";
+    const UUID id = m_selectedEntity.get_id();
+    const auto meshIt = scene->meshRendererComponents.find(id);
+    if (meshIt == scene->meshRendererComponents.end() || !meshIt->second.meshAssetID.is_valid()) {
+        return "O objeto selecionado não tem malha.";
+    }
+    const UUID assetId = meshIt->second.meshAssetID;
+    const auto found = m_assetRegistry.find(assetId);
+    if (!found || found->type != AssetType::Mesh || found->cookedPath.empty() ||
+        !std::filesystem::is_regular_file(found->cookedPath)) {
+        return "Asset de malha não encontrado (o modelo precisa ser importado/cookado).";
+    }
+
+    std::string error;
+    GltfGeometryResult geometry = GltfGeometryParser::parse_vcmesh(found->cookedPath, &error);
+    if (!geometry.success) return "Falha ao ler a malha: " + error;
+
+    for (GltfMeshPrimitive& prim : geometry.primitives) {
+        if (mode == 1) {
+            // Flip: negate the existing normals.
+            for (glm::vec3& n : prim.normals) n = -n;
+            continue;
+        }
+        // Recalc smooth: area-weighted accumulation per vertex.
+        std::vector<glm::vec3> acc(prim.positions.size(), glm::vec3(0.0f));
+        if (prim.indexed && prim.indices.size() >= 3) {
+            for (size_t i = 0; i + 2 < prim.indices.size(); i += 3) {
+                const uint32_t ia = prim.indices[i], ib = prim.indices[i + 1], ic = prim.indices[i + 2];
+                if (ia >= prim.positions.size() || ib >= prim.positions.size() || ic >= prim.positions.size()) continue;
+                const glm::vec3 n = glm::cross(prim.positions[ib] - prim.positions[ia],
+                                               prim.positions[ic] - prim.positions[ia]);
+                acc[ia] += n; acc[ib] += n; acc[ic] += n;
+            }
+        } else {
+            for (size_t i = 0; i + 2 < prim.positions.size(); i += 3) {
+                const glm::vec3 n = glm::cross(prim.positions[i + 1] - prim.positions[i],
+                                               prim.positions[i + 2] - prim.positions[i]);
+                acc[i] += n; acc[i + 1] += n; acc[i + 2] += n;
+            }
+        }
+        prim.normals.resize(prim.positions.size());
+        for (size_t i = 0; i < prim.positions.size(); ++i) {
+            const float len = glm::length(acc[i]);
+            prim.normals[i] = len > 1e-8f ? acc[i] / len : glm::vec3(0.0f, 1.0f, 0.0f);
+        }
+    }
+
+    // Re-upload the GPU resource in place (same vertex layout as load_mesh_resource).
+    const float meshScale = found->importSettings.meshScale > 0.0f ? found->importSettings.meshScale : 1.0f;
+    if (const auto it = m_meshResources.find(assetId); it != m_meshResources.end() && it->second.valid) {
+        std::vector<EditorVertex> verts;
+        std::vector<uint32_t> indices;
+        for (const GltfMeshPrimitive& primitive : geometry.primitives) {
+            const uint32_t vertexOffset = static_cast<uint32_t>(verts.size());
+            verts.reserve(verts.size() + primitive.positions.size());
+            for (size_t i = 0; i < primitive.positions.size(); ++i) {
+                EditorVertex v;
+                v.pos = primitive.positions[i] * meshScale;
+                v.normal = i < primitive.normals.size() ? primitive.normals[i] : glm::vec3(0.0f, 1.0f, 0.0f);
+                v.color = glm::vec3(1.0f);
+                v.uv = i < primitive.uvs.size() ? primitive.uvs[i] : glm::vec2(0.0f);
+                verts.push_back(v);
+            }
+            if (primitive.indexed) {
+                for (uint32_t index : primitive.indices) indices.push_back(index + vertexOffset);
+            }
+        }
+        const VkDeviceSize vbSize = sizeof(EditorVertex) * verts.size();
+        const VkDeviceSize expected = sizeof(EditorVertex) * it->second.vertexCount;
+        if (vbSize == expected && it->second.vb.buffer != VK_NULL_HANDLE) {
+            void* data = nullptr;
+            vkMapMemory(m_device, it->second.vb.memory, 0, vbSize, 0, &data);
+            std::memcpy(data, verts.data(), static_cast<size_t>(vbSize));
+            vkUnmapMemory(m_device, it->second.vb.memory);
+        }
+    }
+
+    // Persist: rewrite the cooked mesh so the change survives a restart.
+    if (!GltfGeometryParser::write_cooked(found->cookedPath, geometry, &error)) {
+        return std::string(mode == 0 ? "Normais recalculadas (somente em memória): "
+                                     : "Normais invertidas (somente em memória): ")
+               + error;
+    }
+    m_meshEdited = true;
+    return mode == 0 ? "Normais recalculadas e salvas no cook."
+                     : "Normais invertidas e salvas no cook.";
 }
 
 } // namespace Engine

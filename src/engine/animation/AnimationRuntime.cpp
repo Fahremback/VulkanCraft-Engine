@@ -1,6 +1,10 @@
 #include "AnimationRuntime.hpp"
+#include "engine/animation/IMotionDatabase.hpp"
+
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <mutex>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/constants.hpp>
 
@@ -28,18 +32,6 @@ TransformPose decompose(const glm::mat4& matrix) {
     return result;
 }
 
-glm::quat rotation_between(glm::vec3 from, glm::vec3 to) {
-    from = glm::normalize(from); to = glm::normalize(to);
-    const float cosine = glm::dot(from, to);
-    if (cosine > 0.9999f) return glm::quat(1,0,0,0);
-    if (cosine < -0.9999f) {
-        glm::vec3 axis = glm::cross(from, glm::vec3(1,0,0));
-        if (glm::dot(axis, axis) < 0.0001f) axis = glm::cross(from, glm::vec3(0,1,0));
-        return glm::angleAxis(glm::pi<float>(), glm::normalize(axis));
-    }
-    const glm::vec3 axis = glm::cross(from, to);
-    return glm::normalize(glm::quat(1.0f + cosine, axis.x, axis.y, axis.z));
-}
 
 glm::mat4 compose(const TransformPose& transform) {
     return glm::translate(glm::mat4(1.0f), transform.translation) * glm::mat4_cast(transform.rotation) *
@@ -65,6 +57,119 @@ TransformPose sample_track(const BoneTrack& track, float time) {
     return {glm::mix(a.position, b.position, alpha), glm::normalize(glm::slerp(a.rotation, b.rotation, alpha)),
             glm::mix(a.scale, b.scale, alpha)};
 }
+
+// ── ozz+ACL motion database pool (FALTANTES §18 item 2) ───────────────────
+// The runtime's sampling and blending route through the public motion
+// database (ozz runtime + ACL compression) instead of the hand-rolled
+// lerp/slerp. A database holds ONE cooked skeleton, so each SkeletonAsset
+// gets its own state, keyed by its address (assets are scene-owned and
+// long-lived). The ozz sampling context is not thread-safe, so all access is
+// serialized through one mutex. The legacy lerp/slerp stays as the reference
+// implementation (used by root_motion and the defensive blend fallback).
+struct SkeletonMotionState {
+    std::unique_ptr<engine::animation::IMotionDatabase> db;
+    std::unordered_map<const AnimationClip*, engine::animation::CookedMotion> clips;
+};
+
+struct MotionStatePool {
+    std::unordered_map<const SkeletonAsset*, SkeletonMotionState> states;
+    std::mutex mutex;
+};
+
+MotionStatePool& motion_pool() {
+    static MotionStatePool pool;
+    return pool;
+}
+
+// Shared database for pose blending (blend_poses needs no cooked skeleton).
+engine::animation::IMotionDatabase& blending_database() {
+    static std::unique_ptr<engine::animation::IMotionDatabase> db =
+        engine::animation::create_motion_database();
+    return *db;
+}
+
+engine::animation::MotionClip to_motion_clip(const SkeletonAsset& skeleton,
+                                              const AnimationClip& clip) {
+    engine::animation::MotionClip motion;
+    motion.name = clip.name;
+    motion.duration = clip.duration;
+    motion.tracks.reserve(clip.tracks.size());
+    for (const BoneTrack& track : clip.tracks) {
+        engine::animation::MotionTrack mt;
+        mt.boneIndex = track.boneIndex;
+        mt.keyframes.reserve(track.keyFrames.size());
+        for (const KeyFrame& key : track.keyFrames) {
+            engine::animation::MotionKeyframe mk;
+            mk.time = key.timeStamp;
+            mk.translation = key.position;
+            mk.rotation = key.rotation;
+            mk.scale = key.scale;
+            mt.keyframes.push_back(mk);
+        }
+        motion.tracks.push_back(std::move(mt));
+    }
+    return motion;
+}
+
+Pose pose_from_motion(const engine::animation::MotionPose& motion) {
+    Pose pose;
+    pose.local.resize(motion.translations.size());
+    for (std::size_t i = 0; i < motion.translations.size(); ++i) {
+        pose.local[i].translation = motion.translations[i];
+        pose.local[i].rotation = motion.rotations[i];
+        pose.local[i].scale = motion.scales[i];
+    }
+    return pose;
+}
+
+engine::animation::MotionPose to_motion_pose(const Pose& pose) {
+    engine::animation::MotionPose motion;
+    motion.translations.reserve(pose.local.size());
+    motion.rotations.reserve(pose.local.size());
+    motion.scales.reserve(pose.local.size());
+    for (const TransformPose& t : pose.local) {
+        motion.translations.push_back(t.translation);
+        motion.rotations.push_back(t.rotation);
+        motion.scales.push_back(t.scale);
+    }
+    return motion;
+}
+
+// Gets (creating and cooking on first use) the motion database state for a
+// skeleton. Returns nullptr with a loud diagnostic when the skeleton cannot
+// be cooked by ozz (e.g. parents after children) — the caller degrades to
+// the bind pose, never silently.
+SkeletonMotionState* motion_state_for(const SkeletonAsset& skeleton) {
+    MotionStatePool& pool = motion_pool();
+    const auto found = pool.states.find(&skeleton);
+    if (found != pool.states.end()) return &found->second;
+    auto db = engine::animation::create_motion_database();
+    engine::animation::MotionSkeleton motion;
+    motion.name = skeleton.name;
+    motion.bones.reserve(skeleton.bones.size());
+    for (const BoneNode& bone : skeleton.bones) {
+        engine::animation::MotionBone mb;
+        mb.name = bone.name;
+        mb.parent = bone.parentIndex;
+        const TransformPose local = decompose(bone.localTransform);
+        mb.localTranslation = local.translation;
+        mb.localRotation = local.rotation;
+        mb.localScale = local.scale;
+        mb.inverseBindMatrix = bone.inverseBindMatrix;
+        motion.bones.push_back(std::move(mb));
+    }
+    std::string error;
+    if (!db->cook_skeleton(motion, error)) {
+        std::fprintf(stderr,
+                     "[animation] sample refused by motion database for "
+                     "skeleton '%s': %s\n",
+                     skeleton.name.c_str(), error.c_str());
+        return nullptr;
+    }
+    auto [it, inserted] =
+        pool.states.emplace(&skeleton, SkeletonMotionState{std::move(db), {}});
+    return inserted ? &it->second : nullptr;
+}
 } // namespace
 
 Pose AnimationSampler::bind_pose(const SkeletonAsset& skeleton) {
@@ -75,12 +180,52 @@ Pose AnimationSampler::bind_pose(const SkeletonAsset& skeleton) {
 }
 
 Pose AnimationSampler::sample(const SkeletonAsset& skeleton, const AnimationClip& clip, float time) {
-    Pose pose = bind_pose(skeleton);
-    const float localTime = clip_time(clip, time);
-    for (const BoneTrack& track : clip.tracks)
-        if (track.boneIndex >= 0 && static_cast<size_t>(track.boneIndex) < pose.local.size())
-            pose.local[track.boneIndex] = sample_track(track, localTime);
-    return pose;
+    // FALTANTES §18 item 2: sampling routes through the ozz+ACL motion
+    // database (per-skeleton cook, exact ozz path; the clip is also
+    // ACL-compressed at first use so the compression stage runs). On a
+    // refusal the caller gets the bind pose AND a diagnostic — never
+    // silently wrong data. Looping semantics are applied here (the database
+    // clamps to the clip duration).
+    MotionStatePool& pool = motion_pool();
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    SkeletonMotionState* state = motion_state_for(skeleton);
+    if (state == nullptr) return bind_pose(skeleton);
+    auto clipFound = state->clips.find(&clip);
+    if (clipFound == state->clips.end()) {
+        const engine::animation::MotionClip motionClip =
+            to_motion_clip(skeleton, clip);
+        std::string error;
+        if (!state->db->cook_clip(motionClip, error)) {
+            std::fprintf(stderr,
+                         "[animation] sample refused by motion database for "
+                         "clip '%s': %s\n",
+                         clip.name.c_str(), error.c_str());
+            return bind_pose(skeleton);
+        }
+        // Capture the ozz handle FIRST — cooked() would return the ACL slot
+        // after compression; sampling stays on the exact ozz path while the
+        // ACL-compressed version remains available through cooked().
+        const engine::animation::CookedMotion* ozzSlot =
+            state->db->cooked(clip.name);
+        std::string cerror;
+        if (!state->db->compress_clip(motionClip, cerror)) {
+            std::fprintf(stderr,
+                         "[animation] clip '%s' compression refused "
+                         "(sampling continues on ozz): %s\n",
+                         clip.name.c_str(), cerror.c_str());
+        }
+        if (ozzSlot == nullptr) return bind_pose(skeleton);
+        clipFound = state->clips.emplace(&clip, *ozzSlot).first;
+    }
+    engine::animation::MotionPose motion;
+    if (!state->db->sample(clipFound->second, clip_time(clip, time), motion)) {
+        std::fprintf(stderr,
+                     "[animation] motion database sample failed for clip "
+                     "'%s'\n",
+                     clip.name.c_str());
+        return bind_pose(skeleton);
+    }
+    return pose_from_motion(motion);
 }
 
 RootMotionDelta AnimationSampler::root_motion(const AnimationClip& clip, float previousTime, float currentTime) {
@@ -105,9 +250,38 @@ std::vector<glm::mat4> AnimationSampler::global_matrices(const SkeletonAsset& sk
 }
 
 Pose AnimationBlender::blend(const Pose& a, const Pose& b, float weight) {
+    // FALTANTES §18 item 2: 2-pose blending goes through the ozz BlendingJob
+    // (SoA, lerp translations/scales, nlerp rotations) via the public motion
+    // database. The legacy lerp/slerp remains only as the defensive fallback
+    // for size-mismatched poses (with a diagnostic — never silent).
+    const size_t count = std::min(a.local.size(), b.local.size());
+    if (count == 0) return {};
+    engine::animation::MotionPose pa, pb, out;
+    pa.translations.reserve(count); pa.rotations.reserve(count); pa.scales.reserve(count);
+    pb.translations.reserve(count); pb.rotations.reserve(count); pb.scales.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        pa.translations.push_back(a.local[i].translation);
+        pa.rotations.push_back(a.local[i].rotation);
+        pa.scales.push_back(a.local[i].scale);
+        pb.translations.push_back(b.local[i].translation);
+        pb.rotations.push_back(b.local[i].rotation);
+        pb.scales.push_back(b.local[i].scale);
+    }
+    if (blending_database().blend_poses(pa, pb, weight, out)) {
+        Pose result;
+        result.local.resize(count);
+        for (size_t i = 0; i < count; ++i) {
+            result.local[i].translation = out.translations[i];
+            result.local[i].rotation = out.rotations[i];
+            result.local[i].scale = out.scales[i];
+        }
+        return result;
+    }
+    std::fprintf(stderr,
+                 "[animation] ozz blend refused — falling back to legacy "
+                 "blend (size mismatch)\n");
     weight = std::clamp(weight, 0.0f, 1.0f);
     Pose result;
-    const size_t count = std::min(a.local.size(), b.local.size());
     result.local.resize(count);
     for (size_t i = 0; i < count; ++i) result.local[i] = {
         glm::mix(a.local[i].translation, b.local[i].translation, weight),
@@ -199,18 +373,47 @@ Pose AnimationRetargeter::retarget(const SkeletonAsset& source, const SkeletonAs
     return result;
 }
 
-bool IKSolver::solve_two_bone(Pose& pose, int root, int end, const glm::vec3& target, float weight) {
-    if (root < 0 || end < 0 || static_cast<size_t>(root) >= pose.local.size() || static_cast<size_t>(end) >= pose.local.size()) return false;
-    weight = std::clamp(weight, 0.0f, 1.0f);
-    pose.local[end].translation = glm::mix(pose.local[end].translation, target, weight);
-    const glm::vec3 direction = target - pose.local[root].translation;
-    if (glm::dot(direction, direction) > 0.000001f) pose.local[root].rotation = glm::normalize(glm::slerp(pose.local[root].rotation,
-        rotation_between(glm::vec3(0,1,0), glm::normalize(direction)), weight));
+bool IKSolver::solve_two_bone(const SkeletonAsset& skeleton, Pose& pose,
+                              int root, int mid, int end,
+                              const glm::vec3& target,
+                              const glm::vec3& poleVector, float weight) {
+    // FALTANTES §18 item 3: routes through the per-skeleton motion database
+    // (ozz IKTwoBoneJob — analytic). Refusals leave the pose untouched.
+    MotionStatePool& pool = motion_pool();
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    SkeletonMotionState* state = motion_state_for(skeleton);
+    if (state == nullptr) return false;
+    const engine::animation::MotionPose motion = to_motion_pose(pose);
+    engine::animation::MotionPose out;
+    if (!state->db->ik_two_bone(motion, root, mid, end, target, poleVector,
+                                weight, out)) {
+        std::fprintf(stderr,
+                     "[animation] ik_two_bone refused for skeleton '%s'\n",
+                     skeleton.name.c_str());
+        return false;
+    }
+    pose = pose_from_motion(out);
     return true;
 }
-bool IKSolver::look_at(Pose& pose, int bone, const glm::vec3& position, const glm::vec3& target, const glm::vec3& forward, float weight) {
-    if (bone < 0 || static_cast<size_t>(bone) >= pose.local.size() || glm::dot(target-position, target-position) < 0.000001f) return false;
-    pose.local[bone].rotation = glm::normalize(glm::slerp(pose.local[bone].rotation, rotation_between(glm::normalize(forward), glm::normalize(target-position)), std::clamp(weight,0.0f,1.0f)));
+bool IKSolver::look_at(const SkeletonAsset& skeleton, Pose& pose, int bone,
+                       const glm::vec3& target, const glm::vec3& forwardAxis,
+                       const glm::vec3& upAxis, const glm::vec3& poleVector,
+                       float weight) {
+    // FALTANTES §18 item 3: routes through the per-skeleton motion database
+    // (ozz IKAimJob). Refusals leave the pose untouched.
+    MotionStatePool& pool = motion_pool();
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    SkeletonMotionState* state = motion_state_for(skeleton);
+    if (state == nullptr) return false;
+    const engine::animation::MotionPose motion = to_motion_pose(pose);
+    engine::animation::MotionPose out;
+    if (!state->db->ik_aim(motion, bone, target, forwardAxis, upAxis, poleVector,
+                           weight, out)) {
+        std::fprintf(stderr, "[animation] ik_aim refused for skeleton '%s'\n",
+                     skeleton.name.c_str());
+        return false;
+    }
+    pose = pose_from_motion(out);
     return true;
 }
 void ProceduralAnimationStack::add_layer(ProceduralAnimationLayer layer) { layers_.push_back(std::move(layer)); }

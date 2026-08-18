@@ -10,6 +10,9 @@
 //
 // This header is self-contained (glm only, no renderer details, no Vulkan).
 
+#include "engine/vehicles/IVehicleAsset.hpp"
+#include "engine/vehicles/IBeamGraphAsset.hpp"
+
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 
@@ -77,12 +80,40 @@ public:
     virtual BodyId create_body(const BodySpec& spec) = 0;
     virtual bool destroy_body(BodyId body) = 0;
     virtual bool body_state(BodyId body, BodyState& out) const = 0;
+    // Instantly moves a body (teleport / kinematic drive — the vehicle
+    // replication reconcile snaps the predicted chassis to the authoritative
+    // pose through this).
+    virtual void set_transform(BodyId body, const glm::vec3& position,
+                               const glm::quat& rotation) = 0;
+    // Instantly sets a body's linear and angular velocity (the vehicle
+    // replication reconcile snaps the predicted velocities to the
+    // authoritative ones so the corrected prediction does not coast on the
+    // stale momentum).
+    virtual void set_velocity(BodyId body, const glm::vec3& linearVelocity,
+                              const glm::vec3& angularVelocity) = 0;
     virtual void apply_impulse(BodyId body, const glm::vec3& impulse) = 0;
     virtual void add_force(BodyId body, const glm::vec3& force) = 0;
     virtual bool raycast(const glm::vec3& origin, const glm::vec3& direction,
                          float maxDistance, RaycastHit& out) const = 0;
     // Advances the physics world by deltaTime (deterministic fixed-step solver).
     virtual void step(float deltaTime) = 0;
+
+    // ---- Provider ownership (FALTANTES §17 item 10) ------------------------
+    // Each physical entity (body) is simulated by EXACTLY ONE provider at a
+    // time — a vehicle solver (Jolt), a deformable chassis (XPBD), a ragdoll,
+    // a destruction debris runtime, etc. Claims are all-or-nothing: claiming a
+    // body that ANOTHER provider already owns is refused with a diagnostic
+    // (the game never silently ends up with two simulators on one entity).
+    // The vehicle factories (create_vehicle_from_asset / create_beam_vehicle)
+    // claim the chassis automatically; a second vehicle on the same chassis
+    // body is refused. Claiming with the SAME provider again is idempotent.
+    virtual bool claim_provider(BodyId body, const std::string& provider,
+                                std::string& errorOut) = 0;
+    // Releases the claim. Only the owning provider may release; returns false
+    // for an unclaimed body or a non-owning provider.
+    virtual bool release_provider(BodyId body, const std::string& provider) = 0;
+    // The provider currently simulating `body` (empty string when unclaimed).
+    virtual std::string provider_of(BodyId body) const = 0;
 };
 
 // ---- Destruction (FALTANTES item 9 / META section 20) ----------------------
@@ -161,7 +192,93 @@ struct VehicleInput {
     float handbrake{ 0.0f };
 };
 
-class IVehicle {
+// Damage part (FALTANTES §17 item 9): parts are AUTO-DERIVED from the
+// vehicle's components — Chassis + Drivetrain for every vehicle, Wheel per
+// wheel, Beam per beam (beam chassis only). componentIndex names the wheel /
+// beam for the Wheel/Beam kinds (0 for Chassis/Drivetrain).
+enum class VehiclePartKind : std::uint8_t { Chassis, Drivetrain, Wheel, Beam };
+
+struct VehiclePartInfo {
+    std::string name;
+    VehiclePartKind kind{ VehiclePartKind::Chassis };
+    float maxHealth{ 100.0f };
+    float health{ 100.0f };
+    bool separated{ false };        // health reached 0 (part popped off)
+    std::size_t componentIndex{ 0 };
+};
+
+// FALTANTES §17 item 8: occupants, entry and exit. An occupant is a physics
+// body the project creates through IPhysicsWorld::create_body (a driver /
+// passenger capsule). enter() attaches it to a seat — the body RIDES the
+// vehicle (the runtime drives it to the seat pose every update); exit() flips
+// it back to dynamic and spawns it at the seat's world exit offset (the
+// occupant stands outside). Every vehicle exposes these methods.
+class IVehicleOccupants {
+public:
+    virtual ~IVehicleOccupants() = default;
+
+    virtual std::size_t seat_count() const = 0;
+    virtual std::string seat_name(std::size_t seatIndex) const = 0;
+    virtual bool seat_occupied(std::size_t seatIndex) const = 0;
+    virtual BodyId occupant(std::size_t seatIndex) const = 0;
+    // Current WORLD pose of the seat (chassis transform * local position; the
+    // deformed node frame for a beam chassis).
+    virtual glm::vec3 seat_position(std::size_t seatIndex) const = 0;
+    // Attaches `occupant` to seat `seatIndex` (kinematic ride). Fails (with a
+    // diagnostic) for an out-of-range/taken seat or a non-dynamic body.
+    virtual bool enter(BodyId occupant, std::size_t seatIndex,
+                       std::string& errorOut) = 0;
+    // Spawns the occupant at the seat's exit offset, dynamic again. Fails if
+    // the seat is empty. The caller reads the body's new state via
+    // IPhysicsWorld::body_state.
+    virtual bool exit(std::size_t seatIndex, std::string& errorOut) = 0;
+};
+
+// FALTANTES §17 item 9: damage and part separation. Parts are auto-derived
+// from the vehicle's components; damage degrades their behavior (a damaged
+// wheel loses grip/drive, a damaged drivetrain loses torque, a damaged beam
+// degrades the deformable chassis stiffness) and at 0 health a part
+// SEPARATES (a wheel pops off — stops contributing; a beam deactivates — no
+// longer holds the mesh together). Deterministic and data-free (no JSON).
+class IVehicleDamage {
+public:
+    virtual ~IVehicleDamage() = default;
+
+    virtual std::size_t part_count() const = 0;
+    virtual VehiclePartInfo part_info(std::size_t partIndex) const = 0;
+    // Damages the part by `amount` (> 0), clamping at 0 and separating it.
+    // Returns false (with a diagnostic) for an out-of-range part or a
+    // non-positive amount.
+    virtual bool apply_damage(std::size_t partIndex, float amount,
+                              std::string& errorOut) = 0;
+    virtual bool repair(std::size_t partIndex, float amount,
+                        std::string& errorOut) = 0;
+    virtual bool is_separated(std::size_t partIndex) const = 0;
+};
+
+// FALTANTES §17 item 7: energy, fuel and data-driven controls. The vehicle
+// carries a fuel tank (burned by throttle) and a battery (drawn by throttle,
+// regenerated by braking) — each ENABLED system (capacity > 0) cuts the drive
+// when its level falls below the configured threshold, so the vehicle coasts
+// to a stop on empty. The control mapping transforms the RAW input (deadzone
+// + sensitivity curve + inversion) before it reaches the physics. Levels are
+// 0..1 fractions of capacity (1 when the system is disabled).
+class IVehiclePower {
+public:
+    virtual ~IVehiclePower() = default;
+
+    virtual float fuel_level() const = 0;
+    virtual float charge_level() const = 0;
+    // true when every ENABLED system is above its cut-out threshold.
+    virtual bool powered() const = 0;
+    // Adds `fraction` * capacity to the live level (clamped; no-op when the
+    // system is disabled).
+    virtual void refuel(float fraction) = 0;
+    virtual void recharge(float fraction) = 0;
+};
+
+class IVehicle : public IVehicleOccupants, public IVehicleDamage,
+                 public IVehiclePower {
 public:
     virtual ~IVehicle() = default;
 
@@ -173,6 +290,29 @@ public:
     virtual std::vector<WheelState> wheel_states() const = 0;
     virtual float speed() const = 0;
     virtual bool valid() const = 0;
+};
+
+// ---- Beam chassis (FALTANTES §17 item 4) -----------------------------------
+// A DEFORMABLE node/beam vehicle chassis: nodes connected by beams with
+// per-beam stiffness, wheels mounted on nodes, solved by XPBD. The chassis
+// bends under load (node positions are exposed).
+class IBeamVehicle : public IVehicleOccupants, public IVehicleDamage,
+                     public IVehiclePower {
+public:
+    virtual ~IBeamVehicle() = default;
+
+    virtual void set_input(const VehicleInput& input) = 0;
+    // Applies wheel suspension/drive/brake forces to the mount nodes, steps
+    // the XPBD solver, and reads the deformed node state.
+    virtual void update(float deltaTime) = 0;
+    virtual bool valid() const = 0;
+    virtual std::size_t node_count() const = 0;
+    virtual glm::vec3 node_position(std::size_t index) const = 0;
+    virtual glm::vec3 chassis_position() const = 0;
+    virtual float speed() const = 0;
+    // Max |node - rest| over the free nodes: the deformability observable.
+    virtual float deformation() const = 0;
+    virtual std::vector<WheelState> wheel_states() const = 0;
 };
 
 // ---- Weapon / abilities (FALTANTES item 9) ---------------------------------
@@ -274,6 +414,18 @@ public:
         const DestructionSpec& spec) = 0;
     virtual std::unique_ptr<IVehicle> create_vehicle(
         BodyId chassis, const std::vector<WheelSpec>& wheels) = 0;
+    // FALTANTES §17 item 2: assembles a vehicle from a VehicleAsset (the
+    // public composable components). The chassis body is created from
+    // asset.chassis at asset.position/rotation; the returned IVehicle::chassis()
+    // is that body (owned by the runtime's physics world).
+    virtual std::unique_ptr<IVehicle> create_vehicle_from_asset(
+        const vehicles::VehicleAsset& asset) = 0;
+    // FALTANTES §17 item 4: assembles a DEFORMABLE node/beam chassis from a
+    // BeamGraphAsset (nodes + beams with per-beam stiffness + wheel mounts),
+    // solved by XPBD. The returned vehicle exposes the deformed node
+    // positions; the chassis bends under load instead of staying rigid.
+    virtual std::unique_ptr<IBeamVehicle> create_beam_vehicle(
+        const vehicles::BeamGraphAsset& asset) = 0;
     virtual std::unique_ptr<IWeapon> create_weapon(const WeaponSpec& spec) = 0;
     virtual std::unique_ptr<IRagdoll> create_ragdoll(
         const std::vector<RagdollBone>& bones, const glm::vec3& rootPosition) = 0;

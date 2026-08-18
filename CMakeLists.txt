@@ -116,6 +116,77 @@ target_include_directories(vc_navigation PUBLIC
     ${VC_SOLUTIONS_DIR}/recast-navigation/Recast/Include
     ${VC_SOLUTIONS_DIR}/recast-navigation/Detour/Include)
 
+# ozz-animation (Guillaume Blanc, MIT) — skeleton/clip runtime, sampling,
+# blending and skinning authority (FALTANTES §18 item 1, promoted 2026-08-17).
+# Sources compiled directly from the pinned clone (base + animation/runtime +
+# animation/offline builders); the upstream CMake is not used. The public
+# contract engine/animation/* never includes ozz; only
+# src/engine/sdk/MotionDatabase.cpp does (adapter rule).
+set(VC_OZZ_BASE_SOURCES
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/base/memory/allocator.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/base/platform.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/base/log.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/base/containers/string_archive.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/base/encode/group_varint.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/base/io/archive.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/base/io/stream.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/base/maths/box.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/base/maths/math_archive.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/base/maths/simd_math.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/base/maths/simd_math_archive.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/base/maths/soa_math_archive.cc
+)
+set(VC_OZZ_RUNTIME_SOURCES
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/runtime/animation.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/runtime/animation_utils.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/runtime/blending_job.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/runtime/ik_aim_job.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/runtime/ik_two_bone_job.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/runtime/local_to_model_job.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/runtime/motion_blending_job.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/runtime/sampling_job.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/runtime/skeleton.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/runtime/skeleton_utils.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/runtime/track.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/runtime/track_sampling_job.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/runtime/track_triggering_job.cc
+)
+set(VC_OZZ_OFFLINE_SOURCES
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/offline/raw_animation.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/offline/raw_animation_archive.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/offline/raw_animation_utils.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/offline/animation_builder.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/offline/raw_skeleton.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/offline/raw_skeleton_archive.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/offline/skeleton_builder.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/offline/track_builder.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/offline/track_optimizer.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/offline/raw_track.cc
+    ${VC_SOLUTIONS_DIR}/ozz-animation/src/animation/offline/raw_track_utils.cc
+)
+add_library(vc_ozz STATIC
+    ${VC_OZZ_BASE_SOURCES}
+    ${VC_OZZ_RUNTIME_SOURCES}
+    ${VC_OZZ_OFFLINE_SOURCES}
+)
+target_include_directories(vc_ozz PUBLIC
+    ${VC_SOLUTIONS_DIR}/ozz-animation/include
+)
+target_include_directories(vc_ozz PRIVATE ${VC_SOLUTIONS_DIR}/ozz-animation/src)
+
+# Animation Compression Library (Nicholas Frechette, MIT) — clip compression
+# and decompression (FALTANTES §18 item 1, promoted 2026-08-17). Header-only
+# (the .impl.h files are included by the public headers); the upstream CMake
+# is not used. RTM (Realtime Math, Nicholas Frechette, MIT) is its math layer
+# and is vendored at the exact pin ACL 2.1.99 requires (v2.2.0 — see
+# SNAPSHOT.md). Only src/engine/sdk/MotionDatabase.cpp includes ACL (adapter
+# rule).
+add_library(vc_acl INTERFACE)
+target_include_directories(vc_acl INTERFACE
+    ${VC_SOLUTIONS_DIR}/acl/includes
+    ${VC_SOLUTIONS_DIR}/acl/external/rtm/includes
+)
+
 # fast-wfc (Mathieu Fehr & Nathanaël Courant, MIT) — deterministic structures/
 # interiors via wave function collapse. Sources compiled directly from the
 # pinned clone (src/lib + src/include); the upstream CMake is not used. The
@@ -321,6 +392,7 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/ProcgenPreview.cpp
     src/engine/sdk/ProcgenJobs.cpp
     src/engine/sdk/LodTerrainSampler.cpp
+    src/engine/sdk/MultiScaleStreaming.cpp
     src/engine/sdk/XpbdDeformable.cpp
     src/engine/sdk/TetraMeshCooking.cpp
     src/engine/sdk/MobBehavior.cpp
@@ -328,6 +400,21 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/WorldReplication.cpp
     src/engine/sdk/OriginRebase.cpp
     src/engine/sdk/LocalSpace.cpp
+    src/engine/sdk/TimeTravel.cpp
+    src/engine/sdk/VehicleAsset.cpp
+    src/engine/sdk/BeamGraphAsset.cpp
+    src/engine/sdk/VehicleReplication.cpp
+    src/engine/sdk/VehicleProvider.cpp
+    src/engine/sdk/MotionDatabase.cpp
+    src/engine/sdk/GaitPlanner.cpp
+    src/engine/sdk/FootPlacement.cpp
+    src/engine/sdk/PoseWarp.cpp
+    src/engine/sdk/ProceduralLegs.cpp
+    src/engine/sdk/MotionMatcher.cpp
+    src/engine/sdk/OfflineFarm.cpp
+    src/engine/sdk/AnimationLod.cpp
+    src/engine/sdk/AiGraphValidation.cpp
+    src/engine/sdk/StrandHair.cpp
     src/engine/sdk/RegistryJson.cpp
 
     src/engine/core/compression/ZstdCompression.cpp
@@ -346,6 +433,9 @@ target_include_directories(vc_sdk_public PRIVATE
     ${VC_SOLUTIONS_DIR}/earcut-hpp/include
     ${VC_SOLUTIONS_DIR}/meshoptimizer/src
     ${VC_SOLUTIONS_DIR}/xatlas/source/xatlas
+    ${VC_SOLUTIONS_DIR}/ozz-animation/include
+    ${VC_SOLUTIONS_DIR}/acl/includes
+    ${VC_SOLUTIONS_DIR}/acl/external/rtm/includes
 )
 if(VC_ENABLE_ZSTD OR VC_ENABLE_BLAKE3 OR VC_ENABLE_FLATBUFFERS OR VC_ENABLE_ROCKSDB)
     target_include_directories(vc_sdk_public PRIVATE
@@ -377,6 +467,7 @@ vc_object_module(vc_gameplay_sdk
     src/engine/physics/VoxelConnectivity.cpp
     src/engine/gameplay/WeaponSystem.cpp
     src/engine/gameplay/VehicleRuntime.cpp
+    src/engine/gameplay/BeamChassisRuntime.cpp
     src/engine/gameplay/DestructionRuntime.cpp
     src/engine/gameplay/FractureConfig.cpp
     src/engine/gameplay/ExplosionRuntime.cpp
@@ -402,6 +493,7 @@ vc_object_module(vc_advanced_runtime
     src/engine/gameplay/GameplayVisual.cpp
     src/engine/gameplay/WeaponSystem.cpp
     src/engine/gameplay/VehicleRuntime.cpp
+    src/engine/gameplay/BeamChassisRuntime.cpp
     src/engine/gameplay/DestructionRuntime.cpp
     src/engine/gameplay/FractureConfig.cpp
     src/engine/gameplay/ExplosionRuntime.cpp
@@ -468,6 +560,7 @@ set(VC_SHADERS
     sky.vert sky.frag post.vert post.frag shadow.vert
     shadow_far_surface.vert shadow.frag shadow_foliage.vert shadow_grass.vert
     editor_viewport.vert editor_viewport.frag editor_pick.frag editor_material.vert
+    editor_grid.vert editor_grid.frag
 )
 set(VC_SHADER_OUTPUTS)
 foreach(shader IN LISTS VC_SHADERS)
@@ -500,13 +593,19 @@ add_executable(VulkanEngineGame
     # RegistryJson lives in vc_sdk_public; these app targets link vc_advanced_runtime
     # (which compiles FractureConfig using the json helpers) without sdk_public, so
     # they compile the sdk TU directly — same pattern as vulkan_craft below.
+    # BeamChassisRuntime (vc_gameplay_sdk) references the public beam-chassis and
+    # XPBD solver contracts, so those two sdk TUs are compiled here too.
     src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/BeamGraphAsset.cpp
+    src/engine/sdk/VehicleProvider.cpp
+    src/engine/sdk/MotionDatabase.cpp
+    src/engine/sdk/XpbdDeformable.cpp
     $<TARGET_OBJECTS:vc_core_runtime>
     $<TARGET_OBJECTS:vc_advanced_runtime>
 )
 target_compile_features(VulkanEngineGame PRIVATE cxx_std_20)
 target_include_directories(VulkanEngineGame PRIVATE src ${glm_SOURCE_DIR})
-target_link_libraries(VulkanEngineGame PRIVATE vc_build_options glfw glm vk-bootstrap Vulkan::Vulkan vc_material_pipeline)
+target_link_libraries(VulkanEngineGame PRIVATE vc_build_options glfw glm vk-bootstrap Vulkan::Vulkan vc_material_pipeline vc_ozz vc_acl)
 
 if(VC_ENABLE_VOXEL_PLUGIN)
 add_executable(vulkan_craft
@@ -518,6 +617,12 @@ add_executable(vulkan_craft
     src/engine/sdk/EntityWorld.cpp
     src/engine/sdk/MobBehavior.cpp
     src/engine/sdk/RegistryJson.cpp
+    # BeamChassisRuntime (vc_gameplay_sdk) references the public beam-chassis
+    # and XPBD solver contracts; compile those sdk TUs directly like the rest.
+    src/engine/sdk/BeamGraphAsset.cpp
+    src/engine/sdk/VehicleProvider.cpp
+    src/engine/sdk/MotionDatabase.cpp
+    src/engine/sdk/XpbdDeformable.cpp
     $<TARGET_OBJECTS:vc_core_runtime>
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:$<TARGET_OBJECTS:vc_voxel_generation>>
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:$<TARGET_OBJECTS:vc_voxel_runtime>>
@@ -532,7 +637,7 @@ target_include_directories(vulkan_craft PRIVATE
     ${VC_SOLUTIONS_DIR}/entt/single_include
 )
 target_link_libraries(vulkan_craft PRIVATE
-    vc_build_options glfw glm vk-bootstrap Vulkan::Vulkan windowscodecs ole32
+    vc_build_options glfw glm vk-bootstrap Vulkan::Vulkan windowscodecs ole32 vc_ozz vc_acl
 )
 endif()
 
@@ -549,17 +654,36 @@ set(IMGUI_SOURCES
 add_executable(VulkanEngineEditor
     src/editor/main_editor.cpp
     src/editor/EditorApplication.cpp
+    # Loopback HTTP control API (curl 127.0.0.1:8321/{play,pause,resume,stop,step,state})
+    src/editor/EditorControlApi.cpp
     src/engine/editor/ui/EditorGUI.cpp
     src/editor/tools/SpecializedEditorsPanel.cpp
+    # Wicked-port tool panels (frontend; PORTS.md): windows wired to the
+    # VulkanCraft scene/components, with TODO(frontend-port) markers where the
+    # runtime feature still needs implementing.
+    src/editor/tools/WickedToolsPanel.cpp
+    # Forge design system (light theme + reusable editor widgets).
+    src/editor/frontend/ForgeTheme.cpp
+    src/editor/frontend/ForgeWidgets.cpp
     # Public navigation provider (FALTANTES item 12): the editor's play nav
     # bakes via Recast + Detour — the legacy grid track was removed.
     src/engine/sdk/RecastNavigation.cpp
     # RegistryJson lives in vc_sdk_public; this target links vc_advanced_runtime
     # (which compiles FractureConfig using the json helpers) without sdk_public,
     # so it compiles the sdk TU directly — same pattern as vulkan_craft below.
+    # BeamChassisRuntime (vc_gameplay_sdk) references the public beam-chassis and
+    # XPBD solver contracts, so those two sdk TUs are compiled here too.
     src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/BeamGraphAsset.cpp
+    src/engine/sdk/VehicleProvider.cpp
+    src/engine/sdk/MotionDatabase.cpp
+    src/engine/sdk/XpbdDeformable.cpp
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:src/engine/audio/SoundEngine.cpp>
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:src/plugins/voxel/VoxelPlugin.cpp>
+    # Frontend port (Wicked Editor, MIT): the UI base font (Liberation Sans) is
+    # embedded zstd-compressed; the adapter TU decompresses it through the
+    # public ICompressionProvider — same pattern as the sdk TUs above.
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:src/engine/core/compression/ZstdCompression.cpp>
     ${IMGUI_SOURCES}
     $<TARGET_OBJECTS:vc_core_runtime>
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:$<TARGET_OBJECTS:vc_voxel_generation>>
@@ -571,11 +695,14 @@ target_include_directories(VulkanEngineEditor PRIVATE
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
     src/editor
+    # Frontend port (Wicked GUI, MIT): base layer of the ported wiGUI module.
+    src/editor/frontend/wicked
     ${VC_SOLUTIONS_DIR}/recast-navigation/Recast/Include
     ${VC_SOLUTIONS_DIR}/recast-navigation/Detour/Include
 )
 target_link_libraries(VulkanEngineEditor PRIVATE
-    vc_build_options glfw glm vk-bootstrap Vulkan::Vulkan windowscodecs ole32 vc_material_pipeline vc_navigation
+    vc_build_options glfw glm vk-bootstrap Vulkan::Vulkan windowscodecs ole32 vc_material_pipeline vc_navigation vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
 )
 add_dependencies(VulkanEngineEditor compile_shaders)
 
@@ -595,6 +722,7 @@ target_include_directories(VulkanEngineServer PRIVATE
 )
 target_link_libraries(VulkanEngineServer PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     glm jolt bullet
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
@@ -668,8 +796,9 @@ add_executable(empty_project_tests
     third_party/tinyexr.cc
     third_party/miniz.c
     third_party/ufbx.c
+    src/engine/sdk/MotionDatabase.cpp
 )
-target_link_libraries(empty_project_tests PRIVATE vc_build_options glm)
+target_link_libraries(empty_project_tests PRIVATE vc_build_options glm vc_ozz vc_acl)
 add_test(NAME empty_project_tests COMMAND empty_project_tests)
 
 add_executable(engine_foundation_tests
@@ -701,8 +830,9 @@ add_executable(engine_foundation_tests
     third_party/tinyexr.cc
     third_party/miniz.c
     third_party/ufbx.c
+    src/engine/sdk/MotionDatabase.cpp
 )
-target_link_libraries(engine_foundation_tests PRIVATE vc_build_options)
+target_link_libraries(engine_foundation_tests PRIVATE vc_build_options vc_ozz vc_acl)
 add_test(NAME engine_foundation_tests COMMAND engine_foundation_tests)
 
 # Runs the same physics scenarios against every backend (builtin, jolt, bullet).
@@ -737,6 +867,26 @@ target_include_directories(skeleton_mapper_tests PRIVATE src)
 target_link_libraries(skeleton_mapper_tests PRIVATE vc_build_options glm)
 add_test(NAME skeleton_mapper_tests COMMAND skeleton_mapper_tests)
 
+# FALTANTES §18 item 8: active/partial ragdoll with recovery driven by the
+# Jolt swing-twist constraint motors (built on the §16 item 2 Ragdoll +
+# SkeletonPoseMapper). Needs the physics stack, so it follows the
+# skeleton_mapper_tests pattern (physics TUs compiled directly, Jolt backend).
+add_executable(active_ragdoll_tests
+    tests/ActiveRagdollTests.cpp
+    src/engine/physics/PhysicsRuntime.cpp
+    src/engine/physics/PhysicsBackend.cpp
+    src/engine/physics/JoltPhysicsBackend.cpp
+    src/engine/physics/BulletPhysicsBackend.cpp
+    src/engine/physics/Ragdoll.cpp
+    src/engine/physics/SkeletonPoseMapper.cpp
+    src/engine/physics/ActiveRagdoll.cpp
+    src/engine/core/uuid/UUID.cpp
+)
+target_compile_features(active_ragdoll_tests PRIVATE cxx_std_20)
+target_include_directories(active_ragdoll_tests PRIVATE src)
+target_link_libraries(active_ragdoll_tests PRIVATE vc_build_options glm)
+add_test(NAME active_ragdoll_tests COMMAND active_ragdoll_tests)
+
 add_executable(advanced_systems_tests
     tests/AdvancedSystemsTests.cpp
     src/engine/core/uuid/UUID.cpp
@@ -767,12 +917,13 @@ add_executable(advanced_systems_tests
     src/engine/world/WorldPartitionProfiler.cpp
     src/engine/world/WorldRegionPackage.cpp
     src/tools/BuildTools.cpp
+    src/engine/sdk/MotionDatabase.cpp
 )
 target_include_directories(advanced_systems_tests PRIVATE
     ${VC_SOLUTIONS_DIR}/recast-navigation/Recast/Include
     ${VC_SOLUTIONS_DIR}/recast-navigation/Detour/Include
 )
-target_link_libraries(advanced_systems_tests PRIVATE vc_build_options glm vc_navigation)
+target_link_libraries(advanced_systems_tests PRIVATE vc_build_options glm vc_navigation vc_ozz vc_acl)
 add_test(NAME advanced_systems_tests COMMAND advanced_systems_tests)
 
 add_executable(rendering_tools_tests
@@ -795,9 +946,15 @@ add_executable(gameplay_framework_tests
     src/engine/gameplay/WeaponSystem.cpp
     src/engine/gameplay/ParticleSimulation.cpp
     src/engine/gameplay/VehicleRuntime.cpp
+    src/engine/gameplay/BeamChassisRuntime.cpp
     src/engine/gameplay/DestructionRuntime.cpp
     src/engine/audio/AudioRuntime.cpp
     src/engine/sdk/RecastNavigation.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/BeamGraphAsset.cpp
+    src/engine/sdk/VehicleProvider.cpp
+    src/engine/sdk/MotionDatabase.cpp
+    src/engine/sdk/XpbdDeformable.cpp
     src/engine/physics/PhysicsRuntime.cpp
     src/engine/physics/PhysicsBackend.cpp
     src/engine/physics/JoltPhysicsBackend.cpp
@@ -809,7 +966,7 @@ target_include_directories(gameplay_framework_tests PRIVATE
     ${VC_SOLUTIONS_DIR}/recast-navigation/Recast/Include
     ${VC_SOLUTIONS_DIR}/recast-navigation/Detour/Include
 )
-target_link_libraries(gameplay_framework_tests PRIVATE vc_build_options glm vc_navigation)
+target_link_libraries(gameplay_framework_tests PRIVATE vc_build_options glm vc_navigation vc_ozz vc_acl)
 add_test(NAME gameplay_framework_tests COMMAND gameplay_framework_tests)
 
 # Public gameplay runtime (FALTANTES item 9 / META section 20): the contract
@@ -818,16 +975,24 @@ add_test(NAME gameplay_framework_tests COMMAND gameplay_framework_tests)
 # the public surface).
 add_executable(gameplay_runtime_tests
     tests/GameplayRuntimeTests.cpp
-    # vc_gameplay_sdk compiles FractureConfig (json helpers); RegistryJson lives
-    # in vc_sdk_public, so this light target compiles the sdk TU directly.
+    # vc_gameplay_sdk compiles FractureConfig (json helpers); RegistryJson and
+    # VehicleAsset live in vc_sdk_public, so this light target compiles the
+    # sdk TUs directly (VehicleAsset.cpp: create_vehicle_from_asset validates
+    # through the public asset contract). BeamChassisRuntime also references
+    # the XPBD solver factory, compiled here as well.
     src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/VehicleAsset.cpp
+    src/engine/sdk/BeamGraphAsset.cpp
+    src/engine/sdk/VehicleProvider.cpp
+    src/engine/sdk/MotionDatabase.cpp
+    src/engine/sdk/XpbdDeformable.cpp
     $<TARGET_OBJECTS:vc_gameplay_sdk>
 )
 target_include_directories(gameplay_runtime_tests PRIVATE
     src/engine/public
     src
 )
-target_link_libraries(gameplay_runtime_tests PRIVATE vc_build_options glm)
+target_link_libraries(gameplay_runtime_tests PRIVATE vc_build_options glm vc_ozz vc_acl)
 add_test(NAME gameplay_runtime_tests COMMAND gameplay_runtime_tests)
 
 add_executable(visual_authoring_tests
@@ -879,6 +1044,7 @@ add_executable(voxel_tools_tests
     src/engine/animation/AnimationRuntime.cpp
     src/engine/animation/AnimationAssets.cpp
     src/editor/tools/EditorRegistry.cpp
+    src/engine/sdk/MotionDatabase.cpp
     third_party/tinyexr.cc
     third_party/miniz.c
     third_party/ufbx.c
@@ -888,7 +1054,7 @@ add_executable(voxel_tools_tests
     src/plugins/voxel/VoxelStructure.cpp
     src/simulation/voxel/tools/VoxelTools.cpp
 )
-target_link_libraries(voxel_tools_tests PRIVATE vc_build_options glm)
+target_link_libraries(voxel_tools_tests PRIVATE vc_build_options glm vc_ozz vc_acl)
 add_test(NAME voxel_tools_tests COMMAND voxel_tools_tests)
 
 # Voxel streaming pipeline: MeshReady->Uploaded transition, async remesh on
@@ -935,6 +1101,7 @@ add_executable(voxel_sdk_tests
 target_include_directories(voxel_sdk_tests PRIVATE src/engine/public ${glm_SOURCE_DIR})
 target_link_libraries(voxel_sdk_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -969,6 +1136,7 @@ target_include_directories(physics_streaming_tests PRIVATE
 )
 target_link_libraries(physics_streaming_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1001,6 +1169,7 @@ target_include_directories(connectivity_tests PRIVATE
 )
 target_link_libraries(connectivity_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1033,6 +1202,7 @@ target_include_directories(explosion_tests PRIVATE
 )
 target_link_libraries(explosion_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1065,6 +1235,7 @@ target_include_directories(debris_tests PRIVATE
 )
 target_link_libraries(debris_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1096,6 +1267,7 @@ target_include_directories(revoxelize_tests PRIVATE
 )
 target_link_libraries(revoxelize_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1127,6 +1299,7 @@ target_include_directories(history_tests PRIVATE
 )
 target_link_libraries(history_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1159,6 +1332,7 @@ target_include_directories(destruction_tests PRIVATE
 )
 target_link_libraries(destruction_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1190,6 +1364,7 @@ target_include_directories(deformable_tests PRIVATE
 )
 target_link_libraries(deformable_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1221,6 +1396,7 @@ target_include_directories(tetra_cooking_tests PRIVATE
 )
 target_link_libraries(tetra_cooking_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1251,6 +1427,7 @@ target_include_directories(world_replication_tests PRIVATE
 )
 target_link_libraries(world_replication_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1281,6 +1458,7 @@ target_include_directories(world_ref_tests PRIVATE
 )
 target_link_libraries(world_ref_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1314,6 +1492,7 @@ target_include_directories(origin_rebase_tests PRIVATE
 )
 target_link_libraries(origin_rebase_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1347,6 +1526,7 @@ target_include_directories(local_space_tests PRIVATE
 )
 target_link_libraries(local_space_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1357,6 +1537,326 @@ if(TARGET vc_generate_world_save)
     add_dependencies(local_space_tests vc_generate_world_save)
 endif()
 add_test(NAME local_space_tests COMMAND local_space_tests)
+
+# Persistent temporal states / branches for time travel (META §19 /
+# FALTANTES §15 "branches/estados temporais persistentes para viagem no
+# tempo"): full world snapshots (save v5) registered on a timeline, branches
+# forked by copying snapshots, and travel_to rewinding the live world
+# transactionally (rollback on failure).
+add_executable(timeline_tests
+    tests/TimelineTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(timeline_tests PRIVATE cxx_std_20)
+target_include_directories(timeline_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(timeline_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(timeline_tests vc_generate_world_save)
+endif()
+add_test(NAME timeline_tests COMMAND timeline_tests)
+
+# Multi-scale streaming (META §19 / FALTANTES §15 vision "streaming
+# multi-escala", Fase 5 checkbox): the world function streamed at several
+# scales around a focus — fine voxel detail near, coarser height-fields far —
+# all sampling the SAME generator, with power-of-two levels sharing anchors
+# (cross-level coherent, lossless path-independent transition).
+add_executable(multiscale_streaming_tests
+    tests/MultiScaleStreamingTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(multiscale_streaming_tests PRIVATE cxx_std_20)
+target_include_directories(multiscale_streaming_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(multiscale_streaming_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(multiscale_streaming_tests vc_generate_world_save)
+endif()
+add_test(NAME multiscale_streaming_tests COMMAND multiscale_streaming_tests)
+
+# Jolt Vehicles adapter (FALTANTES §17 item 1): replaces the hand-rolled
+# raycast vehicle with a real Jolt VehicleConstraint on worlds with a vehicle
+# solver; builtin/bullet keep the raycast fallback.
+add_executable(vehicle_adapter_tests
+    tests/VehicleAdapterTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(vehicle_adapter_tests PRIVATE cxx_std_20)
+target_include_directories(vehicle_adapter_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(vehicle_adapter_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(vehicle_adapter_tests vc_generate_world_save)
+endif()
+add_test(NAME vehicle_adapter_tests COMMAND vehicle_adapter_tests)
+
+# VehicleAsset public contract (FALTANTES §17 item 2): the runtime is exposed
+# as a data-driven asset (chassis/wheels/drivetrain JSON) with public,
+# combinable component types; create_vehicle_from_asset assembles it on the
+# physics world.
+add_executable(vehicle_asset_tests
+    tests/VehicleAssetTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(vehicle_asset_tests PRIVATE cxx_std_20)
+target_include_directories(vehicle_asset_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(vehicle_asset_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(vehicle_asset_tests vc_generate_world_save)
+endif()
+add_test(NAME vehicle_asset_tests COMMAND vehicle_asset_tests)
+
+# Vehicle kinds + propulsion modules (FALTANTES §17 item 3): car / motorcycle /
+# tank through the Jolt controllers (Wheeled / Motorcycle / Tracked) and the
+# public wing/thruster/buoyancy propulsion modules.
+add_executable(vehicle_kinds_tests
+    tests/VehicleKindsTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(vehicle_kinds_tests PRIVATE cxx_std_20)
+target_include_directories(vehicle_kinds_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(vehicle_kinds_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(vehicle_kinds_tests vc_generate_world_save)
+endif()
+add_test(NAME vehicle_kinds_tests COMMAND vehicle_kinds_tests)
+
+# Node/beam deformable chassis (FALTANTES §17 item 4): BeamGraphAsset + XPBD
+# (the public IDeformableProvider solver) + wheel mounts on nodes.
+add_executable(beam_vehicle_tests
+    tests/BeamVehicleTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(beam_vehicle_tests PRIVATE cxx_std_20)
+target_include_directories(beam_vehicle_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(beam_vehicle_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(beam_vehicle_tests vc_generate_world_save)
+endif()
+add_test(NAME beam_vehicle_tests COMMAND beam_vehicle_tests)
+
+# Vehicle lifecycle (FALTANTES §17 items 8-9): occupants (seats, entry, exit,
+# kinematic ride) and damage/part separation (chassis/drivetrain/wheels for
+# rigid vehicles; + beams for the XPBD chassis). Same object modules as the
+# beam chassis tests.
+add_executable(vehicle_lifecycle_tests
+    tests/VehicleLifecycleTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(vehicle_lifecycle_tests PRIVATE cxx_std_20)
+target_include_directories(vehicle_lifecycle_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(vehicle_lifecycle_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(vehicle_lifecycle_tests vc_generate_world_save)
+endif()
+add_test(NAME vehicle_lifecycle_tests COMMAND vehicle_lifecycle_tests)
+
+# Vehicle energy/fuel/controls (FALTANTES §17 item 7): data-driven fuel tank,
+# battery and control mapping — the runtime burns fuel by throttle, draws /
+# regens energy, and cuts the drive when a system is empty. Same object
+# modules as the other vehicle tests.
+add_executable(vehicle_power_tests
+    tests/VehiclePowerTests.cpp
+
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(vehicle_power_tests PRIVATE cxx_std_20)
+target_include_directories(vehicle_power_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(vehicle_power_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(vehicle_power_tests vc_generate_world_save)
+endif()
+add_test(NAME vehicle_power_tests COMMAND vehicle_power_tests)
+
+# Provider ownership (FALTANTES §17 item 10): each physical entity (body) is
+# simulated by EXACTLY ONE provider — claims are all-or-nothing with a
+# diagnostic, and the vehicle factories claim the chassis automatically so a
+# second vehicle on the same body is refused. Same object modules as the
+# other gameplay tests.
+add_executable(physics_ownership_tests
+    tests/PhysicsOwnershipTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(physics_ownership_tests PRIVATE cxx_std_20)
+target_include_directories(physics_ownership_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(physics_ownership_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(physics_ownership_tests vc_generate_world_save)
+endif()
+add_test(NAME physics_ownership_tests COMMAND physics_ownership_tests)
+
+# Vehicle network authority + prediction (FALTANTES §17 item 11): the server
+# owns the simulation (steps vehicles with client input, broadcasts
+# authoritative states); the client predicts locally and reconciles. Same
+# object modules as the other vehicle tests.
+add_executable(vehicle_replication_tests
+    tests/VehicleReplicationTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(vehicle_replication_tests PRIVATE cxx_std_20)
+target_include_directories(vehicle_replication_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(vehicle_replication_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(vehicle_replication_tests vc_generate_world_save)
+endif()
+add_test(NAME vehicle_replication_tests COMMAND vehicle_replication_tests)
 
 # Configurable voxel fracture (FALTANTES §16 item 8): the data-driven
 # FractureConfig turns a solid voxel region into a destructible whose chunks
@@ -1374,6 +1874,7 @@ target_compile_features(fracture_tests PRIVATE cxx_std_20)
 target_include_directories(fracture_tests PRIVATE src/engine/public src ${glm_SOURCE_DIR})
 target_link_libraries(fracture_tests PRIVATE
     vc_build_options glm
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1401,6 +1902,7 @@ add_executable(mcp_registry_gate_tests
 target_include_directories(mcp_registry_gate_tests PRIVATE src/engine/public ${glm_SOURCE_DIR})
 target_link_libraries(mcp_registry_gate_tests PRIVATE
     vc_build_options
+    vc_ozz vc_acl
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1414,21 +1916,344 @@ if(TARGET vc_generate_world_save)
     add_dependencies(mcp_registry_gate_tests vc_generate_world_save)
 endif()
 add_test(NAME mcp_registry_gate_tests COMMAND mcp_registry_gate_tests)
+
+# Vehicle-assembly gate (FALTANTES §17 item 12): the versioned JSON documents
+# the MCP semantic layer authors (Content/Vehicles/*.json via
+# author_vehicle_asset — rigid VehicleAsset / beam BeamGraphAsset) must load
+# through the PUBLIC factories unchanged. The test TU compiles against only
+# the public headers (like mcp_registry_gate_tests) and mirrors the exact
+# documents tools/mcp-server/protocol-smoke.mjs emits.
+add_executable(vehicle_asset_gate_tests
+    tests/VehicleAssetGateTests.cpp
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(vehicle_asset_gate_tests PRIVATE cxx_std_20)
+target_include_directories(vehicle_asset_gate_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(vehicle_asset_gate_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation
+    vc_fastwfc
+    vc_meshoptimizer
+    vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(vehicle_asset_gate_tests vc_generate_world_save)
 endif()
+add_test(NAME vehicle_asset_gate_tests COMMAND vehicle_asset_gate_tests)
+
+# Vehicle provider seam (FALTANTES §17 items 5/6): the asset selects EXACTLY
+# ONE physics provider; only jolt is vendored (chrono/jsbsim are refused with
+# a diagnostic — never a silent fallback). The gate proves the factory refuses
+# non-vendored providers and that the provider field round-trips through both
+# assets.
+add_executable(vehicle_provider_tests
+    tests/VehicleProviderTests.cpp
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(vehicle_provider_tests PRIVATE cxx_std_20)
+target_include_directories(vehicle_provider_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(vehicle_provider_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation
+    vc_fastwfc
+    vc_meshoptimizer
+    vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(vehicle_provider_tests vc_generate_world_save)
+endif()
+add_test(NAME vehicle_provider_tests COMMAND vehicle_provider_tests)
+endif()
+
+add_executable(motion_database_tests
+    tests/MotionDatabaseTests.cpp
+    # Light target (pattern of gameplay_runtime_tests): the motion-database
+    # adapter is self-contained (glm + ozz + acl only), so compile it directly
+    # instead of pulling every vc_sdk_public object.
+    src/engine/sdk/MotionDatabase.cpp
+)
+target_compile_features(motion_database_tests PRIVATE cxx_std_20)
+target_include_directories(motion_database_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+    ${VC_SOLUTIONS_DIR}/ozz-animation/include
+    ${VC_SOLUTIONS_DIR}/acl/includes
+    ${VC_SOLUTIONS_DIR}/acl/external/rtm/includes
+)
+target_link_libraries(motion_database_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+)
+add_test(NAME motion_database_tests COMMAND motion_database_tests)
+
+# FALTANTES §18 item 4: ContactPlanner + GaitAsset + leg-chain assets. The
+# gait adapter is pure logic (glm only); MotionDatabase.cpp is compiled here
+# for the IK-integration gate (a planted foot target solved by the item-3
+# ik_two_bone).
+add_executable(gait_planner_tests
+    tests/GaitPlannerTests.cpp
+    src/engine/sdk/GaitPlanner.cpp
+    src/engine/sdk/MotionDatabase.cpp
+)
+target_compile_features(gait_planner_tests PRIVATE cxx_std_20)
+target_include_directories(gait_planner_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+    ${VC_SOLUTIONS_DIR}/ozz-animation/include
+    ${VC_SOLUTIONS_DIR}/acl/includes
+    ${VC_SOLUTIONS_DIR}/acl/external/rtm/includes
+)
+target_link_libraries(gait_planner_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+)
+add_test(NAME gait_planner_tests COMMAND gait_planner_tests)
+
+# FALTANTES §18 item 7: spider-style procedural locomotion (minecraft-spider
+# concepts as REFERENCE only — never compiled, like shape-ml). The driver is
+# pure (glm + the public animation headers); the integration gate (legs ->
+# placement -> IK) needs the motion database, so the target compiles the SDK
+# adapters directly (the light pattern, like gait_planner_tests). Terrain is
+# sampled through the IFootTerrainSampler seam (item 5) — the gate uses
+# in-test samplers; the voxel sampler itself is proven by foot_placement_tests.
+add_executable(procedural_legs_tests
+    tests/ProceduralLegsTests.cpp
+    src/engine/sdk/ProceduralLegs.cpp
+    src/engine/sdk/GaitPlanner.cpp
+    src/engine/sdk/MotionDatabase.cpp
+)
+target_compile_features(procedural_legs_tests PRIVATE cxx_std_20)
+target_include_directories(procedural_legs_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+    ${VC_SOLUTIONS_DIR}/ozz-animation/include
+    ${VC_SOLUTIONS_DIR}/acl/includes
+    ${VC_SOLUTIONS_DIR}/acl/external/rtm/includes
+)
+target_link_libraries(procedural_legs_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+)
+add_test(NAME procedural_legs_tests COMMAND procedural_legs_tests)
+
+# FALTANTES §18 item 9: motion matching (feature vector + exhaustive search,
+# pure glm — the ozz sample_motion_matching is an MIT reference only). The
+# adapter is self-contained, so the target follows the light pattern (compile
+# the SDK TU directly; no physics/voxel dependencies).
+add_executable(motion_matcher_tests
+    tests/MotionMatcherTests.cpp
+    src/engine/sdk/MotionMatcher.cpp
+    src/engine/sdk/MotionDatabase.cpp
+)
+target_compile_features(motion_matcher_tests PRIVATE cxx_std_20)
+target_include_directories(motion_matcher_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+    ${VC_SOLUTIONS_DIR}/ozz-animation/include
+    ${VC_SOLUTIONS_DIR}/acl/includes
+    ${VC_SOLUTIONS_DIR}/acl/external/rtm/includes
+)
+target_link_libraries(motion_matcher_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+)
+add_test(NAME motion_matcher_tests COMMAND motion_matcher_tests)
+
+# FALTANTES §18 item 10: hair/fur as an optional plugin with LOD. The
+# StrandSolver is self-contained (glm + the engine's own JSON parser); TressFX
+# is the opt-in GPU seam (refused, never a silent fallback — the deformable
+# pattern). Light target: compile the adapter + RegistryJson directly.
+add_executable(hair_tests
+    tests/HairTests.cpp
+    src/engine/sdk/StrandHair.cpp
+    src/engine/sdk/RegistryJson.cpp
+)
+target_compile_features(hair_tests PRIVATE cxx_std_20)
+target_include_directories(hair_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(hair_tests PRIVATE
+    vc_build_options
+)
+add_test(NAME hair_tests COMMAND hair_tests)
+
+# FALTANTES §18 item 11: the OFFLINE physics/learning farm seam. MuJoCo /
+# MuJoCo MPC / DeepMimic generate/validate motion assets OUTSIDE the game
+# (reference only — never compiled, the shape-ml/minecraft-spider pattern);
+# the runtime consumes COOKED + SIGNED assets through IFarmCooker, and this
+# gate proves the RuntimeCooker: deterministic FNV-1a 64 signing over canonical
+# payload bytes, all-or-nothing validation, and the seam that REFUSES the
+# training backends with a diagnostic.
+add_executable(offline_farm_tests
+    tests/OfflineFarmTests.cpp
+    src/engine/sdk/OfflineFarm.cpp
+)
+target_compile_features(offline_farm_tests PRIVATE cxx_std_20)
+target_include_directories(offline_farm_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(offline_farm_tests PRIVATE
+    vc_build_options
+)
+add_test(NAME offline_farm_tests COMMAND offline_farm_tests)
+
+# FALTANTES §18 item 12: animation LOD by relevance (update frequency + bone
+# subset). The adapter is PURE (it only decides budgets, never samples), so
+# the gate is a light target: no ozz/ACL needed — the MotionPose struct comes
+# from the public IMotionDatabase header.
+add_executable(animation_lod_tests
+    tests/AnimationLodTests.cpp
+    src/engine/sdk/AnimationLod.cpp
+)
+target_compile_features(animation_lod_tests PRIVATE cxx_std_20)
+target_include_directories(animation_lod_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(animation_lod_tests PRIVATE
+    vc_build_options
+)
+add_test(NAME animation_lod_tests COMMAND animation_lod_tests)
+
+# FALTANTES §18 item 13: AI clip/graph validation via the public API. The
+# runtime side (validate + sign, pure) compiles the AiGraphValidation adapter;
+# MotionClip::validate lives in MotionDatabase.cpp, so the light target
+# compiles it too (the gait_planner_tests pattern).
+add_executable(ai_graph_validation_tests
+    tests/AiGraphValidationTests.cpp
+    src/engine/sdk/AiGraphValidation.cpp
+    src/engine/sdk/MotionDatabase.cpp
+)
+target_compile_features(ai_graph_validation_tests PRIVATE cxx_std_20)
+target_include_directories(ai_graph_validation_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+    ${VC_SOLUTIONS_DIR}/ozz-animation/include
+    ${VC_SOLUTIONS_DIR}/acl/includes
+    ${VC_SOLUTIONS_DIR}/acl/external/rtm/includes
+)
+target_link_libraries(ai_graph_validation_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+)
+add_test(NAME ai_graph_validation_tests COMMAND ai_graph_validation_tests)
+
+# FALTANTES §18 item 5: foot placement on dynamic voxel terrain and moving
+# surfaces. The placer is pure (glm only); the voxel sampler couples to the
+# public IVoxelWorld. The integration gate (planner -> placement -> IK)
+# needs the voxel world facade, so this follows the connectivity_tests
+# object-library pattern (the SDK adapters come from vc_sdk_public objects).
+add_executable(foot_placement_tests
+    tests/FootPlacementTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(foot_placement_tests PRIVATE cxx_std_20)
+target_include_directories(foot_placement_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(foot_placement_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(foot_placement_tests vc_generate_world_save)
+endif()
+add_test(NAME foot_placement_tests COMMAND foot_placement_tests)
+
+# FALTANTES §18 item 6: pose warping and locomotion adaptation. The warper
+# is pure (glm only); GaitPlanner/FootPlacement/MotionDatabase are compiled
+# here for the planner -> placement -> warp -> IK composition gate.
+add_executable(pose_warp_tests
+    tests/PoseWarpTests.cpp
+    src/engine/sdk/PoseWarp.cpp
+    src/engine/sdk/GaitPlanner.cpp
+    src/engine/sdk/FootPlacement.cpp
+    src/engine/sdk/MotionDatabase.cpp
+)
+target_compile_features(pose_warp_tests PRIVATE cxx_std_20)
+target_include_directories(pose_warp_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+    ${VC_SOLUTIONS_DIR}/ozz-animation/include
+    ${VC_SOLUTIONS_DIR}/acl/includes
+    ${VC_SOLUTIONS_DIR}/acl/external/rtm/includes
+)
+target_link_libraries(pose_warp_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+)
+add_test(NAME pose_warp_tests COMMAND pose_warp_tests)
+
+
+
+
+
 
 add_executable(VulkanEngineCooker
     src/tools/main_cooker.cpp
     src/tools/AssetCooker.cpp
+    # AnimationRuntime (vc_core_runtime) routes through the public motion
+    # database — compile the adapter TU directly (same pattern as the app
+    # targets; vc_sdk_public is not linked here).
+    src/engine/sdk/MotionDatabase.cpp
     $<TARGET_OBJECTS:vc_core_runtime>
 )
-target_link_libraries(VulkanEngineCooker PRIVATE vc_build_options)
+target_link_libraries(VulkanEngineCooker PRIVATE vc_build_options vc_ozz vc_acl)
 
 add_executable(VulkanShaderCompiler src/tools/main_shader_compiler.cpp src/tools/BuildTools.cpp)
 target_link_libraries(VulkanShaderCompiler PRIVATE vc_build_options)
 add_executable(VulkanProjectGenerator src/tools/main_project_generator.cpp src/tools/BuildTools.cpp)
 target_link_libraries(VulkanProjectGenerator PRIVATE vc_build_options)
 add_executable(VulkanPackageBuilder src/tools/main_package_builder.cpp src/tools/BuildTools.cpp)
-target_link_libraries(VulkanPackageBuilder PRIVATE vc_build_options)
+target_link_libraries(VulkanPackageBuilder PRIVATE vc_build_options vc_ozz vc_acl)
 
 # The built tool/game executables, staged when present (a partial build skips
 # the ones it did not produce). The documented flow is Release; the engine's

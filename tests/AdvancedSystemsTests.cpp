@@ -74,11 +74,45 @@ int main() {
     const Pose retargeted = AnimationRetargeter::retarget(skeleton, target, sampled, mapping);
     if (retargeted.local.size() != 2 || !near(retargeted.local[1].translation.y, 1.5f)) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
 
-    Pose ikPose = AnimationSampler::bind_pose(skeleton);
-    ikPose.local[0].translation = {0,0,0};
-    ikPose.local[1].translation = {0,1,0};
-    if (!IKSolver::solve_two_bone(ikPose, 0, 1, {1,1,0}, 1.0f) ||
-        glm::distance(ikPose.local[1].translation, glm::vec3(1,1,0)) > 0.02f) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
+    // FALTANTES §18 item 3: IK routes through the ozz jobs (IKTwoBoneJob /
+    // IKAimJob) behind the per-skeleton motion database. The two-bone solver
+    // is ANALYTIC — with weight 1 the HAND's MODEL-space position reaches the
+    // target (corrections apply to the LOCAL rotations of root/mid; local
+    // translations never change).
+    {
+        SkeletonAsset ikSkeleton;
+        ikSkeleton.name = "IKGate";
+        ikSkeleton.bones = {{"Root", -1}, {"Upper", 0}, {"Forearm", 1}, {"Hand", 2}};
+        auto freshChain = [] {
+            Pose p;
+            p.local.resize(4);
+            p.local[0] = {glm::vec3(0,0,0), glm::quat(1,0,0,0), glm::vec3(1)};
+            p.local[1] = {glm::vec3(0,1,0), glm::quat(1,0,0,0), glm::vec3(1)};
+            p.local[2] = {glm::vec3(0,1,0), glm::quat(1,0,0,0), glm::vec3(1)};
+            p.local[3] = {glm::vec3(0,0.5f,0), glm::quat(1,0,0,0), glm::vec3(1)};
+            return p;
+        };
+        // Model positions: Root (0,0,0), Upper (0,1,0), Forearm (0,2,0), Hand (0,2.5,0).
+        const glm::vec3 ikTarget(1.5f, 1.0f, 0.0f);
+        Pose ikPose = freshChain();
+        if (!IKSolver::solve_two_bone(ikSkeleton, ikPose, 0, 1, 3, ikTarget, {0,0,1}, 1.0f)) { std::cerr << "Failure at line " << __LINE__ << " (solve_two_bone)\n"; return EXIT_FAILURE; }
+        const std::vector<glm::mat4> ikMats = AnimationSampler::global_matrices(ikSkeleton, ikPose);
+        if (glm::distance(glm::vec3(ikMats[3][3]), ikTarget) > 0.02f) { std::cerr << "Failure at line " << __LINE__ << " (IK reach)\n"; return EXIT_FAILURE; }
+        // weight 0 leaves the pose untouched.
+        Pose ikZero = freshChain();
+        if (!IKSolver::solve_two_bone(ikSkeleton, ikZero, 0, 1, 3, {3,0,0}, {0,0,1}, 0.0f)) { std::cerr << "Failure at line " << __LINE__ << " (IK weight 0)\n"; return EXIT_FAILURE; }
+        const std::vector<glm::mat4> ikMats0 = AnimationSampler::global_matrices(ikSkeleton, ikZero);
+        if (glm::distance(glm::vec3(ikMats0[3][3]), glm::vec3(0,2.5f,0)) > 0.001f) { std::cerr << "Failure at line " << __LINE__ << " (IK weight 0 unchanged)\n"; return EXIT_FAILURE; }
+        // look_at: aim the Hand's local +X forward at a target to the side.
+        Pose aimPose = freshChain();
+        const glm::vec3 aimTarget(2.5f, 3.0f, 0.0f);
+        if (!IKSolver::look_at(ikSkeleton, aimPose, 3, aimTarget, {1,0,0}, {0,1,0}, {0,1,0}, 1.0f)) { std::cerr << "Failure at line " << __LINE__ << " (look_at)\n"; return EXIT_FAILURE; }
+        glm::quat handRot = glm::quat(1,0,0,0);
+        for (int b = 0; b <= 3; ++b) handRot = handRot * aimPose.local[b].rotation;
+        const glm::vec3 aimed = glm::normalize(handRot * glm::vec3(1,0,0));
+        const glm::vec3 wantDir = glm::normalize(aimTarget - glm::vec3(0,2.5f,0));
+        if (glm::distance(aimed, wantDir) > 0.05f) { std::cerr << "Failure at line " << __LINE__ << " (aim direction)\n"; return EXIT_FAILURE; }
+    }
 
     // pid suffix: two concurrent instances of this binary must not share the
     // same temp paths (fixed names collided under parallel ctest runs).
@@ -103,6 +137,53 @@ int main() {
     AnimationGraph executableGraph; executableGraph.configure(&skeleton, &idle, &walk, &walk);
     std::vector<glm::mat4> graphMatrices; executableGraph.update(0.25f, 0.5f, graphMatrices);
     if (graphMatrices.size()!=2) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
+
+    // FALTANTES §18 item 2: the runtime facades now sample/blend through the
+    // ozz+ACL motion database (per-skeleton cook; exact ozz path). The gate
+    // proves the facade values match the reference lerp/slerp interpolation
+    // (keyframe values chosen exactly representable in ozz's half-float
+    // translation storage, so the match is tight), that 2-pose blending goes
+    // through the database (nlerp, identity rotations — exact), and that two
+    // different skeletons are cooked independently (same clip object works
+    // per skeleton).
+    {
+        SkeletonAsset motionSkeleton;
+        motionSkeleton.name = "MotionGate";
+        motionSkeleton.bones = {{"Root", -1}, {"Limb", 0}, {"Tip", 1}};
+        AnimationClip ramp;
+        ramp.name = "Ramp";
+        ramp.duration = 1.0f;
+        ramp.looping = false;
+        ramp.tracks.push_back({0, {{0.0f, {0,0,0}}, {1.0f, {2,0,0}}}});
+        ramp.tracks.push_back({2, {{0.0f, {0,1,0}}, {1.0f, {0,3,0}}}});
+        ramp.tracks.push_back({1, {{0.0f, {0,0,0}, glm::quat(1,0,0,0)}, {1.0f, {0,0,0}, glm::angleAxis(glm::radians(90.0f), glm::vec3(0,1,0))}}});
+        // Sampling through the facade == reference interpolation at 0/0.5/1.
+        const Pose s0 = AnimationSampler::sample(motionSkeleton, ramp, 0.0f);
+        const Pose s1 = AnimationSampler::sample(motionSkeleton, ramp, 0.5f);
+        const Pose s2 = AnimationSampler::sample(motionSkeleton, ramp, 1.0f);
+        if (s0.local.size() != 3 || !near(s0.local[0].translation.x, 0.0f) ||
+            !near(s1.local[0].translation.x, 1.0f) || !near(s2.local[0].translation.x, 2.0f) ||
+            !near(s1.local[2].translation.y, 2.0f)) { std::cerr << "Failure at line " << __LINE__ << " (ozz facade sample)\n"; return EXIT_FAILURE; }
+        // Rotation half-way (identity -> Ry90): nlerp == slerp == Ry45.
+        const glm::vec3 mid = glm::mat3_cast(s1.local[1].rotation) * glm::vec3(1.0f, 0.0f, 0.0f);
+        if (!near(mid.x, 0.7071f) || !near(mid.z, -0.7071f)) { std::cerr << "Failure at line " << __LINE__ << " (ozz facade rotation)\n"; return EXIT_FAILURE; }
+        // 2-pose blending through the facade (ozz BlendingJob, nlerp).
+        const Pose blended = AnimationBlender::blend(s1, s0, 0.25f);
+        if (!near(blended.local[0].translation.x, 0.75f)) { std::cerr << "Failure at line " << __LINE__ << " (ozz facade blend)\n"; return EXIT_FAILURE; }
+        // Per-skeleton independence: a second skeleton cooks its own database
+        // and the first keeps working with the same clip objects.
+        SkeletonAsset otherSkeleton;
+        otherSkeleton.name = "Other";
+        otherSkeleton.bones = {{"A", -1}, {"B", 0}};
+        AnimationClip tiny;
+        tiny.name = "Tiny";
+        tiny.duration = 1.0f;
+        tiny.looping = false;
+        tiny.tracks.push_back({0, {{0.0f, {0,0,0}}, {1.0f, {5,0,0}}}});
+        const Pose o1 = AnimationSampler::sample(otherSkeleton, tiny, 0.5f);
+        const Pose m1 = AnimationSampler::sample(motionSkeleton, ramp, 0.5f);
+        if (!near(o1.local[0].translation.x, 2.5f) || !near(m1.local[0].translation.x, 1.0f)) { std::cerr << "Failure at line " << __LINE__ << " (per-skeleton db)\n"; return EXIT_FAILURE; }
+    }
 
     // Typed visual scripting: validation, compilation, VM, variables and debugger.
     ScriptGraphAsset graph;

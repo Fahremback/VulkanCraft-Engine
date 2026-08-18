@@ -141,7 +141,11 @@ bool test_vehicle_equivalence() {
         CHECK(vehicle->wheel_states().size() == 4);
 
         VehicleInput idle;
-        for (int i = 0; i < 180; ++i) vehicle->update(1.0f / 60.0f);
+        for (int i = 0; i < 180; ++i) {
+            vehicle->set_input(idle);
+            vehicle->update(1.0f / 60.0f);
+            runtime->step(1.0f / 60.0f);
+        }
         CHECK(vehicle->speed() < 1.0f);
 
         VehicleInput drive;
@@ -149,6 +153,7 @@ bool test_vehicle_equivalence() {
         for (int i = 0; i < 60; ++i) {
             vehicle->set_input(drive);
             vehicle->update(1.0f / 60.0f);
+            runtime->step(1.0f / 60.0f);
         }
         publicDriveSpeed = vehicle->speed();
         CHECK(publicDriveSpeed > 2.0f);
@@ -158,6 +163,7 @@ bool test_vehicle_equivalence() {
         for (int i = 0; i < 90; ++i) {
             vehicle->set_input(stop);
             vehicle->update(1.0f / 60.0f);
+            runtime->step(1.0f / 60.0f);
         }
         CHECK(vehicle->speed() < publicDriveSpeed);
     }
@@ -188,12 +194,17 @@ bool test_vehicle_equivalence() {
     Engine::Gameplay::VehicleRuntime internal(chassis, std::move(wheels));
     CHECK(internal.valid(world));
     Engine::Gameplay::VehicleInput idle;
-    for (int i = 0; i < 180; ++i) internal.update(world, 1.0f / 60.0f);
+    for (int i = 0; i < 180; ++i) {
+        internal.set_input(idle);
+        internal.update(world, 1.0f / 60.0f);
+        world.step(1.0f / 60.0f);
+    }
     Engine::Gameplay::VehicleInput drive;
     drive.throttle = 1.0f;
     for (int i = 0; i < 60; ++i) {
         internal.set_input(drive);
         internal.update(world, 1.0f / 60.0f);
+        world.step(1.0f / 60.0f);
     }
     const float internalDriveSpeed = internal.speed(world);
     CHECK(internalDriveSpeed > 2.0f);

@@ -492,10 +492,17 @@ try {
   const runCli = (args) => spawnSync(process.execPath, [cliPath, ...args], { encoding: "utf8" });
   const cliKinds = runCli(["kinds"]);
   assert.equal(cliKinds.status, 0, cliKinds.stderr);
-  assert.equal(cliKinds.stdout.split(/\n/).filter(Boolean).length, schemaKinds.length);
+  assert.equal(cliKinds.stdout.split(/\n/).filter(Boolean).length, schemaKinds.length + 2, cliKinds.stdout);
   const cliSchema = runCli(["schema", "block"]);
   assert.equal(cliSchema.status, 0, cliSchema.stderr);
   assert.deepEqual(JSON.parse(cliSchema.stdout).properties.collisionShape.enum, ["full", "cross", "none"]);
+  // §17 item 12: the CLI exposes the vehicle-assembly schemas too.
+  const cliVehicleSchema = runCli(["schema", "vehicle"]);
+  assert.equal(cliVehicleSchema.status, 0, cliVehicleSchema.stderr);
+  assert.deepEqual(JSON.parse(cliVehicleSchema.stdout).properties.kind.enum, ["wheeled", "motorcycle", "tracked"]);
+  const cliBeamSchema = runCli(["schema", "beam"]);
+  assert.equal(cliBeamSchema.status, 0, cliBeamSchema.stderr);
+  assert.ok(JSON.parse(cliBeamSchema.stdout).properties.nodes, "beam schema declares nodes");
 
   const goodDoc = path.join(directory, "mcp-smoke-good-doc.json");
   const badDoc = path.join(directory, "mcp-smoke-bad-doc.json");
@@ -522,6 +529,133 @@ try {
   const cliDryRun = runCli(["author", "--engine", engineRoot, "--project", smokeProject, "--kind", "block", "--name", "CliDry", "--file", cliDoc, "--dry-run"]);
   assert.equal(cliDryRun.status, 0, cliDryRun.stderr);
   assert.ok(!fs.existsSync(path.join(smokeProjectPath, "Content", "Registry", "block", "CliDry.json")));
+
+  // ---- FALTANTES §17 item 12: vehicle assembly authoring ----
+
+  // A rigid wheeled VehicleAsset with seats and a fuel system. The document
+  // must load unchanged through VehicleAsset::load_from_json (proved by
+  // tests/VehicleAssetGateTests.cpp, which mirrors this exact payload).
+  const vehicleAsset = await request("tools/call", {
+    name: "author_vehicle_asset",
+    arguments: {
+      project: smokeProject, kind: "vehicle", name: "Pickup",
+      vehicle_kind: "wheeled", position: [0, 0.5, 0], rotation: [0, 0, 0, 1],
+      chassis: { shape: "box", half_extents: [1.1, 0.4, 0.65], mass: 1500, friction: 0.6, restitution: 0.05 },
+      wheels: [
+        { localPosition: [0.95, 0, 0.7], radius: 0.38, suspension_rest_length: 0.5, max_drive_force: 4200, max_steer_angle: 0.5, steering: true, driven: true },
+        { localPosition: [-0.95, 0, 0.7], radius: 0.38, suspension_rest_length: 0.5, max_drive_force: 4200, max_steer_angle: 0.5, steering: true, driven: true },
+        { localPosition: [0.95, 0, -0.7], radius: 0.38, suspension_rest_length: 0.5, max_drive_force: 4200, driven: true },
+        { localPosition: [-0.95, 0, -0.7], radius: 0.38, suspension_rest_length: 0.5, max_drive_force: 4200, driven: true }
+      ],
+      drivetrain: { engine_max_torque: 1800, engine_min_rpm: 900, engine_max_rpm: 6500, differential_ratio: 3.7, gear_ratios: [3.2, 2.1, 1.5, 1.1, 0.85] },
+      seats: [{ name: "driver", localPosition: [0.2, 0.5, 0.3], exitOffset: [0, 1.1, 1.2] }],
+      power: {
+        fuel: { capacity: 60, initial_level: 0.8, burn_per_second: 0.12, min_level_to_run: 0.05 },
+        energy: { capacity: 0 },
+        controls: { throttle_deadzone: 0.05, throttle_sensitivity: 1.2, steering_invert: false }
+      }
+    }
+  });
+  assert.equal(vehicleAsset.result.isError, undefined, JSON.stringify(vehicleAsset));
+  const vehiclePayload = JSON.parse(vehicleAsset.result.content[0].text);
+  assert.equal(vehiclePayload.created, true);
+  assert.equal(vehiclePayload.diagnostics.length, 0, JSON.stringify(vehiclePayload));
+  assert.ok(fs.existsSync(path.join(smokeProjectPath, "Content", "Vehicles", "Pickup.json")));
+
+  // A node/beam BeamGraphAsset — the soft-body chassis. Mirrored by
+  // BeamGraphAsset::load_from_json in VehicleAssetGateTests.cpp.
+  const beamAsset = await request("tools/call", {
+    name: "author_vehicle_asset",
+    arguments: {
+      project: smokeProject, kind: "beam", name: "SoftCrawler",
+      mass: 900,
+      nodes: [
+        { position: [1.2, 0, 0.8] }, { position: [1.2, 0, -0.8] },
+        { position: [-1.2, 0, 0.8] }, { position: [-1.2, 0, -0.8] },
+        { position: [0, 1, 0], fixed: true }
+      ],
+      beams: [
+        { a: 0, b: 1, stiffness: 0.95 }, { a: 1, b: 3, stiffness: 0.9 },
+        { a: 3, b: 2, stiffness: 0.95 }, { a: 2, b: 0, stiffness: 0.9 },
+        { a: 0, b: 4 }, { a: 1, b: 4 }, { a: 2, b: 4 }, { a: 3, b: 4 }
+      ],
+      wheels: [{ node: 0, steering: true, driven: true, wheel: { radius: 0.4, suspension_rest_length: 0.5, max_drive_force: 3200 } }],
+      solver: { substeps: 3, solver_iterations: 12, stiffness: 0.85, damping: 0.15, gravity: [0, -9.81, 0] }
+    }
+  });
+  assert.equal(beamAsset.result.isError, undefined, JSON.stringify(beamAsset));
+  const beamPayload = JSON.parse(beamAsset.result.content[0].text);
+  assert.equal(beamPayload.created, true);
+  assert.equal(beamPayload.diagnostics.length, 0, JSON.stringify(beamPayload));
+  assert.ok(fs.existsSync(path.join(smokeProjectPath, "Content", "Vehicles", "SoftCrawler.json")));
+
+  // §17 item 12 validation: a wheel with radius <= 0 is refused (all-or-nothing).
+  const badVehicle = await request("tools/call", {
+    name: "author_vehicle_asset",
+    arguments: {
+      project: smokeProject, kind: "vehicle", name: "BrokenWheel",
+      chassis: { shape: "box", half_extents: [1, 0.4, 0.6], mass: 1000 },
+      wheels: [{ localPosition: [0, 0, 0], radius: 0 }],
+      drivetrain: { engine_min_rpm: 1000, engine_max_rpm: 6000, differential_ratio: 3.42, gear_ratios: [2.66] }
+    }
+  });
+  assert.equal(badVehicle.result.isError, undefined, JSON.stringify(badVehicle));
+  const badVehiclePayload = JSON.parse(badVehicle.result.content[0].text);
+  assert.equal(badVehiclePayload.refused, true, JSON.stringify(badVehiclePayload));
+  assert.ok(badVehiclePayload.diagnostics.some((d) => String(d).includes("radius")), JSON.stringify(badVehiclePayload));
+  assert.ok(!fs.existsSync(path.join(smokeProjectPath, "Content", "Vehicles", "BrokenWheel.json")));
+
+  // A beam referencing an invalid node is refused.
+  const badBeam = await request("tools/call", {
+    name: "author_vehicle_asset",
+    arguments: {
+      project: smokeProject, kind: "beam", name: "BrokenBeam",
+      nodes: [{ position: [0, 0, 0] }],
+      beams: [{ a: 0, b: 7, stiffness: 0.9 }]
+    }
+  });
+  assert.equal(badBeam.result.isError, undefined, JSON.stringify(badBeam));
+  const badBeamPayload = JSON.parse(badBeam.result.content[0].text);
+  assert.equal(badBeamPayload.refused, true, JSON.stringify(badBeamPayload));
+  assert.ok(badBeamPayload.diagnostics.some((d) => String(d).includes("invalid node")), JSON.stringify(badBeamPayload));
+
+  // The exported JSON Schema covers both vehicle kinds and the emitted
+  // documents validate against it (editor/IDE/CI consumption).
+  assert.ok(capabilitiesPayload.vehicle_schemas, "game_capabilities exposes vehicle_schemas");
+  for (const kind of ["vehicle", "beam"]) {
+    const schema = capabilitiesPayload.vehicle_schemas[kind];
+    assert.ok(schema, `vehicle schema for '${kind}'`);
+    assert.equal(schema.$schema, "http://json-schema.org/draft-07/schema#");
+    assert.equal(schema.type, "object");
+    assert.ok(schema.properties.version, `'${kind}' vehicle schema declares version`);
+  }
+  for (const [kind, name] of [["vehicle", "Pickup"], ["beam", "SoftCrawler"]]) {
+    const file = path.join(smokeProjectPath, "Content", "Vehicles", `${name}.json`);
+    const document = JSON.parse(fs.readFileSync(file, "utf8"));
+    const schemaErrors = validateJsonSchema(document, capabilitiesPayload.vehicle_schemas[kind]);
+    assert.equal(schemaErrors.length, 0, `${kind}/${name}: ${schemaErrors.join("; ")}`);
+  }
+
+  // The project validation covers vehicle assets and they are listed.
+  const inspectVehicles = await request("tools/call", {
+    name: "inspect_vehicle_assets",
+    arguments: { project: smokeProject }
+  });
+  const inspectVehiclesPayload = JSON.parse(inspectVehicles.result.content[0].text);
+  assert.equal(inspectVehiclesPayload.count, 2);
+  assert.ok(inspectVehiclesPayload.vehicle_assets.every((asset) => asset.valid), JSON.stringify(inspectVehiclesPayload));
+
+  // The CLI-authored CliStone auto-fills its drop to an unknown item (the
+  // registry mirror flags it), so remove it before the final validation — the
+  // vehicle assets themselves must validate clean.
+  fs.rmSync(path.join(smokeProjectPath, "Content", "Registry", "block", "CliStone.json"), { force: true });
+  const vehiclesValidation = await request("tools/call", {
+    name: "validate_game_project",
+    arguments: { project: smokeProject }
+  });
+  const vehiclesValidationPayload = JSON.parse(vehiclesValidation.result.content[0].text);
+  assert.equal(vehiclesValidationPayload.valid, true, JSON.stringify(vehiclesValidationPayload));
+  assert.ok(vehiclesValidationPayload.vehicle_assets >= 2);
 
   process.stdout.write("MCP protocol smoke test passed\n");
 } finally {

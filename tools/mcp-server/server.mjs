@@ -7,6 +7,7 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { callSemanticTool, semanticToolDefinitions } from "./game-authoring.mjs";
+import { callControlApiTool, controlApiToolDefinitions } from "./control-api.mjs";
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ENGINE_ROOT = path.resolve(SERVER_DIR, "..", "..");
@@ -441,6 +442,7 @@ function buildGameTool(args) {
 
 const TOOLS = [
   ...semanticToolDefinitions(),
+  ...controlApiToolDefinitions(),
   {
     name: "engine_overview",
     description: "Return a compact map of VulkanCraft engine modules, CMake targets, authoritative documents, and the concurrency rule.",
@@ -610,6 +612,8 @@ const RESOURCE_MAP = new Map([
 async function toolCall(name, args = {}) {
   const semanticResult = callSemanticTool(ENGINE_ROOT, name, args);
   if (semanticResult !== undefined) return { content: jsonText(semanticResult) };
+  const controlApiResult = await callControlApiTool(name, args);
+  if (controlApiResult !== undefined) return { content: jsonText(controlApiResult) };
   switch (name) {
     case "engine_overview": return { content: jsonText(engineOverview()) };
     case "engine_pending_work": return { content: jsonText(pendingStatus()) };

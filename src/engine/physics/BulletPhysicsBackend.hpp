@@ -24,6 +24,8 @@ public:
     bool get_state(BodyHandle body, glm::vec3& position, glm::quat& rotation,
                    glm::vec3& linearVelocity, glm::vec3& angularVelocity, bool& sleeping) const override;
     void set_linear_velocity(BodyHandle body, const glm::vec3& velocity) override;
+    void set_velocity(BodyHandle body, const glm::vec3& linearVelocity,
+                      const glm::vec3& angularVelocity) override;
     void set_gravity_scale(BodyHandle body, float scale) override;
     void set_linear_damping(BodyHandle body, float damping) override;
 

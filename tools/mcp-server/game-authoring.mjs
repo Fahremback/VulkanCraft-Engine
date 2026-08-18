@@ -45,6 +45,83 @@ export const SCRIPT_NODE_KINDS = Object.freeze([
 // unchanged (proved by tests/McpRegistryGateTests.cpp).
 export const REGISTRY_KINDS = Object.freeze(["block", "item", "fluid", "recipe", "biome", "structure"]);
 
+// Vehicle assembly asset kinds (FALTANTES §17 item 12): the MCP authors a
+// vehicle (rigid wheeled chassis, `VehicleAsset`) or a beam chassis
+// (node/beam deformable, `BeamGraphAsset`) as a versioned JSON document under
+// Content/Vehicles/<name>.json. Each document mirrors EXACTLY the versioned
+// JSON the public C++ factories parse (engine/vehicles/IVehicleAsset.hpp and
+// IBeamGraphAsset.hpp, implemented by src/engine/sdk/VehicleAsset.cpp and
+// BeamGraphAsset.cpp — all-or-nothing, never clamped), so an authored asset
+// loads through `VehicleAsset::load_from_json` / `BeamGraphAsset::load_from_json`
+// unchanged (proved by tests/VehicleAssetGateTests.cpp).
+export const VEHICLE_KINDS = Object.freeze(["vehicle", "beam"]);
+const VEHICLE_SHAPES = new Set(["box", "sphere", "capsule"]);
+const VEHICLE_KIND_ENUM = new Set(["wheeled", "motorcycle", "tracked"]);
+const PROPULSION_KINDS = new Set(["wing", "thruster", "buoyancy"]);
+
+// Compact field contracts surfaced by game_capabilities so an agent can author
+// a vehicle assembly without reading the engine source. Single source for the
+// exported JSON Schema (buildVehicleJsonSchema) and the author tool.
+export const VEHICLE_FIELD_SCHEMAS = Object.freeze({
+  vehicle: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "id", type: "string", required: false, description: "persistent UUID; derived from 'vehicles:<name>' when omitted" },
+    { name: "version", type: "integer", required: false, default: 1 },
+    { name: "provider", type: "enum", values: ["jolt", "chrono", "jsbsim"], required: false, default: "jolt", description: "physics provider (item 5/6): only jolt is vendored — chrono/jsbsim are refused at creation (never a silent fallback)" },
+    { name: "kind", type: "enum", values: [...VEHICLE_KIND_ENUM], required: false, default: "wheeled", description: "Jolt controller family: car / motorcycle / tracked" },
+    { name: "position", type: "array[3]", required: false, default: [0, 0, 0], description: "assembly (spawn) position of the chassis body" },
+    { name: "rotation", type: "array[4]", required: false, default: [0, 0, 0, 1], description: "assembly rotation quaternion [x, y, z, w]" },
+    { name: "chassis", type: "object", required: true, description: "{ shape: box|sphere|capsule, halfExtents: [x,y,z], radius, halfHeight, mass > 0, friction >= 0, restitution >= 0 }" },
+    { name: "wheels", type: "array[object]", required: true, description: "[{ localPosition: [x,y,z], radius > 0, suspensionRestLength > 0, suspensionTravel >= 0, springStrength >= 0, damperStrength >= 0, tireGrip >= 0, maxDriveForce >= 0, maxBrakeForce >= 0, maxSteerAngle >= 0, steering: bool, driven: bool }]" },
+    { name: "drivetrain", type: "object", required: true, description: "{ engineMaxTorque >= 0, engineMinRPM > 0, engineMaxRPM > engineMinRPM, differentialRatio > 0, gearRatios: [> 0] }" },
+    { name: "propulsion", type: "array[object]", required: false, default: [], description: "[{ kind: wing|thruster|buoyancy, localPosition, axis (non-zero), maxForce, area, liftCoefficient, fluidDensity, waterLevel }]" },
+    { name: "seats", type: "array[object]", required: false, default: [], description: "occupant seats (item 8): [{ name, localPosition, exitOffset }]" },
+    { name: "power", type: "object", required: false, description: "fuel/energy/controls (item 7): { fuel?: { capacity, initialLevel, burnPerSecond, idleBurnPerSecond, minLevelToRun }, energy?: { capacity, initialCharge, drawPerSecond, regenPerSecond, minChargeToRun }, controls?: { throttleDeadzone, throttleSensitivity, throttleInvert, steeringDeadzone, steeringSensitivity, steeringInvert, brakeDeadzone, brakeSensitivity } }" }
+  ],
+  beam: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "id", type: "string", required: false, description: "persistent UUID; derived from 'beams:<name>' when omitted" },
+    { name: "version", type: "integer", required: false, default: 1 },
+    { name: "provider", type: "enum", values: ["jolt", "chrono", "jsbsim"], required: false, default: "jolt", description: "physics provider (item 5/6): only jolt is vendored — chrono/jsbsim are refused at creation (never a silent fallback)" },
+    { name: "position", type: "array[3]", required: false, default: [0, 0, 0] },
+    { name: "rotation", type: "array[4]", required: false, default: [0, 0, 0, 1] },
+    { name: "mass", type: "number", required: false, default: 1200, description: "total chassis mass (kg), > 0" },
+    { name: "nodes", type: "array[object]", required: true, description: "mass points: [{ position: [x,y,z], fixed: bool }] (1..4096)" },
+    { name: "beams", type: "array[object]", required: true, description: "distance constraints: [{ a: int, b: int (valid node indices), stiffness in (0, 1] }]" },
+    { name: "wheels", type: "array[object]", required: false, default: [], description: "wheel mounts: [{ node: int, steering: bool, driven: bool, wheel: { localPosition, radius, suspensionRestLength, suspensionTravel, springStrength, damperStrength, tireGrip, maxDriveForce, maxBrakeForce, maxSteerAngle, steering, driven } }]" },
+    { name: "seats", type: "array[object]", required: false, default: [], description: "occupant seats (item 8)" },
+    { name: "power", type: "object", required: false, description: "fuel/energy/controls (item 7)" },
+    { name: "solver", type: "object", required: false, description: "XPBD solver config: { substeps: 1..16, solverIterations: 1..64, stiffness in (0, 1], damping in [0, 1), gravity: [x,y,z] (magnitude <= 1000) }" }
+  ]
+});
+
+// The authoring ARG names (snake_case) differ from the DOCUMENT keys
+// (camelCase — what the public C++ factories parse). Same mapping as
+// buildVehicleDocument, single source.
+const VEHICLE_DOC_KEYS = Object.freeze({
+  vehicle: {
+    half_extents: "halfExtents", half_height: "halfHeight",
+    suspension_rest_length: "suspensionRestLength", suspension_travel: "suspensionTravel",
+    spring_strength: "springStrength", damper_strength: "damperStrength",
+    tire_grip: "tireGrip", max_drive_force: "maxDriveForce", max_brake_force: "maxBrakeForce",
+    max_steer_angle: "maxSteerAngle", engine_max_torque: "engineMaxTorque",
+    engine_min_rpm: "engineMinRPM", engine_max_rpm: "engineMaxRPM",
+    differential_ratio: "differentialRatio", gear_ratios: "gearRatios",
+    local_position: "localPosition", max_force: "maxForce",
+    lift_coefficient: "liftCoefficient", fluid_density: "fluidDensity",
+    water_level: "waterLevel", exit_offset: "exitOffset",
+    initial_level: "initialLevel", burn_per_second: "burnPerSecond",
+    idle_burn_per_second: "idleBurnPerSecond", min_level_to_run: "minLevelToRun",
+    initial_charge: "initialCharge", draw_per_second: "drawPerSecond",
+    regen_per_second: "regenPerSecond", min_charge_to_run: "minChargeToRun",
+    throttle_deadzone: "throttleDeadzone", throttle_sensitivity: "throttleSensitivity",
+    throttle_invert: "throttleInvert", steering_deadzone: "steeringDeadzone",
+    steering_sensitivity: "steeringSensitivity", steering_invert: "steeringInvert",
+    brake_deadzone: "brakeDeadzone", brake_sensitivity: "brakeSensitivity"
+  },
+  beam: {}
+});
+
 // Mirrors BlockType::Count in src/simulation/voxel/core/Voxel.hpp (51).
 const MAX_BUILTIN_BLOCK_ID = 50;
 const BLOCK_CLASSES = new Set(["solid", "transparent", "nonsolid", "non_solid", "fluid"]);
@@ -256,6 +333,48 @@ export function buildRegistryJsonSchema(kind) {
   };
 }
 
+// JSON Schema (draft-07) for one vehicle-assembly kind, generated from the
+// SAME VEHICLE_FIELD_SCHEMAS contracts the author tool mirrors against — the
+// artifact the editor/IDE, scripting and CI consume (FALTANTES §17 item 12).
+// The C++ factories ignore unknown fields, so additionalProperties stays
+// permissive; required/type/enum mirror the all-or-nothing validation.
+export function buildVehicleJsonSchema(kind) {
+  const fields = VEHICLE_FIELD_SCHEMAS[kind];
+  if (!fields) throw new Error(`unsupported vehicle kind '${kind}'`);
+  const docKeys = VEHICLE_DOC_KEYS[kind] ?? {};
+  const properties = {};
+  const required = [];
+  for (const field of fields) {
+    const docKey = docKeys[field.name] ?? field.name;
+    let schema = { description: field.description ?? `"${field.name}" vehicle field` };
+    if (field.default !== undefined) schema.default = field.default;
+    switch (field.type) {
+      case "string": schema.type = "string"; break;
+      case "boolean": schema.type = "boolean"; break;
+      case "number": schema.type = "number"; break;
+      case "integer": schema.type = "integer"; break;
+      case "enum": schema.enum = [...field.values]; break;
+      case "object": schema.type = "object"; break;
+      case "array": schema.type = "array"; break;
+      case "array[object]": schema.type = "array"; schema.items = { type: "object" }; break;
+      case "array[3]": schema.type = "array"; schema.minItems = 3; schema.maxItems = 3; schema.items = { type: "number" }; break;
+      case "array[4]": schema.type = "array"; schema.minItems = 4; schema.maxItems = 4; schema.items = { type: "number" }; break;
+      default: throw new Error(`unknown vehicle field type '${field.type}' in ${kind} schema`);
+    }
+    properties[docKey] = schema;
+    if (field.required) required.push(docKey);
+  }
+  return {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    $id: `https://vulkancraft.engine/schema/vehicles/${kind}.json`,
+    title: `${kind} vehicle assembly`,
+    type: "object",
+    additionalProperties: true,
+    properties,
+    ...(required.length > 0 ? { required } : {})
+  };
+}
+
 const PROJECT_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const PROFILE_NAMES = new Set(["Debug", "Development", "Shipping", "Server", "Editor"]);
 const PLATFORM_NAMES = new Set(["windows-x64", "linux-x64", "macos-universal", "dedicated-server"]);
@@ -317,7 +436,8 @@ function projectPaths(engineRoot, projectName) {
     materials: path.join(root, "Content", "Materials"),
     audioEvents: path.join(root, "Content", "AudioEvents"),
     physicsMaterials: path.join(root, "Content", "PhysicsMaterials"),
-    registry: path.join(root, "Content", "Registry")
+    registry: path.join(root, "Content", "Registry"),
+    vehicles: path.join(root, "Content", "Vehicles")
   };
 }
 
@@ -395,7 +515,9 @@ function capabilityDocument() {
       "add/update/remove components", "author visual scripts", "stage source assets", "validate projects"
       , "author materials", "author audio events", "author physics materials",
       "author registry assets (blocks/items/fluids/recipes/biomes/structures)",
-      "inspect registry assets", "dry-run registry asset updates"
+      "inspect registry assets", "dry-run registry asset updates",
+      "author vehicle assemblies (rigid VehicleAsset / beam BeamGraphAsset)",
+      "inspect vehicle assemblies", "dry-run vehicle assembly updates"
     ],
     components: COMPONENT_SCHEMAS,
     light_types: { Directional: 0, Point: 1, Spot: 2, Area: 3 },
@@ -405,6 +527,22 @@ function capabilityDocument() {
       file: `Content/Registry/${kind}/<name>.json`,
       fields: REGISTRY_FIELD_SCHEMAS[kind]
     })),
+    // Vehicle assembly assets (FALTANTES §17 item 12): rigid VehicleAsset
+    // (chassis/wheels/drivetrain/propulsion) and beam BeamGraphAsset
+    // (nodes/beams/wheel mounts) under Content/Vehicles/<name>.json.
+    vehicle_asset_kinds: VEHICLE_KINDS.map((kind) => ({
+      kind,
+      file: `Content/Vehicles/<name>.json`,
+      fields: VEHICLE_FIELD_SCHEMAS[kind]
+    })),
+    vehicle_schemas: Object.fromEntries(
+      VEHICLE_KINDS.map((kind) => [kind, buildVehicleJsonSchema(kind)])
+    ),
+    vehicle_validation: {
+      note: "Each document mirrors exactly the versioned JSON the public C++ factories parse (VehicleAsset::load_from_json / BeamGraphAsset::load_from_json, implemented by src/engine/sdk/VehicleAsset.cpp and BeamGraphAsset.cpp); the MCP validates structure only — the runtime validates the same document again on load (all-or-nothing).",
+      dry_run: "author_vehicle_asset accepts dry_run: true to validate and preview the document/diff without writing.",
+      rollback: "Updates return the previous document; re-authoring it with update: true restores the prior state."
+    },
     // Full JSON Schema (draft-07) per registry kind (FALTANTES item 10): the
     // editor/IDE, scripting and CI validate or auto-complete assets against
     // these; they are generated from REGISTRY_FIELD_SCHEMAS, the same
@@ -713,6 +851,98 @@ export function semanticToolDefinitions() {
       }
     },
     {
+      name: "author_vehicle_asset",
+      description: "Author a vehicle assembly (vehicle = rigid wheeled VehicleAsset; beam = node/beam deformable BeamGraphAsset) as a versioned JSON document in Content/Vehicles/, mirroring exactly the public C++ vehicle JSON schemas. Validates structure against the public contracts; dry_run previews the document/diff without writing; update replaces an existing asset and returns the previous document for rollback.",
+      inputSchema: {
+        type: "object",
+        required: ["project", "kind", "name"],
+        properties: {
+          project: { type: "string" },
+          kind: { type: "string", enum: VEHICLE_KINDS },
+          name: { type: "string", minLength: 1, description: "asset name (becomes the file name)" },
+          dry_run: { type: "boolean", default: false },
+          update: { type: "boolean", default: false },
+          id: { type: "string" },
+          version: { type: "integer", default: 1 },
+          provider: { type: "string", enum: ["jolt", "chrono", "jsbsim"], default: "jolt", description: "physics provider (items 5/6): only jolt is vendored — chrono/jsbsim refused at creation" },
+          // vehicle (rigid) — the Jolt controller family of a rigid vehicle
+          vehicle_kind: { type: "string", enum: [...VEHICLE_KIND_ENUM], description: "Jolt controller family (wheeled|motorcycle|tracked) for kind=vehicle" },
+          position: { type: "array", items: { type: "number" } },
+          rotation: { type: "array", items: { type: "number" } },
+          chassis: {
+            type: "object", properties: {
+              shape: { type: "string", enum: [...VEHICLE_SHAPES] }, half_extents: { type: "array", items: { type: "number" } },
+              halfExtents: { type: "array", items: { type: "number" } }, radius: { type: "number" }, half_height: { type: "number" },
+              halfHeight: { type: "number" }, mass: { type: "number" }, friction: { type: "number" }, restitution: { type: "number" }
+            }, additionalProperties: false
+          },
+          wheels: {
+            type: "array", items: {
+              type: "object", properties: {
+                localPosition: { type: "array", items: { type: "number" } }, radius: { type: "number" },
+                suspension_rest_length: { type: "number" }, suspensionRestLength: { type: "number" },
+                suspension_travel: { type: "number" }, suspensionTravel: { type: "number" },
+                spring_strength: { type: "number" }, springStrength: { type: "number" },
+                damper_strength: { type: "number" }, damperStrength: { type: "number" },
+                tire_grip: { type: "number" }, tireGrip: { type: "number" },
+                max_drive_force: { type: "number" }, maxDriveForce: { type: "number" },
+                max_brake_force: { type: "number" }, maxBrakeForce: { type: "number" },
+                max_steer_angle: { type: "number" }, maxSteerAngle: { type: "number" },
+                steering: { type: "boolean" }, driven: { type: "boolean" }
+              }, additionalProperties: false
+            }
+          },
+          drivetrain: {
+            type: "object", properties: {
+              engine_max_torque: { type: "number" }, engineMaxTorque: { type: "number" },
+              engine_min_rpm: { type: "number" }, engineMinRPM: { type: "number" },
+              engine_max_rpm: { type: "number" }, engineMaxRPM: { type: "number" },
+              differential_ratio: { type: "number" }, differentialRatio: { type: "number" },
+              gear_ratios: { type: "array", items: { type: "number" } }, gearRatios: { type: "array", items: { type: "number" } }
+            }, additionalProperties: false
+          },
+          propulsion: {
+            type: "array", items: {
+              type: "object", properties: {
+                kind: { type: "string", enum: [...PROPULSION_KINDS] }, localPosition: { type: "array", items: { type: "number" } },
+                axis: { type: "array", items: { type: "number" } }, max_force: { type: "number" }, maxForce: { type: "number" },
+                area: { type: "number" }, lift_coefficient: { type: "number" }, liftCoefficient: { type: "number" },
+                fluid_density: { type: "number" }, fluidDensity: { type: "number" }, water_level: { type: "number" }, waterLevel: { type: "number" }
+              }, additionalProperties: false
+            }
+          },
+          seats: {
+            type: "array", items: {
+              type: "object", properties: {
+                name: { type: "string" }, localPosition: { type: "array", items: { type: "number" } },
+                exitOffset: { type: "array", items: { type: "number" } }
+              }, additionalProperties: false
+            }
+          },
+          power: {
+            type: "object", properties: {
+              fuel: { type: "object", properties: { capacity: { type: "number" }, initial_level: { type: "number" }, initialLevel: { type: "number" }, burn_per_second: { type: "number" }, burnPerSecond: { type: "number" }, idle_burn_per_second: { type: "number" }, idleBurnPerSecond: { type: "number" }, min_level_to_run: { type: "number" }, minLevelToRun: { type: "number" } }, additionalProperties: false },
+              energy: { type: "object", properties: { capacity: { type: "number" }, initial_charge: { type: "number" }, initialCharge: { type: "number" }, draw_per_second: { type: "number" }, drawPerSecond: { type: "number" }, regen_per_second: { type: "number" }, regenPerSecond: { type: "number" }, min_charge_to_run: { type: "number" }, minChargeToRun: { type: "number" } }, additionalProperties: false },
+              controls: { type: "object", properties: { throttle_deadzone: { type: "number" }, throttleDeadzone: { type: "number" }, throttle_sensitivity: { type: "number" }, throttleSensitivity: { type: "number" }, throttle_invert: { type: "boolean" }, throttleInvert: { type: "boolean" }, steering_deadzone: { type: "number" }, steeringDeadzone: { type: "number" }, steering_sensitivity: { type: "number" }, steeringSensitivity: { type: "number" }, steering_invert: { type: "boolean" }, steeringInvert: { type: "boolean" }, brake_deadzone: { type: "number" }, brakeDeadzone: { type: "number" }, brake_sensitivity: { type: "number" }, brakeSensitivity: { type: "number" } }, additionalProperties: false }
+            }, additionalProperties: false
+          },
+          // beam (node/beam deformable)
+          mass: { type: "number" },
+          nodes: { type: "array", items: { type: "object", properties: { position: { type: "array", items: { type: "number" } }, fixed: { type: "boolean" } }, additionalProperties: false } },
+          beams: { type: "array", items: { type: "object", properties: { a: { type: "integer" }, b: { type: "integer" }, stiffness: { type: "number" } }, additionalProperties: false } },
+          solver: { type: "object", properties: { substeps: { type: "integer" }, solver_iterations: { type: "integer" }, solverIterations: { type: "integer" }, stiffness: { type: "number" }, damping: { type: "number" }, gravity: { type: "array", items: { type: "number" } } }, additionalProperties: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_vehicle_assets",
+      description: "List and validate every vehicle assembly asset (rigid vehicle / beam) under Content/Vehicles for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
       name: "validate_game_project",
       description: "Validate the portable project, scenes, entity UUIDs, components, hierarchy, scripts, registry assets, and asset metadata without compiling the engine.",
       inputSchema: {
@@ -741,6 +971,8 @@ export function callSemanticTool(engineRoot, name, args = {}) {
     case "stage_asset": return stageAsset(engineRoot, args);
     case "author_registry_asset": return authorRegistryAsset(engineRoot, args);
     case "inspect_registry_assets": return inspectRegistryAssets(engineRoot, args.project);
+    case "author_vehicle_asset": return authorVehicleAsset(engineRoot, args);
+    case "inspect_vehicle_assets": return inspectVehicleAssets(engineRoot, args.project);
     case "validate_game_project": return validateProject(engineRoot, args.project);
     default: return undefined;
   }
@@ -769,7 +1001,7 @@ function createProject(engineRoot, args) {
   if (!PROFILE_NAMES.has(profile)) throw new Error(`unsupported profile '${profile}'`);
   if (!PLATFORM_NAMES.has(platform)) throw new Error(`unsupported platform '${platform}'`);
 
-  for (const directory of [paths.content, paths.scenes, paths.scripts, paths.assets, paths.materials, paths.audioEvents, paths.physicsMaterials, paths.registry, path.join(paths.root, "Config"), path.join(paths.root, "Intermediate"), path.join(paths.root, "Build")]) {
+  for (const directory of [paths.content, paths.scenes, paths.scripts, paths.assets, paths.materials, paths.audioEvents, paths.physicsMaterials, paths.registry, paths.vehicles, path.join(paths.root, "Config"), path.join(paths.root, "Intermediate"), path.join(paths.root, "Build")]) {
     fs.mkdirSync(directory, { recursive: true });
   }
   const scene = createEmptyScene(initialScene);
@@ -813,6 +1045,7 @@ function inspectProject(engineRoot, projectName) {
     scenes: files(paths.scenes, ".scene"),
     scripts: [...files(paths.scripts, ".script"), ...files(paths.scenes, ".script")],
     assets: fs.existsSync(paths.assets) ? fs.readdirSync(paths.assets, { withFileTypes: true }).filter((entry) => entry.isFile() && !entry.name.endsWith(".import.json")).map((entry) => entry.name).sort() : [],
+    vehicles: files(paths.vehicles, ".json"),
     validation: validateProject(engineRoot, paths.project)
   };
 }
@@ -1501,6 +1734,432 @@ function buildRegistryDocument(kind, args) {
   throw new Error(`unsupported registry kind '${kind}'`);
 }
 
+// --- vehicle assembly authoring (FALTANTES §17 item 12) ----------------------
+
+const finiteNumber = (value) => typeof value === "number" && Number.isFinite(value);
+const finiteVec = (value, size) => Array.isArray(value) && value.length === size && value.every(finiteNumber);
+const finiteQuat = (value) => finiteVec(value, 4);
+
+// Wheel component document — the exact camelCase keys VehicleAsset/
+// BeamGraphAsset parse (mirrors emit_wheel in both SDK adapters).
+function buildVehicleWheel(args, fallback = {}) {
+  const wheel = {
+    localPosition: finiteVec(args.localPosition, 3) ? [...args.localPosition] : (finiteVec(fallback.localPosition, 3) ? [...fallback.localPosition] : [0, 0, 0]),
+    radius: args.radius !== undefined ? Number(args.radius) : (fallback.radius ?? 0.36),
+    suspensionRestLength: args.suspension_rest_length !== undefined ? Number(args.suspension_rest_length) : (fallback.suspensionRestLength ?? 0.45),
+    suspensionTravel: args.suspension_travel !== undefined ? Number(args.suspension_travel) : (fallback.suspensionTravel ?? 0.18),
+    springStrength: args.spring_strength !== undefined ? Number(args.spring_strength) : (fallback.springStrength ?? 26000.0),
+    damperStrength: args.damper_strength !== undefined ? Number(args.damper_strength) : (fallback.damperStrength ?? 3200.0),
+    tireGrip: args.tire_grip !== undefined ? Number(args.tire_grip) : (fallback.tireGrip ?? 1.35),
+    maxDriveForce: args.max_drive_force !== undefined ? Number(args.max_drive_force) : (fallback.maxDriveForce ?? 4200.0),
+    maxBrakeForce: args.max_brake_force !== undefined ? Number(args.max_brake_force) : (fallback.maxBrakeForce ?? 6000.0),
+    maxSteerAngle: args.max_steer_angle !== undefined ? Number(args.max_steer_angle) : (fallback.maxSteerAngle ?? 0.55),
+    steering: args.steering !== undefined ? Boolean(args.steering) : (fallback.steering ?? false),
+    driven: args.driven !== undefined ? Boolean(args.driven) : (fallback.driven ?? true)
+  };
+  return wheel;
+}
+
+function buildVehiclePower(args) {
+  const power = {};
+  const fuel = args.fuel ?? {};
+  power.fuel = {
+    capacity: Number(fuel.capacity ?? 0),
+    initialLevel: Number(fuel.initial_level ?? fuel.initialLevel ?? 1.0),
+    burnPerSecond: Number(fuel.burn_per_second ?? fuel.burnPerSecond ?? 0.05),
+    idleBurnPerSecond: Number(fuel.idle_burn_per_second ?? fuel.idleBurnPerSecond ?? 0.0),
+    minLevelToRun: Number(fuel.min_level_to_run ?? fuel.minLevelToRun ?? 0.0)
+  };
+  const energy = args.energy ?? {};
+  power.energy = {
+    capacity: Number(energy.capacity ?? 0),
+    initialCharge: Number(energy.initial_charge ?? energy.initialCharge ?? 1.0),
+    drawPerSecond: Number(energy.draw_per_second ?? energy.drawPerSecond ?? 0.0),
+    regenPerSecond: Number(energy.regen_per_second ?? energy.regenPerSecond ?? 0.0),
+    minChargeToRun: Number(energy.min_charge_to_run ?? energy.minChargeToRun ?? 0.0)
+  };
+  const controls = args.controls ?? {};
+  power.controls = {
+    throttleDeadzone: Number(controls.throttle_deadzone ?? controls.throttleDeadzone ?? 0.0),
+    throttleSensitivity: Number(controls.throttle_sensitivity ?? controls.throttleSensitivity ?? 1.0),
+    throttleInvert: Boolean(controls.throttle_invert ?? controls.throttleInvert ?? false),
+    steeringDeadzone: Number(controls.steering_deadzone ?? controls.steeringDeadzone ?? 0.0),
+    steeringSensitivity: Number(controls.steering_sensitivity ?? controls.steeringSensitivity ?? 1.0),
+    steeringInvert: Boolean(controls.steering_invert ?? controls.steeringInvert ?? false),
+    brakeDeadzone: Number(controls.brake_deadzone ?? controls.brakeDeadzone ?? 0.0),
+    brakeSensitivity: Number(controls.brake_sensitivity ?? controls.brakeSensitivity ?? 1.0)
+  };
+  return power;
+}
+
+function buildVehicleSeats(args) {
+  return (args.seats ?? []).map((seat) => ({
+    name: String(seat.name ?? ""),
+    localPosition: finiteVec(seat.localPosition, 3) ? [...seat.localPosition] : (finiteVec(seat.local_position, 3) ? [...seat.local_position] : [0, 0, 0]),
+    exitOffset: finiteVec(seat.exitOffset, 3) ? [...seat.exitOffset] : (finiteVec(seat.exit_offset, 3) ? [...seat.exit_offset] : [0, 1.2, 1.0])
+  }));
+}
+
+// Builds the exact camelCase document the public C++ factory parses.
+function buildVehicleDocument(kind, args) {
+  if (kind === "vehicle") {
+    const chassisArgs = args.chassis ?? {};
+    const document = {
+      name: String(args.name),
+      version: args.version !== undefined ? Number(args.version) : 1,
+      provider: String(args.provider ?? "jolt"),
+      kind: String(args.vehicle_kind ?? "wheeled"),
+      position: finiteVec(args.position, 3) ? [...args.position] : [0, 0, 0],
+      rotation: finiteVec(args.rotation, 4) ? [...args.rotation] : [0, 0, 0, 1],
+      chassis: {
+        shape: String(chassisArgs.shape ?? "box"),
+        halfExtents: finiteVec(chassisArgs.halfExtents, 3) ? [...chassisArgs.halfExtents] : (finiteVec(chassisArgs.half_extents, 3) ? [...chassisArgs.half_extents] : [0.9, 0.35, 0.56]),
+        radius: Number(chassisArgs.radius ?? 0.5),
+        halfHeight: Number(chassisArgs.half_height ?? chassisArgs.halfHeight ?? 0.65),
+        mass: Number(chassisArgs.mass ?? 1200.0),
+        friction: Number(chassisArgs.friction ?? 0.55),
+        restitution: Number(chassisArgs.restitution ?? 0.05)
+      },
+      wheels: (args.wheels ?? []).map((wheel) => buildVehicleWheel(wheel)),
+      drivetrain: {
+        engineMaxTorque: Number(args.drivetrain?.engine_max_torque ?? args.drivetrain?.engineMaxTorque ?? 0),
+        engineMinRPM: Number(args.drivetrain?.engine_min_rpm ?? args.drivetrain?.engineMinRPM ?? 1000.0),
+        engineMaxRPM: Number(args.drivetrain?.engine_max_rpm ?? args.drivetrain?.engineMaxRPM ?? 6000.0),
+        differentialRatio: Number(args.drivetrain?.differential_ratio ?? args.drivetrain?.differentialRatio ?? 3.42),
+        gearRatios: (args.drivetrain?.gear_ratios ?? args.drivetrain?.gearRatios ?? [2.66, 1.78, 1.3, 1.0, 0.74]).map(Number)
+      },
+      propulsion: (args.propulsion ?? []).map((module) => ({
+        kind: String(module.kind ?? "thruster"),
+        localPosition: finiteVec(module.localPosition, 3) ? [...module.localPosition] : (finiteVec(module.local_position, 3) ? [...module.local_position] : [0, 0, 0]),
+        axis: finiteVec(module.axis, 3) ? [...module.axis] : [0, 1, 0],
+        maxForce: Number(module.max_force ?? module.maxForce ?? 1000.0),
+        area: Number(module.area ?? 4.0),
+        liftCoefficient: Number(module.lift_coefficient ?? module.liftCoefficient ?? 0.8),
+        fluidDensity: Number(module.fluid_density ?? module.fluidDensity ?? 1000.0),
+        waterLevel: Number(module.water_level ?? module.waterLevel ?? 0.0)
+      })),
+      seats: buildVehicleSeats(args),
+      power: buildVehiclePower(args)
+    };
+    if (args.id !== undefined) document.id = String(args.id);
+    return document;
+  }
+  if (kind === "beam") {
+    const document = {
+      name: String(args.name),
+      version: args.version !== undefined ? Number(args.version) : 1,
+      provider: String(args.provider ?? "jolt"),
+      position: finiteVec(args.position, 3) ? [...args.position] : [0, 0, 0],
+      rotation: finiteVec(args.rotation, 4) ? [...args.rotation] : [0, 0, 0, 1],
+      mass: Number(args.mass ?? 1200.0),
+      nodes: (args.nodes ?? []).map((node) => ({
+        position: finiteVec(node.position, 3) ? [...node.position] : [0, 0, 0],
+        fixed: Boolean(node.fixed ?? false)
+      })),
+      beams: (args.beams ?? []).map((beam) => ({
+        a: Number(beam.a ?? 0),
+        b: Number(beam.b ?? 0),
+        stiffness: Number(beam.stiffness ?? 0.9)
+      })),
+      wheels: (args.wheels ?? []).map((mount) => ({
+        node: Number(mount.node ?? 0),
+        steering: Boolean(mount.steering ?? true),
+        driven: Boolean(mount.driven ?? true),
+        wheel: buildVehicleWheel(mount.wheel ?? {}, mount.wheel ?? {})
+      })),
+      seats: buildVehicleSeats(args),
+      power: buildVehiclePower(args),
+      solver: {
+        substeps: Number(args.solver?.substeps ?? 2),
+        solverIterations: Number(args.solver?.solver_iterations ?? args.solver?.solverIterations ?? 8),
+        stiffness: Number(args.solver?.stiffness ?? 0.8),
+        damping: Number(args.solver?.damping ?? 0.1),
+        gravity: finiteVec(args.solver?.gravity, 3) ? [...args.solver.gravity] : [0, -9.81, 0]
+      }
+    };
+    if (args.id !== undefined) document.id = String(args.id);
+    return document;
+  }
+  throw new Error(`unsupported vehicle kind '${kind}'`);
+}
+
+// Structured validation mirroring the public C++ factories (VehicleAsset::
+// load_from_json / BeamGraphAsset::load_from_json — all-or-nothing, never
+// clamp or guess). Returns { valid, errors }.
+export function validateVehicleDocument(kind, document) {
+  const errors = [];
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
+    return { valid: false, errors: ["vehicle asset must be a JSON object"] };
+  }
+  if (document.version !== undefined && document.version !== 1) errors.push("vehicle asset 'version' must be 1");
+  if (typeof document.name !== "string" || !document.name) errors.push("vehicle asset 'name' is required");
+  // Physics provider (items 5/6): jolt|chrono|jsbsim — the document carries
+  // the asset's choice; chrono/jsbsim are refused at CREATION by the C++
+  // factory (never a silent fallback), which the mirror reflects by keeping
+  // the enum strict but NOT rejecting the document (it must round-trip).
+  if (document.provider !== undefined && !["jolt", "chrono", "jsbsim"].includes(String(document.provider))) {
+    errors.push("vehicle asset 'provider' must be jolt|chrono|jsbsim");
+  }
+  if (!finiteVec(document.position, 3)) errors.push("vehicle asset 'position' must be a finite [x,y,z] array");
+  if (!finiteQuat(document.rotation)) errors.push("vehicle asset 'rotation' must be a finite [x,y,z,w] array");
+  const failPower = (label, message) => errors.push(`vehicle asset ${label}: ${message}`);
+  const validateFuel = (fuel, label) => {
+    if (!fuel || typeof fuel !== "object") return failPower(label, "fuel must be an object");
+    for (const key of ["capacity", "initialLevel", "burnPerSecond", "idleBurnPerSecond", "minLevelToRun"]) {
+      if (!finiteNumber(fuel[key])) failPower(label, `fuel '${key}' must be finite`);
+    }
+    if (finiteNumber(fuel.capacity) && fuel.capacity < 0) failPower(label, "fuel capacity must be >= 0");
+    if (finiteNumber(fuel.burnPerSecond) && fuel.burnPerSecond < 0) failPower(label, "fuel burnPerSecond must be >= 0");
+    if (finiteNumber(fuel.idleBurnPerSecond) && fuel.idleBurnPerSecond < 0) failPower(label, "fuel idleBurnPerSecond must be >= 0");
+    if (finiteNumber(fuel.initialLevel) && (fuel.initialLevel < 0 || fuel.initialLevel > 1)) failPower(label, "fuel initialLevel must be in [0, 1]");
+    if (finiteNumber(fuel.minLevelToRun) && (fuel.minLevelToRun < 0 || fuel.minLevelToRun > 1)) failPower(label, "fuel minLevelToRun must be in [0, 1]");
+  };
+  const validateEnergy = (energy, label) => {
+    if (!energy || typeof energy !== "object") return failPower(label, "energy must be an object");
+    for (const key of ["capacity", "initialCharge", "drawPerSecond", "regenPerSecond", "minChargeToRun"]) {
+      if (!finiteNumber(energy[key])) failPower(label, `energy '${key}' must be finite`);
+    }
+    if (finiteNumber(energy.capacity) && energy.capacity < 0) failPower(label, "energy capacity must be >= 0");
+    if (finiteNumber(energy.drawPerSecond) && energy.drawPerSecond < 0) failPower(label, "energy drawPerSecond must be >= 0");
+    if (finiteNumber(energy.regenPerSecond) && energy.regenPerSecond < 0) failPower(label, "energy regenPerSecond must be >= 0");
+    if (finiteNumber(energy.initialCharge) && (energy.initialCharge < 0 || energy.initialCharge > 1)) failPower(label, "energy initialCharge must be in [0, 1]");
+    if (finiteNumber(energy.minChargeToRun) && (energy.minChargeToRun < 0 || energy.minChargeToRun > 1)) failPower(label, "energy minChargeToRun must be in [0, 1]");
+  };
+  const validateControls = (controls, label) => {
+    if (!controls || typeof controls !== "object") return failPower(label, "controls must be an object");
+    for (const key of ["throttleDeadzone", "throttleSensitivity", "steeringDeadzone", "steeringSensitivity", "brakeDeadzone", "brakeSensitivity"]) {
+      if (!finiteNumber(controls[key])) failPower(label, `controls '${key}' must be finite`);
+    }
+    for (const key of ["throttleDeadzone", "steeringDeadzone", "brakeDeadzone"]) {
+      if (finiteNumber(controls[key]) && (controls[key] < 0 || controls[key] > 1)) failPower(label, `controls '${key}' must be in [0, 1]`);
+    }
+    for (const key of ["throttleSensitivity", "steeringSensitivity", "brakeSensitivity"]) {
+      if (finiteNumber(controls[key]) && !(controls[key] > 0)) failPower(label, `controls '${key}' must be > 0`);
+    }
+  };
+  const validateWheel = (wheel, label) => {
+    if (!wheel || typeof wheel !== "object" || Array.isArray(wheel)) return errors.push(`vehicle asset ${label} must be an object`);
+    if (!finiteVec(wheel.localPosition, 3)) errors.push(`vehicle asset ${label} 'localPosition' must be a finite [x,y,z] array`);
+    for (const key of ["radius", "suspensionRestLength", "suspensionTravel", "springStrength", "damperStrength", "tireGrip", "maxDriveForce", "maxBrakeForce", "maxSteerAngle"]) {
+      if (!finiteNumber(wheel[key])) errors.push(`vehicle asset ${label} '${key}' must be finite`);
+    }
+    if (finiteNumber(wheel.radius) && !(wheel.radius > 0)) errors.push(`vehicle asset ${label} 'radius' must be > 0`);
+    if (finiteNumber(wheel.suspensionRestLength) && !(wheel.suspensionRestLength > 0)) errors.push(`vehicle asset ${label} 'suspensionRestLength' must be > 0`);
+    for (const key of ["suspensionTravel", "springStrength", "damperStrength", "tireGrip", "maxDriveForce", "maxBrakeForce", "maxSteerAngle"]) {
+      if (finiteNumber(wheel[key]) && wheel[key] < 0) errors.push(`vehicle asset ${label} '${key}' must be >= 0`);
+    }
+  };
+  const validateSeats = (seats) => {
+    (Array.isArray(seats) ? seats : []).forEach((seat, index) => {
+      if (!seat || typeof seat !== "object" || Array.isArray(seat)) return errors.push(`vehicle asset seat ${index} must be an object`);
+      if (!finiteVec(seat.localPosition, 3)) errors.push(`vehicle asset seat ${index} 'localPosition' must be a finite [x,y,z] array`);
+      if (!finiteVec(seat.exitOffset, 3)) errors.push(`vehicle asset seat ${index} 'exitOffset' must be a finite [x,y,z] array`);
+    });
+  };
+  const validatePower = (power) => {
+    if (power === undefined) return;
+    if (!power || typeof power !== "object" || Array.isArray(power)) return failPower("", "power must be an object");
+    if (power.fuel !== undefined) validateFuel(power.fuel, "power");
+    if (power.energy !== undefined) validateEnergy(power.energy, "power");
+    if (power.controls !== undefined) validateControls(power.controls, "power");
+  };
+  validatePower(document.power);
+  if (kind === "vehicle") {
+    if (!VEHICLE_KIND_ENUM.has(String(document.kind))) errors.push("vehicle asset 'kind' must be wheeled|motorcycle|tracked");
+    const chassis = document.chassis;
+    if (!chassis || typeof chassis !== "object" || Array.isArray(chassis)) return { valid: errors.length === 0, errors };
+    if (!VEHICLE_SHAPES.has(String(chassis.shape))) errors.push("vehicle asset chassis 'shape' must be box|sphere|capsule");
+    for (const key of ["mass", "friction", "restitution"]) {
+      if (!finiteNumber(chassis[key])) errors.push(`vehicle asset chassis '${key}' must be finite`);
+    }
+    if (finiteNumber(chassis.mass) && !(chassis.mass > 0)) errors.push("vehicle asset chassis 'mass' must be > 0");
+    if (finiteNumber(chassis.friction) && chassis.friction < 0) errors.push("vehicle asset chassis 'friction' must be >= 0");
+    if (finiteNumber(chassis.restitution) && chassis.restitution < 0) errors.push("vehicle asset chassis 'restitution' must be >= 0");
+    if (String(chassis.shape) === "box" && !(finiteVec(chassis.halfExtents, 3) && chassis.halfExtents.every((value) => value > 0))) {
+      errors.push("vehicle asset chassis 'halfExtents' must be [x,y,z] with all values > 0 for a box");
+    }
+    if (String(chassis.shape) === "sphere" && (!finiteNumber(chassis.radius) || !(chassis.radius > 0))) {
+      errors.push("vehicle asset chassis 'radius' must be > 0 for a sphere");
+    }
+    if (String(chassis.shape) === "capsule") {
+      if (!finiteNumber(chassis.radius) || !(chassis.radius > 0)) errors.push("vehicle asset chassis 'radius' must be > 0 for a capsule");
+      if (!finiteNumber(chassis.halfHeight) || !(chassis.halfHeight > 0)) errors.push("vehicle asset chassis 'halfHeight' must be > 0 for a capsule");
+    }
+    if (!Array.isArray(document.wheels) || document.wheels.length === 0) {
+      errors.push("vehicle asset needs at least one wheel");
+    } else {
+      document.wheels.forEach((wheel, index) => validateWheel(wheel, `wheel ${index}`));
+    }
+    const drivetrain = document.drivetrain;
+    if (!drivetrain || typeof drivetrain !== "object") {
+      errors.push("vehicle asset 'drivetrain' must be an object");
+    } else {
+      if (!finiteNumber(drivetrain.engineMaxTorque)) errors.push("vehicle asset drivetrain 'engineMaxTorque' must be finite");
+      if (finiteNumber(drivetrain.engineMaxTorque) && drivetrain.engineMaxTorque < 0) errors.push("vehicle asset drivetrain 'engineMaxTorque' must be >= 0");
+      if (!finiteNumber(drivetrain.engineMinRPM) || !(drivetrain.engineMinRPM > 0)) errors.push("vehicle asset drivetrain 'engineMinRPM' must be > 0");
+      if (!finiteNumber(drivetrain.engineMaxRPM) || !(drivetrain.engineMaxRPM > drivetrain.engineMinRPM)) errors.push("vehicle asset drivetrain 'engineMaxRPM' must exceed engineMinRPM");
+      if (!finiteNumber(drivetrain.differentialRatio) || !(drivetrain.differentialRatio > 0)) errors.push("vehicle asset drivetrain 'differentialRatio' must be > 0");
+      if (!Array.isArray(drivetrain.gearRatios) || drivetrain.gearRatios.length === 0) {
+        errors.push("vehicle asset drivetrain needs at least one gear ratio");
+      } else {
+        drivetrain.gearRatios.forEach((ratio, index) => {
+          if (!finiteNumber(ratio) || !(ratio > 0)) errors.push(`vehicle asset drivetrain gear ratio ${index} must be finite and > 0`);
+        });
+      }
+    }
+    (Array.isArray(document.propulsion) ? document.propulsion : []).forEach((module, index) => {
+      if (!module || typeof module !== "object" || Array.isArray(module)) return errors.push(`vehicle asset propulsion module ${index} must be an object`);
+      if (!PROPULSION_KINDS.has(String(module.kind))) errors.push(`vehicle asset propulsion module ${index} 'kind' must be wing|thruster|buoyancy`);
+      if (!finiteVec(module.localPosition, 3)) errors.push(`vehicle asset propulsion module ${index} 'localPosition' must be a finite [x,y,z] array`);
+      if (!finiteVec(module.axis, 3) || module.axis.every((value) => value === 0)) errors.push(`vehicle asset propulsion module ${index} 'axis' must be a finite non-zero [x,y,z] array`);
+      for (const key of ["maxForce", "area", "liftCoefficient", "fluidDensity"]) {
+        if (!finiteNumber(module[key]) || module[key] < 0) errors.push(`vehicle asset propulsion module ${index} '${key}' must be >= 0`);
+      }
+    });
+    validateSeats(document.seats);
+  } else if (kind === "beam") {
+    if (!finiteNumber(document.mass) || !(document.mass > 0)) errors.push("beam asset 'mass' must be finite and > 0");
+    if (!Array.isArray(document.nodes) || document.nodes.length === 0) {
+      errors.push("beam asset needs at least one node");
+    } else {
+      if (document.nodes.length > 4096) errors.push("beam asset node count exceeds 4096");
+      document.nodes.forEach((node, index) => {
+        if (!node || typeof node !== "object" || Array.isArray(node)) return errors.push(`beam asset node ${index} must be an object`);
+        if (!finiteVec(node.position, 3)) errors.push(`beam asset node ${index} 'position' must be a finite [x,y,z] array`);
+      });
+    }
+    if (!Array.isArray(document.beams) || document.beams.length === 0) {
+      errors.push("beam asset needs at least one beam");
+    } else {
+      document.beams.forEach((beam, index) => {
+        if (!beam || typeof beam !== "object" || Array.isArray(beam)) return errors.push(`beam asset beam ${index} must be an object`);
+        if (!Number.isInteger(beam.a) || !Number.isInteger(beam.b) || beam.a < 0 || beam.b < 0 || beam.a >= document.nodes.length || beam.b >= document.nodes.length) {
+          errors.push(`beam asset beam ${index} references an invalid node`);
+        }
+        if (!finiteNumber(beam.stiffness) || !(beam.stiffness > 0) || beam.stiffness > 1) errors.push(`beam asset beam ${index} 'stiffness' must be in (0, 1]`);
+      });
+    }
+    (Array.isArray(document.wheels) ? document.wheels : []).forEach((mount, index) => {
+      if (!mount || typeof mount !== "object" || Array.isArray(mount)) return errors.push(`beam asset wheel mount ${index} must be an object`);
+      if (!Number.isInteger(mount.node) || mount.node < 0 || mount.node >= document.nodes.length) errors.push(`beam asset wheel mount ${index} mounts an invalid node`);
+      validateWheel(mount.wheel, `wheel mount ${index}`);
+    });
+    validateSeats(document.seats);
+    const solver = document.solver;
+    if (solver !== undefined) {
+      if (!solver || typeof solver !== "object" || Array.isArray(solver)) errors.push("beam asset 'solver' must be an object");
+      else {
+        if (!Number.isInteger(solver.substeps) || solver.substeps < 1 || solver.substeps > 16) errors.push("beam asset solver 'substeps' must be an integer in [1, 16]");
+        if (!Number.isInteger(solver.solverIterations) || solver.solverIterations < 1 || solver.solverIterations > 64) errors.push("beam asset solver 'solverIterations' must be an integer in [1, 64]");
+        if (!finiteNumber(solver.stiffness) || !(solver.stiffness > 0) || solver.stiffness > 1) errors.push("beam asset solver 'stiffness' must be in (0, 1]");
+        if (!finiteNumber(solver.damping) || solver.damping < 0 || solver.damping >= 1) errors.push("beam asset solver 'damping' must be in [0, 1)");
+        if (!finiteVec(solver.gravity, 3)) errors.push("beam asset solver 'gravity' must be a finite [x,y,z] array");
+        else if (Math.hypot(...solver.gravity) > 1000) errors.push("beam asset solver 'gravity' magnitude must be <= 1000");
+      }
+    }
+  } else {
+    errors.push(`unsupported vehicle kind '${kind}'`);
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+function vehicleDiff(previous, document) {
+  const keys = new Set([...Object.keys(previous), ...Object.keys(document)]);
+  const changed = [...keys].filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(document[key])).sort();
+  return { changed_fields: changed };
+}
+
+function authorVehicleAsset(engineRoot, args) {
+  const project = requireProject(engineRoot, args.project);
+  const kind = String(args.kind);
+  if (!VEHICLE_KINDS.includes(kind)) throw new Error(`unsupported vehicle kind '${kind}' (supported: ${VEHICLE_KINDS.join(", ")})`);
+  const name = assetName(args.name);
+  const document = buildVehicleDocument(kind, args);
+  const validation = validateVehicleDocument(kind, document);
+  if (!validation.valid) {
+    return {
+      refused: true,
+      project: project.project,
+      kind,
+      name,
+      diagnostics: validation.errors,
+      reason: "vehicle asset fails public-contract validation; nothing was written"
+    };
+  }
+  const file = path.join(project.vehicles, `${name}.json`);
+  const previous = fs.existsSync(file) ? readJson(file) : null;
+  const diff = previous ? vehicleDiff(previous, document) : null;
+  const relative = path.relative(project.root, file).replaceAll(path.sep, "/");
+  if (args.dry_run) {
+    return {
+      dry_run: true,
+      would_write: relative,
+      project: project.project,
+      kind,
+      name,
+      document,
+      diagnostics: [],
+      diff
+    };
+  }
+  if (previous && !args.update) throw new Error(`vehicle asset '${name}' already exists (pass update: true to replace, or use dry_run to preview the diff)`);
+  atomicWriteJson(file, document);
+  return {
+    created: !previous,
+    updated: Boolean(previous),
+    project: project.project,
+    kind,
+    name,
+    path: relative,
+    sha256: sha256File(file),
+    diagnostics: [],
+    diff,
+    rollback: previous ? { document: previous, hint: "re-author with update: true and this document to restore" } : undefined
+  };
+}
+
+// Reads every vehicle assembly asset of a project with its structural
+// diagnostics (mirrors readRegistryAssets).
+function readVehicleAssets(project) {
+  const assets = [];
+  if (!fs.existsSync(project.vehicles)) return assets;
+  for (const fileName of fs.readdirSync(project.vehicles).filter((file) => file.endsWith(".json")).sort()) {
+    const file = path.join(project.vehicles, fileName);
+    const baseName = fileName.replace(/\.json$/, "");
+    let document = null;
+    const diagnostics = [];
+    try {
+      document = readJson(file);
+    } catch (error) {
+      diagnostics.push(`malformed JSON: ${error.message}`);
+    }
+    // Which factory parses this document? A document with a 'nodes'/'beams'
+    // array is a BeamGraphAsset; otherwise it is a VehicleAsset. Unknown
+    // shapes are flagged but not guessed.
+    let kind = null;
+    if (document && typeof document === "object" && !Array.isArray(document)) {
+      kind = Array.isArray(document.nodes) || Array.isArray(document.beams) ? "beam" : "vehicle";
+    }
+    if (document && kind) diagnostics.push(...validateVehicleDocument(kind, document).errors);
+    else if (document) diagnostics.push("vehicle asset cannot be classified (no nodes/beams and no vehicle fields)");
+    assets.push({
+      kind: kind ?? "unknown",
+      name: baseName,
+      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      document,
+      valid: diagnostics.length === 0,
+      diagnostics
+    });
+  }
+  return assets;
+}
+
+function inspectVehicleAssets(engineRoot, projectName) {
+  const project = requireProject(engineRoot, projectName);
+  const assets = readVehicleAssets(project);
+  return { project: project.project, vehicle_assets: assets, count: assets.length };
+}
+
 function registryDiff(previous, document) {
   const keys = new Set([...Object.keys(previous), ...Object.keys(document)]);
   const changed = [...keys].filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(document[key])).sort();
@@ -1715,5 +2374,14 @@ function validateProject(engineRoot, projectName) {
     }
   }
 
-  return { project: project.project, valid: errors.length === 0, errors, warnings, scenes: sceneFiles.length, registry_assets: registryAssets.length };
+  // Vehicle assembly assets (FALTANTES §17 item 12): structural validation
+  // mirroring the public C++ VehicleAsset/BeamGraphAsset factories.
+  const vehicleAssets = readVehicleAssets(project);
+  for (const asset of vehicleAssets) {
+    for (const diagnostic of asset.diagnostics) {
+      errors.push(`Content/Vehicles/${asset.name}.json: ${diagnostic}`);
+    }
+  }
+
+  return { project: project.project, valid: errors.length === 0, errors, warnings, scenes: sceneFiles.length, registry_assets: registryAssets.length, vehicle_assets: vehicleAssets.length };
 }

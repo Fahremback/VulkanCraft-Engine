@@ -4,7 +4,12 @@
 #include <string>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <array>
+#include <atomic>
+#include <deque>
+#include <mutex>
+#include <optional>
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -17,6 +22,7 @@
 
 #include "../engine/scene/Scene.hpp"
 #include "../engine/physics/PhysicsRuntime.hpp"
+#include "../engine/physics/PhysicsAdvanced.hpp"
 #include "../engine/physics/Ragdoll.hpp"
 #include "../engine/rendering/materials/Material.hpp"
 #include "../engine/rendering/MaterialGraph.hpp"
@@ -37,6 +43,9 @@
 #include "../engine/audio/AudioRuntime.hpp"
 #include "engine/navigation/INavigationProvider.hpp"
 #include "../engine/editor/ui/EditorGUI.hpp"
+#include "EditorControlApi.hpp"
+#include "WindowClamp.hpp"
+#include "tools/WickedToolsPanel.hpp"
 
 // Play-mode nav agent (Fase 8): follows a path from the public navigation
 // provider toward the primary camera entity, writing its position back to the
@@ -65,7 +74,7 @@ namespace Engine {
 // -----------------------------------------------------------------------
 // Gizmo operation mode
 // -----------------------------------------------------------------------
-enum class GizmoMode { Translate, Rotate, Scale };
+enum class GizmoMode { Select, Translate, Rotate, Scale };
 enum class GizmoAxis { None, X, Y, Z };
 
 // -----------------------------------------------------------------------
@@ -174,10 +183,22 @@ struct ScenePushConstants {
     glm::vec4 color;   // .w = entity pick ID (encoded as float)
 };
 
+// -----------------------------------------------------------------------
+// Push constant for the analytic infinite grid (128 bytes, no VBO)
+// -----------------------------------------------------------------------
+struct GridPushConstants {
+    glm::mat4 view;
+    glm::mat4 proj;
+};
+
 class EditorApplication {
 public:
     EditorApplication();
     ~EditorApplication();
+
+    // Loopback HTTP control API (curl http://127.0.0.1:8321/play etc.) so the
+    // editor can be driven from a terminal or an agent without mouse clicks.
+    EditorControlApi m_controlApi;
 
     int run();
 
@@ -210,7 +231,6 @@ private:
 
     // Geometry generation
     void generate_cube_geometry(std::vector<EditorVertex>& verts, std::vector<uint32_t>& indices);
-    void generate_grid_geometry(std::vector<EditorVertex>& verts, float extent, float step);
     void generate_gizmo_geometry();
     void generate_light_icon(std::vector<EditorVertex>& verts);
     void generate_camera_icon(std::vector<EditorVertex>& verts);
@@ -224,6 +244,19 @@ private:
 
     // Camera input
     void update_editor_camera(float deltaTime);
+    // Shared executor for Control API commands (loopback HTTP + UI buttons).
+    void handle_control_command(const std::string& cmd);
+    // Runs one headless self-test (spawns this exe with the test env var,
+    // waits for it, returns "PASS"/"FAIL"/error). 0=RenderGraph 1=HDR
+    // 2=Material 3=Play 4=Build.
+    std::string run_editor_self_test(int which);
+    // Last self-test result, published to the Control API /state.
+    std::string m_lastSelfTestResult;
+    // Standalone packaging: cooks nothing, packages every cooked asset into
+    // Intermediate/Package (same AssetPackager the Build uses). Returns a
+    // status line.
+    std::string package_assets_only();
+    void recompute_editor_camera_position();
     void process_viewport_input();
 
     // Vulkan helpers
@@ -235,6 +268,7 @@ private:
                                   uint32_t mipLevels = 1);
     void create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
                        VkBuffer& buffer, VkDeviceMemory& memory);
+    void destroy_buffer(GPUBuffer& buffer);
     void transition_image_layout(VkCommandBuffer cmd, VkImage image,
                                  VkImageLayout oldLayout, VkImageLayout newLayout,
                                  VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -249,7 +283,7 @@ private:
     // GUI Panel Renderers
     void draw_dockspace();
     void draw_menu_bar();
-    void draw_toolbar();
+    void draw_app_bar();
     void draw_hierarchy_panel();
     void draw_inspector_panel();
     void draw_viewport_panel();
@@ -267,6 +301,7 @@ private:
 
     VkInstance m_instance{ VK_NULL_HANDLE };
     VkPhysicalDevice m_physicalDevice{ VK_NULL_HANDLE };
+    std::string m_gpuName{ "Unknown GPU" };
     VkDevice m_device{ VK_NULL_HANDLE };
     VkQueue m_graphicsQueue{ VK_NULL_HANDLE };
     uint32_t m_graphicsQueueFamily{ 0 };
@@ -308,8 +343,11 @@ private:
     GPUBuffer m_cubeIB;
     uint32_t m_cubeIndexCount{ 0 };
 
-    GPUBuffer m_gridVB;
-    uint32_t m_gridVertexCount{ 0 };
+    // Analytic infinite grid (fullscreen triangle, no vertex buffer)
+    VkShaderModule m_gridVertShader{ VK_NULL_HANDLE };
+    VkShaderModule m_gridFragShader{ VK_NULL_HANDLE };
+    VkPipeline m_gridPipeline{ VK_NULL_HANDLE };
+    VkPipelineLayout m_gridPipelineLayout{ VK_NULL_HANDLE };
 
     // Light / camera helper icons (LINE_LIST, non-indexed)
     GPUBuffer m_lightIconVB;
@@ -332,6 +370,11 @@ private:
     // Editor Camera
     EditorCamera m_editorCamera;
     bool m_viewportHovered{ false };
+    // Raw mouse-wheel accumulator fed by our own GLFW scroll callback (chained
+    // before ImGui's). io.MouseWheel is zeroed at the end of ImGui::NewFrame,
+    // which runs AFTER the camera update — so the camera reads it too late.
+    // This accumulator is readable at any point and is consumed by the camera.
+    double m_scrollAccum{ 0.0 };
     bool m_viewportFocused{ false };
     ImVec2 m_viewportPos{ 0, 0 };
     ImVec2 m_viewportSize{ 800, 600 };
@@ -342,6 +385,13 @@ private:
 
     // Gizmo State
     GizmoMode m_gizmoMode{ GizmoMode::Translate };
+    bool m_gizmoLocal{ false }; // World/Local: gizmo axes follow entity rotation
+    // Viewport display toggles (⋯ overflow menu in the viewport toolbar).
+    bool m_showGrid{ true };
+    bool m_showGizmos{ true };
+    bool m_showColliders{ true };
+    // Set by the Ctrl+K shortcut; consumed by the app bar search field.
+    bool m_focusGlobalSearch{ false };
     GizmoAxis m_hoveredAxis{ GizmoAxis::None };
     GizmoAxis m_activeAxis{ GizmoAxis::None };
     bool m_gizmoDragging{ false };
@@ -360,6 +410,9 @@ private:
     ImVec2 m_viewportImagePos{ 0, 0 };
     ImVec2 m_viewportImageSize{ 0, 0 };
     bool m_viewportImageHovered{ false };
+    // Panel content size (screen coords) - the offscreen target is sized to
+    // match this so the rendered image fills the panel at the same aspect.
+    ImVec2 m_viewportPanelSize{ 0, 0 };
 
     // Camera drag state
     bool m_orbitDragging{ false };
@@ -385,6 +438,11 @@ private:
         std::vector<DrawRange> ranges;
         uint32_t vertexCount{ 0 };
         bool valid{ false };
+        // Object-space bounds (computed at load) — used to frame the 3D
+        // thumbnail camera and to auto-fit new entities.
+        glm::vec3 boundsMin{ 0.0f };
+        glm::vec3 boundsMax{ 0.0f };
+        bool hasBounds{ false };
     };
     std::unordered_map<UUID, EditorMeshResource> m_meshResources;
     std::unordered_set<UUID> m_meshLoadFailed;
@@ -428,14 +486,146 @@ private:
         std::string lastError;
         bool valid{ false };
     };
-    bool load_viewport_texture(const UUID& assetId, GraphTexture& out, std::string& error);
+    // maxDim > 0 box-downscales before upload: the Content Browser requests a
+    // small thumbnail (192 px) instead of uploading the full-res texture.
+    bool load_viewport_texture(const UUID& assetId, GraphTexture& out, std::string& error,
+                               uint32_t maxDim = 0);
     bool upload_texture_half_pixels(uint32_t width, uint32_t height,
                                     const std::vector<uint8_t>& halfRgba,
                                     GraphTexture& out, std::string& error);
     bool upload_texture_pixels(uint32_t width, uint32_t height, const std::vector<uint8_t>& rgba,
                                uint32_t mipCount, bool srgb, GraphTexture& out, std::string& error);
     void destroy_graph_texture(GraphTexture& t);
+
+    // Asset previews (Content Browser): lazy GPU thumbnails for cooked
+    // textures and a single active audio preview voice.
+    struct AssetThumbnail {
+        VkImage image{ VK_NULL_HANDLE };
+        VkDeviceMemory memory{ VK_NULL_HANDLE };
+        VkImageView view{ VK_NULL_HANDLE };
+        VkDescriptorSet imguiId{ VK_NULL_HANDLE };
+    };
+    std::unordered_map<UUID, AssetThumbnail> m_assetThumbnails;
+    std::unordered_set<UUID> m_assetThumbnailFailed;
+    Engine::Audio::VoiceId m_audioPreviewVoice{ 0 };
+    UUID m_audioPreviewAsset{ 0, 0 };
+    VkDescriptorSet get_asset_thumbnail(const AssetMetadata& asset);
+    void toggle_audio_preview(const AssetMetadata& asset);
+    void destroy_asset_thumbnails();
+
+    // 3D asset thumbnails (Content Browser): a small offscreen renders each
+    // cooked mesh / block cube once, cached as an AssetThumbnail. Pending
+    // assets are processed a few per frame so the grid never stalls.
+    VkImage m_thumbImage{ VK_NULL_HANDLE };
+    VkDeviceMemory m_thumbMemory{ VK_NULL_HANDLE };
+    VkImageView m_thumbView{ VK_NULL_HANDLE };
+    VkImage m_thumbDepthImage{ VK_NULL_HANDLE };
+    VkDeviceMemory m_thumbDepthMemory{ VK_NULL_HANDLE };
+    VkImageView m_thumbDepthView{ VK_NULL_HANDLE };
+    VkFramebuffer m_thumbFramebuffer{ VK_NULL_HANDLE };
+    uint32_t m_thumbSize{ 256 };
+    std::deque<UUID> m_thumbnailQueue;
+    std::unordered_set<UUID> m_thumbnailQueued;
+    std::unordered_map<UUID, VkDescriptorSet> m_asset3dThumbnails;
+    void init_thumbnail_target();
+    void destroy_thumbnail_target();
+    void request_3d_thumbnail(const UUID& assetId);
+    void pump_asset_thumbnails(int budget);
+    void render_mesh_thumbnail(const UUID& assetId, const EditorMeshResource& mesh);
+    void render_block_thumbnail(const UUID& assetId, VkDescriptorSet textureDesc);
+
+    // Textured unit cube (block pipeline): renders Minecraft-style block
+    // models assembled from a PNG texture, both as thumbnails and (via the
+    // scene) as cube previews of the block asset.
+    VkShaderModule m_blockVertShader{ VK_NULL_HANDLE };
+    VkShaderModule m_blockFragShader{ VK_NULL_HANDLE };
+    VkPipeline m_blockPipeline{ VK_NULL_HANDLE };
+    VkPipelineLayout m_blockPipelineLayout{ VK_NULL_HANDLE };
+    VkDescriptorSetLayout m_blockDescSetLayout{ VK_NULL_HANDLE };
+    VkSampler m_blockSampler{ VK_NULL_HANDLE };
+    GPUBuffer m_blockCubeVB;
+    GPUBuffer m_blockCubeIB;
+    uint32_t m_blockCubeIndexCount{ 0 };
+    std::unordered_map<UUID, VkDescriptorSet> m_blockDescriptors;
+    std::unordered_map<UUID, GraphTexture> m_blockTextures; // keeps the views alive
+    void init_block_cube();
+    void destroy_block_cube();
+    VkDescriptorSet get_block_descriptor(const UUID& textureAsset);
+
+    // Minecraft-style block model recognition: a small square power-of-two
+    // texture is treated as a block face. "Criar Modelo de Bloco" writes a
+    // .vblock sidecar (texture UUIDs per face) and registers an
+    // AssetType::Block asset, which appears under the Modelos filter.
+    [[nodiscard]] bool looks_like_block_texture(const AssetMetadata& meta) const;
+    void create_block_asset(const AssetMetadata& textureMeta);
+    struct BlockAssetData {
+        UUID texture{ 0, 0 }; // all faces default to this
+        UUID top{ 0, 0 }, bottom{ 0, 0 }, side{ 0, 0 };
+    };
+    std::unordered_map<UUID, BlockAssetData> m_blockAssetCache;
+    std::unordered_set<UUID> m_blockAssetFailed;
+    [[nodiscard]] bool load_block_asset(const UUID& blockAssetId, BlockAssetData& out);
+    [[nodiscard]] UUID resolve_block_texture(const UUID& blockAssetId);
+    // Block models in the scene: a block asset renders as a textured cube.
+    // ensure_block_cube_resource builds the GPU cube mesh on demand (survives
+    // restarts — the mesh is regenerated from geometry, no asset file needed).
+    void ensure_block_cube_resource(const UUID& blockId);
+    // Creates an entity whose MeshRenderer references a Block asset (rendered
+    // as the textured cube in the editor and in play).
+    void spawn_block_entity(const UUID& blockId, const glm::vec3& position);
+
+    // Voxel sculpting (Escultura de Blocos): each VoxelVolumeComponent entity
+    // gets an editable grid (Engine::Voxel::VoxelStructure) rendered as colored
+    // cubes in the viewport. The brush panel paints into it in real time — the
+    // panel used to be decorative (the brush was never consumed).
+    struct EditorVoxelMesh {
+        GPUBuffer vb;
+        GPUBuffer ib;
+        uint32_t indexCount{ 0 };
+        bool valid{ false };
+    };
+    std::unordered_map<UUID, std::unique_ptr<Engine::Voxel::VoxelStructure>> m_voxelStructures;
+    std::unordered_map<UUID, EditorVoxelMesh> m_voxelMeshes;
+    std::unordered_set<UUID> m_voxelMeshesDirty;
+    bool m_voxelPaintMode{ false }; // "Pintar" toggle in the sculpt panel
+    void ensure_voxel_volume(const UUID& entityId, uint32_t seed, float seaLevel);
+    void rebuild_voxel_mesh(const UUID& entityId);
+    void draw_voxel_volumes(VkCommandBuffer cmd, const glm::mat4& viewProj, Scene* scene);
+    void paint_voxel_ray(const glm::vec3& origin, const glm::vec3& dir, bool remove);
+    void destroy_voxel_editor_meshes();
+
+    // Playback sink for the play-in-editor mixer: a miniaudio device (pull
+    // model) whose data callback renders the mixer each period. Kept opaque
+    // (EditorAudioSink*, defined in the .cpp) so the header never has to
+    // include miniaudio.h.
+    void* m_audioDevice{ nullptr };
+    bool m_audioDeviceStarted{ false };
+    void init_audio_output();
+    void shutdown_audio_output();
+
+    // Async audio preview: the OGG decode runs on a worker thread (decode of
+    // a long clip on the UI thread was freezing the whole editor); the result
+    // is picked up by the main loop and played if the request is still active.
+    struct PendingAudioDecode {
+        UUID assetId{ 0, 0 };
+        Engine::Audio::AudioBuffer buffer;
+    };
+    std::mutex m_audioDecodeMutex;
+    std::optional<PendingAudioDecode> m_audioDecodeReady;
+    std::atomic<bool> m_audioDecodeBusy{ false };
+    std::unordered_set<UUID> m_audioPreviewDecodeFailed;
+    UUID m_audioPreviewRequest{ 0, 0 };
+    // Small bounded LRU of decoded previews so replaying an asset is instant.
+    std::unordered_map<UUID, std::shared_ptr<const Engine::Audio::AudioBuffer>> m_audioPreviewCache;
+    std::deque<UUID> m_audioPreviewCacheOrder;
+    std::size_t m_audioPreviewCacheFrames{ 0 };
+    void pump_audio_preview_decodes();
+    void start_preview_voice(const UUID& assetId);
+    void cache_audio_preview(const UUID& assetId, const Engine::Audio::AudioBuffer& buffer);
     std::unordered_map<UUID, GraphMaterialPipeline> m_graphMaterialPipelines;
+    // Block-model cubes in the scene: pipeline cached per block asset UUID
+    // (textured cube, rebuilt when the resolved texture changes).
+    std::unordered_map<UUID, GraphMaterialPipeline> m_blockGraphPipelines;
     std::unordered_set<UUID> m_materialLoadFailed;
     std::unordered_map<UUID, MaterialAsset> m_materialAssets;
     bool load_material_asset(const UUID& assetId);
@@ -478,13 +668,64 @@ private:
     std::string m_currentProjectName{ "EmptyProject" };
     void draw_project_launcher();
 
+    // Panel visibility (Janelas menu). The EditorGUI duplicate panels are
+    // disabled (see init_default_scene) — these flags drive the real panels.
+    bool m_showHierarchy{ true };
+    bool m_showInspector{ true };
+    bool m_showViewport{ true };
+    bool m_showContentBrowser{ true };
+    bool m_showConsole{ false };
+
+    // Play-mode frame stepping (PASSO button): advance the play world one
+    // frame while paused.
+    bool m_stepRequested{ false };
+
+    // Help > Sobre modal.
+    bool m_showAboutDialog{ false };
+
+    // New-scene flow: confirm save before discarding (modal) and name the scene.
+    bool m_pendingNewSceneConfirm{ false };
+    bool m_pendingNewSceneCreate{ false };
+    char m_newSceneName[128]{ 'U', 'n', 't', 'i', 't', 'l', 'e', 'd', ' ', 'S', 'c', 'e', 'n', 'e', 0 };
+    // Forge UI: Inspector advanced mode (shows UUIDs, near/far planes, raw
+    // asset ids) and the Scene panel search filter.
+    bool m_advancedInspector{ false };
+    char m_hierarchySearch[128]{ 0 };
+
+    // Windows file/folder pickers (Abrir Jogo / Procurar Pasta / Salvar Como).
+    bool pick_file_dialog(std::string& outPath, const wchar_t* filter,
+                          const wchar_t* title, const wchar_t* defExt);
+    bool pick_save_file_dialog(std::string& outPath, const wchar_t* filter,
+                               const wchar_t* title, const wchar_t* defExt);
+    bool pick_folder_dialog(std::string& outPath, const wchar_t* title);
+
     // Build Game (README §39): cook → package → scene → shaders → exe.
     std::vector<std::string> m_buildLog;
     void run_game_build();
 
+    // Load a .scene file into the editor (Abrir Jogo / Open Scene).
+    void load_scene_file(const std::string& path);
+    // Save the current scene; if it has no path yet, opens Salvar Como.
+    void save_current_scene();
+    void save_scene_as();
+    // Project creation (Criador de Projetos panel): folder + empty scene.
+    std::string create_project(const std::string& name, const std::string& folder);
+    // Create a brand-new scene named m_newSceneName (after Novo Jogo confirm).
+    void create_new_scene();
+    // Scan Projects/ for the launcher list.
+    struct LauncherProject {
+        std::string name;
+        std::string path;
+        std::string lastModified;
+        bool hasScene{ false };
+    };
+    void scan_projects(std::vector<LauncherProject>& out) const;
+
     // Editor Scene & State
     std::unique_ptr<Scene> m_editorScene;
     EditorGUI m_editorGui;
+    // Wicked-port tool windows (frontend; PORTS.md).
+    WickedToolsPanel m_wickedTools;
     PlayModeManager m_playMode;
     UndoSystem m_undo;
     Entity m_selectedEntity;
@@ -510,6 +751,20 @@ private:
     // Play-world vehicles: one VehicleRuntime per VehicleComponent entity with
     // a chassis body in the play physics; driven with the arrow keys.
     std::unordered_map<UUID, Engine::Gameplay::VehicleRuntime> m_playVehicles;
+    // Wicked-port runtime (formerly TODO(frontend-port)): constraints run as
+    // soft force-based constraints (the runtime solver has no rigid-joint API),
+    // springs hold a rest anchor, spline followers keep their progress; the
+    // sky pass is driven by WeatherComponent.
+    struct ConstraintRest {
+        glm::vec3 anchorA{ 0.0f };
+        glm::vec3 anchorB{ 0.0f };
+        float restLength{ 0.0f };
+        bool broken{ false };
+    };
+    std::unordered_map<UUID, ConstraintRest> m_constraintRests;
+    std::unordered_map<UUID, glm::vec3> m_springRests;
+    std::unordered_map<UUID, float> m_splineProgress;
+    float m_skyTime{ 0.0f };
     std::unordered_map<UUID, Physics::BodyHandle> m_playVehicleChassis;
     // Play-world ragdolls (Fase 6): one Ragdoll per RagdollComponent entity,
     // built from the skin skeleton when fromSkeleton is set.
@@ -538,6 +793,58 @@ private:
     // (FALTANTES item 12).
     std::unique_ptr<engine::navigation::INavigationProvider> m_playNav;
     std::unordered_map<UUID, PlayNavAgent> m_playNavAgents;
+    // Sky pass (Clima panel): procedural day/night sky driven by the scene's
+    // first WeatherComponent + directional sun. Drawn first in the viewport.
+    struct SkyPushConstants {
+        glm::mat4 mvp;
+        glm::vec4 cameraPos;
+        glm::vec4 sunDirection;
+        glm::vec4 sunColor;
+        glm::vec4 environment; // x = time, y = daylight, z = unused, w = unused
+    };
+    VkShaderModule m_skyVertShader{ VK_NULL_HANDLE };
+    VkShaderModule m_skyFragShader{ VK_NULL_HANDLE };
+    VkPipeline m_skyPipeline{ VK_NULL_HANDLE };
+    VkPipelineLayout m_skyPipelineLayout{ VK_NULL_HANDLE };
+
+    // Terrain (Terreno panel): single procedural heightmap mesh in the scene,
+    // regenerated by the panel (noise scale/octaves/amount/falloff).
+    struct TerrainParams {
+        float scale{ 1.0f };
+        int octaves{ 4 };
+        float amount{ 0.5f };
+        float falloff{ 0.4f };
+        float halfExtent{ 60.0f };
+        int segments{ 128 };
+    };
+    GPUBuffer m_terrainVB;
+    GPUBuffer m_terrainIB;
+    uint32_t m_terrainIndexCount{ 0 };
+    bool m_terrainValid{ false };
+    TerrainParams m_terrainParams;
+    void generate_terrain_mesh(const TerrainParams& params);
+
+    // Editor settings persisted to settings.json (Opções Gerais / Tema).
+    std::string m_settingsPath;
+    void load_settings();
+    void save_settings();
+
+    // Graphics (Opções Gráficas): VSync (swapchain present mode) and shadow
+    // map resolution (512/1024/2048/4096). The *_recreate flags are processed
+    // at the top of the next frame (before acquire), so the Vulkan resources
+    // are recreated while nothing is in flight.
+    bool m_vsyncEnabled{ true };
+    int m_shadowQuality{ 2 };
+    bool m_recreateSwapchain{ false };
+    bool m_recreateShadowMap{ false };
+    void apply_graphics_settings(bool vsync, int quality);
+    uint32_t shadow_size_from_quality(int quality) const;
+
+    // Mesh panel (Malha): recompute/flip normals on the selected entity's
+    // mesh asset (CPU geometry → GPU re-upload → cooked file rewrite).
+    std::string apply_mesh_normals(int mode);
+    bool m_meshEdited{ false };
+
     void setup_play_runtime();
     void tick_play_runtime(float deltaTime);
     void teardown_play_runtime();
@@ -563,6 +870,9 @@ private:
     VisualScriptCanvas m_scriptCanvas;
     bool m_showScriptCanvas{ false };
     bool m_scriptCanvasLoaded{ false };
+    // Frontend port (Wicked toolbar): voxel sculpting panel visibility, toggled
+    // by the toolbar button (our own button — the donor's toolbar has none).
+    bool m_showVoxelTools{ true };
     UUID m_canvasDragPin{ 0, 0 };        // output pin currently being dragged
     glm::vec2 m_canvasDragPinPos{ 0.0f };
     std::string m_canvasAddKind{ "Event" };

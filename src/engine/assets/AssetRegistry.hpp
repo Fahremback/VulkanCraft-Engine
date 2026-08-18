@@ -14,7 +14,7 @@
 namespace Engine {
 
 enum class AssetType {
-    Unknown, Texture, Mesh, Material, Audio, Skeleton, Animation, Scene, VoxelStructure
+    Unknown, Texture, Mesh, Material, Audio, Skeleton, Animation, Scene, VoxelStructure, Block
 };
 
 struct ImportSettings {

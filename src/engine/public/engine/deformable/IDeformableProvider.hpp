@@ -41,12 +41,15 @@ enum class DeformableProviderKind : std::uint8_t {
 // One deformable body: a node/edge mesh. `nodes` are the rest positions in
 // world space; `edges` are distance constraints (node index pairs); `fixed`
 // marks anchored nodes (inverse mass 0 — infinite mass, never moved by the
-// solver). Deterministic solver order: nodes and edges are processed in the
-// given order.
+// solver). `stiffness` is the OPTIONAL per-edge stiffness (FALTANTES §17 item
+// 4 — node/beam chassis): must be empty (all edges use the config stiffness)
+// or match edges.size() with values in (0, 1]. Deterministic solver order:
+// nodes and edges are processed in the given order.
 struct DeformableMeshDesc {
     std::vector<glm::vec3> nodes;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> edges;
     std::vector<bool> fixed;  // must match nodes.size() (false = free)
+    std::vector<float> stiffness;  // optional per-edge stiffness (empty = config)
 };
 
 // XPBD solver configuration, data-driven via JSON (all-or-nothing: out-of-
@@ -90,6 +93,14 @@ public:
     // cleared). No-op for an invalid body/node.
     virtual void apply_force(DeformableBodyHandle body, std::uint32_t node,
                              const glm::vec3& force) = 0;
+
+    // FALTANTES §17 item 9 (vehicle damage): changes an edge's stiffness AFTER
+    // creation. stiffness == 0 fully complies (the constraint is deactivated —
+    // the damaged/separated part no longer holds the mesh together); (0, 1]
+    // sets the edge's compliance. No-op for an invalid body/edge index.
+    virtual void set_edge_stiffness(DeformableBodyHandle body,
+                                    std::uint32_t edgeIndex,
+                                    float stiffness) = 0;
 
     // Advances the simulation: for each substep, integrate (gravity + forces
     // + damping), solve the XPBD distance constraints with the configured

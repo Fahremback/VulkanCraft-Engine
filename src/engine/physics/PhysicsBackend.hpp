@@ -1,6 +1,7 @@
 #pragma once
 
 #include "PhysicsRuntime.hpp"
+#include "Vehicle.hpp"
 
 #include <memory>
 #include <string>
@@ -44,6 +45,13 @@ public:
     virtual bool get_state(BodyHandle body, glm::vec3& position, glm::quat& rotation,
                            glm::vec3& linearVelocity, glm::vec3& angularVelocity, bool& sleeping) const = 0;
     virtual void set_linear_velocity(BodyHandle body, const glm::vec3& velocity) = 0;
+    // Sets both velocities at once (vehicle replication reconcile snaps the
+    // predicted body to the authoritative state, including momentum).
+    virtual void set_velocity(BodyHandle body, const glm::vec3& linearVelocity,
+                              const glm::vec3& angularVelocity) {
+        set_linear_velocity(body, linearVelocity);
+        (void)angularVelocity;
+    }
     virtual void set_gravity_scale(BodyHandle body, float scale) = 0;
     virtual void set_linear_damping(BodyHandle body, float damping) = 0;
 
@@ -60,12 +68,49 @@ public:
         return InvalidConstraint;
     }
     virtual bool supports_swing_twist() const { return false; }
+    // Updates the motor of an existing swing-twist constraint (active ragdoll —
+    // FALTANTES §18 item 8): toggles the Position-state motors, sets the spring
+    // (frequency/damping) and the target relative orientation of body B in body
+    // A's constraint frame (the same convention as
+    // SwingTwistConstraintDesc::motorTarget). Backends without the seam return
+    // false (no-op).
+    virtual bool set_swing_twist_motor(ConstraintHandle constraint, bool motorOn,
+                                       float frequency, float damping,
+                                       const glm::quat& target) {
+        (void)constraint; (void)motorOn; (void)frequency; (void)damping;
+        (void)target;
+        return false;
+    }
     virtual bool destroy_constraint(ConstraintHandle constraint) = 0;
 
-    virtual std::optional<RaycastHit> raycast(const glm::vec3& origin, const glm::vec3& direction,
-                                              float maxDistance, std::uint32_t layerMask,
-                                              BodyHandle ignoredBody) const = 0;
+    virtual    std::optional<RaycastHit> raycast(const glm::vec3& origin, const glm::vec3& direction,
+                                      float maxDistance, std::uint32_t layerMask,
+                                      BodyHandle ignoredBody) const = 0;
     virtual std::vector<BodyHandle> overlap_aabb(const Aabb& bounds, std::uint32_t layerMask) const = 0;
+
+    // Vehicle seam (Jolt Vehicles adapter). Backends without a vehicle solver
+    // return InvalidVehicle / false and the caller falls back to the legacy
+    // raycast model.
+    virtual VehicleHandle create_vehicle(const VehicleDesc& description) {
+        (void)description;
+        return InvalidVehicle;
+    }
+    virtual bool destroy_vehicle(VehicleHandle vehicle) {
+        (void)vehicle;
+        return false;
+    }
+    virtual bool set_vehicle_input(VehicleHandle vehicle, const VehicleInput& input) {
+        (void)vehicle;
+        (void)input;
+        return false;
+    }
+    virtual bool vehicle_wheel_state(VehicleHandle vehicle, std::size_t index, WheelState& out) const {
+        (void)vehicle;
+        (void)index;
+        (void)out;
+        return false;
+    }
+    virtual bool supports_vehicles() const { return false; }
 
     virtual std::vector<Contact> contacts() = 0;
     virtual std::vector<TriggerEvent> trigger_events() = 0;

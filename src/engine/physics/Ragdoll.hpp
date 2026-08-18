@@ -56,6 +56,12 @@ public:
                   const std::vector<glm::mat4>& ragdollPose);
     std::vector<RagdollPoseBone> pose(const PhysicsRuntime& world) const;
     BodyHandle bone_body(const std::string& bone) const;
+    // The joint handles in creation order (one per bone that has a parent —
+    // the k-th handle belongs to the k-th bone-with-parent in the bones vector
+    // passed to create()). Empty on the distance-constraint fallback backends.
+    const std::vector<ConstraintHandle>& joint_handles() const noexcept {
+        return joints_;
+    }
     bool empty() const noexcept { return bodies_.empty(); }
     // True when the joints were created as real swing-twist constraints (Jolt)
     // instead of the distance-constraint fallback.

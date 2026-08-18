@@ -1,15 +1,15 @@
 #!/usr/bin/env node
-// Registry asset CLI (FALTANTES item 10): expose the complete registry
-// schemas and validate/author assets WITHOUT a running MCP server. Every
-// command goes through the SAME factories the MCP server uses
-// (game-authoring.mjs), so the CLI can never drift from what the mirror
-// validation accepts — and the exported JSON Schemas are generated from the
-// same REGISTRY_FIELD_SCHEMAS contracts.
+// Registry/vehicle asset CLI (FALTANTES item 10 + §17 item 12): expose the
+// complete registry AND vehicle-assembly schemas and validate/author assets
+// WITHOUT a running MCP server. Every command goes through the SAME
+// factories the MCP server uses (game-authoring.mjs), so the CLI can never
+// drift from what the mirror validation accepts — and the exported JSON
+// Schemas are generated from the same FIELD_SCHEMAS contracts.
 //
 // Usage:
 //   node registry-cli.mjs kinds
 //   node registry-cli.mjs schema <kind>
-//   node registry-cli.mjs export-schemas [outDir]        (default: <engine>/schema/registry)
+//   node registry-cli.mjs export-schemas [outDir]        (default: <engine>/schema)
 //   node registry-cli.mjs validate <kind> <file.json>
 //   node registry-cli.mjs author --engine <root> --project <name> --kind <kind>
 //                                --name <n> --file <doc.json> [--dry-run] [--update]
@@ -19,12 +19,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   REGISTRY_KINDS,
+  VEHICLE_KINDS,
   buildRegistryJsonSchema,
-  validateRegistryDocument
+  buildVehicleJsonSchema,
+  validateRegistryDocument,
+  validateVehicleDocument
 } from "./game-authoring.mjs";
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ENGINE_ROOT = path.resolve(SERVER_DIR, "..", "..");
+const ALL_KINDS = [...REGISTRY_KINDS, ...VEHICLE_KINDS];
+const VEHICLE_KIND_SET = new Set(VEHICLE_KINDS);
 
 function fail(message, code = 1) {
   console.error(`registry-cli: ${message}`);
@@ -51,28 +56,30 @@ function readJson(filePath) {
 }
 
 function cmdKinds() {
-  console.log(REGISTRY_KINDS.join("\n"));
+  console.log([...REGISTRY_KINDS, ...VEHICLE_KINDS].join("\n"));
 }
 
 function cmdSchema(kind) {
-  if (!REGISTRY_KINDS.includes(kind)) fail(`unsupported registry kind '${kind}' (supported: ${REGISTRY_KINDS.join(", ")})`);
-  console.log(JSON.stringify(buildRegistryJsonSchema(kind), null, 2));
+  if (!ALL_KINDS.includes(kind)) fail(`unsupported asset kind '${kind}' (supported: ${ALL_KINDS.join(", ")})`);
+  const schema = VEHICLE_KIND_SET.has(kind) ? buildVehicleJsonSchema(kind) : buildRegistryJsonSchema(kind);
+  console.log(JSON.stringify(schema, null, 2));
 }
 
 function cmdExportSchemas(outDir) {
-  const target = outDir ?? path.join(ENGINE_ROOT, "schema", "registry");
+  const target = outDir ?? path.join(ENGINE_ROOT, "schema");
   fs.mkdirSync(target, { recursive: true });
   const written = [];
-  for (const kind of REGISTRY_KINDS) {
+  for (const kind of ALL_KINDS) {
     const file = path.join(target, `${kind}.json`);
-    atomicWriteJson(file, buildRegistryJsonSchema(kind));
+    const schema = VEHICLE_KIND_SET.has(kind) ? buildVehicleJsonSchema(kind) : buildRegistryJsonSchema(kind);
+    atomicWriteJson(file, schema);
     written.push(file);
   }
   for (const file of written) console.log(`wrote ${path.relative(ENGINE_ROOT, file).replaceAll(path.sep, "/")}`);
 }
 
 function cmdValidate(kind, file) {
-  if (!REGISTRY_KINDS.includes(kind)) fail(`unsupported registry kind '${kind}' (supported: ${REGISTRY_KINDS.join(", ")})`);
+  if (!ALL_KINDS.includes(kind)) fail(`unsupported asset kind '${kind}' (supported: ${ALL_KINDS.join(", ")})`);
   if (!file) fail("usage: validate <kind> <file.json>");
   let document;
   try {
@@ -80,7 +87,9 @@ function cmdValidate(kind, file) {
   } catch (error) {
     fail(`cannot read '${file}': ${error.message}`);
   }
-  const result = validateRegistryDocument(kind, document);
+  const result = VEHICLE_KIND_SET.has(kind)
+    ? validateVehicleDocument(kind, document)
+    : validateRegistryDocument(kind, document);
   if (!result.valid) {
     for (const diagnostic of result.errors) console.error(`- ${diagnostic}`);
     console.error(`registry-cli: '${file}' is INVALID (${result.errors.length} diagnostic(s))`);
@@ -100,19 +109,23 @@ function cmdAuthor(args) {
   if (!project || !kind || !name || !file) {
     fail("author requires --project <name> --kind <kind> --name <n> --file <doc.json> [--engine <root>] [--dry-run] [--update]");
   }
-  if (!REGISTRY_KINDS.includes(kind)) fail(`unsupported registry kind '${kind}' (supported: ${REGISTRY_KINDS.join(", ")})`);
+  if (!ALL_KINDS.includes(kind)) fail(`unsupported asset kind '${kind}' (supported: ${ALL_KINDS.join(", ")})`);
   let document;
   try {
     document = readJson(file);
   } catch (error) {
     fail(`cannot read '${file}': ${error.message}`);
   }
-  const validation = validateRegistryDocument(kind, document);
+  const validation = VEHICLE_KIND_SET.has(kind)
+    ? validateVehicleDocument(kind, document)
+    : validateRegistryDocument(kind, document);
   if (!validation.valid) {
     for (const diagnostic of validation.errors) console.error(`- ${diagnostic}`);
     fail(`asset '${kind}/${name}' fails public-contract validation; nothing was written`);
   }
-  const target = path.join(engine, "Projects", project, "Content", "Registry", kind, `${name}.json`);
+  const target = VEHICLE_KIND_SET.has(kind)
+    ? path.join(engine, "Projects", project, "Content", "Vehicles", `${name}.json`)
+    : path.join(engine, "Projects", project, "Content", "Registry", kind, `${name}.json`);
   const relative = path.relative(path.join(engine, "Projects", project), target).replaceAll(path.sep, "/");
   const previous = fs.existsSync(target) ? readJson(target) : null;
   if (dryRun) {
@@ -148,7 +161,7 @@ function main() {
     default:
       console.error(
         "Usage: node registry-cli.mjs <kinds|schema|export-schemas|validate|author> ...\n" +
-        "  kinds                     list supported registry kinds\n" +
+        "  kinds                     list supported registry + vehicle kinds\n" +
         "  schema <kind>             print the JSON Schema (draft-07) for a kind\n" +
         "  export-schemas [outDir]   write <kind>.json for every kind\n" +
         "  validate <kind> <file>    validate an asset document (exit 1 on invalid)\n" +

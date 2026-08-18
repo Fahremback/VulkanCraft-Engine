@@ -44,6 +44,16 @@ Scene::Scene(Scene&& other) noexcept
       materialComponents(std::move(other.materialComponents)),
       hierarchyComponents(std::move(other.hierarchyComponents)),
       voxelVolumeComponents(std::move(other.voxelVolumeComponents)),
+      colliderComponents(std::move(other.colliderComponents)),
+      constraintComponents(std::move(other.constraintComponents)),
+      softBodyComponents(std::move(other.softBodyComponents)),
+      springComponents(std::move(other.springComponents)),
+      decalComponents(std::move(other.decalComponents)),
+      splineComponents(std::move(other.splineComponents)),
+      forceFieldComponents(std::move(other.forceFieldComponents)),
+      envProbeComponents(std::move(other.envProbeComponents)),
+      weatherComponents(std::move(other.weatherComponents)),
+      hairParticleComponents(std::move(other.hairParticleComponents)),
       m_genericComponents(std::move(other.m_genericComponents)) {
     rebind_entities();
 }
@@ -70,6 +80,16 @@ Scene& Scene::operator=(Scene&& other) noexcept {
     materialComponents     = std::move(other.materialComponents);
     hierarchyComponents    = std::move(other.hierarchyComponents);
     voxelVolumeComponents  = std::move(other.voxelVolumeComponents);
+    colliderComponents     = std::move(other.colliderComponents);
+    constraintComponents   = std::move(other.constraintComponents);
+    softBodyComponents     = std::move(other.softBodyComponents);
+    springComponents       = std::move(other.springComponents);
+    decalComponents        = std::move(other.decalComponents);
+    splineComponents       = std::move(other.splineComponents);
+    forceFieldComponents   = std::move(other.forceFieldComponents);
+    envProbeComponents     = std::move(other.envProbeComponents);
+    weatherComponents      = std::move(other.weatherComponents);
+    hairParticleComponents = std::move(other.hairParticleComponents);
     m_genericComponents    = std::move(other.m_genericComponents);
     rebind_entities();
     return *this;
@@ -232,6 +252,16 @@ Scene Scene::clone_for_play() const {
     clone.materialComponents     = materialComponents;
     clone.hierarchyComponents    = hierarchyComponents;
     clone.voxelVolumeComponents  = voxelVolumeComponents;
+    clone.colliderComponents     = colliderComponents;
+    clone.constraintComponents   = constraintComponents;
+    clone.softBodyComponents     = softBodyComponents;
+    clone.springComponents       = springComponents;
+    clone.decalComponents        = decalComponents;
+    clone.splineComponents       = splineComponents;
+    clone.forceFieldComponents   = forceFieldComponents;
+    clone.envProbeComponents     = envProbeComponents;
+    clone.weatherComponents      = weatherComponents;
+    clone.hairParticleComponents = hairParticleComponents;
 
     // Clone generic component stores
     for (const auto& [typeId, entityMap] : m_genericComponents) {

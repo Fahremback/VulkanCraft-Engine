@@ -331,7 +331,7 @@ bool AssetRegistry::load(const std::filesystem::path& databasePath) {
     };
 
     while (parse_line()) {
-        if (type < static_cast<int>(AssetType::Unknown) || type > static_cast<int>(AssetType::VoxelStructure) ||
+        if (type < static_cast<int>(AssetType::Unknown) || type > static_cast<int>(AssetType::Block) ||
             (cooked != 0 && cooked != 1) || (generateMipmaps != 0 && generateMipmaps != 1) ||
             (srgb != 0 && srgb != 1) || textureQuality > 100 || meshScale <= 0.0f ||
             dependencyCount > 100000) return false;

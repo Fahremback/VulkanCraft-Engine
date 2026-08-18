@@ -154,6 +154,21 @@ public:
     std::unordered_map<UUID, HierarchyComponent>     hierarchyComponents;
     std::unordered_map<UUID, VoxelVolumeComponent>   voxelVolumeComponents;
 
+    // Wicked-port component set (frontend; PORTS.md). Authored in the tool
+    // panels; runtime integration status is noted on each struct in
+    // Components.hpp (TODO(frontend-port) where the play world does not
+    // simulate the feature yet).
+    std::unordered_map<UUID, ColliderComponent>     colliderComponents;
+    std::unordered_map<UUID, ConstraintComponent>   constraintComponents;
+    std::unordered_map<UUID, SoftBodyComponent>     softBodyComponents;
+    std::unordered_map<UUID, SpringComponent>       springComponents;
+    std::unordered_map<UUID, DecalComponent>        decalComponents;
+    std::unordered_map<UUID, SplineComponent>       splineComponents;
+    std::unordered_map<UUID, ForceFieldComponent>   forceFieldComponents;
+    std::unordered_map<UUID, EnvProbeComponent>     envProbeComponents;
+    std::unordered_map<UUID, WeatherComponent>      weatherComponents;
+    std::unordered_map<UUID, HairParticleComponent> hairParticleComponents;
+
     // -----------------------------------------------------------------------
     // Generic Component Storage (new — for plugins and future types)
     //

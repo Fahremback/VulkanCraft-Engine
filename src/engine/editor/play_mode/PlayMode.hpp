@@ -20,6 +20,11 @@ public:
 
     PlayState get_state() const { return m_state; }
 
+    // Editor-only: used by the PASSO (frame-step) button to advance the play
+    // world one frame while paused (the editor flips Pause→Play, ticks once,
+    // and flips back).
+    void set_state(PlayState state) { m_state = state; }
+
     void start_play(Scene* editorScene) {
         if (m_state != PlayState::Edit) return;
         m_editorScene = editorScene;

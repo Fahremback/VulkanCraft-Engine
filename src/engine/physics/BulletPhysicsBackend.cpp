@@ -299,6 +299,15 @@ void BulletPhysicsBackend::set_linear_velocity(BodyHandle body, const glm::vec3&
     it->second.rigid->activate();
 }
 
+void BulletPhysicsBackend::set_velocity(BodyHandle body, const glm::vec3& linearVelocity,
+                                        const glm::vec3& angularVelocity) {
+    const auto it = impl_->bodies_.find(body);
+    if (it == impl_->bodies_.end() || it->second.rigid == nullptr) return;
+    it->second.rigid->setLinearVelocity(to_bt(linearVelocity));
+    it->second.rigid->setAngularVelocity(to_bt(angularVelocity));
+    it->second.rigid->activate();
+}
+
 void BulletPhysicsBackend::set_gravity_scale(BodyHandle body, float scale) {
     const auto it = impl_->bodies_.find(body);
     if (it == impl_->bodies_.end() || it->second.rigid == nullptr) return;

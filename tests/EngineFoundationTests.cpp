@@ -106,7 +106,48 @@ int main() {
     const Entity overridden = lightPrefab.instantiate(&prefabScene, "Overridden Light");
     if (!near(prefabScene.lightComponents.at(overridden.get_id()).intensity, 9000.0f)) return EXIT_FAILURE;
 
-    // Multi-entity prefabs retain stable local identities and remap hierarchy per instance.
+    // Wicked-port component set survives a save → load round trip.
+    {
+        Scene rich("Rich Scene");
+        const Entity hero = rich.create_entity("Hero");
+        const UUID hid = hero.get_id();
+        rich.colliderComponents[hid] = ColliderComponent{ ColliderShape::Capsule, {2.0f, 3.0f, 4.0f}, 0.75f, 1.8f, {0.1f, 0.2f, 0.3f}, true, true };
+        rich.constraintComponents[hid] = ConstraintComponent{ ConstraintType::Hinge, UUID(), {1.0f, 2.0f, 3.0f}, {0.0f, 1.0f, 0.0f}, 500.0f, true };
+        rich.softBodyComponents[hid] = SoftBodyComponent{ 12, 2.5f, 0.3f, 0.2f, 0.4f, 0.08f, false, true };
+        rich.springComponents[hid] = SpringComponent{ 0.6f, 0.15f, 0.2f, 0.9f, 0.7f, false, true, true };
+        rich.decalComponents[hid] = DecalComponent{ "decal.png", {0.5f, 0.4f, 0.3f}, 2.0f, false, true, true };
+        rich.splineComponents[hid] = SplineComponent{ { {0.0f, 0.0f, 0.0f}, {1.0f, 2.0f, 3.0f}, {4.0f, 5.0f, 6.0f} }, true, true, 2.0f, 0.5f, 24, true };
+        rich.forceFieldComponents[hid] = ForceFieldComponent{ ForceFieldType::Vortex, 3.5f, 25.0f, true };
+        rich.envProbeComponents[hid] = EnvProbeComponent{ true, 150.0f, 512, true };
+        rich.weatherComponents[hid] = WeatherComponent{ {1.0f, 0.9f, 0.8f}, 0.002f, 50.0f, 1.2f, 0.3f, 12.0f, 0.4f, 2.0f, true, true };
+        rich.hairParticleComponents[hid] = HairParticleComponent{ "head.fbx", 5000, 0.4f, 0.02f, 0.6f, 0.2f, 1.5f, 0.3f, 12, 7, true };
+
+        const std::filesystem::path richFile = temporary / "rich.scene";
+        if (!Serializer::serialize_scene(rich, richFile)) return EXIT_FAILURE;
+        Scene richLoaded;
+        if (!Serializer::deserialize_scene(richLoaded, richFile)) return EXIT_FAILURE;
+        const auto& cl = richLoaded.colliderComponents.at(hid);
+        if (cl.shape != ColliderShape::Capsule || !near(cl.radius, 0.75f) || !near(cl.height, 1.8f) || !cl.isTrigger) return EXIT_FAILURE;
+        const auto& cn = richLoaded.constraintComponents.at(hid);
+        if (cn.type != ConstraintType::Hinge || !near(cn.breakForce, 500.0f)) return EXIT_FAILURE;
+        const auto& sb = richLoaded.softBodyComponents.at(hid);
+        if (sb.detail != 12 || !near(sb.mass, 2.5f) || sb.wind) return EXIT_FAILURE;
+        const auto& sp = richLoaded.springComponents.at(hid);
+        if (!near(sp.stiffness, 0.6f) || sp.disabled) return EXIT_FAILURE;
+        const auto& dc = richLoaded.decalComponents.at(hid);
+        if (dc.texturePath != "decal.png" || !near(dc.slopeBlendPower, 2.0f)) return EXIT_FAILURE;
+        const auto& spl = richLoaded.splineComponents.at(hid);
+        if (spl.points.size() != 3 || !near(spl.points[1].y, 2.0f) || !near(spl.points[2].z, 6.0f) || !spl.looped) return EXIT_FAILURE;
+        const auto& ff = richLoaded.forceFieldComponents.at(hid);
+        if (ff.type != ForceFieldType::Vortex || !near(ff.strength, 3.5f)) return EXIT_FAILURE;
+        const auto& ep = richLoaded.envProbeComponents.at(hid);
+        if (!ep.realTime || ep.resolution != 512) return EXIT_FAILURE;
+        const auto& wt = richLoaded.weatherComponents.at(hid);
+        if (!near(wt.fogDensity, 0.002f) || !near(wt.rainAmount, 0.4f) || !wt.heightFog) return EXIT_FAILURE;
+        const auto& hp = richLoaded.hairParticleComponents.at(hid);
+        if (hp.count != 5000 || !near(hp.length, 0.4f) || hp.segments != 12) return EXIT_FAILURE;
+    }
+
     Scene vehicleSource("Vehicle Authoring");
     const Entity chassis = vehicleSource.create_entity("Chassis");
     const Entity wheel = vehicleSource.create_entity("Wheel");
@@ -1360,8 +1401,13 @@ int main() {
             std::cerr << "Failure at line " << __LINE__ << " sampled pose size\n";
             return EXIT_FAILURE;
         }
+        // FALTANTES §18 item 2: sampling now routes through the ozz runtime,
+        // which quantizes rotations to 15 bits per component
+        // (ozz::animation::QuaternionKey::kBits = 15 — the 1e-4 `near` bound
+        // assumed the hand-rolled slerp's bit-exactness; the ozz bound is
+        // ~2e-4, half-float/15-bit quantization of the runtime dominates).
         const glm::vec3 halfway = glm::mat3_cast(sampled.local[1].rotation) * glm::vec3(1.0f, 0.0f, 0.0f);
-        if (!near(halfway.x, 0.7071f) || !near(halfway.y, 0.7071f)) {
+        if (std::abs(halfway.x - 0.7071f) > 5e-4f || std::abs(halfway.y - 0.7071f) > 5e-4f) {
             std::cerr << "Failure at line " << __LINE__ << " sampled rotation ("
                       << halfway.x << ", " << halfway.y << ")\n";
             return EXIT_FAILURE;

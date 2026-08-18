@@ -1,4 +1,6 @@
 #pragma once
+#include <imgui.h>
+#include <string>
 #include "../../engine/core/uuid/UUID.hpp"
 #include "../../engine/scene/Scene.hpp"
 #include "AnimationEditorModel.hpp"
@@ -23,6 +25,10 @@ public:
  bool open{false};
  bool previewOnSelected{false};
  void draw();
+ // Programmatically opens the panel on the given tab (used by asset
+ // double-click: e.g. double-clicking a Material asset opens the Material
+ // editor).
+ void open_editor(const std::string& tab) { open = true; openTab_ = tab; }
  void set_texture_assets(std::vector<std::pair<std::string, UUID>> assets) { textureAssets_ = std::move(assets); }
  // Scene context for panel → scene integration (Weapon tab applies the
  // authored parameters as a real WeaponComponent on the selected entity).
@@ -31,6 +37,11 @@ public:
  [[nodiscard]] Rendering::MaterialGraph& live_material_graph_mutable() noexcept { return materialGraph_; }
 private:
  void draw_validation(const EditorDocumentModel& model);
+ ImGuiTabItemFlags tab_flags(const char* name) {
+  if (openTab_ == name) { openTab_.clear(); return ImGuiTabItemFlags_SetSelected; }
+  return ImGuiTabItemFlags_None;
+ }
+ std::string openTab_;
  AnimationEditorModel animation_; TimelineEditorModel timeline_; RetargetEditorModel retarget_; IKEditorModel ik_; RagdollEditorModel ragdoll_;
  WeaponEditorModel weapon_; VehicleEditorModel vehicle_; DestructionEditorModel destruction_; ParticleEditorModel particle_; AudioEditorModel audio_;
  NavigationEditorModel navigation_; MissionEditorModel mission_; DialogueEditorModel dialogue_; PhysicsEditorModel physics_;
