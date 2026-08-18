@@ -657,6 +657,49 @@ try {
   assert.equal(vehiclesValidationPayload.valid, true, JSON.stringify(vehiclesValidationPayload));
   assert.ok(vehiclesValidationPayload.vehicle_assets >= 2);
 
+  // ---- Control API (editor_*): drive the RUNNING editor via :8321 ----
+
+  // All 65 control tools are registered.
+  const controlTools = listed.result.tools.filter((t) => t.name.startsWith("editor_"));
+  assert.equal(controlTools.length, 66, `expected 66 editor_* tools, got ${controlTools.length}`);
+  for (const expected of ["editor_status", "editor_play", "editor_step", "editor_add_entity",
+    "editor_set_gizmo", "editor_set_snap", "editor_voxel_paint", "editor_run_self_test",
+    "editor_spawn_character", "editor_layer_set", "editor_decal_add", "editor_hair_add",
+    "editor_softbody_add", "editor_envprobe_capture", "editor_paint_mode",
+    "editor_video_add_frame", "editor_gaussian_add", "editor_expression_add"]) {
+    assert.ok(controlTools.some((t) => t.name === expected), `missing tool ${expected}`);
+  }
+
+  // Client-side validation refuses invalid enum values without touching HTTP.
+  const badEntity = await request("tools/call", {
+    name: "editor_add_entity", arguments: { type: "unicorn" }
+  });
+  assert.equal(badEntity.result.isError, true, JSON.stringify(badEntity));
+  assert.match(badEntity.result.content[0].text, /one of/);
+
+  // Live editor checks are skipped gracefully when the editor is not running,
+  // so the smoke test still passes in CI/headless environments.
+  const status = await request("tools/call", { name: "editor_status", arguments: {} });
+  if (status.result.isError) {
+    assert.match(status.result.content[0].text, /127.0.0.1:8321/);
+    process.stdout.write("Control API smoke (skipped: editor not running)\n");
+  } else {
+    const payload = JSON.parse(status.result.content[0].text);
+    assert.equal(payload.tool, "editor_status");
+    assert.ok(payload.result.state, "editor_status returns live state");
+    const play = await request("tools/call", { name: "editor_play", arguments: {} });
+    assert.equal(play.result.isError, undefined, JSON.stringify(play));
+    const pause = await request("tools/call", { name: "editor_pause", arguments: {} });
+    assert.equal(pause.result.isError, undefined, JSON.stringify(pause));
+    const step = await request("tools/call", { name: "editor_step", arguments: {} });
+    assert.equal(step.result.isError, undefined, JSON.stringify(step));
+    const stop = await request("tools/call", { name: "editor_stop", arguments: {} });
+    assert.equal(stop.result.isError, undefined, JSON.stringify(stop));
+    const gizmo = await request("tools/call", { name: "editor_set_gizmo", arguments: { mode: "move" } });
+    assert.equal(gizmo.result.isError, undefined, JSON.stringify(gizmo));
+    process.stdout.write("Control API smoke (live editor verified)\n");
+  }
+
   process.stdout.write("MCP protocol smoke test passed\n");
 } finally {
   for (const temp of ["mcp-smoke-good-doc.json", "mcp-smoke-bad-doc.json", "mcp-smoke-cli-doc.json"]) {

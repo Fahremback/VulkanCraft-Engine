@@ -35,7 +35,7 @@ layout (push_constant) uniform PushConstants {
 // Cells of the current grid frequency span roughly this many pixels before the
 // grid steps up to the next decade. Raise to 96 for even earlier transitions.
 const float TARGET_PIXELS_PER_CELL = 64.0;
-const float MAX_DISTANCE = 1500.0;
+const float MAX_DISTANCE = 5000.0;
 
 // One family of parallel grid lines with a constant screen-space width.
 float gridLine1D(float worldCoord, float step, float pixelWidth) {

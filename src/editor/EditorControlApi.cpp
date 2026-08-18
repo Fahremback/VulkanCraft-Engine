@@ -164,6 +164,16 @@ std::string query_value(const std::string& path) {
     return url_decode(path.substr(q + 1));
 }
 
+// Query value with a leading "key=" token stripped: "?path=assets/x.png"
+// (route also matches on the key) must become "assets/x.png", not
+// "path=assets/x.png".
+std::string query_value_after(const std::string& path, const char* key) {
+    std::string v = query_value(path);
+    const std::string prefix = std::string(key) + "=";
+    if (v.rfind(prefix, 0) == 0) v = v.substr(prefix.size());
+    return v;
+}
+
 // Takes the substring after "/prefix/" and turns '/' separators into spaces.
 std::string slash_args(const std::string& path, size_t prefixLen) {
     std::string rest = path.substr(prefixLen);
@@ -247,16 +257,16 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
         // ---- Scene ------------------------------------------------------------
         else if (path == "/new-scene") cmd = "new-scene";
         else if (path == "/save-scene") cmd = "save-scene";
-        else if (path.rfind("/open-scene?path=", 0) == 0) cmd = "open-scene " + query_value(path);
+        else if (path.rfind("/open-scene?path=", 0) == 0) cmd = "open-scene " + query_value_after(path, "path");
         else if (path.rfind("/add-entity/", 0) == 0) cmd = "add-entity " + slash_args(path, 12);
         else if (path.rfind("/select/", 0) == 0) cmd = "select " + slash_args(path, 8);
-        else if (path.rfind("/select?name=", 0) == 0) cmd = "select-name " + query_value(path);
+        else if (path.rfind("/select?name=", 0) == 0) cmd = "select-name " + query_value_after(path, "name");
         else if (path.rfind("/delete-entity/", 0) == 0) cmd = "delete-entity " + path.substr(15);
         else if (path.rfind("/rename-entity/", 0) == 0) {
             // /rename-entity/{uuid}?name=...
             const size_t q = path.find('?', 15);
             if (q != std::string::npos) {
-                cmd = "rename-entity " + path.substr(15, q - 15) + " " + query_value(path);
+                cmd = "rename-entity " + path.substr(15, q - 15) + " " + query_value_after(path, "name");
             }
         } else if (path.rfind("/set-transform/", 0) == 0) cmd = "set-transform " + slash_args(path, 15);
         else if (path.rfind("/add-component/", 0) == 0) cmd = "add-component " + slash_args(path, 15);
@@ -264,18 +274,59 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
         else if (path.rfind("/gizmo-space/", 0) == 0) cmd = "gizmo-space " + slash_args(path, 13);
         else if (path.rfind("/snap/", 0) == 0) cmd = "snap " + slash_args(path, 6);
         // ---- Assets -----------------------------------------------------------
-        else if (path.rfind("/import?path=", 0) == 0) cmd = "import " + query_value(path);
+        else if (path.rfind("/import?path=", 0) == 0) cmd = "import " + query_value_after(path, "path");
         else if (path.rfind("/block-model/", 0) == 0) cmd = "block-model " + path.substr(13);
         else if (path.rfind("/spawn-block/", 0) == 0) cmd = "spawn-block " + path.substr(13);
+        else if (path.rfind("/spawn-character/", 0) == 0) cmd = "spawn-character " + path.substr(17);
+        // ---- Runtime-wired Wicked-port features (Layers/Decal/Hair/SoftBody/
+        //      EnvProbe/Paint/Video/Gaussian/Expressions) ----------------------
+        else if (path.rfind("/layer/", 0) == 0) cmd = "layer " + path.substr(7);
+        else if (path.rfind("/layer-vis?name=", 0) == 0) {
+            // /layer-vis?name=<url-encoded>&visible=0 — parse each key: the
+            // generic query_value_after returns the whole tail after the first
+            // key, so split on '&' manually.
+            const size_t q = path.find('?');
+            const std::string query = (q == std::string::npos) ? "" : path.substr(q + 1);
+            const size_t amp = query.find('&');
+            const std::string namePart = (amp == std::string::npos) ? query : query.substr(0, amp);
+            const std::string visPart = (amp == std::string::npos) ? "" : query.substr(amp + 1);
+            std::string name = namePart.rfind("name=", 0) == 0 ? namePart.substr(5) : namePart;
+            std::string vis = "1";
+            if (visPart.rfind("visible=", 0) == 0) vis = visPart.substr(8);
+            cmd = "layer-vis " + url_decode(name) + "|" + vis;
+        }
+        else if (path.rfind("/decal-add/", 0) == 0) {
+            const size_t q = path.find('?');
+            const std::string uuid = (q == std::string::npos) ? path.substr(11) : path.substr(11, q - 11);
+            cmd = "decal-add " + uuid + " " + query_value_after(path, "texture");
+        }
+        else if (path.rfind("/hair-add/", 0) == 0) cmd = "hair-add " + path.substr(10);
+        else if (path.rfind("/softbody-add/", 0) == 0) cmd = "softbody-add " + path.substr(14);
+        else if (path.rfind("/env-add/", 0) == 0) cmd = "env-add " + path.substr(9);
+        else if (path.rfind("/env-capture/", 0) == 0) cmd = "env-capture " + path.substr(13);
+        else if (path.rfind("/paint-add/", 0) == 0) cmd = "paint-add " + path.substr(11);
+        else if (path.rfind("/paint-mode/", 0) == 0) cmd = "paint-mode " + slash_args(path, 12);
+        else if (path.rfind("/paint-color/", 0) == 0) cmd = "paint-color " + slash_args(path, 13);
+        else if (path.rfind("/video-add/", 0) == 0) cmd = "video-add " + path.substr(11);
+        else if (path.rfind("/video-frame/", 0) == 0) {
+            const size_t q = path.find('?');
+            const std::string uuid = (q == std::string::npos) ? path.substr(13) : path.substr(13, q - 13);
+            cmd = "video-frame " + uuid + " " + query_value_after(path, "name");
+        }
+        else if (path.rfind("/video-play/", 0) == 0) cmd = "video-play " + slash_args(path, 12);
+        else if (path.rfind("/gaussian-add/", 0) == 0) cmd = "gaussian-add " + path.substr(13);
+        else if (path.rfind("/gaussian-regen/", 0) == 0) cmd = "gaussian-regen " + path.substr(15);
+        else if (path.rfind("/expression-add/", 0) == 0) cmd = "expression-add " + slash_args(path, 15);
         else if (path.rfind("/asset-duplicate/", 0) == 0) cmd = "asset-duplicate " + path.substr(17);
         else if (path.rfind("/asset-delete/", 0) == 0) cmd = "asset-delete " + path.substr(14);
         else if (path.rfind("/reimport/", 0) == 0) cmd = "reimport " + path.substr(10);
+        else if (path.rfind("/import-pack?path=", 0) == 0) cmd = "import-pack " + query_value_after(path, "path");
         // ---- Voxel ------------------------------------------------------------
         else if (path.rfind("/voxel-generate/", 0) == 0) cmd = "voxel-generate " + slash_args(path, 16);
         else if (path.rfind("/voxel-clear/", 0) == 0) cmd = "voxel-clear " + path.substr(13);
         else if (path.rfind("/voxel-paint/", 0) == 0) cmd = "voxel-paint " + slash_args(path, 13);
         // ---- Scripts ----------------------------------------------------------
-        else if (path.rfind("/script-event?name=", 0) == 0) cmd = "script-event " + query_value(path);
+        else if (path.rfind("/script-event?name=", 0) == 0) cmd = "script-event " + query_value_after(path, "name");
         else if (path == "/script-pause") cmd = "script-pause";
         else if (path == "/script-continue") cmd = "script-continue";
         else if (path == "/script-step") cmd = "script-step";

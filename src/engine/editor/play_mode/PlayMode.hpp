@@ -57,6 +57,11 @@ public:
     void stop_play() {
         if (m_state == PlayState::Edit) return;
         m_playScene.reset();
+        // The cached editor-scene pointer was captured at start_play and can
+        // dangle the moment the editor replaces its scene (e.g. New Scene) —
+        // clear it so get_active_scene() never hands out a freed Scene. In
+        // Edit mode callers fall back to their own current scene.
+        m_editorScene = nullptr;
         m_state = PlayState::Edit;
     }
 

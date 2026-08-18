@@ -560,7 +560,8 @@ set(VC_SHADERS
     sky.vert sky.frag post.vert post.frag shadow.vert
     shadow_far_surface.vert shadow.frag shadow_foliage.vert shadow_grass.vert
     editor_viewport.vert editor_viewport.frag editor_pick.frag editor_material.vert
-    editor_grid.vert editor_grid.frag
+    editor_grid.vert editor_grid.frag editor_splat.vert editor_splat.frag
+    editor_envsphere.vert editor_envsphere.frag
 )
 set(VC_SHADER_OUTPUTS)
 foreach(shader IN LISTS VC_SHADERS)

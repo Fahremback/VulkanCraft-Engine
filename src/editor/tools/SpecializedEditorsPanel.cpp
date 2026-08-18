@@ -28,18 +28,84 @@ void SpecializedEditorsPanel::draw(){
    ImGui::Checkbox("Playing",&animation_.playing);ImGui::DragFloat("Preview Time",&animation_.previewTime,.01f,0,100);
    if(ImGui::Button("Add State")){const auto n=animation_.states.size();animation_.add_state({"State"+std::to_string(n+1),{},true,1});if(animation_.entryState.empty())animation_.entryState=animation_.states.back().id;}
    ImGui::SameLine();if(ImGui::Button("Add Transition")&&animation_.states.size()>1)animation_.transitions.push_back({animation_.states[animation_.states.size()-2].id,animation_.states.back().id,"speed > 0",.2f});
-   for(auto&s:animation_.states){ImGui::PushID(&s);ImGui::Text("%s",s.id.c_str());ImGui::SameLine();ImGui::Checkbox("Loop",&s.loop);ImGui::SameLine();ImGui::DragFloat("Speed",&s.speed,.05f,.01f,5);ImGui::PopID();}draw_validation(animation_);ImGui::EndTabItem();
+   for(auto&s:animation_.states){ImGui::PushID(&s);ImGui::Text("%s",s.id.c_str());ImGui::SameLine();ImGui::Checkbox("Loop",&s.loop);ImGui::SameLine();ImGui::DragFloat("Speed",&s.speed,.05f,.01f,5);ImGui::PopID();}draw_validation(animation_);
+   // Panel -> scene integration: Apply writes the authored state machine
+   // (states/transitions/entry) as a real AnimationComponent on the selected
+   // entity; the play world samples clips and drives bone entity transforms.
+   ImGui::Separator();
+   const bool hasSelAn = scene_ && selected_.is_valid();
+   ImGui::TextDisabled(hasSelAn ? "Apply to selected entity" : "Select an entity to apply");
+   if(ImGui::Button("Apply to Selected") && hasSelAn){
+    AnimationComponent ac; ac.entryState = animation_.entryState; ac.playing = animation_.playing;
+    for(const auto& s : animation_.states) ac.states.push_back({s.id, s.clip, s.loop, s.speed});
+    for(const auto& t : animation_.transitions) ac.transitions.push_back({t.from, t.to, t.condition, t.blendSeconds});
+    scene_->animationComponents[selected_] = ac;
+   }
+   ImGui::SameLine();
+   if(ImGui::Button("Remove from Selected") && hasSelAn) scene_->animationComponents.erase(selected_);
+   ImGui::EndTabItem();
   }
   if(ImGui::BeginTabItem("Timeline", nullptr, tab_flags("Timeline"))){
    ImGui::DragFloat("Duration",&timeline_.duration,.1f,.01f,10000);ImGui::SliderFloat("Playhead",&timeline_.playhead,0,std::max(timeline_.duration,.01f));ImGui::Checkbox("Loop",&timeline_.loop);
    if(ImGui::Button("Add Animation Track"))timeline_.add_track({"Animation "+std::to_string(timeline_.tracks.size()+1),TimelineTrackType::Animation});
-   for(size_t i=0;i<timeline_.tracks.size();++i){auto&t=timeline_.tracks[i];ImGui::PushID(static_cast<int>(i));ImGui::Checkbox("Mute",&t.muted);ImGui::SameLine();ImGui::Text("%s (%zu keys)",t.name.c_str(),t.keys.size());ImGui::SameLine();if(ImGui::Button("Key"))timeline_.add_key(i,{timeline_.playhead,"value"});ImGui::PopID();}draw_validation(timeline_);ImGui::EndTabItem();
+   for(size_t i=0;i<timeline_.tracks.size();++i){auto&t=timeline_.tracks[i];ImGui::PushID(static_cast<int>(i));ImGui::Checkbox("Mute",&t.muted);ImGui::SameLine();ImGui::Text("%s (%zu keys)",t.name.c_str(),t.keys.size());ImGui::SameLine();if(ImGui::Button("Key"))timeline_.add_key(i,{timeline_.playhead,"value"});ImGui::PopID();}draw_validation(timeline_);
+   // Panel -> scene integration: Apply writes the authored tracks as a real
+   // TimelineComponent; the play world animates the entity transform from
+   // Property tracks ("x y z"/"rx ry rz"/"sx sy sz" keys).
+   ImGui::Separator();
+   const bool hasSelTl = scene_ && selected_.is_valid();
+   ImGui::TextDisabled(hasSelTl ? "Apply to selected entity" : "Select an entity to apply");
+   if(ImGui::Button("Apply to Selected") && hasSelTl){
+    TimelineComponent tc; tc.duration = std::max(timeline_.duration, 0.01f); tc.loop = timeline_.loop; tc.playhead = timeline_.playhead;
+    for(const auto& t : timeline_.tracks){
+     TimelineTrackDef td; td.name = t.name; td.type = static_cast<uint8_t>(t.type); td.muted = t.muted;
+     for(const auto& k : t.keys) td.keys.push_back({k.time, k.value});
+     tc.tracks.push_back(td);
+    }
+    scene_->timelineComponents[selected_] = tc;
+   }
+   ImGui::SameLine();
+   if(ImGui::Button("Remove from Selected") && hasSelTl) scene_->timelineComponents.erase(selected_);
+   ImGui::EndTabItem();
   }
   if(ImGui::BeginTabItem("Retarget", nullptr, tab_flags("Retarget"))){
-   ImGui::Checkbox("Preserve Root Motion",&retarget_.preserveRootMotion);if(ImGui::Button("Auto-map Humanoid")){retarget_.map({"Root","Pelvis",1,{0,0,0}});retarget_.map({"Hand.L","Hand.L",1,{0,0,0}});}for(auto&m:retarget_.mapping){ImGui::Text("%s -> %s",m.sourceBone.c_str(),m.targetBone.c_str());ImGui::SameLine();ImGui::DragFloat("Scale",&m.translationScale,.01f,.01f,10);}draw_validation(retarget_);ImGui::EndTabItem();
-  }
-  if(ImGui::BeginTabItem("IK", nullptr, tab_flags("IK"))){
-   if(ImGui::Button("Add Two Bone Chain"))ik_.add_chain({"Chain"+std::to_string(ik_.chains.size()+1),"Upper","End",IKSolverKind::TwoBone,8,1,{0,1,0}});for(auto&c:ik_.chains){ImGui::PushID(&c);ImGui::Text("%s: %s -> %s",c.name.c_str(),c.rootBone.c_str(),c.endBone.c_str());ImGui::SliderFloat("Weight",&c.weight,0,1);ImGui::DragInt("Iterations",reinterpret_cast<int*>(&c.iterations),1,1,64);ImGui::PopID();}draw_validation(ik_);ImGui::EndTabItem();
+   ImGui::Checkbox("Preserve Root Motion",&retarget_.preserveRootMotion);if(ImGui::Button("Auto-map Humanoid")){retarget_.map({"Root","Pelvis",1,{0,0,0}});retarget_.map({"Hand.L","Hand.L",1,{0,0,0}});}for(auto&m:retarget_.mapping){ImGui::Text("%s -> %s",m.sourceBone.c_str(),m.targetBone.c_str());ImGui::SameLine();ImGui::DragFloat("Scale",&m.translationScale,.01f,.01f,10);}draw_validation(retarget_);
+   // Panel -> scene integration: Apply writes the bone mapping as a real
+   // RetargetComponent; the play world offsets target-bone transforms by the
+   // authored scale/rotation while the source pose is played.
+   ImGui::Separator();
+   const bool hasSelRt = scene_ && selected_.is_valid();
+   ImGui::TextDisabled(hasSelRt ? "Apply to selected entity" : "Select an entity to apply");
+   if(ImGui::Button("Apply to Selected") && hasSelRt){
+    RetargetComponent rc; rc.sourceSkeleton = retarget_.sourceSkeleton; rc.targetSkeleton = retarget_.targetSkeleton; rc.preserveRootMotion = retarget_.preserveRootMotion;
+    for(const auto& m : retarget_.mapping) rc.mapping.push_back({m.sourceBone, m.targetBone, m.translationScale, m.rotationOffset});
+    scene_->retargetComponents[selected_] = rc;
+   }
+   ImGui::SameLine();
+   if(ImGui::Button("Remove from Selected") && hasSelRt) scene_->retargetComponents.erase(selected_);
+   ImGui::EndTabItem();
+  }   if(ImGui::BeginTabItem("IK", nullptr, tab_flags("IK"))){
+   if(ImGui::Button("Add Two Bone Chain"))ik_.add_chain({"Chain"+std::to_string(ik_.chains.size()+1),"Upper","End",IKSolverKind::TwoBone,8,1,{0,1,0}});for(auto&c:ik_.chains){ImGui::PushID(&c);ImGui::Text("%s: %s -> %s",c.name.c_str(),c.rootBone.c_str(),c.endBone.c_str());ImGui::SliderFloat("Weight",&c.weight,0,1);ImGui::DragInt("Iterations",reinterpret_cast<int*>(&c.iterations),1,1,64);ImGui::PopID();}draw_validation(ik_);
+   // Panel -> scene integration: Apply writes the first chain as a real
+   // IKComponent. Bone names resolve to scene entities by name (the chain
+   // name + "_Target" is the optional target entity). The play world runs
+   // two-bone IK so the end entity reaches the target.
+   ImGui::Separator();
+   const bool hasSelIk = scene_ && selected_.is_valid();
+   ImGui::TextDisabled(hasSelIk ? "Apply to selected entity" : "Select an entity to apply");
+   if(ImGui::Button("Apply to Selected") && hasSelIk && !ik_.chains.empty()){
+    const auto& c = ik_.chains.front();
+    IKComponent ic; ic.poleVector = c.pole; ic.weight = c.weight; ic.iterations = static_cast<int>(c.iterations); ic.enabled = true;
+    for(const auto& [id, ent] : scene_->get_entities()){
+     if(ent.get_name() == c.rootBone) ic.rootEntity = id;
+     else if(ent.get_name() == c.endBone) ic.endEntity = id;
+     else if(ent.get_name() == c.name + "_Target") ic.targetEntity = id;
+    }
+    scene_->ikComponents[selected_] = ic;
+   }
+   ImGui::SameLine();
+   if(ImGui::Button("Remove from Selected") && hasSelIk) scene_->ikComponents.erase(selected_);
+   ImGui::EndTabItem();
   }
   if(ImGui::BeginTabItem("Ragdoll", nullptr, tab_flags("Ragdoll"))){
    ImGui::SliderFloat("Physics Blend",&ragdoll_.globalBlend,0,1);if(ImGui::Button("Add Body"))ragdoll_.add_body({"Bone"+std::to_string(ragdoll_.bodies.size()),RagdollShape::Capsule,{.2f,.5f,.2f},1,0});for(auto&b:ragdoll_.bodies){ImGui::PushID(&b);ImGui::Text("%s",b.bone.c_str());ImGui::DragFloat("Mass",&b.mass,.1f,.01f,100);ImGui::DragFloat3("Size",&b.size.x,.01f,.01f,10);ImGui::PopID();}draw_validation(ragdoll_);

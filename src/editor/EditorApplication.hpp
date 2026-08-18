@@ -88,7 +88,7 @@ struct EditorCamera {
     float sensitivity{ 0.15f };
     float fov{ 60.0f };
     float nearPlane{ 0.1f };
-    float farPlane{ 2000.0f };
+    float farPlane{ 50000.0f };
     float scrollSpeed{ 2.0f };
 
     // Orbit
@@ -116,18 +116,28 @@ struct EditorVertex {
 // Offscreen render target for the viewport
 // -----------------------------------------------------------------------
 struct OffscreenTarget {
+    // Resolve target, 1x: the final image ImGui shows.
     VkImage colorImage{ VK_NULL_HANDLE };
     VkDeviceMemory colorMemory{ VK_NULL_HANDLE };
     VkImageView colorView{ VK_NULL_HANDLE };
 
+    // Scene color, multisampled (m_viewportSamples).
+    VkImage msaaColorImage{ VK_NULL_HANDLE };
+    VkDeviceMemory msaaColorMemory{ VK_NULL_HANDLE };
+    VkImageView msaaColorView{ VK_NULL_HANDLE };
+
+    // Scene depth, multisampled (m_viewportSamples).
     VkImage depthImage{ VK_NULL_HANDLE };
     VkDeviceMemory depthMemory{ VK_NULL_HANDLE };
     VkImageView depthView{ VK_NULL_HANDLE };
 
-    // Pick buffer (color-ID pass)
+    // Pick buffer (color-ID pass) — stays 1x.
     VkImage pickImage{ VK_NULL_HANDLE };
     VkDeviceMemory pickMemory{ VK_NULL_HANDLE };
     VkImageView pickView{ VK_NULL_HANDLE };
+    VkImage pickDepthImage{ VK_NULL_HANDLE };
+    VkDeviceMemory pickDepthMemory{ VK_NULL_HANDLE };
+    VkImageView pickDepthView{ VK_NULL_HANDLE };
 
     // Staging buffer for pick readback
     VkBuffer pickStagingBuffer{ VK_NULL_HANDLE };
@@ -181,6 +191,9 @@ struct GPUBuffer {
 struct ScenePushConstants {
     glm::mat4 mvp;
     glm::vec4 color;   // .w = entity pick ID (encoded as float)
+    // Fog parameters (from WeatherComponent)
+    glm::vec4 fogParams; // x=density, y=start, z=heightFog(0/1), w=unused
+    glm::vec4 fogColor;  // xyz=fog color, w=unused
 };
 
 // -----------------------------------------------------------------------
@@ -263,7 +276,8 @@ private:
     uint32_t find_memory_type(uint32_t typeFilter, VkMemoryPropertyFlags properties);
     void create_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage,
                       VkMemoryPropertyFlags memProps, VkImage& image, VkDeviceMemory& memory,
-                      uint32_t mipLevels = 1);
+                      uint32_t mipLevels = 1,
+                      VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT);
     VkImageView create_image_view(VkImage image, VkFormat format, VkImageAspectFlags aspect,
                                   uint32_t mipLevels = 1);
     void create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
@@ -301,6 +315,9 @@ private:
 
     VkInstance m_instance{ VK_NULL_HANDLE };
     VkPhysicalDevice m_physicalDevice{ VK_NULL_HANDLE };
+    // MSAA sample count for the viewport (clamped to device support). The pick
+    // pass and the shadow map stay 1x.
+    VkSampleCountFlagBits m_viewportSamples{ VK_SAMPLE_COUNT_4_BIT };
     std::string m_gpuName{ "Unknown GPU" };
     VkDevice m_device{ VK_NULL_HANDLE };
     VkQueue m_graphicsQueue{ VK_NULL_HANDLE };
@@ -348,6 +365,35 @@ private:
     VkShaderModule m_gridFragShader{ VK_NULL_HANDLE };
     VkPipeline m_gridPipeline{ VK_NULL_HANDLE };
     VkPipelineLayout m_gridPipelineLayout{ VK_NULL_HANDLE };
+
+    // Runtime-wired Wicked-port rendering (frontend port): hair strands,
+    // gaussian splat clouds, env-probe reflective sphere and the decal quad.
+    VkPipeline m_hairPipeline{ VK_NULL_HANDLE };
+    VkShaderModule m_splatVertShader{ VK_NULL_HANDLE };
+    VkShaderModule m_splatFragShader{ VK_NULL_HANDLE };
+    VkPipeline m_splatPipeline{ VK_NULL_HANDLE };
+    VkPipelineLayout m_splatPipelineLayout{ VK_NULL_HANDLE };
+    VkShaderModule m_envSphereVertShader{ VK_NULL_HANDLE };
+    VkShaderModule m_envSphereFragShader{ VK_NULL_HANDLE };
+    VkPipeline m_envSpherePipeline{ VK_NULL_HANDLE };
+    VkPipelineLayout m_envSpherePipelineLayout{ VK_NULL_HANDLE };
+    VkDescriptorSetLayout m_envSphereDescLayout{ VK_NULL_HANDLE };
+    VkDescriptorPool m_envSphereDescPool{ VK_NULL_HANDLE };
+    GPUBuffer m_envSphereVB;
+    GPUBuffer m_envSphereIB;
+    uint32_t m_envSphereIndexCount{ 0 };
+    GPUBuffer m_decalVB;
+    GPUBuffer m_decalIB;
+    uint32_t m_decalIndexCount{ 0 };
+    struct SplatPushConstants {
+        glm::mat4 mvp;
+        glm::vec4 pointSize;  // x = px size, y = viewport height, z = opacity
+    };
+    struct EnvSpherePushConstants {
+        glm::mat4 mvp;
+        glm::mat4 model;
+        glm::vec4 camPos;
+    };
 
     // Light / camera helper icons (LINE_LIST, non-indexed)
     GPUBuffer m_lightIconVB;
@@ -438,6 +484,10 @@ private:
         std::vector<DrawRange> ranges;
         uint32_t vertexCount{ 0 };
         bool valid{ false };
+        // CPU copy of the geometry (kept for vertex painting raycasts and
+        // paint-buffer rebuilds; meshes are small enough to hold in RAM).
+        std::vector<glm::vec3> cpuPositions;
+        std::vector<uint32_t> cpuIndices;
         // Object-space bounds (computed at load) — used to frame the 3D
         // thumbnail camera and to auto-fit new entities.
         glm::vec3 boundsMin{ 0.0f };
@@ -446,6 +496,7 @@ private:
     };
     std::unordered_map<UUID, EditorMeshResource> m_meshResources;
     std::unordered_set<UUID> m_meshLoadFailed;
+
     bool load_mesh_resource(const UUID& assetId);
     const EditorMeshResource* get_mesh_resource(const UUID& assetId);
     void draw_mesh_resource(VkCommandBuffer cmd, const glm::mat4& mvp, const glm::vec4& color,
@@ -507,9 +558,30 @@ private:
     };
     std::unordered_map<UUID, AssetThumbnail> m_assetThumbnails;
     std::unordered_set<UUID> m_assetThumbnailFailed;
+    // Async texture thumbnails: the cooked file is decoded + downscaled on a
+    // worker thread (one at a time); the main thread uploads one small image
+    // per frame. Only assets whose cards are visible in the browser grid are
+    // ever requested (lazy loading), so scrolling a huge folder never decodes
+    // the whole list or stalls the frame.
+    struct PendingThumbDecode {
+        UUID assetId{ 0, 0 };
+        uint32_t width = 0, height = 0;
+        bool srgb = false;
+        bool halfFloat = false;
+        std::vector<uint8_t> rgba;
+    };
+    std::deque<UUID> m_thumbDecodeQueue;
+    std::unordered_set<UUID> m_thumbDecodeRequested;
+    std::mutex m_thumbDecodeMutex;
+    std::atomic<bool> m_thumbDecodeBusy{ false };
+    std::optional<PendingThumbDecode> m_thumbDecodeReady;
+    std::thread m_thumbDecodeThread;   // joinable worker (not detached)
+    void request_asset_thumbnail_decode(const AssetMetadata& asset);
+    void pump_asset_thumbnail_decodes();
+    void join_worker_threads();         // join before shutdown
     Engine::Audio::VoiceId m_audioPreviewVoice{ 0 };
     UUID m_audioPreviewAsset{ 0, 0 };
-    VkDescriptorSet get_asset_thumbnail(const AssetMetadata& asset);
+    std::thread m_audioDecodeThread;   // joinable worker (not detached)
     void toggle_audio_preview(const AssetMetadata& asset);
     void destroy_asset_thumbnails();
 
@@ -519,6 +591,9 @@ private:
     VkImage m_thumbImage{ VK_NULL_HANDLE };
     VkDeviceMemory m_thumbMemory{ VK_NULL_HANDLE };
     VkImageView m_thumbView{ VK_NULL_HANDLE };
+    VkImage m_thumbMsaaImage{ VK_NULL_HANDLE };
+    VkDeviceMemory m_thumbMsaaMemory{ VK_NULL_HANDLE };
+    VkImageView m_thumbMsaaView{ VK_NULL_HANDLE };
     VkImage m_thumbDepthImage{ VK_NULL_HANDLE };
     VkDeviceMemory m_thumbDepthMemory{ VK_NULL_HANDLE };
     VkImageView m_thumbDepthView{ VK_NULL_HANDLE };
@@ -557,7 +632,30 @@ private:
     // .vblock sidecar (texture UUIDs per face) and registers an
     // AssetType::Block asset, which appears under the Modelos filter.
     [[nodiscard]] bool looks_like_block_texture(const AssetMetadata& meta) const;
-    void create_block_asset(const AssetMetadata& textureMeta);
+    // A texture is a block when it looks like one (square POT 8-256) OR has an
+    // existing .vblock sidecar referencing it (cached: the registry scan only
+    // runs once per texture UUID). The PNG is the single user-visible entry;
+    // .vblock sidecars are hidden plumbing that scenes still resolve.
+    [[nodiscard]] bool is_block_texture(const AssetMetadata& meta);
+    std::unordered_set<UUID> m_blockSidecarChecked;
+    std::unordered_set<UUID> m_blockTextureSet;
+    // Explicit "not a block" override: a <texture>.noblock marker file next
+    // to the PNG (written by "Desmarcar como Bloco") beats both the heuristic
+    // and any sidecar, so a misclassified character/mob skin stays a texture.
+    std::unordered_set<UUID> m_noblockTextures;
+    std::unordered_set<UUID> m_noblockChecked; // one stat() per texture UUID
+    // Minecraft character/mob skins are also square POT (player 64x64, mobs
+    // 64x64...): entity/mob path + filename signals classify them as MODELS,
+    // not blocks (resource-pack block folders like /textures/block/ win).
+    [[nodiscard]] bool is_character_texture(const AssetMetadata& meta) const;
+    // User override: remove the .vblock sidecar so a texture stops being a
+    // block (a misclassified character/mob skin). The sidecar file + registry
+    // entry are deleted; the texture becomes a plain texture again.
+    void unmark_block_texture(const AssetMetadata& textureMeta);
+    // Find-or-create the .vblock sidecar for a texture: the PNG IS the block
+    // (Minecraft-style), so repeated drops/clicks reuse the same asset instead
+    // of piling up duplicates. Returns the block asset UUID (invalid on failure).
+    UUID create_block_asset(const AssetMetadata& textureMeta);
     struct BlockAssetData {
         UUID texture{ 0, 0 }; // all faces default to this
         UUID top{ 0, 0 }, bottom{ 0, 0 }, side{ 0, 0 };
@@ -573,6 +671,22 @@ private:
     // Creates an entity whose MeshRenderer references a Block asset (rendered
     // as the textured cube in the editor and in play).
     void spawn_block_entity(const UUID& blockId, const glm::vec3& position);
+    // Minecraft character/mob skins: the texture ITSELF is the character (no
+    // sidecar file — avoids the PNG+duplicate problem). The humanoid mesh is
+    // built on demand from the standard 64x64/64x32 skin UV layout, and the
+    // skin PNG is sampled by a material-graph pipeline, exactly like blocks.
+    void ensure_character_mesh_resource(const UUID& texId);
+    void spawn_character_entity(const UUID& texId, const glm::vec3& position);
+    // Batch import: scans a folder recursively and imports all compatible
+    // assets (textures, meshes, audio, materials). Returns the count of
+    // successfully imported files. Minecraft texture packs become blocks
+    // automatically (square POT 8-256 textures get .vblock sidecars).
+    size_t import_texture_pack(const std::filesystem::path& folder);
+    // Shared material-graph pipeline that samples a single texture (used by
+    // block cubes and character humanoids). Cached per texture UUID in the
+    // given map and rebuilt when the graph hash changes.
+    GraphMaterialPipeline* ensure_texture_pipeline(
+        const UUID& texId, std::unordered_map<UUID, GraphMaterialPipeline>& cache);
 
     // Voxel sculpting (Escultura de Blocos): each VoxelVolumeComponent entity
     // gets an editable grid (Engine::Voxel::VoxelStructure) rendered as colored
@@ -626,6 +740,9 @@ private:
     // Block-model cubes in the scene: pipeline cached per block asset UUID
     // (textured cube, rebuilt when the resolved texture changes).
     std::unordered_map<UUID, GraphMaterialPipeline> m_blockGraphPipelines;
+    // Minecraft character/mob skins in the scene: textured humanoid pipelines,
+    // cached per skin texture UUID (rebuilt when the texture changes).
+    std::unordered_map<UUID, GraphMaterialPipeline> m_skinGraphPipelines;
     std::unordered_set<UUID> m_materialLoadFailed;
     std::unordered_map<UUID, MaterialAsset> m_materialAssets;
     bool load_material_asset(const UUID& assetId);
@@ -654,6 +771,9 @@ private:
     bool m_pickRequested{ false };
     glm::vec2 m_pickPixel{ 0, 0 };
     std::unordered_map<uint32_t, UUID> m_pickColorToEntity;
+    std::string m_hoverEntityName;  // shown as tooltip when hovering the viewport
+    glm::vec2 m_hoverPickPixel{ 0, 0 };
+    bool m_hoverPickPending{ false };
 
     // Localization System
     enum class EngineLanguage { PT_BR, EN_US };
@@ -674,6 +794,7 @@ private:
     bool m_showInspector{ true };
     bool m_showViewport{ true };
     bool m_showContentBrowser{ true };
+    bool m_contentBrowserDirty{ true }; // set when folder may have changed externally
     bool m_showConsole{ false };
 
     // Play-mode frame stepping (PASSO button): advance the play world one
@@ -764,6 +885,102 @@ private:
     std::unordered_map<UUID, ConstraintRest> m_constraintRests;
     std::unordered_map<UUID, glm::vec3> m_springRests;
     std::unordered_map<UUID, float> m_splineProgress;
+    // Play-world animation (the Animation/Timeline/IK/Retarget editors now
+    // Apply to the scene): timeline property tracks animate the entity's
+    // transform, the Animation state machine samples clips into bone-entity
+    // transforms, IK bends a two-bone chain to a target, and retargeting
+    // copies mapped bone transforms between skeletons. Clips are cooked once
+    // per play session (loaded from the asset registry by UUID).
+    struct AnimationRuntimeState {
+        float time{ 0.0f };
+        std::string currentState;
+        std::unordered_map<std::string, float> params;
+    };
+    std::unordered_map<UUID, AnimationRuntimeState> m_animStates;
+    std::unordered_map<UUID, AnimationClip> m_animClips;
+    void tick_animation_runtime(Scene* playScene, float deltaTime);
+
+    // Runtime-wired Wicked-port simulation (frontend port): hair verlet
+    // strands, soft-body cloth, video flipbooks, gaussian splats, vertex
+    // painting and env-probe cubemap captures. tick_special_runtimes runs in
+    // both Edit and Play so the editor previews the authored feature.
+    struct HairSim {
+        std::vector<glm::vec3> pos;
+        std::vector<glm::vec3> prev;
+        std::vector<glm::vec3> rest;
+        GPUBuffer vb;
+        uint32_t vertexCount{ 0 };
+        bool built{ false };
+    };
+    std::unordered_map<UUID, HairSim> m_hairs;
+    struct SoftBodySim {
+        std::vector<glm::vec3> pos;
+        std::vector<glm::vec3> prev;
+        std::vector<glm::vec3> rest;
+        std::vector<uint32_t> indices;
+        GPUBuffer vb;
+        GPUBuffer ib;
+        uint32_t indexCount{ 0 };
+        bool built{ false };
+    };
+    std::unordered_map<UUID, SoftBodySim> m_softBodies;
+    // Video flipbook: texture pipelines keyed by frame-texture UUID, cached so
+    // frames swap without recompiling (textures downscaled on load).
+    std::unordered_map<UUID, GraphMaterialPipeline> m_videoGraphPipelines;
+    // Vertex painting: per-entity GPU buffers rebuilt when the colors change.
+    struct PaintData {
+        GPUBuffer vb;
+        uint32_t vertexCount{ 0 };
+        bool dirty{ true };
+    };
+    std::unordered_map<UUID, PaintData> m_paintBuffers;
+    bool m_paintToolActive{ false };
+    bool m_paintBrushDown{ false };
+    // Gaussian splat clouds: cached per-entity GPU buffers, rebuilt when the
+    // parameters change or regenerate is requested.
+    struct SplatCloud {
+        GPUBuffer vb;
+        uint32_t count{ 0 };
+        float scale{ 0.0f };
+        uint32_t seed{ 0 };
+        bool dirty{ true };
+    };
+    std::unordered_map<UUID, SplatCloud> m_splatClouds;
+    // Env probe cubemap capture (one shared capture target, re-captured for
+    // the active probe on demand or periodically when realTime).
+    struct EnvProbeCapture {
+        VkImage image{ VK_NULL_HANDLE };
+        VkDeviceMemory memory{ VK_NULL_HANDLE };
+        VkImageView views[6]{};
+        VkFramebuffer framebuffers[6]{};
+        VkSampler sampler{ VK_NULL_HANDLE };
+        VkDescriptorSet descriptorSet{ VK_NULL_HANDLE };
+        VkRenderPass renderPass{ VK_NULL_HANDLE };
+        uint32_t size{ 0 };
+        UUID entity{ 0, 0 };
+        bool valid{ false };
+    } m_envCapture;
+    // Extra capture resources kept alive for the capture's lifetime.
+    VkImageView m_envCubeView{ VK_NULL_HANDLE };
+    VkImageView m_envDepthView{ VK_NULL_HANDLE };
+    VkImage m_envDepthImage{ VK_NULL_HANDLE };
+    VkDeviceMemory m_envDepthMemory{ VK_NULL_HANDLE };
+    bool m_envCapturePending{ false };
+    float m_envCaptureTimer{ 0.0f };
+    void tick_special_runtimes(Scene* scene, float deltaTime);
+    void ensure_hair_sim(const UUID& id, const HairParticleComponent& h, const TransformComponent& t);
+    void upload_hair(HairSim& sim, const HairParticleComponent& h);
+    void ensure_softbody_sim(const UUID& id, const SoftBodyComponent& s, const TransformComponent& t);
+    void upload_softbody(SoftBodySim& sim, const SoftBodyComponent& s);
+    void rebuild_paint_buffer(const UUID& id, PaintComponent& pc, const EditorMeshResource* mesh);
+    void generate_splat_cloud(const GaussianSplatComponent& gs, std::vector<EditorVertex>& verts) const;
+    void capture_env_probe(const UUID& id, const EnvProbeComponent& ep, const TransformComponent& t);
+    void record_env_face(VkCommandBuffer cmd, const glm::mat4& view, const glm::mat4& proj,
+                         const glm::vec3& pos, Scene* scene);
+    void record_env_capture(VkCommandBuffer cmd, Scene* scene);
+    UUID resolve_texture_asset_by_name(const std::string& name) const;
+    glm::vec3 viewport_mouse_dir(const glm::vec2& mouseScreen) const;
+    bool paint_mesh_stroke(const glm::vec3& origin, const glm::vec3& dir);
     float m_skyTime{ 0.0f };
     std::unordered_map<UUID, Physics::BodyHandle> m_playVehicleChassis;
     // Play-world ragdolls (Fase 6): one Ragdoll per RagdollComponent entity,
@@ -814,8 +1031,8 @@ private:
         int octaves{ 4 };
         float amount{ 0.5f };
         float falloff{ 0.4f };
-        float halfExtent{ 60.0f };
-        int segments{ 128 };
+        float halfExtent{ 500.0f };
+        int segments{ 256 };
     };
     GPUBuffer m_terrainVB;
     GPUBuffer m_terrainIB;

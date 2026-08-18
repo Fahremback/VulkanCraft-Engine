@@ -111,21 +111,66 @@ void WickedToolsPanel::draw_layer_window() {
     if (!showLayerWindow || !m_scene) return;
     ImGui::Begin(tr("Camadas", "Layers"), &showLayerWindow);
     clamp_floating_window_on_screen();
-    todo_badge("Layers: runtime de camadas (filtros de render/física) é TODO(frontend-port).",
-               "Layers: the layer runtime (render/physics filters) is TODO(frontend-port).");
-    ImGui::TextWrapped("%s",
-        tr("O Wicked agrupa objetos em camadas nomeadas. Aqui as camadas são "
-           "estáticas por cena; o runtime de camadas (filtros de render/física) "
-           "é TODO(frontend-port).",
-           "Wicked groups objects into named layers. Here layers are scene-"
-           "static; the layer runtime (render/physics filters) is "
-           "TODO(frontend-port)."));
-    if (has_selection()) {
-        const auto it = m_scene->get_entities().find(m_selectedEntity);
-        if (it != m_scene->get_entities().end()) {
-            static int layer = 0;
-            ImGui::SliderInt(tr("Camada do Objeto", "Object Layer"), &layer, 0, 31);
+    ImGui::TextWrapped("%s", tr(
+        "Camadas nomeadas com runtime REAL: entidades numa camada oculta não são "
+        "renderizadas nem simuladas no play (nem aparecem no pick); camadas "
+        "bloqueadas não podem ser selecionadas. Os toggles propagam para todas "
+        "as entidades que compartilham o nome da camada.",
+        "Named layers with a REAL runtime: entities on a hidden layer are not "
+        "rendered or simulated in play (and can't be picked); locked layers "
+        "can't be selected. The toggles propagate to every entity sharing the "
+        "layer name."));
+    // Unique layer names across the scene, with a representative sample.
+    std::vector<std::pair<std::string, LayerComponent*>> layers;
+    for (auto& [id, lc] : m_scene->layerComponents) {
+        (void)id;
+        bool found = false;
+        for (auto& [name, ptr] : layers) {
+            if (name == lc.name) { found = true; break; }
         }
+        if (!found) layers.emplace_back(lc.name, &lc);
+    }
+    if (layers.empty()) {
+        if (ImGui::Button(tr("Criar Camada no Objeto Selecionado", "Create Layer on Selected Object")) && has_selection()) {
+            m_scene->layerComponents[m_selectedEntity] = LayerComponent{};
+        }
+        ImGui::TextWrapped("%s", tr("Selecione um objeto e crie uma camada nele.",
+                                     "Select an object and create a layer on it."));
+    } else {
+        for (auto& [name, sample] : layers) {
+            bool visible = sample->visible;
+            bool locked = sample->locked;
+            ImGui::PushID(name.c_str());
+            if (ImGui::Checkbox(tr("Visível", "Visible"), &visible)) {
+                for (auto& [eid, lc] : m_scene->layerComponents) {
+                    if (lc.name == name) lc.visible = visible;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Checkbox(tr("Bloqueada", "Locked"), &locked)) {
+                for (auto& [eid, lc] : m_scene->layerComponents) {
+                    if (lc.name == name) lc.locked = locked;
+                }
+            }
+            ImGui::SameLine();
+            ImGui::TextUnformatted(name.c_str());
+            ImGui::PopID();
+        }
+    }
+    if (has_selection()) {
+        ImGui::Separator();
+        auto& lc = m_scene->layerComponents[m_selectedEntity];
+        char buf[64];
+        strncpy(buf, lc.name.c_str(), sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        if (ImGui::InputText(tr("Camada do Objeto", "Object Layer"), buf, sizeof(buf))) {
+            if (buf[0] == '\0') strcpy(buf, "Default");
+            lc.name = buf;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Remover", "Remove"))) m_scene->layerComponents.erase(m_selectedEntity);
+        ImGui::TextWrapped("%s", tr("O nome define o agrupamento: renomeie para mover o objeto entre camadas.",
+                                     "The name defines the group: rename to move the object between layers."));
     }
     ImGui::End();
 }
@@ -387,8 +432,6 @@ void WickedToolsPanel::draw_softbody_window() {
         if (ImGui::Button(tr("Adicionar Corpo Mole", "Add Soft Body"))) m_scene->softBodyComponents[id] = SoftBodyComponent{};
         ImGui::End(); return;
     }
-    todo_badge("Soft body: solver no backend de física (tecidos/trapos) é TODO(frontend-port).",
-               "Soft body: physics-backend solver (cloth/rags) is TODO(frontend-port).");
     if (!component_panel_begin(tr("Corpo Mole (Tecido)", "Soft Body Component"), true)) { ImGui::End(); return; }
     auto& s = m_scene->softBodyComponents[id];
     ImGui::DragInt(tr("Detalhe", "Detail"), reinterpret_cast<int*>(&s.detail), 1, 2, 64);
@@ -398,8 +441,13 @@ void WickedToolsPanel::draw_softbody_window() {
     ImGui::DragFloat(tr("Pressão", "Pressure"), &s.pressure, 0.01f, 0.0f, 10.0f);
     ImGui::DragFloat(tr("Raio do Vértice", "Vertex Radius"), &s.vertexRadius, 0.005f, 0.001f, 1.0f);
     ImGui::Checkbox(tr("Vento", "Wind"), &s.wind);
-    ImGui::TextWrapped("%s", tr("TODO(frontend-port): solver de corpo mole no backend de física (tecidos/trapos).",
-        "TODO(frontend-port): soft body solver in the physics backend (cloth/rags)."));
+    ImGui::TextWrapped("%s", tr(
+        "Runtime REAL no editor e no play: malha de tecido verlet (grade de "
+        "Detalhe x Detalhe, borda superior presa, gravidade pela Massa, vento, "
+        "pressão e colisão com o chão). Ajuste e veja balançar ao vivo.",
+        "REAL runtime in the editor and in play: a verlet cloth mesh (Detail x "
+        "Detail grid, top edge pinned, gravity from Mass, wind, pressure and "
+        "ground collision). Tune it and watch it sway live."));
     if (ImGui::Button(tr("Remover Corpo Mole", "Remove Soft Body"))) m_scene->softBodyComponents.erase(id);
     component_panel_end();
     ImGui::End();
@@ -441,17 +489,21 @@ void WickedToolsPanel::draw_decal_window() {
         if (ImGui::Button(tr("Adicionar Decalque", "Add Decal"))) m_scene->decalComponents[id] = DecalComponent{};
         ImGui::End(); return;
     }
-    todo_badge("Decal: pass de decal no renderer é TODO(frontend-port).",
-               "Decal: decal pass in the renderer is TODO(frontend-port).");
     if (!component_panel_begin(tr("Textura Projetada", "Decal Component"), true)) { ImGui::End(); return; }
     auto& d = m_scene->decalComponents[id];
     texture_path_input(tr("Textura", "Texture"), d.texturePath);
     ImGui::ColorEdit3(tr("Cor", "Color"), &d.color.r);
+    ImGui::DragFloat2(tr("Tamanho", "Size"), &d.size.x, 0.05f, 0.1f, 100.0f);
     ImGui::DragFloat(tr("Suavidade da Inclinação", "Slope Blend Power"), &d.slopeBlendPower, 0.1f, 0.0f, 10.0f);
     ImGui::Checkbox(tr("Projetar em Estáticos", "Project on Static"), &d.projectOnStatic);
     ImGui::Checkbox(tr("Apenas Alfa", "Only Alpha"), &d.onlyAlpha);
-    ImGui::TextWrapped("%s", tr("TODO(frontend-port): pass de decal no renderer.",
-        "TODO(frontend-port): decal pass in the renderer."));
+    ImGui::TextWrapped("%s", tr(
+        "Runtime REAL: o decalque é renderizado como um quad texturizado na "
+        "transformação do objeto (com depth test e a textura do registro de "
+        "assets). Gire/posicione o objeto para projetá-lo na superfície.",
+        "REAL runtime: the decal renders as a textured quad at the object's "
+        "transform (depth-tested, texture from the asset registry). Rotate/"
+        "position the object to project it onto the surface."));
     if (ImGui::Button(tr("Remover Decalque", "Remove Decal"))) m_scene->decalComponents.erase(id);
     component_panel_end();
     ImGui::End();
@@ -502,8 +554,6 @@ void WickedToolsPanel::draw_hair_particle_window() {
         if (ImGui::Button(tr("Adicionar Cabelo", "Add Hair"))) m_scene->hairParticleComponents[id] = HairParticleComponent{};
         ImGui::End(); return;
     }
-    todo_badge("Hair: render de fios (strands) é TODO(frontend-port).",
-               "Hair: strand rendering is TODO(frontend-port).");
     if (!component_panel_begin(tr("Sistema de Fios", "Hair Particle Component"), true)) { ImGui::End(); return; }
     auto& h = m_scene->hairParticleComponents[id];
     texture_path_input(tr("Mesh (cabeça)", "Mesh (head)"), h.meshPath);
@@ -516,8 +566,14 @@ void WickedToolsPanel::draw_hair_particle_window() {
     ImGui::SliderFloat(tr("Aleatoriedade", "Randomness"), &h.randomness, 0.0f, 1.0f);
     ImGui::DragInt(tr("Segmentos", "Segments"), reinterpret_cast<int*>(&h.segments), 1, 1, 32);
     ImGui::DragInt(tr("Semente", "Random Seed"), reinterpret_cast<int*>(&h.seed), 1);
-    ImGui::TextWrapped("%s", tr("TODO(frontend-port): render de fios (strands) no renderer.",
-        "TODO(frontend-port): strand rendering in the renderer."));
+    ImGui::ColorEdit3(tr("Cor", "Color"), &h.color.r);
+    ImGui::TextWrapped("%s", tr(
+        "Runtime REAL no editor e no play: fios verlet (gravidade, rigidez, "
+        "arrasto, vento) renderizados como linhas a partir de uma concha de "
+        "cabeça (ou do mesh informado). Aumente a Quantidade com cuidado.",
+        "REAL runtime in the editor and in play: verlet strands (gravity, "
+        "stiffness, drag, wind) rendered as lines from a head shell (or the "
+        "given mesh). Be careful raising Count."));
     if (ImGui::Button(tr("Remover Cabelo", "Remove Hair"))) m_scene->hairParticleComponents.erase(id);
     component_panel_end();
     ImGui::End();
@@ -590,8 +646,6 @@ void WickedToolsPanel::draw_env_probe_window() {
         if (ImGui::Button(tr("Adicionar Sonda", "Add Env Probe"))) m_scene->envProbeComponents[id] = EnvProbeComponent{};
         ImGui::End(); return;
     }
-    todo_badge("Env Probe: captura de cubemap é TODO(frontend-port).",
-               "Env Probe: cubemap capture is TODO(frontend-port).");
     if (!component_panel_begin(tr("Reflexão Ambiental", "Env Probe Component"), true)) { ImGui::End(); return; }
     auto& e = m_scene->envProbeComponents[id];
     ImGui::Checkbox(tr("Tempo Real", "Real Time"), &e.realTime);
@@ -600,8 +654,16 @@ void WickedToolsPanel::draw_env_probe_window() {
     int resIdx = 0;
     for (int i = 0; i < 4; ++i) if (e.resolution == static_cast<uint32_t>(128 << i)) resIdx = i;
     if (ImGui::Combo(tr("Resolução", "Resolution"), &resIdx, res, 4)) e.resolution = static_cast<uint32_t>(128 << resIdx);
-    ImGui::TextWrapped("%s", tr("TODO(frontend-port): captura de cubemap no renderer.",
-        "TODO(frontend-port): cubemap capture pass in the renderer."));
+    if (ImGui::Button(tr("Capturar Agora", "Capture Now"))) e.captureRequested = true;
+    ImGui::TextWrapped("%s", tr(
+        "Runtime REAL: a cena é capturada em 6 faces a partir da posição da "
+        "sonda para um cubemap, e uma esfera reflexiva na posição mostra o "
+        "resultado ao vivo. Tempo Real recaptura a cada 0,5 s; senão, use "
+        "Capturar Agora (ou a API /env-capture).",
+        "REAL runtime: the scene is captured on 6 faces from the probe position "
+        "into a cubemap, and a reflective sphere at the position previews the "
+        "result live. Real Time recaptures every 0.5 s; otherwise use Capture "
+        "Now (or the /env-capture API)."));
     if (ImGui::Button(tr("Remover Sonda", "Remove Env Probe"))) m_scene->envProbeComponents.erase(id);
     component_panel_end();
     ImGui::End();
@@ -649,95 +711,261 @@ void WickedToolsPanel::draw_weather_window() {
 // ===========================================================================
 
 void WickedToolsPanel::draw_animation_window() {
-    if (!showAnimationWindow) return;
+    if (!showAnimationWindow || !m_scene) return;
     ImGui::Begin(tr("Animação", "Animation"), &showAnimationWindow);
     clamp_floating_window_on_screen();
-    todo_badge("Animation: playback de clips no play mode é TODO(frontend-port).",
-               "Animation: clip playback in play mode is TODO(frontend-port).");
     ImGui::TextWrapped("%s", tr(
-        "Playback de animações: a engine tem AnimationClip/SkeletonAsset com "
-        "sampler, blender, state machine e retargeter (src/engine/animation). "
-        "TODO(frontend-port): ligar este painel ao runtime de animação do "
-        "editor (carregar clips do asset registry e dirigir um AnimationSampler "
-        "na cena); os controles abaixo já refletem o modelo de dados.",
-        "Animation playback: the engine has AnimationClip/SkeletonAsset with "
-        "sampler, blender, state machine and retargeter (src/engine/animation). "
-        "TODO(frontend-port): wire this panel to the editor animation runtime "
-        "(load clips from the asset registry and drive an AnimationSampler in "
-        "the scene); the controls below already mirror the data model."));
-    ImGui::TextDisabled("%s", tr("Modo: Clip", "Mode: Clip"));
-    ImGui::TextDisabled("%s", tr("Loop: Sim", "Loop: Yes"));
-    if (ImGui::Button((std::string(ICON_FA_PLAY) + "  " + tr("Tocar", "Play")).c_str())) { /* TODO(frontend-port) */ }
+        "Playback REAL no play mode: a máquina de estados amostra os clips "
+        "(.aclip) na hierarquia de ossos da entidade (ordem da hierarquia = "
+        "ordem dos ossos) e as transições trocam de estado. Os controles abaixo "
+        "ligam/desligam o componente AnimationComponent da entidade selecionada "
+        "(ou da primeira da cena).",
+        "REAL playback in play mode: the state machine samples clips (.aclip) "
+        "into the entity's bone hierarchy (hierarchy order = bone order) and "
+        "transitions switch states. The controls below toggle the "
+        "AnimationComponent of the selected entity (or the first in the scene)."));
+    UUID target{ 0, 0 };
+    if (has_selection() && m_scene->animationComponents.contains(m_selectedEntity)) target = m_selectedEntity;
+    else {
+        for (const auto& [id, ac] : m_scene->animationComponents) {
+            (void)ac;
+            if (m_scene->transformComponents.contains(id)) { target = id; break; }
+        }
+    }
+    if (!target.is_valid()) {
+        if (ImGui::Button(tr("Adicionar Componente de Animação", "Add Animation Component")) && has_selection()) {
+            m_scene->animationComponents[m_selectedEntity] = AnimationComponent{};
+            target = m_selectedEntity;
+        }
+        ImGui::TextWrapped("%s", tr("Crie estados/clips no editor especializado Animation e dê Apply; depois use os botões abaixo.",
+            "Create states/clips in the Animation specialized editor and Apply; then use the buttons below."));
+        ImGui::End();
+        return;
+    }
+    auto& ac = m_scene->animationComponents[target];
+    if (ImGui::Button((std::string(ICON_FA_PLAY) + "  " + tr("Tocar", "Play")).c_str())) ac.playing = true;
     ImGui::SameLine();
-    if (ImGui::Button((std::string(ICON_FA_STOP) + "  " + tr("Parar", "Stop")).c_str())) { /* TODO(frontend-port) */ }
+    if (ImGui::Button((std::string(ICON_FA_STOP) + "  " + tr("Parar", "Stop")).c_str())) {
+        ac.playing = false;
+    }
     ImGui::SameLine();
-    if (ImGui::Button((std::string(ICON_FA_PAUSE) + "  " + tr("Pausar", "Pause")).c_str())) { /* TODO(frontend-port) */ }
-    ImGui::SliderFloat(tr("Tempo", "Time"), &m_animTime, 0.0f, 1.0f);
-    ImGui::SliderFloat(tr("Velocidade", "Speed"), &m_animSpeed, 0.0f, 2.0f);
+    if (ImGui::Button((std::string(ICON_FA_PAUSE) + "  " + tr("Pausar", "Pause")).c_str())) ac.playing = false;
+    ImGui::TextDisabled("%s: %s", tr("Estado", "State"), ac.playing ? tr("Tocando", "Playing") : tr("Parado", "Stopped"));
+    ImGui::TextDisabled("%s: %zu", tr("Estados", "States"), ac.states.size());
+    ImGui::TextDisabled("%s: %zu", tr("Transições", "Transitions"), ac.transitions.size());
+    if (ImGui::Button(tr("Remover Componente", "Remove Component"))) m_scene->animationComponents.erase(target);
     ImGui::End();
 }
 
+// Creates the standard humanoid rig as child entities of `parentId` (the
+// character). The animation runtime drives this hierarchy in play mode.
+void WickedToolsPanel::create_humanoid_rig(UUID parentId) {
+    if (!m_scene || !parentId.is_valid()) return;
+    const auto parentIt = m_scene->get_entities().find(parentId);
+    if (parentIt == m_scene->get_entities().end()) return;
+    const std::string prefix = parentIt->second.get_name() + ".";
+    const auto addBone = [&](const std::string& name, const glm::vec3& pos, UUID parent) {
+        Entity e = m_scene->create_entity(prefix + name);
+        m_scene->transformComponents[e.get_id()].position = pos;
+        m_scene->set_parent(e.get_id(), parent);
+        return e.get_id();
+    };
+    const UUID hips = addBone("Hips", { 0.0f, 1.0f, 0.0f }, parentId);
+    const UUID spine = addBone("Spine", { 0.0f, 0.35f, 0.0f }, hips);
+    const UUID chest = addBone("Chest", { 0.0f, 0.22f, 0.0f }, spine);
+    const UUID head = addBone("Head", { 0.0f, 0.28f, 0.0f }, chest);
+    (void)head;
+    const UUID uaL = addBone("UpperArm.L", { -0.38f, 0.08f, 0.0f }, chest);
+    const UUID uaR = addBone("UpperArm.R", { 0.38f, 0.08f, 0.0f }, chest);
+    const UUID lwL = addBone("LowerArm.L", { -0.28f, -0.32f, 0.0f }, uaL);
+    const UUID lwR = addBone("LowerArm.R", { 0.28f, -0.32f, 0.0f }, uaR);
+    (void)lwL; (void)lwR;
+    const UUID thL = addBone("Thigh.L", { -0.16f, -0.42f, 0.0f }, hips);
+    const UUID thR = addBone("Thigh.R", { 0.16f, -0.42f, 0.0f }, hips);
+    const UUID shL = addBone("Shin.L", { 0.0f, -0.38f, 0.0f }, thL);
+    const UUID shR = addBone("Shin.R", { 0.0f, -0.38f, 0.0f }, thR);
+    const UUID ftL = addBone("Foot.L", { 0.0f, -0.26f, 0.02f }, shL);
+    const UUID ftR = addBone("Foot.R", { 0.0f, -0.26f, 0.02f }, shR);
+    (void)ftL; (void)ftR;
+}
+
 void WickedToolsPanel::draw_armature_window() {
-    if (!showArmatureWindow) return;
+    if (!showArmatureWindow || !m_scene) return;
     ImGui::Begin(tr("Esqueleto (Armature)", "Armature"), &showArmatureWindow);
     clamp_floating_window_on_screen();
-    todo_badge("Armature: listagem de ossos e rig no editor são TODO(frontend-port).",
-               "Armature: bone listing and rigging in the editor are TODO(frontend-port).");
     ImGui::TextWrapped("%s", tr(
-        "Os esqueletos vivem nos assets de mesh esqueleto (SkeletonAsset). "
-        "TODO(frontend-port): listar ossos do asset selecionado, reset de pose "
-        "e criação de humanoid rig.",
-        "Skeletons live in skinned mesh assets (SkeletonAsset). "
-        "TODO(frontend-port): list bones of the selected asset, pose reset and "
-        "humanoid rig creation."));
-    if (ImGui::Button(tr("Resetar Pose", "Reset Pose"))) { /* TODO(frontend-port) */ }
-    ImGui::TextDisabled("%s", tr("(sem osso selecionado)", "(no bone selected)"));
+        "O runtime de animação usa a HIERARQUIA de entidades como esqueleto "
+        "(ordem da hierarquia = ordem dos ossos). Este painel lista os ossos "
+        "(entidades filhas) do objeto selecionado, permite resetar a pose e "
+        "criar um esqueleto humanoide padrão para animar com clips.",
+        "The animation runtime uses the ENTITY hierarchy as the skeleton "
+        "(hierarchy order = bone order). This panel lists the bones (child "
+        "entities) of the selected object, can reset the pose, and can create "
+        "a standard humanoid skeleton to animate with clips."));
+    std::vector<UUID> bones;
+    if (has_selection()) {
+        std::function<void(UUID)> collect = [&](UUID parent) {
+            for (const auto& [eid, hc] : m_scene->hierarchyComponents) {
+                if (hc.parentID == parent) {
+                    bones.push_back(eid);
+                    collect(eid);
+                }
+            }
+        };
+        collect(m_selectedEntity);
+    }
+    if (bones.empty()) {
+        ImGui::TextDisabled("%s", tr("(selecione um objeto com ossos/hierarquia)", "(select an object with bones/hierarchy)"));
+    } else {
+        ImGui::TextDisabled("%s (%zu)", tr("Ossos", "Bones"), bones.size());
+        for (const UUID& bid : bones) {
+            const auto it = m_scene->get_entities().find(bid);
+            if (it != m_scene->get_entities().end()) ImGui::BulletText("%s", it->second.get_name().c_str());
+        }
+        if (ImGui::Button(tr("Guardar Pose Atual", "Store Current Pose"))) {
+            m_boneRestPose.clear();
+            for (const UUID& bid : bones) {
+                const auto tit = m_scene->transformComponents.find(bid);
+                if (tit != m_scene->transformComponents.end()) m_boneRestPose[bid] = tit->second;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Resetar Pose", "Reset Pose"))) {
+            for (const UUID& bid : bones) {
+                const auto it = m_boneRestPose.find(bid);
+                if (it != m_boneRestPose.end()) m_scene->transformComponents[bid] = it->second;
+            }
+        }
+        ImGui::TextWrapped("%s", tr("Resetar Pose restaura as transformações guardadas por Guardar Pose Atual (na sessão).",
+            "Reset Pose restores the transforms stored by Store Current Pose (this session)."));
+    }
+    if (has_selection() && ImGui::Button(tr("Criar Esqueleto Humanoide (Rig)", "Create Humanoid Skeleton (Rig)"))) {
+        create_humanoid_rig(m_selectedEntity);
+    }
     ImGui::End();
 }
 
 void WickedToolsPanel::draw_humanoid_window() {
-    if (!showHumanoidWindow) return;
+    if (!showHumanoidWindow || !m_scene) return;
     ImGui::Begin(tr("Humanoide (Humanoid)", "Humanoid Rig"), &showHumanoidWindow);
     clamp_floating_window_on_screen();
-    todo_badge("Humanoid: editor de mapeamento de ossos é TODO(frontend-port).",
-               "Humanoid: bone-mapping editor is TODO(frontend-port).");
     ImGui::TextWrapped("%s", tr(
-        "A engine define HumanoidRigDefinition (mapeamento de ossos) e "
-        "AnimationRetargeter. TODO(frontend-port): editor de mapeamento "
-        "(osso origem → osso alvo) usando o rig definition.",
-        "The engine defines HumanoidRigDefinition (bone mapping) and "
-        "AnimationRetargeter. TODO(frontend-port): mapping editor (source bone "
-        "→ target bone) using the rig definition."));
-    if (ImGui::Button(tr("Criar Rig Humanoide", "Create Humanoid Rig"))) { /* TODO(frontend-port) */ }
+        "O rig humanoide é uma hierarquia de entidades com nomes padrão "
+        "(Hips, Spine, Chest, Head, UpperArm.L/R, LowerArm.L/R, Thigh.L/R, "
+        "Shin.L/R, Foot.L/R) mais um componente Retarget que espelha os ossos "
+        "do personagem para o rig no play. Crie o rig e edite o mapeamento.",
+        "The humanoid rig is an entity hierarchy with standard names (Hips, "
+        "Spine, Chest, Head, UpperArm.L/R, LowerArm.L/R, Thigh.L/R, Shin.L/R, "
+        "Foot.L/R) plus a Retarget component that mirrors the character's "
+        "bones to the rig in play. Create the rig and edit the mapping."));
+    UUID retargetId{ 0, 0 };
+    if (has_selection() && m_scene->retargetComponents.contains(m_selectedEntity)) retargetId = m_selectedEntity;
+    if (has_selection() && ImGui::Button(tr("Criar Rig Humanoide", "Create Humanoid Rig"))) {
+        create_humanoid_rig(m_selectedEntity);
+        if (m_scene->retargetComponents.contains(m_selectedEntity)) retargetId = m_selectedEntity;
+    }
+    if (!retargetId.is_valid()) {
+        ImGui::TextWrapped("%s", tr("Selecione o personagem (com ossos) e crie o rig.",
+            "Select the character (with bones) and create the rig."));
+        ImGui::End();
+        return;
+    }
+    auto& rt = m_scene->retargetComponents[retargetId];
+    ImGui::TextDisabled("%s (%zu)", tr("Mapeamento", "Mapping"), rt.mapping.size());
+    size_t removeIdx = SIZE_MAX;
+    for (size_t i = 0; i < rt.mapping.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::Text("%s → %s", rt.mapping[i].sourceBone.c_str(), rt.mapping[i].targetBone.c_str());
+        if (ImGui::SmallButton(tr("Remover", "Remove"))) removeIdx = i;
+        ImGui::PopID();
+    }
+    if (removeIdx != SIZE_MAX) rt.mapping.erase(rt.mapping.begin() + static_cast<ptrdiff_t>(removeIdx));
+    static char srcBuf[64]{ "Head" };
+    static char dstBuf[64]{ "Head" };
+    ImGui::InputText(tr("Osso origem", "Source bone"), srcBuf, sizeof(srcBuf));
+    ImGui::InputText(tr("Osso alvo", "Target bone"), dstBuf, sizeof(dstBuf));
+    if (ImGui::Button(tr("Adicionar Mapeamento", "Add Mapping")) && srcBuf[0] && dstBuf[0]) {
+        RetargetBoneMapDef def;
+        def.sourceBone = srcBuf;
+        def.targetBone = dstBuf;
+        rt.mapping.push_back(def);
+    }
     ImGui::End();
 }
 
 void WickedToolsPanel::draw_ik_window() {
-    if (!showIKWindow) return;
+    if (!showIKWindow || !m_scene) return;
     ImGui::Begin(tr("IK (Cinemática Inversa)", "Inverse Kinematics"), &showIKWindow);
     clamp_floating_window_on_screen();
-    todo_badge("IK: alvo do solver no viewport é TODO(frontend-port).",
-               "IK: solver target in the viewport is TODO(frontend-port).");
     ImGui::TextWrapped("%s", tr(
-        "A engine tem IKSolver (src/engine/animation). TODO(frontend-port): "
-        "alvo do solver no viewport (gizmo) e controles de cadeia.",
-        "The engine has IKSolver (src/engine/animation). TODO(frontend-port): "
-        "solver target in the viewport (gizmo) and chain controls."));
-    ImGui::SliderFloat(tr("Força", "Strength"), &m_ikStrength, 0.0f, 1.0f);
+        "Cadeia de 2 ossos resolvida no play mode (runtime REAL): raiz → meio → "
+        "ponta, com a ponta alcançando o objeto alvo (peso 0..1). Use os "
+        "combos abaixo para montar a cadeia no componente IKComponent do objeto "
+        "selecionado (ou crie o editor especializado IK e dê Apply).",
+        "Two-bone chain solved in play mode (REAL runtime): root → mid → end, "
+        "with the end reaching the target object (weight 0..1). Use the combos "
+        "below to build the chain on the selected object's IKComponent (or use "
+        "the IK specialized editor and Apply)."));
+    if (!has_selection()) {
+        ImGui::TextDisabled("%s", tr("Nenhum objeto selecionado", "No Object Selected"));
+        ImGui::End();
+        return;
+    }
+    const UUID id = m_selectedEntity;
+    if (!m_scene->ikComponents.contains(id)) {
+        if (ImGui::Button(tr("Adicionar IK ao Objeto", "Add IK to Object"))) m_scene->ikComponents[id] = IKComponent{};
+        ImGui::End();
+        return;
+    }
+    auto& ik = m_scene->ikComponents[id];
+    entity_combo(tr("Osso Raiz", "Root Bone"), ik.rootEntity);
+    entity_combo(tr("Osso do Meio", "Mid Bone"), ik.midEntity);
+    entity_combo(tr("Osso da Ponta", "End Bone"), ik.endEntity);
+    entity_combo(tr("Objeto Alvo", "Target Object"), ik.targetEntity);
+    ImGui::DragFloat3(tr("Vetor Polo", "Pole Vector"), &ik.poleVector.x, 0.05f);
+    ImGui::SliderFloat(tr("Força (Peso)", "Strength (Weight)"), &ik.weight, 0.0f, 1.0f);
+    ImGui::DragInt(tr("Iterações", "Iterations"), &ik.iterations, 1, 1, 64);
+    ImGui::Checkbox(tr("Ativo", "Enabled"), &ik.enabled);
+    if (ImGui::Button(tr("Remover IK", "Remove IK"))) m_scene->ikComponents.erase(id);
     ImGui::End();
 }
 
 void WickedToolsPanel::draw_expression_window() {
-    if (!showExpressionWindow) return;
+    if (!showExpressionWindow || !m_scene) return;
     ImGui::Begin(tr("Expressões Faciais", "Expressions"), &showExpressionWindow);
     clamp_floating_window_on_screen();
-    todo_badge("Expressions: morph targets/blend shapes são TODO(frontend-port).",
-               "Expressions: morph targets/blend shapes are TODO(frontend-port).");
     ImGui::TextWrapped("%s", tr(
-        "TODO(frontend-port): morph targets das expressões (blend shapes) e "
-        "editor de poses faciais.",
-        "TODO(frontend-port): expression morph targets (blend shapes) and a "
-        "facial pose editor."));
+        "Runtime REAL no editor e no play: cada expressão aplica um squash/"
+        "stretch visível na entidade de cabeça (relativo à escala base). "
+        "Selecione a cabeça (entidade) do personagem e ajuste os pesos.",
+        "REAL runtime in the editor and in play: each expression applies a "
+        "visible squash/stretch to the head entity (relative to its base "
+        "scale). Select the character's head (entity) and tune the weights."));
+    if (!has_selection()) {
+        ImGui::TextDisabled("%s", tr("Nenhum objeto selecionado", "No Object Selected"));
+        ImGui::End();
+        return;
+    }
+    const UUID id = m_selectedEntity;
+    if (!m_scene->expressionComponents.contains(id)) {
+        if (ImGui::Button(tr("Adicionar Expressões ao Objeto", "Add Expressions to Object"))) {
+            m_scene->expressionComponents[id] = ExpressionComponent{};
+        }
+        ImGui::End();
+        return;
+    }
+    auto& ex = m_scene->expressionComponents[id];
+    entity_combo(tr("Entidade da Cabeça", "Head Entity"), ex.headEntity);
+    ImGui::SliderFloat(tr("Sorriso", "Smile"), &ex.smile, 0.0f, 1.0f);
+    ImGui::SliderFloat(tr("Carranca", "Frown"), &ex.frown, 0.0f, 1.0f);
+    ImGui::SliderFloat(tr("Piscada", "Blink"), &ex.blink, 0.0f, 1.0f);
+    ImGui::SliderFloat(tr("Surpresa", "Surprised"), &ex.surprised, 0.0f, 1.0f);
+    ImGui::SliderFloat(tr("Raiva", "Anger"), &ex.anger, 0.0f, 1.0f);
+    if (ImGui::Button(tr("Capturar Escala Base da Cabeça", "Capture Head Base Scale")) && ex.headEntity.is_valid()) {
+        const auto tit = m_scene->transformComponents.find(ex.headEntity);
+        if (tit != m_scene->transformComponents.end()) ex.baseScale = tit->second.scale;
+    }
+    if (ImGui::Button(tr("Remover Expressões", "Remove Expressions"))) m_scene->expressionComponents.erase(id);
     ImGui::End();
 }
 
@@ -769,20 +997,45 @@ void WickedToolsPanel::draw_terrain_window() {
 }
 
 void WickedToolsPanel::draw_paint_tool_window() {
-    if (!showPaintToolWindow) return;
+    if (!showPaintToolWindow || !m_scene) return;
     ImGui::Begin(tr("Ferramenta de Pintura", "Paint Tool"), &showPaintToolWindow);
     clamp_floating_window_on_screen();
-    todo_badge("Paint Tool: pintura de vértices/textura em mesh é TODO(frontend-port).",
-               "Paint Tool: vertex/texture painting on meshes is TODO(frontend-port).");
     ImGui::TextWrapped("%s", tr(
-        "TODO(frontend-port): pintura de vértices/textura em mesh no viewport. "
-        "O painel de Escultura de Blocos já cobre pintura voxel (nosso).",
-        "TODO(frontend-port): vertex/texture painting on meshes in the viewport. "
-        "The Voxel Sculpting panel already covers voxel painting (ours)."));
-    ImGui::SliderFloat(tr("Raio do Pincel", "Brush Radius"), &m_paintRadius, 0.01f, 10.0f);
-    ImGui::SliderFloat(tr("Força", "Amount"), &m_paintAmount, 0.0f, 1.0f);
-    ImGui::SliderFloat(tr("Suavidade", "Smoothness"), &m_paintSmooth, 0.0f, 1.0f);
-    ImGui::ColorEdit3(tr("Cor", "Color"), &m_paintColor.r);
+        "Pintura de vértices REAL no viewport: ative o Modo Pintura e segure o "
+        "clique esquerdo sobre a malha do objeto selecionado para pintar "
+        "(raio + cor + opacidade). A pintura persiste na cena (save/load).",
+        "REAL vertex painting in the viewport: enable Paint Mode and hold the "
+        "left button over the selected object's mesh to paint (radius + color "
+        "+ opacity). The paint persists with the scene (save/load)."));
+    if (!has_selection()) {
+        ImGui::TextDisabled("%s", tr("Nenhum objeto selecionado", "No Object Selected"));
+        ImGui::End();
+        return;
+    }
+    const UUID id = m_selectedEntity;
+    if (!m_scene->paintComponents.contains(id)) {
+        if (ImGui::Button(tr("Adicionar Pintura ao Objeto", "Add Paint to Object"))) {
+            m_scene->paintComponents[id] = PaintComponent{};
+        }
+        ImGui::TextWrapped("%s", tr("O objeto precisa de uma malha (Mesh Renderer) para receber pintura.",
+            "The object needs a mesh (Mesh Renderer) to receive paint."));
+        ImGui::End();
+        return;
+    }
+    auto& pc = m_scene->paintComponents[id];
+    if (ImGui::Checkbox(tr("Modo Pintura (segurar clique no viewport)", "Paint Mode (hold click in viewport)"), &pc.paintMode)) {
+        // The editor mirrors paintMode on the selected entity into its paint tool.
+    }
+    ImGui::ColorEdit3(tr("Cor", "Color"), &pc.brushColor.r);
+    ImGui::SliderFloat(tr("Raio do Pincel", "Brush Radius"), &pc.brushSize, 0.01f, 10.0f);
+    ImGui::SliderFloat(tr("Força (Opacidade)", "Amount (Opacity)"), &pc.opacity, 0.0f, 1.0f);
+    ImGui::TextDisabled("%s: %zu", tr("Vértices pintados", "Painted vertices"), pc.vertexColors.size());
+    if (ImGui::Button(tr("Limpar Pintura", "Clear Paint"))) {
+        pc.vertexColors.clear();
+        const auto pit = m_scene->paintComponents.find(id);
+        if (pit != m_scene->paintComponents.end()) pit->second.vertexColors.clear();
+    }
+    if (ImGui::Button(tr("Remover Pintura", "Remove Paint"))) m_scene->paintComponents.erase(id);
     ImGui::End();
 }
 
@@ -846,33 +1099,98 @@ void WickedToolsPanel::draw_model_importer_window() {
 }
 
 void WickedToolsPanel::draw_video_window() {
-    if (!showVideoWindow) return;
+    if (!showVideoWindow || !m_scene) return;
     ImGui::Begin(tr("Vídeo", "Video"), &showVideoWindow);
     clamp_floating_window_on_screen();
-    todo_badge("Video: player de vídeo (textura dinâmica) é TODO(frontend-port).",
-               "Video: video player (dynamic texture) is TODO(frontend-port).");
     ImGui::TextWrapped("%s", tr(
-        "TODO(frontend-port): player de vídeo (textura dinâmica) e "
-        "decodificação — não há decodificador de vídeo no core ainda.",
-        "TODO(frontend-port): video player (dynamic texture) and decoding — no "
-        "video decoder exists in the core yet."));
-    if (ImGui::Button(tr("Abrir Vídeo...", "Open Video..."))) { /* TODO(frontend-port) */ }
-    ImGui::Checkbox(tr("Em Loop", "Looped"), &m_videoLoop);
+        "Player de vídeo flipbook REAL: uma sequência de texturas do registro "
+        "de assets é reproduzida no objeto selecionado em FPS configurável "
+        "(o editor mostra o quadro atual ao vivo, no editor e no play).",
+        "REAL flipbook video player: a sequence of registry textures plays on "
+        "the selected object at a configurable FPS (the editor shows the "
+        "current frame live, in the editor and in play)."));
+    if (!has_selection()) {
+        ImGui::TextDisabled("%s", tr("Nenhum objeto selecionado", "No Object Selected"));
+        ImGui::End();
+        return;
+    }
+    const UUID id = m_selectedEntity;
+    if (!m_scene->videoComponents.contains(id)) {
+        if (ImGui::Button(tr("Adicionar Vídeo ao Objeto", "Add Video to Object"))) {
+            m_scene->videoComponents[id] = VideoComponent{};
+        }
+        ImGui::End();
+        return;
+    }
+    auto& v = m_scene->videoComponents[id];
+    ImGui::SliderFloat(tr("FPS", "FPS"), &v.fps, 0.1f, 60.0f);
+    ImGui::Checkbox(tr("Tocando", "Playing"), &v.playing);
+    ImGui::Checkbox(tr("Em Loop", "Looped"), &v.loop);
+    const int maxFrame = std::max(0, static_cast<int>(v.framePaths.size()) - 1);
+    ImGui::SliderInt(tr("Quadro Atual", "Current Frame"), &v.currentFrame, 0, maxFrame);
+    ImGui::Separator();
+    ImGui::TextDisabled("%s (%zu)", tr("Quadros (texturas do registro)", "Frames (registry textures)"), v.framePaths.size());
+    size_t removeIdx = SIZE_MAX;
+    for (size_t i = 0; i < v.framePaths.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        char buf[512];
+        strncpy(buf, v.framePaths[i].c_str(), sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        ImGui::InputText(tr("Quadro", "Frame"), buf, sizeof(buf));
+        if (ImGui::IsItemDeactivatedAfterEdit()) v.framePaths[i] = buf;
+        ImGui::SameLine();
+        if (ImGui::SmallButton(tr("Remover", "Remove"))) removeIdx = i;
+        ImGui::PopID();
+    }
+    if (removeIdx != SIZE_MAX) v.framePaths.erase(v.framePaths.begin() + static_cast<ptrdiff_t>(removeIdx));
+    if (ImGui::Button(tr("Adicionar Quadro", "Add Frame"))) v.framePaths.push_back("");
+    if (v.framePaths.empty() && ImGui::Button(tr("Usar Texturas da Pasta Selecionada", "Use Textures From Selected Folder"))) {
+        // Fill from the asset registry (all textures, first 64).
+        if (m_assetRegistry) {
+            for (const AssetMetadata& meta : m_assetRegistry->snapshot()) {
+                if (meta.type == AssetType::Texture) {
+                    v.framePaths.push_back(meta.sourcePath.filename().string());
+                    if (v.framePaths.size() >= 64) break;
+                }
+            }
+        }
+    }
+    if (ImGui::Button(tr("Remover Vídeo", "Remove Video"))) m_scene->videoComponents.erase(id);
     ImGui::End();
 }
 
 void WickedToolsPanel::draw_gaussian_splat_window() {
-    if (!showGaussianSplatWindow) return;
+    if (!showGaussianSplatWindow || !m_scene) return;
     ImGui::Begin(tr("Gaussian Splat", "Gaussian Splat"), &showGaussianSplatWindow);
     clamp_floating_window_on_screen();
-    todo_badge("Gaussian Splat: render de nuvens de splat é TODO(frontend-port).",
-               "Gaussian Splat: splat cloud rendering is TODO(frontend-port).");
     ImGui::TextWrapped("%s", tr(
-        "TODO(frontend-port): render de nuvens de Gaussian Splatting — sem "
-        "suporte no renderer ainda.",
-        "TODO(frontend-port): Gaussian Splatting cloud rendering — not supported "
-        "by the renderer yet."));
-    if (ImGui::Button(tr("Importar .splat...", "Import .splat..."))) { /* TODO(frontend-port) */ }
+        "Nuvem de Gaussian Splatting REAL: pontos com falloff gaussiano suave "
+        "(blend, depth test sem escrita) renderizados no editor e no play. "
+        "Regenere a nuvem para aplicar os parâmetros; posicione com o gizmo.",
+        "REAL Gaussian Splatting cloud: points with soft gaussian falloff "
+        "(blend, depth test without writing) rendered in the editor and play. "
+        "Regenerate to apply the parameters; position with the gizmo."));
+    if (!has_selection()) {
+        ImGui::TextDisabled("%s", tr("Nenhum objeto selecionado", "No Object Selected"));
+        ImGui::End();
+        return;
+    }
+    const UUID id = m_selectedEntity;
+    if (!m_scene->gaussianSplatComponents.contains(id)) {
+        if (ImGui::Button(tr("Adicionar Nuvem ao Objeto", "Add Cloud to Object"))) {
+            m_scene->gaussianSplatComponents[id] = GaussianSplatComponent{};
+        }
+        ImGui::End();
+        return;
+    }
+    auto& gs = m_scene->gaussianSplatComponents[id];
+    ImGui::DragInt(tr("Splats", "Splats"), reinterpret_cast<int*>(&gs.count), 100, 10, 200000);
+    ImGui::DragFloat(tr("Escala da Caixa", "Box Scale"), &gs.scale, 0.1f, 0.1f, 100.0f);
+    ImGui::SliderFloat(tr("Tamanho do Ponto", "Point Size"), &gs.pointSize, 0.5f, 64.0f);
+    ImGui::SliderFloat(tr("Opacidade", "Opacity"), &gs.opacity, 0.0f, 1.0f);
+    ImGui::DragInt(tr("Semente", "Seed"), reinterpret_cast<int*>(&gs.seed), 1);
+    if (ImGui::Button(tr("Regenerar Nuvem", "Regenerate Cloud"))) gs.regenerate = true;
+    if (ImGui::Button(tr("Remover Nuvem", "Remove Cloud"))) m_scene->gaussianSplatComponents.erase(id);
     ImGui::End();
 }
 

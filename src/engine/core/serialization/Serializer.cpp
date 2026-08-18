@@ -412,7 +412,104 @@ SerializationResult Serializer::serialize_scene(
             const auto& v=wt->second;out<<",\n      \"Weather\":{\"sr\":"<<v.sunColor.r<<",\"sg\":"<<v.sunColor.g<<",\"sb\":"<<v.sunColor.b<<",\"fogDensity\":"<<v.fogDensity<<",\"fogStart\":"<<v.fogStart<<",\"skyExposure\":"<<v.skyExposure<<",\"skyRotation\":"<<v.skyRotation<<",\"windSpeed\":"<<v.windSpeed<<",\"rainAmount\":"<<v.rainAmount<<",\"rainLength\":"<<v.rainLength<<",\"heightFog\":"<<(v.heightFog?"true":"false")<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
         }
         if (auto hp = scene.hairParticleComponents.find(id); hp != scene.hairParticleComponents.end()) {
-            const auto& v=hp->second;out<<",\n      \"HairParticle\":{\"mesh\":\""<<escape_json(v.meshPath)<<"\",\"count\":"<<v.count<<",\"length\":"<<v.length<<",\"width\":"<<v.width<<",\"stiffness\":"<<v.stiffness<<",\"drag\":"<<v.drag<<",\"gravityPower\":"<<v.gravityPower<<",\"randomness\":"<<v.randomness<<",\"segments\":"<<v.segments<<",\"seed\":"<<v.seed<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
+            const auto& v=hp->second;out<<",\n      \"HairParticle\":{\"mesh\":\""<<escape_json(v.meshPath)<<"\",\"count\":"<<v.count<<",\"length\":"<<v.length<<",\"width\":"<<v.width<<",\"stiffness\":"<<v.stiffness<<",\"drag\":"<<v.drag<<",\"gravityPower\":"<<v.gravityPower<<",\"randomness\":"<<v.randomness<<",\"segments\":"<<v.segments<<",\"seed\":"<<v.seed<<",\"cr\":"<<v.color.r<<",\"cg\":"<<v.color.g<<",\"cb\":"<<v.color.b<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
+        }
+        if (auto ly = scene.layerComponents.find(id); ly != scene.layerComponents.end()) {
+            const auto& v=ly->second;out<<",\n      \"Layer\":{\"name\":\""<<escape_json(v.name)<<"\",\"index\":"<<v.index<<",\"visible\":"<<(v.visible?"true":"false")<<",\"locked\":"<<(v.locked?"true":"false")<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
+        }
+        if (auto pc = scene.paintComponents.find(id); pc != scene.paintComponents.end()) {
+            const auto& v=pc->second;
+            out << ",\n      \"Paint\":{\"r\":" << v.brushColor.r << ",\"g\":" << v.brushColor.g
+                << ",\"b\":" << v.brushColor.b << ",\"brush\":" << v.brushSize
+                << ",\"opacity\":" << v.opacity << ",\"mode\":" << (v.paintMode ? "true" : "false")
+                << ",\"colors\":[";
+            for (size_t ci = 0; ci < v.vertexColors.size(); ++ci) {
+                out << (ci ? "," : "") << "[" << v.vertexColors[ci].x << "," << v.vertexColors[ci].y
+                    << "," << v.vertexColors[ci].z << "," << v.vertexColors[ci].w << "]";
+            }
+            out << "]}";
+        }
+        if (auto vc = scene.videoComponents.find(id); vc != scene.videoComponents.end()) {
+            const auto& v=vc->second;
+            out << ",\n      \"Video\":{\"fps\":" << v.fps << ",\"frame\":" << v.currentFrame
+                << ",\"time\":" << v.time << ",\"playing\":" << (v.playing ? "true" : "false")
+                << ",\"loop\":" << (v.loop ? "true" : "false")
+                << ",\"enabled\":" << (v.enabled ? "true" : "false") << ",\"frames\":[";
+            for (size_t fi = 0; fi < v.framePaths.size(); ++fi) {
+                out << (fi ? "," : "") << "\"" << escape_json(v.framePaths[fi]) << "\"";
+            }
+            out << "]}";
+        }
+        if (auto gs = scene.gaussianSplatComponents.find(id); gs != scene.gaussianSplatComponents.end()) {
+            const auto& v=gs->second;out<<",\n      \"GaussianSplat\":{\"count\":"<<v.count<<",\"scale\":"<<v.scale<<",\"pointSize\":"<<v.pointSize<<",\"opacity\":"<<v.opacity<<",\"seed\":"<<v.seed<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
+        }
+        if (auto ex = scene.expressionComponents.find(id); ex != scene.expressionComponents.end()) {
+            const auto& v=ex->second;out<<",\n      \"Expression\":{\"head\":\""<<v.headEntity.to_string()<<"\",\"bsx\":"<<v.baseScale.x<<",\"bsy\":"<<v.baseScale.y<<",\"bsz\":"<<v.baseScale.z<<",\"smile\":"<<v.smile<<",\"frown\":"<<v.frown<<",\"blink\":"<<v.blink<<",\"surprised\":"<<v.surprised<<",\"anger\":"<<v.anger<<",\"enabled\":"<<(v.enabled?"true":"false")<<"}";
+        }
+        if (auto an = scene.animationComponents.find(id); an != scene.animationComponents.end()) {
+            const auto& v=an->second;
+            out << ",\n      \"Animation\":{\"playing\":" << (v.playing ? "true" : "false")
+                << ",\"entry\":\"" << escape_json(v.entryState) << "\",\"states\":[";
+            for (size_t i = 0; i < v.states.size(); ++i) {
+                const auto& s = v.states[i];
+                if (i) out << ',';
+                out << "{\"id\":\"" << escape_json(s.id) << "\",\"clip\":\"" << s.clip.to_string()
+                    << "\",\"loop\":" << (s.loop ? "true" : "false") << ",\"speed\":" << s.speed << "}";
+            }
+            out << "],\"transitions\":[";
+            for (size_t i = 0; i < v.transitions.size(); ++i) {
+                const auto& t = v.transitions[i];
+                if (i) out << ',';
+                out << "{\"from\":\"" << escape_json(t.from) << "\",\"to\":\"" << escape_json(t.to)
+                    << "\",\"condition\":\"" << escape_json(t.condition)
+                    << "\",\"blend\":" << t.blendSeconds << "}";
+            }
+            out << "]}";
+        }
+        if (auto tl = scene.timelineComponents.find(id); tl != scene.timelineComponents.end()) {
+            const auto& v = tl->second;
+            out << ",\n      \"Timeline\":{\"duration\":" << v.duration << ",\"loop\":"
+                << (v.loop ? "true" : "false") << ",\"playhead\":" << v.playhead << ",\"tracks\":[";
+            for (size_t i = 0; i < v.tracks.size(); ++i) {
+                const auto& t = v.tracks[i];
+                if (i) out << ',';
+                out << "{\"name\":\"" << escape_json(t.name) << "\",\"type\":"
+                    << static_cast<int>(t.type) << ",\"muted\":" << (t.muted ? "true" : "false")
+                    << ",\"keys\":[";
+                for (size_t k = 0; k < t.keys.size(); ++k) {
+                    const auto& key = t.keys[k];
+                    if (k) out << ',';
+                    out << "{\"time\":" << key.time << ",\"value\":\""
+                        << escape_json(key.value) << "\"}";
+                }
+                out << "]}";
+            }
+            out << "]}";
+        }
+        if (auto ik = scene.ikComponents.find(id); ik != scene.ikComponents.end()) {
+            const auto& v = ik->second;
+            out << ",\n      \"IK\":{\"root\":\"" << v.rootEntity.to_string() << "\",\"mid\":\""
+                << v.midEntity.to_string() << "\",\"end\":\"" << v.endEntity.to_string()
+                << "\",\"target\":\"" << v.targetEntity.to_string() << "\",\"px\":" << v.poleVector.x
+                << ",\"py\":" << v.poleVector.y << ",\"pz\":" << v.poleVector.z
+                << ",\"weight\":" << v.weight << ",\"iterations\":" << v.iterations
+                << ",\"enabled\":" << (v.enabled ? "true" : "false") << "}";
+        }
+        if (auto rt = scene.retargetComponents.find(id); rt != scene.retargetComponents.end()) {
+            const auto& v = rt->second;
+            out << ",\n      \"Retarget\":{\"source\":\"" << v.sourceSkeleton.to_string()
+                << "\",\"target\":\"" << v.targetSkeleton.to_string()
+                << "\",\"rootMotion\":" << (v.preserveRootMotion ? "true" : "false")
+                << ",\"mapping\":[";
+            for (size_t i = 0; i < v.mapping.size(); ++i) {
+                const auto& m = v.mapping[i];
+                if (i) out << ',';
+                out << "{\"source\":\"" << escape_json(m.sourceBone)
+                    << "\",\"target\":\"" << escape_json(m.targetBone)
+                    << "\",\"scale\":" << m.translationScale << ",\"ox\":" << m.rotationOffset.x
+                    << ",\"oy\":" << m.rotationOffset.y << ",\"oz\":" << m.rotationOffset.z << "}";
+            }
+            out << "]}";
         }
         out << "\n    }" << (++emitted < scene.m_entities.size() ? "," : "") << '\n';
     }
@@ -568,7 +665,125 @@ SerializationResult Serializer::deserialize_scene(
             WeatherComponent v;v.sunColor={static_cast<float>(number_field(*wt,"sr").value_or(1)),static_cast<float>(number_field(*wt,"sg").value_or(.95)),static_cast<float>(number_field(*wt,"sb").value_or(.85))};v.fogDensity=static_cast<float>(number_field(*wt,"fogDensity").value_or(.001));v.fogStart=static_cast<float>(number_field(*wt,"fogStart").value_or(100));v.skyExposure=static_cast<float>(number_field(*wt,"skyExposure").value_or(1));v.skyRotation=static_cast<float>(number_field(*wt,"skyRotation").value_or(0));v.windSpeed=static_cast<float>(number_field(*wt,"windSpeed").value_or(5));v.rainAmount=static_cast<float>(number_field(*wt,"rainAmount").value_or(0));v.rainLength=static_cast<float>(number_field(*wt,"rainLength").value_or(1));v.heightFog=bool_field(*wt,"heightFog").value_or(false);v.enabled=bool_field(*wt,"enabled").value_or(true);loaded.weatherComponents[entityId]=v;
         }
         if (const auto hp = object_field(object, "HairParticle")) {
-            HairParticleComponent v;v.meshPath=string_field(*hp,"mesh").value_or("");v.count=static_cast<uint32_t>(number_field(*hp,"count").value_or(1000));v.length=static_cast<float>(number_field(*hp,"length").value_or(.3));v.width=static_cast<float>(number_field(*hp,"width").value_or(.01));v.stiffness=static_cast<float>(number_field(*hp,"stiffness").value_or(.5));v.drag=static_cast<float>(number_field(*hp,"drag").value_or(.1));v.gravityPower=static_cast<float>(number_field(*hp,"gravityPower").value_or(1));v.randomness=static_cast<float>(number_field(*hp,"randomness").value_or(.2));v.segments=static_cast<uint32_t>(number_field(*hp,"segments").value_or(8));v.seed=static_cast<uint32_t>(number_field(*hp,"seed").value_or(0));v.enabled=bool_field(*hp,"enabled").value_or(true);loaded.hairParticleComponents[entityId]=v;
+            HairParticleComponent v;v.meshPath=string_field(*hp,"mesh").value_or("");v.count=static_cast<uint32_t>(number_field(*hp,"count").value_or(1000));v.length=static_cast<float>(number_field(*hp,"length").value_or(.3));v.width=static_cast<float>(number_field(*hp,"width").value_or(.01));v.stiffness=static_cast<float>(number_field(*hp,"stiffness").value_or(.5));v.drag=static_cast<float>(number_field(*hp,"drag").value_or(.1));v.gravityPower=static_cast<float>(number_field(*hp,"gravityPower").value_or(1));v.randomness=static_cast<float>(number_field(*hp,"randomness").value_or(.2));v.segments=static_cast<uint32_t>(number_field(*hp,"segments").value_or(8));v.seed=static_cast<uint32_t>(number_field(*hp,"seed").value_or(0));v.color={static_cast<float>(number_field(*hp,"cr").value_or(.95)),static_cast<float>(number_field(*hp,"cg").value_or(.88)),static_cast<float>(number_field(*hp,"cb").value_or(.78))};v.enabled=bool_field(*hp,"enabled").value_or(true);loaded.hairParticleComponents[entityId]=v;
+        }
+        if (const auto ly = object_field(object, "Layer")) {
+            LayerComponent v;v.name=string_field(*ly,"name").value_or("Default");v.index=static_cast<int>(number_field(*ly,"index").value_or(0));v.visible=bool_field(*ly,"visible").value_or(true);v.locked=bool_field(*ly,"locked").value_or(false);v.enabled=bool_field(*ly,"enabled").value_or(true);loaded.layerComponents[entityId]=v;
+        }
+        if (const auto pc = object_field(object, "Paint")) {
+            PaintComponent v;v.brushColor={static_cast<float>(number_field(*pc,"r").value_or(1)),static_cast<float>(number_field(*pc,"g").value_or(.3)),static_cast<float>(number_field(*pc,"b").value_or(.22))};v.brushSize=static_cast<float>(number_field(*pc,"brush").value_or(.5));v.opacity=static_cast<float>(number_field(*pc,"opacity").value_or(1));v.paintMode=bool_field(*pc,"mode").value_or(false);
+            const std::string_view src = *pc;
+            const auto arrBegin = src.find("colors\"");
+            const auto colon = (arrBegin != std::string_view::npos) ? src.find(':', arrBegin) : std::string_view::npos;
+            if (colon != std::string_view::npos) {
+                size_t pos = src.find('[', colon);
+                while (pos != std::string_view::npos) {
+                    const auto open = src.find('[', pos + 1);
+                    if (open == std::string_view::npos) break;
+                    const auto close = src.find(']', open);
+                    if (close == std::string_view::npos) break;
+                    const std::string_view quad = src.substr(open + 1, close - open - 1);
+                    float x = 0.0f, y = 0.0f, z = 0.0f, w = 1.0f;
+                    if (std::sscanf(std::string(quad).c_str(), "%f,%f,%f,%f", &x, &y, &z, &w) == 4) {
+                        v.vertexColors.push_back({x, y, z, w});
+                    }
+                    pos = close;
+                }
+            }
+            loaded.paintComponents[entityId]=v;
+        }
+        if (const auto vc = object_field(object, "Video")) {
+            VideoComponent v;v.fps=static_cast<float>(number_field(*vc,"fps").value_or(24));v.currentFrame=static_cast<int>(number_field(*vc,"frame").value_or(0));v.time=static_cast<float>(number_field(*vc,"time").value_or(0));v.playing=bool_field(*vc,"playing").value_or(true);v.loop=bool_field(*vc,"loop").value_or(true);v.enabled=bool_field(*vc,"enabled").value_or(true);
+            const std::string_view src = *vc;
+            const auto arrBegin = src.find("frames\"");
+            const auto colon = (arrBegin != std::string_view::npos) ? src.find(':', arrBegin) : std::string_view::npos;
+            if (colon != std::string_view::npos) {
+                size_t pos = src.find('[', colon);
+                while (pos != std::string_view::npos) {
+                    const auto q = src.find('"', pos + 1);
+                    if (q == std::string_view::npos) break;
+                    const auto qe = src.find('"', q + 1);
+                    if (qe == std::string_view::npos) break;
+                    v.framePaths.push_back(std::string(src.substr(q + 1, qe - q - 1)));
+                    pos = qe;
+                }
+            }
+            loaded.videoComponents[entityId]=v;
+        }
+        if (const auto gs = object_field(object, "GaussianSplat")) {
+            GaussianSplatComponent v;v.count=static_cast<uint32_t>(number_field(*gs,"count").value_or(8000));v.scale=static_cast<float>(number_field(*gs,"scale").value_or(3));v.pointSize=static_cast<float>(number_field(*gs,"pointSize").value_or(6));v.opacity=static_cast<float>(number_field(*gs,"opacity").value_or(.6));v.seed=static_cast<uint32_t>(number_field(*gs,"seed").value_or(1));v.enabled=bool_field(*gs,"enabled").value_or(true);loaded.gaussianSplatComponents[entityId]=v;
+        }
+        if (const auto ex = object_field(object, "Expression")) {
+            ExpressionComponent v;v.headEntity=UUID::from_string(string_field(*ex,"head").value_or(""));v.baseScale={static_cast<float>(number_field(*ex,"bsx").value_or(1)),static_cast<float>(number_field(*ex,"bsy").value_or(1)),static_cast<float>(number_field(*ex,"bsz").value_or(1))};v.smile=static_cast<float>(number_field(*ex,"smile").value_or(0));v.frown=static_cast<float>(number_field(*ex,"frown").value_or(0));v.blink=static_cast<float>(number_field(*ex,"blink").value_or(0));v.surprised=static_cast<float>(number_field(*ex,"surprised").value_or(0));v.anger=static_cast<float>(number_field(*ex,"anger").value_or(0));v.enabled=bool_field(*ex,"enabled").value_or(true);loaded.expressionComponents[entityId]=v;
+        }
+        if (const auto an = object_field(object, "Animation")) {
+            AnimationComponent v;
+            v.playing = bool_field(*an, "playing").value_or(true);
+            v.entryState = string_field(*an, "entry").value_or("");
+            for (const auto st : array_objects(*an, "states")) {
+                AnimationStateDef s;
+                s.id = string_field(st, "id").value_or("");
+                s.clip = UUID::from_string(string_field(st, "clip").value_or(""));
+                s.loop = bool_field(st, "loop").value_or(true);
+                s.speed = static_cast<float>(number_field(st, "speed").value_or(1.0));
+                v.states.push_back(s);
+            }
+            for (const auto tr : array_objects(*an, "transitions")) {
+                AnimationTransitionDef t;
+                t.from = string_field(tr, "from").value_or("");
+                t.to = string_field(tr, "to").value_or("");
+                t.condition = string_field(tr, "condition").value_or("");
+                t.blendSeconds = static_cast<float>(number_field(tr, "blend").value_or(0.2));
+                v.transitions.push_back(t);
+            }
+            loaded.animationComponents[entityId] = v;
+        }
+        if (const auto tl = object_field(object, "Timeline")) {
+            TimelineComponent v;
+            v.duration = static_cast<float>(number_field(*tl, "duration").value_or(1.0));
+            v.loop = bool_field(*tl, "loop").value_or(false);
+            v.playhead = static_cast<float>(number_field(*tl, "playhead").value_or(0.0));
+            for (const auto tr : array_objects(*tl, "tracks")) {
+                TimelineTrackDef t;
+                t.name = string_field(tr, "name").value_or("");
+                t.type = static_cast<uint8_t>(static_cast<int>(number_field(tr, "type").value_or(0)));
+                t.muted = bool_field(tr, "muted").value_or(false);
+                for (const auto k : array_objects(tr, "keys")) {
+                    TimelineKeyDef key;
+                    key.time = static_cast<float>(number_field(k, "time").value_or(0.0));
+                    key.value = string_field(k, "value").value_or("");
+                    t.keys.push_back(key);
+                }
+                v.tracks.push_back(t);
+            }
+            loaded.timelineComponents[entityId] = v;
+        }
+        if (const auto ik = object_field(object, "IK")) {
+            IKComponent v;
+            v.rootEntity = UUID::from_string(string_field(*ik, "root").value_or(""));
+            v.midEntity = UUID::from_string(string_field(*ik, "mid").value_or(""));
+            v.endEntity = UUID::from_string(string_field(*ik, "end").value_or(""));
+            v.targetEntity = UUID::from_string(string_field(*ik, "target").value_or(""));
+            v.poleVector = {static_cast<float>(number_field(*ik, "px").value_or(0)), static_cast<float>(number_field(*ik, "py").value_or(1)), static_cast<float>(number_field(*ik, "pz").value_or(0))};
+            v.weight = static_cast<float>(number_field(*ik, "weight").value_or(1.0));
+            v.iterations = static_cast<int>(number_field(*ik, "iterations").value_or(8));
+            v.enabled = bool_field(*ik, "enabled").value_or(true);
+            loaded.ikComponents[entityId] = v;
+        }
+        if (const auto rt = object_field(object, "Retarget")) {
+            RetargetComponent v;
+            v.sourceSkeleton = UUID::from_string(string_field(*rt, "source").value_or(""));
+            v.targetSkeleton = UUID::from_string(string_field(*rt, "target").value_or(""));
+            v.preserveRootMotion = bool_field(*rt, "rootMotion").value_or(true);
+            for (const auto mp : array_objects(*rt, "mapping")) {
+                RetargetBoneMapDef m;
+                m.sourceBone = string_field(mp, "source").value_or("");
+                m.targetBone = string_field(mp, "target").value_or("");
+                m.translationScale = static_cast<float>(number_field(mp, "scale").value_or(1.0));
+                m.rotationOffset = {static_cast<float>(number_field(mp, "ox").value_or(0)), static_cast<float>(number_field(mp, "oy").value_or(0)), static_cast<float>(number_field(mp, "oz").value_or(0))};
+                v.mapping.push_back(m);
+            }
+            loaded.retargetComponents[entityId] = v;
         }
         if (const auto hier = object_field(object, "Hierarchy")) {
             if (const auto parentIdText = string_field(*hier, "parent_id")) {

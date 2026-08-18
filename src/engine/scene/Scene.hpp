@@ -169,6 +169,22 @@ public:
     std::unordered_map<UUID, WeatherComponent>      weatherComponents;
     std::unordered_map<UUID, HairParticleComponent> hairParticleComponents;
 
+    // Runtime-wired component set (added by the frontend port): Layers,
+    // vertex Paint, flipbook Video and Gaussian Splat clouds all have REAL
+    // runtime behaviour in the editor and in play mode.
+    std::unordered_map<UUID, LayerComponent>        layerComponents;
+    std::unordered_map<UUID, PaintComponent>        paintComponents;
+    std::unordered_map<UUID, VideoComponent>        videoComponents;
+    std::unordered_map<UUID, GaussianSplatComponent> gaussianSplatComponents;
+    std::unordered_map<UUID, ExpressionComponent>   expressionComponents;
+
+    // Animation stack (Playback): Apply targets of the Animation / Timeline /
+    // IK / Retarget specialized editors. Simulated by tick_play_runtime.
+    std::unordered_map<UUID, AnimationComponent>    animationComponents;
+    std::unordered_map<UUID, TimelineComponent>     timelineComponents;
+    std::unordered_map<UUID, IKComponent>           ikComponents;
+    std::unordered_map<UUID, RetargetComponent>     retargetComponents;
+
     // -----------------------------------------------------------------------
     // Generic Component Storage (new — for plugins and future types)
     //

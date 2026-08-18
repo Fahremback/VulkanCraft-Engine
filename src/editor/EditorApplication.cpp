@@ -18,6 +18,7 @@
 #include "../engine/gameplay/MissionSystem.hpp"
 #include "engine/navigation/INavigationProvider.hpp"
 #include <array>
+#include <random>
 #include <cctype>
 #include <cstdlib>
 #include <sstream>
@@ -38,6 +39,49 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_impl_glfw.h>
+
+// Local copies of the file-scope render helpers (the originals live in a
+// nested anonymous namespace inside `namespace Engine`, later in this TU, so
+// they are not visible to the runtime-wired Wicked-port code below). These
+// global-scope versions share the same implementations.
+namespace {
+glm::mat4 model_from_transform(const Engine::TransformComponent& t) {
+    glm::mat4 model(1.0f);
+    model = glm::translate(model, t.position);
+    model = glm::rotate(model, glm::radians(t.rotation.z), glm::vec3(0, 0, 1));
+    model = glm::rotate(model, glm::radians(t.rotation.y), glm::vec3(0, 1, 0));
+    model = glm::rotate(model, glm::radians(t.rotation.x), glm::vec3(1, 0, 0));
+    model = glm::scale(model, t.scale);
+    return model;
+}
+// Current fog state (set per-frame from WeatherComponent)
+static glm::vec4 g_fogParams{ 0.001f, 100.0f, 0.0f, 0.0f };
+static glm::vec4 g_fogColor{ 0.5f, 0.6f, 0.7f, 1.0f };
+void push_constants(VkCommandBuffer cmd, VkPipelineLayout layout, const glm::mat4& mvp, const glm::vec4& color) {
+    const Engine::ScenePushConstants pc{ mvp, color, g_fogParams, g_fogColor };
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       static_cast<uint32_t>(sizeof(pc)), &pc);
+}
+void set_viewport_scissor(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
+    VkViewport viewport{ 0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h), 0.0f, 1.0f };
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    VkRect2D scissor{ { 0, 0 }, { w, h } };
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+}
+void draw_indexed_cube(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb, const VkBuffer& ib,
+                       uint32_t indexCount, const glm::mat4& mvp, const glm::vec4& color) {
+    const VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
+    vkCmdBindIndexBuffer(cmd, ib, 0, VK_INDEX_TYPE_UINT32);
+    push_constants(cmd, layout, mvp, color);
+    vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
+}
+void draw_indexed_editor_mesh(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb,
+                              const VkBuffer& ib, uint32_t indexCount, const glm::mat4& mvp,
+                              const glm::vec4& color) {
+    draw_indexed_cube(cmd, layout, vb, ib, indexCount, mvp, color);
+}
+} // namespace
 #include <imgui_impl_vulkan.h>
 #include <VkBootstrap.h>
 #include <miniaudio.h>
@@ -224,7 +268,7 @@ int EditorApplication::run() {
 void EditorApplication::init_window() {
     if (!glfwInit()) throw std::runtime_error("Failed to initialize GLFW");
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    m_window = glfwCreateWindow(m_windowWidth, m_windowHeight, tr("Vulkan Engine 1.5 - Gerenciador de Jogos", "Vulkan Engine 1.5 - Game Launcher"), nullptr, nullptr);
+    m_window = glfwCreateWindow(m_windowWidth, m_windowHeight, tr("VulkanCraft Engine - Gerenciador de Jogos", "VulkanCraft Engine - Game Launcher"), nullptr, nullptr);
     if (!m_window) throw std::runtime_error("Failed to create GLFW window");
     // Own scroll callback (chained by the ImGui backend, which stores it as its
     // previous callback and forwards events). The camera consumes the delta
@@ -248,7 +292,7 @@ void EditorApplication::init_vulkan() {
     // the launcher hub so the 3D viewport is exercised immediately.
     const bool validate = std::getenv("VC_EDITOR_VALIDATION") != nullptr;
     vkb::InstanceBuilder builder;
-    builder.set_app_name("Vulkan Engine Studio")
+    builder.set_app_name("VulkanCraft Engine")
            .require_api_version(1, 3, 0);
     if (validate) {
         builder.request_validation_layers(true);
@@ -503,7 +547,7 @@ void EditorApplication::init_default_scene() {
 
     if (std::getenv("VC_EDITOR_SKIP_LAUNCHER") != nullptr) {
         m_inLauncherMode = false;
-        glfwSetWindowTitle(m_window, ("Vulkan Engine Studio 1.5 - [" + m_currentProjectName + "]").c_str());
+        glfwSetWindowTitle(m_window, ("VulkanCraft Engine - [" + m_currentProjectName + "]").c_str());
     }
 
     // VC_EDITOR_TEST_MATERIAL=1: exercise the material-graph viewport path
@@ -589,760 +633,14 @@ void EditorApplication::init_default_scene() {
     }
 }
 
-void EditorApplication::setup_play_runtime() {
-    teardown_play_runtime();
-    Scene* playScene = m_playMode.get_active_scene();
-    if (!playScene) return;
-    for (const auto& [id, rb] : playScene->rigidbodyComponents) {
-        Physics::BodyDesc desc;
-        desc.motion = rb.isKinematic ? Physics::MotionType::Kinematic : Physics::MotionType::Dynamic;
-        desc.mass = std::max(rb.mass, 0.01f);
-        desc.collider.friction = rb.friction;
-        desc.collider.restitution = rb.restitution;
-        const auto tit = playScene->transformComponents.find(id);
-        if (tit != playScene->transformComponents.end()) {
-            desc.position = tit->second.position;
-            desc.rotation = glm::quat(glm::radians(tit->second.rotation));
-        }
-        const Physics::BodyHandle handle = m_playPhysics.create_body(desc);
-        if (handle != Physics::InvalidBody) m_playBodies[id] = handle;
-    }
 
-    // Wicked-port runtime (formerly TODO(frontend-port)): constraints run as
-    // soft force-based constraints — the runtime solver exposes no rigid-joint
-    // API (PhysicsWorld's joints are a separate, unintegrated world). Each
-    // constraint stores the world anchors captured at play start; the tick
-    // applies spring forces to keep the anchors together (see
-    // tick_play_runtime). Springs just record a rest anchor.
-    for (const auto& [id, cn] : playScene->constraintComponents) {
-        if (!cn.enabled) continue;
-        if (!m_playBodies.contains(id)) continue;
-        const auto tit = playScene->transformComponents.find(id);
-        const glm::vec3 baseA = (tit != playScene->transformComponents.end())
-                                    ? tit->second.position
-                                    : glm::vec3(0.0f);
-        ConstraintRest rest;
-        rest.anchorA = baseA + cn.anchor;
-        rest.anchorB = baseA + cn.anchor; // refined when the other body exists
-        if (const auto bodyBIt = m_playBodies.find(cn.otherEntity); bodyBIt != m_playBodies.end()) {
-            if (Physics::RigidBody* bodyB = m_playPhysics.body(bodyBIt->second)) {
-                rest.anchorB = bodyB->position + cn.anchor;
-            }
-        }
-        rest.restLength = glm::length(rest.anchorB - rest.anchorA);
-        m_constraintRests[id] = rest;
-    }
-    for (const auto& [id, sp] : playScene->springComponents) {
-        if (sp.disabled || !sp.enabled) continue;
-        if (!m_playBodies.contains(id)) continue;
-        const auto tit = playScene->transformComponents.find(id);
-        m_springRests[id] = (tit != playScene->transformComponents.end())
-                                ? tit->second.position
-                                : glm::vec3(0.0f);
-    }
-
-    // Play particles (Fase 8): one ParticleSimulation emitter per
-    // ParticleEmitterComponent entity, positioned at the world transform.
-    for (const auto& [id, pe] : playScene->particleEmitterComponents) {
-        if (!pe.emitting) continue;
-        Engine::Gameplay::ParticleEmitterDesc desc;
-        desc.direction = glm::normalize(pe.direction);
-        desc.coneAngle = pe.coneAngle;
-        desc.rate = pe.rate;
-        desc.speedMin = pe.speedMin;
-        desc.speedMax = pe.speedMax;
-        desc.lifetimeMin = pe.lifetimeMin;
-        desc.lifetimeMax = pe.lifetimeMax;
-        desc.sizeStart = pe.sizeStart;
-        desc.sizeEnd = pe.sizeEnd;
-        desc.colorStart = pe.colorStart;
-        desc.colorEnd = pe.colorEnd;
-        desc.acceleration = pe.acceleration;
-        desc.drag = pe.drag;
-        desc.turbulence = pe.turbulence;
-        desc.restitution = pe.restitution;
-        desc.collide = pe.collide;
-        desc.emitting = pe.emitting;
-        const auto tit = playScene->transformComponents.find(id);
-        desc.position = (tit != playScene->transformComponents.end())
-                            ? tit->second.position + pe.position
-                            : pe.position;
-        m_playEmitters[id] = m_playParticles.add_emitter(desc);
-        if (pe.burstCount > 0) m_playParticles.emit_burst(m_playEmitters[id], pe.burstCount);
-    }
-
-    // Play vehicles (Fase 8): chassis body + four wheels derived from the
-    // component's wheelBase/trackWidth, driven by the arrow keys in play.
-    for (const auto& [id, veh] : playScene->vehicleComponents) {
-        if (!veh.enabled) continue;
-        Physics::BodyDesc chassis;
-        chassis.motion = Physics::MotionType::Dynamic;
-        chassis.mass = std::max(veh.mass, 1.0f);
-        chassis.collider.shape = Physics::BoxShape{{veh.wheelBase * 0.35f, 0.35f, veh.trackWidth * 0.35f}};
-        const auto tit = playScene->transformComponents.find(id);
-        if (tit != playScene->transformComponents.end()) {
-            chassis.position = tit->second.position;
-            chassis.rotation = glm::quat(glm::radians(tit->second.rotation));
-        }
-        const Physics::BodyHandle body = m_playPhysics.create_body(chassis);
-        if (body == Physics::InvalidBody) continue;
-        m_playVehicleChassis[id] = body;
-        const float halfBase = veh.wheelBase * 0.5f;
-        const float halfTrack = veh.trackWidth * 0.5f;
-        const glm::vec3 locals[4] = {
-            {-halfBase, -0.1f, -halfTrack}, {-halfBase, -0.1f, halfTrack},
-            {halfBase, -0.1f, -halfTrack},  {halfBase, -0.1f, halfTrack},
-        };
-        std::vector<Engine::Gameplay::WheelDesc> wheels(4);
-        for (int i = 0; i < 4; ++i) {
-            wheels[i].localPosition = locals[i];
-            wheels[i].radius = veh.wheelRadius;
-            wheels[i].suspensionRestLength = veh.suspensionRest;
-            wheels[i].maxDriveForce = veh.enginePower;
-            wheels[i].maxBrakeForce = veh.brakeForce;
-            wheels[i].maxSteerAngle = veh.maxSteerAngle;
-            wheels[i].steering = i < 2;
-            wheels[i].driven = veh.frontWheelDrive ? i < 2 : i >= 2;
-        }
-        m_playVehicles.emplace(id, Engine::Gameplay::VehicleRuntime(body, std::move(wheels)));
-    }
-
-    // Play ragdolls (Fase 6): physics bodies per bone. With fromSkeleton set,
-    // the bones come from the entity's skin skeleton (a sibling Skeleton asset
-    // matching the mesh stem); otherwise a two-bone fallback is used. The play
-    // physics simulates them each frame; the pose drives skinned rendering.
-    for (const auto& [id, rg] : playScene->ragdollComponents) {
-        if (!rg.enabled) continue;
-        glm::vec3 rootPos{0.0f};
-        const auto tit = playScene->transformComponents.find(id);
-        if (tit != playScene->transformComponents.end()) rootPos = tit->second.position;
-        rootPos += rg.spawnOffset;
-        std::vector<Physics::RagdollBoneDesc> bones;
-        bool fromSkin = false;
-        if (rg.fromSkeleton) {
-            std::string meshStem;
-            if (const auto mit = playScene->meshRendererComponents.find(id); mit != playScene->meshRendererComponents.end()) {
-                for (const AssetMetadata& asset : m_assetRegistry.snapshot()) {
-                    if (asset.type == AssetType::Mesh && asset.id == mit->second.meshAssetID) {
-                        meshStem = asset.sourcePath.stem().string();
-                        break;
-                    }
-                }
-            }
-            if (!meshStem.empty()) {
-                for (const AssetMetadata& asset : m_assetRegistry.snapshot()) {
-                    if (asset.type != AssetType::Skeleton || asset.sourcePath.stem().string() != meshStem) continue;
-                    SkeletonAsset skeleton;
-                    if (AnimationAssetIO::load_skeleton(skeleton, asset.cookedPath)) {
-                        bones = Physics::build_ragdoll_bones(skeleton, rg.massPerBone);
-                        fromSkin = !bones.empty();
-                    }
-                    break;
-                }
-            }
-            if (!fromSkin) {
-                std::cout << "[Editor] Ragdoll entity " << id.to_string() << ": no sibling skeleton for mesh '"
-                          << meshStem << "' — using two-bone fallback\n";
-            }
-        }
-        if (bones.empty()) {
-            bones.push_back(Physics::RagdollBoneDesc{"Root", "", glm::vec3(0.0f), glm::quat(1, 0, 0, 0), 0.6f, 0.12f, rg.massPerBone, glm::vec3(0.0f)});
-            bones.push_back(Physics::RagdollBoneDesc{"Tip", "Root", glm::vec3(1.0f, 0.0f, 0.0f), glm::quat(1, 0, 0, 0), 0.6f, 0.12f, rg.massPerBone, glm::vec3(0.0f)});
-        }
-        Physics::Ragdoll ragdoll;
-        if (ragdoll.create(m_playPhysics, bones, rootPos)) {
-            m_playRagdolls.emplace(id, std::move(ragdoll));
-            std::cout << "[Editor] Play ragdoll active (entity=" << id.to_string() << ", bones="
-                      << bones.size() << (fromSkin ? ", from skin skeleton)\n" : ", fallback)\n");
-        }
-    }
-
-    // Play missions (Fase 8): Start -> SetObjective -> WaitForEvent -> Complete.
-    // The completeEvent is dispatched to the mission system by the play tick
-    // when another component raises it (e.g. a weapon kill or script emit).
-    for (const auto& [id, mc] : playScene->missionComponents) {
-        std::vector<Engine::Gameplay::MissionNode> nodes;
-        nodes.push_back(Engine::Gameplay::start_node("start", "obj"));
-        nodes.push_back(Engine::Gameplay::set_objective_node("obj", "objective", mc.objectiveText, mc.objectiveTarget, "wait"));
-        nodes.push_back(Engine::Gameplay::wait_for_event_node("wait", mc.completeEvent, 1, "done"));
-        nodes.push_back(Engine::Gameplay::complete_mission_node("done"));
-        Engine::Gameplay::Mission mission("mission_" + id.to_string(), mc.missionId, std::move(nodes));
-        m_playMissions.register_mission(std::move(mission));
-        m_playMissionIds[id] = mc.missionId;
-        if (mc.autoStart) m_playMissions.start("mission_" + id.to_string());
-    }
-
-    // Play dialogues (Fase 8): a one-node graph with a single choice that can
-    // chain to another dialogue; played on start when playOnStart is set.
-    for (const auto& [id, dc] : playScene->dialogueComponents) {
-        Engine::Gameplay::DialogueGraph graph;
-        graph.id = dc.dialogueId;
-        Engine::Gameplay::DialogueNode node;
-        node.id = "line";
-        node.line.character = dc.character;
-        node.line.text = dc.line;
-        if (!dc.choiceText.empty()) {
-            Engine::Gameplay::DialogueChoice choice;
-            choice.text = dc.choiceText;
-            choice.nextNode = dc.nextDialogueId;   // empty = end
-            node.choices.push_back(std::move(choice));
-        }
-        graph.nodes.push_back(std::move(node));
-        m_playDialogues.register_graph(std::move(graph));
-        m_playDialogueIds[id] = dc.dialogueId;
-        if (dc.playOnStart) m_playDialogues.play(dc.dialogueId);
-    }
-
-    // Play audio (Fase 8): resolve the .ogg through the asset registry, decode
-    // it into an AudioClip and start a voice on the mixer (spatial vs the
-    // camera listener). Voices advance when the mixer is rendered each tick.
-    for (const auto& [id, ac] : playScene->audioComponents) {
-        if (!ac.playOnStart || ac.clipPath.empty()) continue;
-        std::filesystem::path clipSource;
-        for (const AssetMetadata& asset : m_assetRegistry.snapshot()) {
-            if (asset.type == AssetType::Audio && asset.sourcePath == ac.clipPath) {
-                clipSource = asset.sourcePath;
-                break;
-            }
-        }
-        if (clipSource.empty()) {
-            std::cout << "[Editor] Play audio: no registered asset for '" << ac.clipPath << "'\n";
-            continue;
-        }
-        const auto decoded = Engine::Audio::OggDecoder::decode_file(clipSource);
-        if (!decoded || !decoded->valid()) {
-            std::cout << "[Editor] Play audio: failed to decode '" << clipSource.string() << "'\n";
-            continue;
-        }
-        auto clip = std::make_shared<Engine::Audio::AudioClip>(clipSource.filename().string());
-        Engine::Audio::AudioBuffer buffer;
-        buffer.sampleRate = decoded->sampleRate;
-        buffer.channels = decoded->channels;
-        buffer.samples = decoded->samples;
-        clip->hot_swap(std::move(buffer));
-        Engine::Audio::VoiceDescription desc;
-        desc.clip = std::move(clip);
-        desc.bus = m_playAudio.master_bus();
-        desc.gain = ac.volume;
-        desc.pitch = ac.pitch;
-        desc.looping = ac.looping;
-        desc.spatial = ac.spatial;
-        const auto tit = playScene->transformComponents.find(id);
-        desc.position = (tit != playScene->transformComponents.end()) ? tit->second.position : glm::vec3(0.0f);
-        const Engine::Audio::VoiceId voice = m_playAudio.play(std::move(desc));
-        m_playVoices[id] = voice;
-        std::cout << "[Editor] Play audio voice started ('" << clipSource.filename().string() << "')\n";
-    }
-
-    // Play destructibles (Fase 8): chunkCount boxes laid out in a square grid
-    // around the entity transform; weapon hits apply radial damage.
-    for (const auto& [id, dc] : playScene->destructionComponents) {
-        if (!dc.enabled) continue;
-        const glm::vec3 center = [&]() {
-            const auto tit = playScene->transformComponents.find(id);
-            return (tit != playScene->transformComponents.end()) ? tit->second.position : glm::vec3(0.0f);
-        }();
-        const glm::quat rotation = [&]() {
-            const auto tit = playScene->transformComponents.find(id);
-            return (tit != playScene->transformComponents.end())
-                       ? glm::quat(glm::radians(tit->second.rotation))
-                       : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
-        }();
-        const uint32_t n = std::max(dc.chunkCount, 1u);
-        const uint32_t cols = static_cast<uint32_t>(std::ceil(std::sqrt(static_cast<float>(n))));
-        std::vector<Engine::Gameplay::DestructionChunkDesc> chunks;
-        chunks.reserve(n);
-        const glm::vec3 half = dc.chunkSize * 0.5f;
-        for (uint32_t i = 0; i < n; ++i) {
-            const int cx = static_cast<int>(i % cols);
-            const int cy = static_cast<int>(i / cols);
-            const glm::vec3 local = glm::vec3((static_cast<float>(cx) - (cols - 1) * 0.5f) * dc.chunkSize.x,
-                                              (static_cast<float>(cy) - (cols - 1) * 0.5f) * dc.chunkSize.y, 0.0f);
-            Engine::Gameplay::DestructionChunkDesc chunk;
-            chunk.localPosition = local;
-            chunk.halfExtents = half;
-            chunk.mass = 1.0f;
-            chunk.health = dc.chunkHealth;
-            chunks.push_back(chunk);
-        }
-        Engine::Gameplay::DestructibleRuntime runtime;
-        if (runtime.create(m_playPhysics, center, rotation, chunks)) {
-            m_playDestructibles.emplace(id, std::move(runtime));
-        }
-    }
-
-    // Play navigation (Fase 8): bake the public navmesh — one column per grid
-    // cell of the NavigationComponent; cells covered by a play physics body
-    // are omitted (blocked), exactly the footprint the legacy grid used. The
-    // promoted INavigationProvider (Recast + Detour) is the navigation
-    // authority (FALTANTES item 12: the grid track was removed).
-    for (const auto& [id, nc] : playScene->navigationComponents) {
-        if (!nc.enabled) continue;
-        const auto tit = playScene->transformComponents.find(id);
-        const glm::vec3 start = (tit != playScene->transformComponents.end()) ? tit->second.position : glm::vec3(0.0f);
-        if (!m_playNav) m_playNav = engine::navigation::create_recast_navigation_provider();
-
-        engine::navigation::NavmeshConfig config;
-        config.boundsMinX = start.x - nc.gridWidth * nc.cellSize * 0.5f;
-        config.boundsMaxX = start.x + nc.gridWidth * nc.cellSize * 0.5f;
-        config.boundsMinZ = start.z - nc.gridHeight * nc.cellSize * 0.5f;
-        config.boundsMaxZ = start.z + nc.gridHeight * nc.cellSize * 0.5f;
-        config.boundsMinY = start.y - 8.0f;
-        config.boundsMaxY = start.y + 200.0f;
-        config.cellSize = nc.cellSize;
-        config.cellHeight = 0.2f;
-        config.agentRadius = 0.4f;
-        config.agentHeight = 1.8f;
-        config.agentMaxClimb = 1.0f;
-        config.agentMaxSlope = 45.0f;
-
-        std::vector<engine::navigation::VoxelColumn> columns;
-        const float floorY = start.y;
-        for (int gx = 0; gx < nc.gridWidth; ++gx) {
-            for (int gz = 0; gz < nc.gridHeight; ++gz) {
-                const float cx = config.boundsMinX + (gx + 0.5f) * nc.cellSize;
-                const float cz = config.boundsMinZ + (gz + 0.5f) * nc.cellSize;
-                bool blocked = false;
-                for (const auto& [bid, handle] : m_playBodies) {
-                    (void)bid;
-                    Physics::RigidBody* body = m_playPhysics.body(handle);
-                    if (!body) continue;
-                    const glm::vec3 half = std::visit([](const auto& s) -> glm::vec3 {
-                        using T = std::decay_t<decltype(s)>;
-                        if constexpr (std::is_same_v<T, Physics::BoxShape>) return s.halfExtents;
-                        else if constexpr (std::is_same_v<T, Physics::SphereShape>) return glm::vec3(s.radius);
-                        else return glm::vec3(s.radius, s.halfHeight, s.radius);
-                    }, body->collider.shape);
-                    const glm::vec3 min = body->position - half;
-                    const glm::vec3 max = body->position + half;
-                    if (cx >= min.x && cx <= max.x && cz >= min.z && cz <= max.z) {
-                        blocked = true;
-                        break;
-                    }
-                }
-                if (blocked) continue;
-                columns.push_back({ cx, cz, floorY, floorY + 1.0f, true });
-            }
-        }
-        if (!columns.empty()) {
-            std::string navError;
-            m_playNav->build(config, columns, navError);
-        }
-        PlayNavAgent agent;
-        agent.position = start;
-        agent.speed = nc.agentSpeed;
-        m_playNavAgents.emplace(id, agent);
-    }
-
-    // Play-mode script: watch the scene's companion .script and compile it into
-    // the play VM. OnStart starts immediately; a "Tick" event runs each frame
-    // (same convention as the packaged game's player controller).
-    m_playScriptPath = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Content" / "Scenes" / "Initial.script";
-    if (m_playScriptReloader.watch(m_playScriptPath)) {
-        ScriptGraphAsset graph;
-        if (graph.load(m_playScriptPath)) {
-            const auto compiled = ScriptCompiler::compile(graph);
-            if (compiled) {
-                m_playScript.load(std::move(compiled.program));
-                m_playScript.start_event("OnStart");
-                m_playScriptLoaded = true;
-                m_scriptDebugGraph = graph;
-                m_scriptDebugger.attach(m_playScript);
-                m_scriptDebuggerAttached = true;
-                m_scriptPauseRequested = false;
-                std::cout << "[Editor] Play script loaded: " << m_playScriptPath.string() << std::endl;
-            }
-        }
-    }
-}
-
-void EditorApplication::tick_play_runtime(float deltaTime) {
-    const PlayState state = m_playMode.get_state();
-    if (state != PlayState::Play && state != PlayState::Simulate) return;
-    Scene* playScene = m_playMode.get_active_scene();
-    if (!playScene) return;
-
-    // Wicked-port runtime: force fields push/pull bodies within range;
-    // springs pull their body back toward the authored rest anchor. Both run
-    // before the solver step so the forces feed this frame's simulation.
-    for (const auto& [id, ff] : playScene->forceFieldComponents) {
-        if (!ff.enabled) continue;
-        const auto fit = playScene->transformComponents.find(id);
-        const glm::vec3 center = (fit != playScene->transformComponents.end())
-                                     ? fit->second.position
-                                     : glm::vec3(0.0f);
-        glm::vec3 forward(0.0f, 0.0f, 1.0f);
-        if (fit != playScene->transformComponents.end()) {
-            forward = glm::quat(glm::radians(fit->second.rotation)) * glm::vec3(0.0f, 0.0f, 1.0f);
-        }
-        for (const auto& [bid, handle] : m_playBodies) {
-            Physics::RigidBody* body = m_playPhysics.body(handle);
-            if (!body || !body->dynamic()) continue;
-            const glm::vec3 delta = body->position - center;
-            const float dist = glm::length(delta);
-            if (dist > ff.range) continue;
-            const float falloff = 1.0f - (ff.range > 0.01f ? dist / ff.range : 0.0f);
-            glm::vec3 force(0.0f);
-            switch (ff.type) {
-                case ForceFieldType::Gravity:
-                    force = glm::vec3(0.0f, -ff.strength * 9.81f, 0.0f);
-                    break;
-                case ForceFieldType::Push:
-                    force = forward * (ff.strength * 40.0f);
-                    break;
-                case ForceFieldType::Wind:
-                    force = forward * (ff.strength * 15.0f);
-                    break;
-                case ForceFieldType::Vortex: {
-                    const glm::vec3 tangent = glm::normalize(glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), delta));
-                    force = tangent * (ff.strength * 30.0f) + glm::vec3(0.0f, ff.strength * 2.0f, 0.0f);
-                    break;
-                }
-            }
-            m_playPhysics.add_force(handle, force * falloff);
-        }
-    }
-    for (const auto& [id, sp] : playScene->springComponents) {
-        if (sp.disabled || !sp.enabled) continue;
-        const auto restIt = m_springRests.find(id);
-        const auto bodyIt = m_playBodies.find(id);
-        if (restIt == m_springRests.end() || bodyIt == m_playBodies.end()) continue;
-        Physics::RigidBody* body = m_playPhysics.body(bodyIt->second);
-        if (!body || !body->dynamic()) continue;
-        const glm::vec3 force = (restIt->second - body->position) * (12.0f * sp.stiffness)
-                              - body->linearVelocity * (2.0f * sp.drag);
-        m_playPhysics.add_force(bodyIt->second, force);
-    }
-    // Wicked-port runtime: constraints as soft point-to-point springs between
-    // the entity's anchor and the target body's anchor (fixed when the other
-    // entity is missing). Broken when the required force exceeds breakForce.
-    for (const auto& [id, cn] : playScene->constraintComponents) {
-        if (!cn.enabled) continue;
-        auto restIt = m_constraintRests.find(id);
-        const auto bodyIt = m_playBodies.find(id);
-        if (restIt == m_constraintRests.end() || bodyIt == m_playBodies.end()) continue;
-        ConstraintRest& rest = restIt->second;
-        if (rest.broken) continue;
-        Physics::RigidBody* bodyA = m_playPhysics.body(bodyIt->second);
-        if (!bodyA || !bodyA->dynamic()) continue;
-        Physics::RigidBody* bodyB = nullptr;
-        Physics::BodyHandle bodyBHandle = Physics::InvalidBody;
-        if (const auto bodyBIt = m_playBodies.find(cn.otherEntity); bodyBIt != m_playBodies.end()) {
-            bodyB = m_playPhysics.body(bodyBIt->second);
-            bodyBHandle = bodyBIt->second;
-        }
-        const glm::vec3 anchorA = bodyA->position + cn.anchor;
-        glm::vec3 anchorB = rest.anchorB;
-        if (bodyB && bodyB->dynamic()) anchorB = bodyB->position + cn.anchor;
-        const glm::vec3 delta = anchorB - anchorA;
-        const float dist = glm::length(delta);
-        glm::vec3 force(0.0f);
-        if (dist > 1e-5f) {
-            const glm::vec3 dir = delta / dist;
-            if (cn.type == ConstraintType::Spring) {
-                force = dir * ((dist - rest.restLength) * 25.0f);
-            } else {
-                // Fixed / Hinge / Point: pull the anchors together (stiff).
-                force = dir * (dist * 40.0f);
-            }
-        }
-        force -= bodyA->linearVelocity * 0.8f; // axial damping, no ringing
-        if (cn.breakForce > 0.0f && glm::length(force) > cn.breakForce) {
-            rest.broken = true;
-            continue;
-        }
-        m_playPhysics.add_force(bodyIt->second, force);
-        if (bodyB && bodyB->dynamic() && bodyBHandle != Physics::InvalidBody) {
-            m_playPhysics.add_force(bodyBHandle, -force);
-        }
-    }
-
-    m_playPhysics.step(deltaTime);
-    for (const auto& [id, handle] : m_playBodies) {
-        Physics::RigidBody* body = m_playPhysics.body(handle);
-        if (!body) continue;
-        auto tit = playScene->transformComponents.find(id);
-        if (tit == playScene->transformComponents.end()) continue;
-        tit->second.position = body->position;
-        tit->second.rotation = glm::degrees(glm::eulerAngles(body->rotation));
-    }
-
-    // Wicked-port runtime: spline followers drive their entity along the
-    // Catmull-Rom path (looped) in play mode; kinematic bodies follow too.
-    for (const auto& [id, sp] : playScene->splineComponents) {
-        if (!sp.enabled || sp.points.size() < 2) continue;
-        auto tit = playScene->transformComponents.find(id);
-        if (tit == playScene->transformComponents.end()) continue;
-        auto [progIt, inserted] = m_splineProgress.try_emplace(id, 0.0f);
-        (void)inserted;
-        float total = 0.0f;
-        for (size_t i = 1; i < sp.points.size(); ++i) {
-            total += glm::length(sp.points[i] - sp.points[i - 1]);
-        }
-        if (total < 1e-4f) continue;
-        constexpr float kSplineSpeed = 2.0f; // m/s
-        progIt->second += kSplineSpeed * deltaTime / total;
-        if (sp.looped) {
-            progIt->second -= std::floor(progIt->second);
-        } else {
-            progIt->second = glm::clamp(progIt->second, 0.0f, 1.0f);
-        }
-        const float t = progIt->second * static_cast<float>(sp.points.size() - 1);
-        const size_t i = std::min<size_t>(static_cast<size_t>(t), sp.points.size() - 2);
-        const float f = t - static_cast<float>(i);
-        const glm::vec3& p0 = sp.points[i > 0 ? i - 1 : i];
-        const glm::vec3& p1 = sp.points[i];
-        const glm::vec3& p2 = sp.points[i + 1];
-        const glm::vec3& p3 = sp.points[std::min(i + 2, sp.points.size() - 1)];
-        const float f2 = f * f, f3 = f2 * f;
-        const glm::vec3 pos = 0.5f * ((2.0f * p1) + (-p0 + p2) * f
-            + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * f2
-            + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * f3);
-        tit->second.position = pos;
-        const auto bodyIt = m_playBodies.find(id);
-        if (bodyIt != m_playBodies.end()) {
-            Physics::RigidBody* body = m_playPhysics.body(bodyIt->second);
-            if (body) {
-                body->position = pos;
-                body->linearVelocity = glm::vec3(0.0f);
-                body->angularVelocity = glm::vec3(0.0f);
-            }
-        }
-    }
-
-    // Hot reload: recompile + swap the program when the .script changes on
-    // disk (variables survive — load() keeps the variable map).
-    if (m_playScriptLoaded) {
-        std::string reloadError;
-        if (m_playScriptReloader.reload_if_changed(m_playScript, &reloadError)) {
-            std::cout << "[Editor] Script hot-reloaded: " << m_playScriptPath.filename().string()
-                      << (reloadError.empty() ? "" : " (" + reloadError + ")") << std::endl;
-            m_playScript.start_event("OnStart");
-        }
-        // Debugger-aware tick: hold on a panel pause or a breakpoint pause;
-        // otherwise drive the VM through the debugger so breakpoints halt it
-        // and the panel stays in sync (variables/ip/call stack).
-        const bool breakpointPaused = m_playScript.status() == VMStatus::Paused;
-        if (!m_scriptPauseRequested && !breakpointPaused) {
-            if (m_scriptDebuggerAttached) m_scriptDebugger.continue_run(10000, deltaTime);
-            else m_playScript.run(deltaTime, 10000);
-            if (m_playScript.status() == VMStatus::Paused) return; // hit a breakpoint
-            std::vector<std::string> emitted;
-            m_playScript.consume_emitted_events(emitted);
-            for (const std::string& event : emitted) m_playScript.start_event(event);
-        if (m_playScript.has_event("Tick")) {
-            m_playScript.start_event("Tick");
-            if (m_scriptDebuggerAttached) m_scriptDebugger.continue_run(10000, deltaTime);
-            else m_playScript.run(deltaTime, 10000);
-        }
-    }
-
-    // Play weapons (Fase 8): one WeaponRuntime per WeaponComponent entity,
-    // fired with the viewport camera ray against the play physics on SPACE.
-    const bool fireHeld = glfwGetKey(m_window, GLFW_KEY_SPACE) == GLFW_PRESS;
-    const glm::mat4 camView = m_editorCamera.get_view_matrix();
-    const glm::vec3 camFront = glm::normalize(
-        glm::vec3(-camView[2][0], -camView[2][1], -camView[2][2]));
-    for (const auto& [id, comp] : playScene->weaponComponents) {
-        auto it = m_playWeapons.find(id);
-        if (it == m_playWeapons.end()) {
-            Engine::WeaponDefinition def;
-            def.id = id;
-            def.name = "Scene Weapon";
-            def.fireMode = comp.automatic ? Engine::FireMode::Automatic : Engine::FireMode::Single;
-            def.magazineSize = comp.magazineSize;
-            def.reserveAmmo = comp.reserveAmmo;
-            def.roundsPerMinute = comp.roundsPerMinute;
-            def.damage = comp.damage;
-            def.range = 120.0f;
-            def.spreadDegrees = comp.spreadDegrees;
-            def.hitscan = comp.hitscan;
-            it = m_playWeapons.emplace(id, Engine::WeaponRuntime(std::move(def))).first;
-            it->second.set_raycast([this](const glm::vec3& o, const glm::vec3& d, float maxDist)
-                                       -> std::optional<Engine::WeaponHit> {
-                const auto hit = m_playPhysics.raycast(o, d, maxDist);
-                if (!hit) return std::nullopt;
-                Engine::WeaponHit out;
-                out.position = hit->point;
-                out.normal = hit->normal;
-                out.distance = hit->distance;
-                return out;
-            });
-        }
-        if (fireHeld) it->second.trigger_pressed(m_editorCamera.position, camFront);
-        else it->second.trigger_released();
-        it->second.update(deltaTime, m_editorCamera.position, camFront);
-    }
-    if (fireHeld && !m_playWeaponStatusLogged && !m_playWeapons.empty()) {
-        m_playWeaponStatusLogged = true;
-        std::cout << "[Editor] Play weapon firing via physics raycast ("
-                  << m_playWeapons.size() << " weapon entity/entities)\n";
-    }
-
-    // Play particles (Fase 8): keep each emitter at its entity's world
-    // position and step the simulation against the play physics.
-    for (const auto& [id, emitter] : m_playEmitters) {
-        auto* desc = m_playParticles.emitter(emitter);
-        if (!desc) continue;
-        const auto tit = playScene->transformComponents.find(id);
-        const auto pe = playScene->particleEmitterComponents.find(id);
-        const glm::vec3 localPos =
-            (pe != playScene->particleEmitterComponents.end()) ? pe->second.position : glm::vec3(0.0f);
-        desc->position = (tit != playScene->transformComponents.end())
-                             ? tit->second.position + localPos
-                             : localPos;
-    }
-    m_playParticles.update(deltaTime, &m_playPhysics);
-
-    // Play vehicles (Fase 8): drive with the arrow keys.
-    const bool throttle = glfwGetKey(m_window, GLFW_KEY_UP) == GLFW_PRESS;
-    const bool brake = glfwGetKey(m_window, GLFW_KEY_DOWN) == GLFW_PRESS;
-    const float steer = (glfwGetKey(m_window, GLFW_KEY_RIGHT) == GLFW_PRESS ? 1.0f : 0.0f) -
-                        (glfwGetKey(m_window, GLFW_KEY_LEFT) == GLFW_PRESS ? 1.0f : 0.0f);
-    for (auto& [id, vehicle] : m_playVehicles) {
-        (void)id;
-        Engine::Gameplay::VehicleInput input;
-        input.throttle = throttle ? 1.0f : 0.0f;
-        input.brake = brake ? 1.0f : 0.0f;
-        input.steering = steer;
-        vehicle.set_input(input);
-        vehicle.update(m_playPhysics, deltaTime);
-    }
-
-    // Play missions (Fase 8): step the graph and mirror the live state back
-    // to the component. Events emitted by the play script (consume_emitted)
-    // are dispatched to the mission system, so authored script events can
-    // complete missions.
-    m_playMissions.update(deltaTime);
-    for (auto& [id, mc] : playScene->missionComponents) {
-        const Engine::Gameplay::Mission* mission = m_playMissions.mission("mission_" + id.to_string());
-        mc.active = mission && mission->is_active();
-    }
-    {
-        std::vector<std::string> emitted;
-        if (m_playScriptLoaded) m_playScript.consume_emitted_events(emitted);
-        for (const std::string& event : emitted) m_playMissions.dispatch_event(event);
-    }
-
-    // Play dialogues (Fase 8): mirror the playing state.
-    for (auto& [id, dc] : playScene->dialogueComponents) {
-        dc.playing = m_playDialogues.is_playing();
-    }
-
-    // Play audio (Fase 8): keep the listener on the camera and render one
-    // mix block per frame so voices advance; drop voices that finished.
-    m_playAudio.set_listener(m_editorCamera.position, camFront);
-    for (const auto& [id, voice] : m_playVoices) {
-        const auto tit = playScene->transformComponents.find(id);
-        if (tit != playScene->transformComponents.end()) {
-            m_playAudio.set_voice_position(voice, tit->second.position);
-        }
-        auto ac = playScene->audioComponents.find(id);
-        if (ac != playScene->audioComponents.end()) ac->second.playing = m_playAudio.is_active(voice);
-    }
-
-    // Play destructibles (Fase 8): weapon hits from this frame apply radial
-    // damage (chunks detach with an impulse) and the destroyed flag syncs.
-    std::vector<glm::vec3> hitPoints;
-    for (const auto& [id, comp] : playScene->weaponComponents) {
-        (void)id;
-        auto it = m_playWeapons.find(id);
-        if (it == m_playWeapons.end()) continue;
-        for (const Engine::WeaponHit& hit : it->second.hits()) hitPoints.push_back(hit.position);
-        it->second.clear_hits();
-    }
-    for (auto& [id, runtime] : m_playDestructibles) {
-        auto dc = playScene->destructionComponents.find(id);
-        for (const glm::vec3& point : hitPoints) {
-            runtime.apply_radial_damage(m_playPhysics, point, dc->second.damageRadius, 25.0f, dc->second.damageImpulse);
-        }
-        if (dc != playScene->destructionComponents.end()) {
-            dc->second.destroyed = runtime.fully_destroyed();
-        }
-    }
-
-    // Play navigation (Fase 8): repath toward the camera entity when the agent
-    // arrives (or the target moved), then write the agent position back.
-    glm::vec3 target{0.0f};
-    bool haveTarget = false;
-    for (const auto& [cid, cam] : playScene->cameraComponents) {
-        (void)cam;
-        const auto tit = playScene->transformComponents.find(cid);
-        if (tit != playScene->transformComponents.end()) {
-            target = tit->second.position;
-            haveTarget = true;
-            break;
-        }
-    }
-    if (!haveTarget) target = m_editorCamera.position;
-    for (auto& [id, agent] : m_playNavAgents) {
-        if (m_playNav &&
-            (agent.reached_destination() ||
-             glm::distance(agent.position, target) > 1.0f)) {
-            engine::navigation::PathResult result;
-            if (m_playNav->find_path(agent.position.x, agent.position.y,
-                                     agent.position.z, target.x, target.y,
-                                     target.z, result) && result.found) {
-                std::vector<glm::vec3> points;
-                points.reserve(result.waypoints.size() / 3);
-                for (std::size_t i = 0; i + 2 < result.waypoints.size(); i += 3) {
-                    points.emplace_back(result.waypoints[i], result.waypoints[i + 1],
-                                        result.waypoints[i + 2]);
-                }
-                agent.set_path(std::move(points));
-            }
-        }
-        agent.update(deltaTime);
-        auto tit = playScene->transformComponents.find(id);
-        if (tit != playScene->transformComponents.end()) tit->second.position = agent.position;
-    }
-}
-}
-
-void EditorApplication::teardown_play_runtime() {
-    m_constraintRests.clear();
-    m_springRests.clear();
-    m_splineProgress.clear();
-    for (const auto& [id, handle] : m_playBodies) {
-        (void)id;
-        m_playPhysics.destroy_body(handle);
-    }
-    m_playBodies.clear();        m_playScriptLoaded = false;
-    m_scriptDebugger.detach();
-    m_scriptDebuggerAttached = false;
-    m_scriptPauseRequested = false;
-    m_playWeapons.clear();
-    m_playWeaponStatusLogged = false;
-    for (const auto& [id, handle] : m_playVehicleChassis) {
-        (void)id;
-        m_playPhysics.destroy_body(handle);
-    }
-    m_playVehicleChassis.clear();
-    m_playVehicles.clear();
-    m_playParticles.clear();
-    m_playEmitters.clear();
-    for (auto& [id, ragdoll] : m_playRagdolls) {
-        (void)id;
-        ragdoll.destroy(m_playPhysics);
-    }
-    m_playRagdolls.clear();
-    m_playMissions.clear();
-    m_playMissionIds.clear();
-    m_playDialogues.clear();
-    m_playDialogueIds.clear();
-    for (const auto& [id, voice] : m_playVoices) {
-        (void)id;
-        m_playAudio.stop(voice);
-    }
-    m_playVoices.clear();
-    for (auto& [id, runtime] : m_playDestructibles) {
-        (void)id;
-        runtime.destroy(m_playPhysics);
-    }
-    m_playDestructibles.clear();
-    m_playNavAgents.clear();
-    m_playNav.reset();
-}
+// ===========================================================================
+// Core (constructor, init, main loop, render frame)
+// Panels → EditorApplication_Panels.cpp
+// Vulkan  → EditorApplication_Vulkan.cpp
+// Play    → EditorApplication_PlayMode.cpp
+// Assets  → EditorApplication_Assets.cpp
+// ===========================================================================
 
 int EditorApplication::run_render_graph_self_test() {
     using namespace Engine::Rendering;
@@ -1563,12 +861,19 @@ void EditorApplication::main_loop() {
             }
         }
 
-        if (!m_inLauncherMode) {
-            // Control API: execute queued commands (play/pause/resume/stop/step)
-            // from the loopback HTTP server, then publish live state for /state.
-            {
-                for (const std::string& cmd : m_controlApi.drain_commands()) handle_control_command(cmd);
+        // Control API: execute queued commands (play/pause/resume/stop/step)
+        // from the loopback HTTP server. The drain runs even while the
+        // launcher hub is open so API-driven actions (open-scene, new-scene,
+        // create-project) can leave the hub; then publish live state for
+        // /state.
+        {
+            for (const std::string& cmd : m_controlApi.drain_commands()) {
+                std::cout << "[API-DEBUG] " << cmd << std::endl;
+                handle_control_command(cmd);
             }
+        }
+
+        if (!m_inLauncherMode) {
             {
                 EditorApiState api;
                 switch (m_playMode.get_state()) {
@@ -1646,10 +951,18 @@ void EditorApplication::main_loop() {
         // device drives the mixer in real time when available; without a
         // device we still advance it so voice state (▶/⏸) stays truthful.
         pump_audio_preview_decodes();
+        pump_asset_thumbnail_decodes();
         if (!m_audioDeviceStarted) m_playAudio.render(1024);
 
         // 3D asset thumbnails (mesh + block cubes): a few renders per frame.
         pump_asset_thumbnails(4);
+
+        // Runtime-wired Wicked-port features (hair strands, soft-body cloth,
+        // video flipbooks, gaussian splats, env-probe captures): preview in
+        // Edit and keep simulating in Play (the same scene the viewport draws).
+        Scene* simScene = m_playMode.get_active_scene();
+        if (!simScene) simScene = m_editorScene.get();
+        tick_special_runtimes(simScene, deltaTime);
 
         render_frame();
 
@@ -1735,10 +1048,13 @@ void EditorApplication::render_frame() {
 
     // A pick requested from the previous frame is resolved before this frame's
     // scene pass so the freshly selected entity is highlighted immediately.
-    if (m_pickRequested && !m_inLauncherMode) {
+    // Hover pick uses the same pass (one extra pixel read, zero extra GPU cost).
+    if ((m_pickRequested || m_hoverPickPending) && !m_inLauncherMode) {
         perform_pick_readback();
         m_pickRequested = false;
+        m_hoverPickPending = false;
     }
+
 
     uint32_t imageIndex;
     VkResult result = vkAcquireNextImageKHR(m_device, m_swapchain, UINT64_MAX, m_imageAvailableSemaphores[m_currentFrame], VK_NULL_HANDLE, &imageIndex);
@@ -1825,6 +1141,15 @@ void EditorApplication::render_frame() {
         {
             // Wicked-port tool windows: refresh the live context every frame.
             m_wickedTools.set_context(activeScene, m_selectedEntity.get_id(), &m_currentLanguage);
+            // Paint tool state mirrors the selected entity's paintMode so the
+            // viewport click handler paints without an extra callback.
+            if (m_selectedEntity.is_valid()) {
+                const auto paintIt = activeScene->paintComponents.find(m_selectedEntity.get_id());
+                m_paintToolActive = paintIt != activeScene->paintComponents.end() &&
+                                    paintIt->second.enabled && paintIt->second.paintMode;
+            } else {
+                m_paintToolActive = false;
+            }
             m_wickedTools.set_asset_registry(&m_assetRegistry);
             m_wickedTools.set_open_specialized_editors(&m_specializedEditors.open);
             m_wickedTools.set_on_entity_deleted([this](UUID doomed) {
@@ -2035,6 +1360,60 @@ void EditorApplication::recreate_swapchain() {
     }
 }
 
+
+size_t EditorApplication::import_texture_pack(const std::filesystem::path& folder) {
+    if (!m_assetPipeline || !std::filesystem::is_directory(folder)) return 0;
+    const std::filesystem::path cookedRoot =
+        std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "DerivedDataCache";
+    size_t imported = 0;
+    std::error_code ec;
+    for (std::filesystem::recursive_directory_iterator it(folder, ec), end; it != end && !ec; it.increment(ec)) {
+        if (!it->is_regular_file()) continue;
+        std::string ext = it->path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext != ".png" && ext != ".tga" && ext != ".jpg" && ext != ".jpeg" &&
+            ext != ".bmp" && ext != ".hdr" && ext != ".dds" &&
+            ext != ".glb" && ext != ".gltf" && ext != ".fbx" &&
+            ext != ".obj" && ext != ".ply" &&
+            ext != ".wav" && ext != ".ogg" && ext != ".mp3" &&
+            ext != ".vmat") continue;
+        const ImportResult result = m_assetPipeline->import({it->path(), cookedRoot, 1});
+        if (result) {
+            ++imported;
+            if ((ext == ".png" || ext == ".tga" || ext == ".bmp" || ext == ".dds") &&
+                result.asset.width > 0 && result.asset.height > 0 &&
+                result.asset.width == result.asset.height) {
+                const uint32_t s = result.asset.width;
+                if (s >= 8 && s <= 256 && (s & (s - 1)) == 0) {
+                    if (!is_character_texture(result.asset)) {
+                        create_block_asset(result.asset);
+                    }
+                }
+            }
+        } else if (result.error.rfind("No importer supports", 0) != 0) {
+            std::cerr << "[PackImport] " << it->path().filename().string()
+                      << ": " << result.error << std::endl;
+        }
+    }
+    if (imported > 0) {
+        m_assetHotReload->watch_registered_assets();
+        const auto registryPath = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) /
+            "Intermediate" / "AssetRegistry.db";
+        if (!m_assetRegistry.save(registryPath))
+            std::cerr << "[PackImport] Could not persist registry" << std::endl;
+        std::cout << "[PackImport] Imported " << imported << " assets from "
+                  << folder.string() << std::endl;
+    }
+    return imported;
+}
+
+
+
+
+// ===========================================================================
+// Editor Panels (split from EditorApplication.cpp for compilation-unit separation)
+// ===========================================================================
 void EditorApplication::draw_project_launcher() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
@@ -2085,7 +1464,7 @@ void EditorApplication::draw_project_launcher() {
             m_currentProjectName = proj.name;
             if (ImGui::IsMouseDoubleClicked(0)) {
                 m_inLauncherMode = false; // Launch Engine Studio
-                glfwSetWindowTitle(m_window, ("Vulkan Engine Studio 1.5 - [" + m_currentProjectName + "]").c_str());
+                glfwSetWindowTitle(m_window, ("VulkanCraft Engine - [" + m_currentProjectName + "]").c_str());
             }
         }
         ImGui::SameLine();
@@ -2114,14 +1493,14 @@ void EditorApplication::draw_project_launcher() {
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.49f, 0.50f, 1.00f, 1.00f));
     if (ImGui::Button(tr("ABRIR NO EDITOR", "LAUNCH ENGINE STUDIO"), ImVec2(250, 44))) {
         m_inLauncherMode = false;
-        glfwSetWindowTitle(m_window, ("Vulkan Engine Studio 1.5 - [" + m_currentProjectName + "]").c_str());
+        glfwSetWindowTitle(m_window, ("VulkanCraft Engine - [" + m_currentProjectName + "]").c_str());
     }
     ImGui::PopStyleColor(2);
 
     ImGui::SameLine();
     if (ImGui::Button(tr("+ Criar Novo Jogo", "+ Create New Game"), ImVec2(220, 44))) {
         m_inLauncherMode = false;
-        glfwSetWindowTitle(m_window, "Vulkan Engine Studio 1.5 - [Novo Jogo]");
+        glfwSetWindowTitle(m_window, "VulkanCraft Engine - [Novo Jogo]");
     }
     ImGui::SameLine();
     if (ImGui::Button(tr("Procurar Pasta...", "Browse Folder..."), ImVec2(220, 44))) {
@@ -2131,7 +1510,7 @@ void EditorApplication::draw_project_launcher() {
             m_currentProjectName = std::filesystem::path(folder).filename().string();
             if (m_currentProjectName.empty()) m_currentProjectName = "Projeto";
             m_inLauncherMode = false;
-            glfwSetWindowTitle(m_window, ("Vulkan Engine Studio 1.5 - [" + m_currentProjectName + "]").c_str());
+            glfwSetWindowTitle(m_window, ("VulkanCraft Engine - [" + m_currentProjectName + "]").c_str());
         }
     }
 
@@ -2165,7 +1544,7 @@ void EditorApplication::draw_dockspace() {
     // No global WindowMinSize may inflate the shell (it fills the remaining area).
     ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1.0f, 1.0f));
 
-    ImGui::Begin("Vulkan Engine Studio Shell", nullptr, host_window_flags);
+    ImGui::Begin("VulkanCraft Engine Shell", nullptr, host_window_flags);
     ImGui::PopStyleVar(4);
 
     ImGuiDockNodeFlags dockspace_flags = ImGuiDockNodeFlags_PassthruCentralNode;
@@ -2206,7 +1585,7 @@ void EditorApplication::draw_menu_bar() {
         if (ImGui::BeginMenu(tr("Arquivo", "File"))) {
             if (ImGui::MenuItem(tr("Gerenciador de Jogos", "Game Launcher Hub"))) {
                 m_inLauncherMode = true;
-                glfwSetWindowTitle(m_window, tr("Vulkan Engine 1.5 - Gerenciador de Jogos", "Vulkan Engine 1.5 - Game Launcher"));
+                glfwSetWindowTitle(m_window, tr("VulkanCraft Engine - Gerenciador de Jogos", "VulkanCraft Engine - Game Launcher"));
             }
             ImGui::Separator();
             if (ImGui::MenuItem(tr("Novo Jogo", "New Scene"), "Ctrl+N")) {
@@ -2215,7 +1594,7 @@ void EditorApplication::draw_menu_bar() {
             }
             if (ImGui::MenuItem(tr("Abrir Jogo...", "Open Scene..."), "Ctrl+O")) {
                 std::string scenePath;
-                if (pick_file_dialog(scenePath, L"Cenas Vulkan Engine (*.scene)\0*.scene\0Todos (*.*)\0*.*\0",
+                if (pick_file_dialog(scenePath, L"Cenas VulkanCraft (*.scene)\0*.scene\0Todos (*.*)\0*.*\0",
                                      L"Abrir Cena", L"scene")) {
                     load_scene_file(scenePath);
                 }
@@ -2340,7 +1719,7 @@ void EditorApplication::draw_menu_bar() {
             if (ImGui::MenuItem(tr("Painel de Desenvolvimento", "Developer Panel"))) {
                 m_wickedTools.showDevWindow = !m_wickedTools.showDevWindow;
             }
-            if (ImGui::MenuItem(tr("Manual da Engine", "Vulkan Engine Documentation"))) {
+            if (ImGui::MenuItem(tr("Manual da Engine", "VulkanCraft Documentation"))) {
                 // Open the docs folder in Explorer (best effort).
                 std::string docsDir = "docs";
                 if (std::filesystem::exists("docs")) {
@@ -2349,7 +1728,7 @@ void EditorApplication::draw_menu_bar() {
                     ShellExecuteW(nullptr, L"open", L"..\\docs", nullptr, nullptr, SW_SHOWNORMAL);
                 }
             }
-            if (ImGui::MenuItem(tr("Sobre a Engine", "About Vulkan Engine Studio 1.5"))) {
+            if (ImGui::MenuItem(tr("Sobre a Engine", "About VulkanCraft Engine"))) {
                 m_showAboutDialog = true;
             }
             ImGui::EndMenu();
@@ -2361,7 +1740,7 @@ void EditorApplication::draw_menu_bar() {
             m_showAboutDialog = false;
         }
         if (ImGui::BeginPopupModal(tr("Sobre a Engine", "About"), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::Text("Vulkan Engine Studio 1.5.0");
+            ImGui::Text("VulkanCraft Engine 1.5.0");
             ImGui::Separator();
             ImGui::TextWrapped("%s", tr(
                 "Engine de jogos em Vulkan 1.3 (renderer, cena, ECS, física, "
@@ -2594,7 +1973,7 @@ void EditorApplication::draw_app_bar() {
             { tr("Novo Jogo...", "New Scene..."), [this]() { m_pendingNewSceneConfirm = true; } },
             { tr("Abrir Cena...", "Open Scene..."), [this]() {
                 std::string p;
-                if (pick_file_dialog(p, L"Cenas Vulkan Engine (*.scene)\0*.scene\0Todos (*.*)\0*.*\0", L"Abrir Cena", L"scene")) load_scene_file(p);
+                if (pick_file_dialog(p, L"Cenas VulkanCraft (*.scene)\0*.scene\0Todos (*.*)\0*.*\0", L"Abrir Cena", L"scene")) load_scene_file(p);
             } },
             { tr("Salvar Cena", "Save Scene"), [this]() { save_current_scene(); } },
             { tr("Salvar Como...", "Save Scene As..."), [this]() { save_scene_as(); } },
@@ -2883,6 +2262,7 @@ void EditorApplication::draw_inspector_panel() {
     }
 
     Scene* scene = m_playMode.get_active_scene();
+    if (!scene) scene = m_editorScene.get();
     if (!scene) {
         ImGui::End();
         return;
@@ -2920,7 +2300,7 @@ void EditorApplication::draw_inspector_panel() {
     // Semantic sections (Inspector): components are grouped by role —
     // Appearance / Physics / Gameplay / Effects & World. Each group header is
     // emitted once, before the first component of that group that exists.
-    bool inspectorGroupEmitted[4] = { false, false, false, false };
+    bool inspectorGroupEmitted[5] = { false, false, false, false, false };
     const auto beginInspectorGroup = [&](int group, const char* title) {
         if (inspectorGroupEmitted[group]) return;
         inspectorGroupEmitted[group] = true;
@@ -3079,6 +2459,68 @@ void EditorApplication::draw_inspector_panel() {
         ImGui::Spacing();
     }
 
+    // Animation Component (authored in the Animation editor; the play world
+    // samples the entry state's clip onto the bone entities under this one).
+    if (scene->animationComponents.contains(id)) {
+        beginInspectorGroup(4, tr("ANIMAÇÃO", "ANIMATION"));
+        UI::sectionHeader(ICON_FA_FILM, tr("Animação", "Animation"));
+        auto& an = scene->animationComponents[id];
+        ImGui::Checkbox(tr("Tocando", "Playing"), &an.playing);
+        char entryBuf[64];
+        std::snprintf(entryBuf, sizeof(entryBuf), "%s", an.entryState.c_str());
+        if (ImGui::InputText(tr("Estado de entrada", "Entry State"), entryBuf, sizeof(entryBuf))) an.entryState = entryBuf;
+        ImGui::TextDisabled("%zu %s", an.states.size(), tr("estados", "states"));
+        for (const auto& s : an.states) {
+            ImGui::BulletText("%s (clip %s, x%.2f)", s.id.c_str(), s.clip.to_string().c_str(), s.speed);
+        }
+        if (ImGui::Button(tr("Remover Animação", "Remove Animation"))) scene->animationComponents.erase(id);
+        ImGui::Spacing();
+    }
+
+    // Timeline Component (authored in the Timeline editor; the play world
+    // animates the entity's transform from Property tracks).
+    if (scene->timelineComponents.contains(id)) {
+        beginInspectorGroup(4, tr("ANIMAÇÃO", "ANIMATION"));
+        UI::sectionHeader(ICON_FA_CLOCK, tr("Timeline", "Timeline"));
+        auto& tl = scene->timelineComponents[id];
+        ImGui::DragFloat(tr("Duração", "Duration"), &tl.duration, 0.1f, 0.01f, 10000.0f);
+        ImGui::SliderFloat(tr("Playhead", "Playhead"), &tl.playhead, 0.0f, std::max(tl.duration, 0.01f));
+        ImGui::Checkbox(tr("Loop", "Loop"), &tl.loop);
+        ImGui::TextDisabled("%zu %s", tl.tracks.size(), tr("trilhas", "tracks"));
+        for (const auto& t : tl.tracks) ImGui::BulletText("%s (%zu %s)", t.name.c_str(), t.keys.size(), tr("chaves", "keys"));
+        if (ImGui::Button(tr("Remover Timeline", "Remove Timeline"))) scene->timelineComponents.erase(id);
+        ImGui::Spacing();
+    }
+
+    // IK Component (authored in the IK editor; the play world bends the
+    // chain root -> mid -> end so the end entity reaches the target entity).
+    if (scene->ikComponents.contains(id)) {
+        beginInspectorGroup(4, tr("ANIMAÇÃO", "ANIMATION"));
+        UI::sectionHeader(ICON_FA_BONE, tr("IK", "IK"));
+        auto& ik = scene->ikComponents[id];
+        ImGui::Checkbox(tr("Habilitado", "Enabled"), &ik.enabled);
+        ImGui::SliderFloat(tr("Peso", "Weight"), &ik.weight, 0.0f, 1.0f);
+        ImGui::DragInt(tr("Iterações", "Iterations"), &ik.iterations, 1, 1, 64);
+        ImGui::TextDisabled("root=%s mid=%s end=%s target=%s", ik.rootEntity.to_string().c_str(),
+                            ik.midEntity.to_string().c_str(), ik.endEntity.to_string().c_str(),
+                            ik.targetEntity.to_string().c_str());
+        if (ImGui::Button(tr("Remover IK", "Remove IK"))) scene->ikComponents.erase(id);
+        ImGui::Spacing();
+    }
+
+    // Retarget Component (authored in the Retarget editor; the play world
+    // copies mapped source-bone transforms onto the target-bone entities).
+    if (scene->retargetComponents.contains(id)) {
+        beginInspectorGroup(4, tr("ANIMAÇÃO", "ANIMATION"));
+        UI::sectionHeader(ICON_FA_SHUFFLE, tr("Retarget", "Retarget"));
+        auto& rt = scene->retargetComponents[id];
+        ImGui::Checkbox(tr("Preservar root motion", "Preserve Root Motion"), &rt.preserveRootMotion);
+        ImGui::TextDisabled("%zu %s", rt.mapping.size(), tr("mapeamentos", "mappings"));
+        for (const auto& m : rt.mapping) ImGui::BulletText("%s -> %s", m.sourceBone.c_str(), m.targetBone.c_str());
+        if (ImGui::Button(tr("Remover Retarget", "Remove Retarget"))) scene->retargetComponents.erase(id);
+        ImGui::Spacing();
+    }
+
     // Mission Component (the play world registers a Mission that the
     // completeEvent — a script EmitEvent — finishes).
     if (scene->missionComponents.contains(id)) {
@@ -3168,7 +2610,7 @@ void EditorApplication::draw_inspector_panel() {
         ImGui::SliderFloat(tr("Campo de Visão (FOV)", "Field of View (FOV)"), &c.fov, 10.0f, 160.0f);
         if (m_advancedInspector) {
             ImGui::DragFloat(tr("Visão Próxima", "Near Plane"), &c.nearPlane, 0.01f, 0.001f, 10.0f);
-            ImGui::DragFloat(tr("Visão Distante", "Far Plane"), &c.farPlane, 10.0f, 10.0f, 10000.0f);
+            ImGui::DragFloat(tr("Visão Distante", "Far Plane"), &c.farPlane, 100.0f, 10.0f, 100000.0f);
         }
         ImGui::Checkbox(tr("Câmera Principal do Jogo", "Primary Camera"), &c.isPrimary);
         ImGui::Spacing();
@@ -3262,6 +2704,12 @@ void EditorApplication::draw_inspector_panel() {
         if (match(tr("Fonte de Áudio", "Audio"))) { if (ImGui::MenuItem(tr("Fonte de Áudio", "Audio Component"))) scene->audioComponents[id] = AudioComponent{}; }
         if (match(tr("Missão", "Mission"))) { if (ImGui::MenuItem(tr("Missão", "Mission Component"))) scene->missionComponents[id] = MissionComponent{}; }
         if (match(tr("Diálogo", "Dialogue"))) { if (ImGui::MenuItem(tr("Diálogo", "Dialogue Component"))) scene->dialogueComponents[id] = DialogueComponent{}; }
+        ImGui::Separator();
+        section(tr("ANIMAÇÃO", "ANIMATION"));
+        if (match(tr("Máquina de Estados (Animação)", "Animation State Machine"))) { if (ImGui::MenuItem(tr("Máquina de Estados (Animação)", "Animation Component"))) scene->animationComponents[id] = AnimationComponent{}; }
+        if (match(tr("Timeline", "Timeline"))) { if (ImGui::MenuItem(tr("Timeline", "Timeline Component"))) scene->timelineComponents[id] = TimelineComponent{}; }
+        if (match(tr("IK (Cadeia de Ossos)", "IK Chain"))) { if (ImGui::MenuItem(tr("IK (Cadeia de Ossos)", "IK Component"))) scene->ikComponents[id] = IKComponent{}; }
+        if (match(tr("Retargeting de Esqueleto", "Retarget"))) { if (ImGui::MenuItem(tr("Retargeting de Esqueleto", "Retarget Component"))) scene->retargetComponents[id] = RetargetComponent{}; }
 #if VC_ENABLE_VOXEL_PLUGIN
         ImGui::Separator();
         section(tr("MUNDO", "WORLD"));
@@ -3456,9 +2904,19 @@ void EditorApplication::draw_viewport_panel() {
     const glm::vec2 mouse(io.MousePos.x, io.MousePos.y);
 
     if (m_viewportImageHovered) {
+        // Paint tool (vertex painting): left-drag paints the selected mesh
+        // instead of picking. Active while m_paintToolActive is on (the Paint
+        // panel toggles it, or the toolbar 'P' button).
+        if (m_paintToolActive && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            m_paintBrushDown = paint_mesh_stroke(m_editorCamera.position, viewport_mouse_dir(mouse));
+            m_activeAxis = GizmoAxis::None;
+            m_gizmoDragging = false;
+        } else {
+            m_paintBrushDown = false;
+        }
         // Left click: grab the gizmo axis first, otherwise pick the entity.
         // Select mode has no gizmo — clicks always pick.
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !m_gizmoDragging) {
+        if (!m_paintToolActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !m_gizmoDragging) {
             if (m_gizmoMode != GizmoMode::Select && gizmo_axis_hit_test(mouse)) {
                 m_activeAxis = m_hoveredAxis;
                 start_gizmo_drag(mouse);
@@ -3481,6 +2939,26 @@ void EditorApplication::draw_viewport_panel() {
         }
     } else if (m_viewportImageHovered && !ImGui::IsAnyMouseDown() && m_gizmoMode != GizmoMode::Select) {
         gizmo_axis_hit_test(mouse); // hover highlight
+    }
+
+    // Entity hover tooltip: update the hover-pick pixel every few frames
+    // (throttled to avoid a GPU pick pass every frame).
+    if (m_viewportImageHovered && !m_gizmoDragging && !ImGui::IsAnyMouseDown()) {
+        static int hoverFrame = 0;
+        if (++hoverFrame % 3 == 0) {
+            m_hoverPickPixel = (mouse - glm::vec2(dispPos.x, dispPos.y)) *
+                glm::vec2(static_cast<float>(m_offscreen.width) / dispW,
+                          static_cast<float>(m_offscreen.height) / dispH);
+            m_hoverPickPending = true;
+        }
+    } else {
+        m_hoverEntityName.clear();
+    }
+    // Tooltip: show entity name at cursor position when hovering over an entity
+    if (!m_hoverEntityName.empty() && m_viewportImageHovered) {
+        ImGui::BeginTooltip();
+        ImGui::TextColored(ImVec4(0.55f, 0.60f, 1.0f, 1.0f), ICON_FA_CUBE " %s", m_hoverEntityName.c_str());
+        ImGui::EndTooltip();
     }
 
     ImGui::End();
@@ -3509,6 +2987,24 @@ void EditorApplication::handle_asset_drop(const UUID& assetId) {
         spawn_block_entity(asset.id, m_editorCamera.position + m_editorCamera.get_front() * 2.0f);
         std::cout << "[Viewport] Dropped block '" << asset.sourcePath.filename().string()
                   << "' -> spawned block entity\n";
+    } else if (asset.type == AssetType::Texture && is_character_texture(asset)) {
+        // Minecraft character/mob skin: drop it and the humanoid character
+        // spawns in the scene with the skin as its texture — no sidecar, the
+        // PNG itself is the character (just like the block flow).
+        spawn_character_entity(asset.id, m_editorCamera.position + m_editorCamera.get_front() * 2.0f);
+        std::cout << "[Viewport] Dropped skin '" << asset.sourcePath.filename().string()
+                  << "' -> spawned character entity\n";
+    } else if (asset.type == AssetType::Texture && is_block_texture(asset)) {
+        // The PNG itself IS a Minecraft-style block (square POT 8-256, not a
+        // character/mob skin): drop it straight in the viewport and it becomes
+        // the textured cube — no manual "create block model" step needed. The
+        // .vblock sidecar is auto-created on first use and reused afterwards.
+        const UUID blockId = create_block_asset(asset);
+        if (blockId.is_valid()) {
+            spawn_block_entity(blockId, m_editorCamera.position + m_editorCamera.get_front() * 2.0f);
+            std::cout << "[Viewport] Dropped block texture '" << asset.sourcePath.filename().string()
+                      << "' -> spawned block entity (vblock " << blockId.to_string() << ")\n";
+        }
     } else if (asset.type == AssetType::Material) {
         if (m_selectedEntity.is_valid()) {
             const auto it = scene->meshRendererComponents.find(m_selectedEntity.get_id());
@@ -3573,6 +3069,22 @@ void EditorApplication::draw_content_browser_panel() {
             }
         }
     }
+    ImGui::SameLine();
+    if (ImGui::Button(tr(ICON_FA_ROTATE "  Atualizar", ICON_FA_ROTATE "  Refresh"), ImVec2(0, 0))) {
+        indexed = false;
+        m_contentBrowserDirty = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(tr(ICON_FA_UPLOAD "  Pack", ICON_FA_UPLOAD "  Pack"), ImVec2(0, 0))) {
+        std::string packFolder;
+        if (pick_folder_dialog(packFolder, L"Selecionar pasta do pack de texturas")) {
+            const size_t count = import_texture_pack(std::filesystem::path(packFolder));
+            if (count > 0) {
+                indexed = false; // force re-index on next frame
+                m_contentBrowserDirty = true;
+            }
+        }
+    }
     // Type filter tabs (the old Combo row could not fit when the dock shrank).
     // "Modelos" groups every 3D/model asset: industry meshes (glTF), block
     // models assembled from Minecraft-style PNGs, and voxel structures.
@@ -3603,11 +3115,18 @@ void EditorApplication::draw_content_browser_panel() {
 
     AssetBrowserModel browser(m_assetRegistry);
     std::vector<AssetMetadata> assets = browser.query(search, selectedType);
+    // .vblock sidecars are hidden plumbing: the PNG IS the block, so Block
+    // assets never appear as cards (that would duplicate the texture).
+    assets.erase(std::remove_if(assets.begin(), assets.end(), [](const AssetMetadata& candidate) {
+        return candidate.type == AssetType::Block;
+    }), assets.end());
     if (typeFilter == 3) {
-        // Modelos: meshes + block models + voxel structures.
+        // Modelos: industry meshes + voxel structures + block-capable textures
+        // (the PNG itself is the Minecraft-style block) + character/mob skins.
         assets.erase(std::remove_if(assets.begin(), assets.end(), [&](const AssetMetadata& candidate) {
-            return candidate.type != AssetType::Mesh && candidate.type != AssetType::Block &&
-                   candidate.type != AssetType::VoxelStructure;
+            return candidate.type != AssetType::Mesh && candidate.type != AssetType::VoxelStructure &&
+                   !(candidate.type == AssetType::Texture &&
+                     (is_block_texture(candidate) || is_character_texture(candidate)));
         }), assets.end());
     }
     if (typeFilter == 8) {
@@ -3651,25 +3170,45 @@ void EditorApplication::draw_content_browser_panel() {
 
     const float cellSize = 150.0f;
     int columns = std::max(1, static_cast<int>(ImGui::GetContentRegionAvail().x / cellSize));
-    // Cap GPU thumbnail uploads per frame: a folder with hundreds of textures
-    // fills the cache progressively instead of stalling one frame / all VRAM.
-    int thumbnailBudget = 48;
+    // Lazy loading (like IntersectionObserver in JS): only assets whose cards
+    // are inside the browser's visible area ever trigger thumbnail work.
+    // Off-screen rows never decode/upload/render, so scrolling a huge folder
+    // loads just the screenful instead of the whole list. Row height is an
+    // estimate (48px button + type line + wrapped name + spacing) with a
+    // one-row safety margin; being slightly generous only costs a few extra
+    // small async requests, never a stall.
+    const float cellHeight = 96.0f;
+    const float scrollY = ImGui::GetScrollY();
+    const float windowH = ImGui::GetWindowHeight();
+    const int firstVisibleRow = std::max(0, static_cast<int>(scrollY / cellHeight) - 1);
+    const int lastVisibleRow = static_cast<int>((scrollY + windowH) / cellHeight) + 1;
     ImGui::Columns(columns, "AssetGrid", false);
+    size_t gridIndex = 0;
     for (const AssetMetadata& asset : assets) {
+        const int row = static_cast<int>(gridIndex / static_cast<size_t>(std::max(columns, 1)));
+        ++gridIndex;
+        const bool isVisible = row >= firstVisibleRow && row <= lastVisibleRow;
         const std::string filename = asset.sourcePath.filename().string();
         ImGui::PushID(asset.id.to_string().c_str());
 
-        // Real previews: cooked textures show the actual image (lazy, cached);
-        // meshes and blocks render a true 3D thumbnail (rendered offscreen);
-        // audio tiles carry a single active ▶/⏸ preview voice.
+        // Real previews: cooked textures show the actual image (async decode on
+        // a worker, cached forever); meshes and blocks render a true 3D
+        // thumbnail (offscreen, budgeted a few per frame); audio tiles carry a
+        // single active ▶/⏸ preview voice. Only visible cards request work.
         const bool isTexture = (asset.type == AssetType::Texture);
         const bool isAudio = (asset.type == AssetType::Audio);
-        const bool isModel = (asset.type == AssetType::Mesh || asset.type == AssetType::Block);
+        const bool isBlockTexture = isTexture && is_block_texture(asset);
+        const bool isSkinTexture = isTexture && !isBlockTexture && is_character_texture(asset);
+        const bool isModel = (asset.type == AssetType::Mesh);
         VkDescriptorSet thumb = VK_NULL_HANDLE;
-        if (isTexture && thumbnailBudget > 0) {
-            thumb = get_asset_thumbnail(asset);
-            if (thumb) --thumbnailBudget;
-        } else if (isModel) {
+        if (isTexture && !isBlockTexture) {
+            const auto found = m_assetThumbnails.find(asset.id);
+            if (found != m_assetThumbnails.end()) {
+                thumb = found->second.imguiId;
+            } else if (isVisible) {
+                request_asset_thumbnail_decode(asset); // async, 1 upload/frame
+            }
+        } else if ((isModel || isBlockTexture) && isVisible) {
             const auto thumbIt = m_asset3dThumbnails.find(asset.id);
             if (thumbIt != m_asset3dThumbnails.end()) {
                 thumb = thumbIt->second;
@@ -3689,7 +3228,10 @@ void EditorApplication::draw_content_browser_panel() {
             }
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s\n%s", filename.c_str(), assetTypeName(asset.type));
+            const char* label = isBlockTexture ? tr("Bloco", "Block")
+                               : isSkinTexture ? tr("Skin (Personagem/Mob)", "Skin (Character/Mob)")
+                               : assetTypeName(asset.type);
+            ImGui::SetTooltip("%s\n%s", filename.c_str(), label);
         }
         // Double-click opens the matching editor (industry convention).
         if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
@@ -3739,18 +3281,32 @@ void EditorApplication::draw_content_browser_panel() {
                         std::cerr << "[AssetRegistry] Could not persist asset deletion" << std::endl;
                 }
             }
-            // Minecraft-style recognition: a small square POT texture can be
-            // assembled into a block model — offer that as a real action.
-            if (asset.type == AssetType::Texture && looks_like_block_texture(asset)) {
+            // The PNG is the block: spawn it as a textured cube in the scene
+            // (same result as dragging it into the viewport).
+            if (isBlockTexture) {
+                if (ImGui::MenuItem(tr("Criar Entidade de Bloco na Cena", "Spawn Block in Scene"))) {
+                    const UUID blockId = create_block_asset(asset);
+                    if (blockId.is_valid()) spawn_block_entity(blockId, m_editorCamera.orbitTarget);
+                }
                 if (ImGui::MenuItem(tr("Criar Modelo de Bloco (Minecraft)", "Create Block Model (Minecraft)"))) {
                     create_block_asset(asset);
                 }
             }
-            // Block model: spawn it as a textured cube in the scene (the
-            // missing button — blocks used to live only as assets with previews).
-            if (asset.type == AssetType::Block) {
-                if (ImGui::MenuItem(tr("Criar Entidade de Bloco na Cena", "Spawn Block in Scene"))) {
-                    spawn_block_entity(asset.id, m_editorCamera.orbitTarget);
+            // The PNG is the character/mob: spawn the humanoid in the scene
+            // (same result as dragging it into the viewport).
+            if (isSkinTexture) {
+                if (ImGui::MenuItem(tr("Criar Personagem na Cena", "Spawn Character in Scene"))) {
+                    spawn_character_entity(asset.id, m_editorCamera.orbitTarget);
+                }
+            }
+            // Classification override: the heuristic can misfire on skins vs
+            // blocks — the .vblock sidecar is the explicit user mark.
+            if (isTexture) {
+                if (ImGui::MenuItem(isBlockTexture
+                                        ? tr("Desmarcar como Bloco (é personagem/mob?)", "Unmark as Block (character/mob?)")
+                                        : tr("Marcar como Bloco de Minecraft", "Mark as Minecraft Block"))) {
+                    if (isBlockTexture) unmark_block_texture(asset);
+                    else create_block_asset(asset);
                 }
             }
             const auto referencers = m_assetRegistry.referencers_of(asset.id);
@@ -3766,10 +3322,12 @@ void EditorApplication::draw_content_browser_panel() {
             ImGui::TextUnformatted(filename.c_str());
             ImGui::EndDragDropSource();
         }
-        ImGui::TextColored(UI::Colors::TextSecondary, "%s", assetTypeName(asset.type));
-        if (asset.type == AssetType::Texture && looks_like_block_texture(asset)) {
-            ImGui::SameLine();
+        if (isBlockTexture) {
             ImGui::TextColored(ImVec4(0.30f, 0.75f, 0.95f, 1.0f), "%s", tr("Bloco", "Block"));
+        } else if (isSkinTexture) {
+            ImGui::TextColored(ImVec4(0.85f, 0.55f, 0.95f, 1.0f), "%s", tr("Skin", "Skin"));
+        } else {
+            ImGui::TextColored(UI::Colors::TextSecondary, "%s", assetTypeName(asset.type));
         }
         ImGui::SameLine();
         if (asset.isCooked) ImGui::TextColored(UI::Colors::Success, "%s", ICON_FA_CIRCLE_CHECK);
@@ -4482,7 +4040,7 @@ void EditorApplication::run_game_build() {
 void EditorApplication::draw_console_panel() {
     ImGui::Begin(tr("Console", "Console"));
 
-    ImGui::TextColored(ImVec4(0.39f, 0.40f, 0.95f, 1.00f), "%s", tr("Vulkan Engine Studio 1.5.0 - Português (Brasil)", "Vulkan Engine Studio 1.5.0 - English (US)"));
+    ImGui::TextColored(ImVec4(0.39f, 0.40f, 0.95f, 1.00f), "%s", tr("VulkanCraft Engine 1.5.0 - Português (Brasil)", "VulkanCraft Engine 1.5.0 - English (US)"));
     ImGui::Text(tr("Velocidade: %.1f FPS  |  Tempo por Quadro: %.2f ms  |  Memória RAM: %zu MB", "Speed: %.1f FPS  |  Frame Time: %.2f ms  |  RAM: %zu MB"), m_fps, m_frameTimeMs, m_ramUsageMb);
     ImGui::Separator();
 
@@ -4570,10 +4128,12 @@ VkShaderModule make_module(VkDevice device, const std::vector<uint32_t>& spirv) 
 
 VkPipeline create_scene_pipeline(VkDevice device, VkRenderPass renderPass, VkPipelineLayout layout,
                                  VkShaderModule vert, VkShaderModule frag,
+                                 VkSampleCountFlagBits samples,
                                  bool wireframe, bool depthTest, bool cull, bool withUv = false,
                                  bool noVertexInput = false, bool blend = false,
                                  bool lessOrEqualDepth = false, bool depthBias = false,
-                                 bool depthWrite = true) {
+                                 bool depthWrite = true,
+                                 VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) {
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -4600,7 +4160,7 @@ VkPipeline create_scene_pipeline(VkDevice device, VkRenderPass renderPass, VkPip
     vertexInput.pVertexAttributeDescriptions = noVertexInput ? nullptr : attrs;
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-    inputAssembly.topology = wireframe ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    inputAssembly.topology = wireframe ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : topology;
     inputAssembly.primitiveRestartEnable = VK_FALSE;
 
     VkPipelineViewportStateCreateInfo viewportState{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
@@ -4625,7 +4185,8 @@ VkPipeline create_scene_pipeline(VkDevice device, VkRenderPass renderPass, VkPip
 
     VkPipelineMultisampleStateCreateInfo multisampling{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
     multisampling.sampleShadingEnable = VK_FALSE;
-    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    multisampling.rasterizationSamples = samples;
+    multisampling.alphaToCoverageEnable = VK_FALSE;
 
     VkPipelineDepthStencilStateCreateInfo depthStencil{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
     depthStencil.depthTestEnable = depthTest ? VK_TRUE : VK_FALSE;
@@ -4680,18 +4241,29 @@ VkPipeline create_scene_pipeline(VkDevice device, VkRenderPass renderPass, VkPip
 }
 
 // Unit cube (24 vertices with per-face normals, 36 indices). Vertex colors white.
+// Cube with per-face UVs: 24 vertices / 36 indices. The UVs matter — the
+// material-graph pipeline samples textures with the vertex UVs (location 3),
+// so block cubes in the scene would otherwise sample the single (0,0) texel
+// and render as a solid color ("sem textura").
 void build_cube(std::vector<EditorVertex>& verts, std::vector<uint32_t>& indices) {
     const glm::vec3 n[6] = {
         { 0,  0, -1}, { 0,  0,  1}, {-1,  0,  0},
         { 1,  0,  0}, { 0, -1,  0}, { 0,  1,  0}
     };
-    const glm::vec3 corners[8] = {
-        {-0.5f, -0.5f, -0.5f}, { 0.5f, -0.5f, -0.5f}, { 0.5f,  0.5f, -0.5f}, {-0.5f,  0.5f, -0.5f},
-        {-0.5f, -0.5f,  0.5f}, { 0.5f, -0.5f,  0.5f}, { 0.5f,  0.5f,  0.5f}, {-0.5f,  0.5f,  0.5f}
-    };
-    const uint32_t faces[6][4] = {
-        {0, 1, 2, 3}, {5, 4, 7, 6}, {4, 0, 3, 7},
-        {1, 5, 6, 2}, {4, 5, 1, 0}, {3, 2, 6, 7}
+    struct FaceVert { glm::vec3 pos; glm::vec2 uv; };
+    const FaceVert face[6][4] = {
+        { FaceVert{{-0.5f, -0.5f, -0.5f}, {0, 0}}, FaceVert{{ 0.5f, -0.5f, -0.5f}, {1, 0}},
+          FaceVert{{ 0.5f,  0.5f, -0.5f}, {1, 1}}, FaceVert{{-0.5f,  0.5f, -0.5f}, {0, 1}} }, // -Z
+        { FaceVert{{ 0.5f, -0.5f,  0.5f}, {0, 0}}, FaceVert{{-0.5f, -0.5f,  0.5f}, {1, 0}},
+          FaceVert{{-0.5f,  0.5f,  0.5f}, {1, 1}}, FaceVert{{ 0.5f,  0.5f,  0.5f}, {0, 1}} }, // +Z
+        { FaceVert{{-0.5f, -0.5f,  0.5f}, {0, 0}}, FaceVert{{-0.5f, -0.5f, -0.5f}, {1, 0}},
+          FaceVert{{-0.5f,  0.5f, -0.5f}, {1, 1}}, FaceVert{{-0.5f,  0.5f,  0.5f}, {0, 1}} }, // -X
+        { FaceVert{{ 0.5f, -0.5f, -0.5f}, {0, 0}}, FaceVert{{ 0.5f, -0.5f,  0.5f}, {1, 0}},
+          FaceVert{{ 0.5f,  0.5f,  0.5f}, {1, 1}}, FaceVert{{ 0.5f,  0.5f, -0.5f}, {0, 1}} }, // +X
+        { FaceVert{{-0.5f, -0.5f, -0.5f}, {0, 0}}, FaceVert{{ 0.5f, -0.5f, -0.5f}, {1, 0}},
+          FaceVert{{ 0.5f, -0.5f,  0.5f}, {1, 1}}, FaceVert{{-0.5f, -0.5f,  0.5f}, {0, 1}} }, // -Y
+        { FaceVert{{-0.5f,  0.5f,  0.5f}, {0, 0}}, FaceVert{{ 0.5f,  0.5f,  0.5f}, {1, 0}},
+          FaceVert{{ 0.5f,  0.5f, -0.5f}, {1, 1}}, FaceVert{{-0.5f,  0.5f, -0.5f}, {0, 1}} }, // +Y
     };
     verts.clear();
     indices.clear();
@@ -4699,9 +4271,10 @@ void build_cube(std::vector<EditorVertex>& verts, std::vector<uint32_t>& indices
         const uint32_t base = static_cast<uint32_t>(verts.size());
         for (int c = 0; c < 4; ++c) {
             EditorVertex v;
-            v.pos = corners[faces[f][c]];
+            v.pos = face[f][c].pos;
             v.normal = n[f];
             v.color = glm::vec3(1.0f);
+            v.uv = face[f][c].uv;
             verts.push_back(v);
         }
         indices.push_back(base);
@@ -4711,6 +4284,137 @@ void build_cube(std::vector<EditorVertex>& verts, std::vector<uint32_t>& indices
         indices.push_back(base + 2);
         indices.push_back(base + 3);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Minecraft-style character geometry (player/mob skin → humanoid): head + body
+// + arms + legs boxes, each face UV-mapped to the standard 64x64 skin layout
+// (legacy 64x32 reuses the right arm/leg regions for the left side; HD skins
+// scale the whole layout, so UVs are normalized from the 64-unit grid). One
+// unit = 1/16 m → the character is ~2 m tall. Winding matches build_cube
+// (CCW + back-cull), so it renders with the material-graph pipeline.
+// ---------------------------------------------------------------------------
+namespace {
+struct CharacterUVRect { float u0, v0, u1, v1; };
+
+void append_character_face(std::vector<EditorVertex>& verts, std::vector<uint32_t>& indices,
+                           const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
+                           const glm::vec3& d, const glm::vec2& ta, const glm::vec2& tb,
+                           const glm::vec2& tc, const glm::vec2& td, const glm::vec3& normal) {
+    const uint32_t base = static_cast<uint32_t>(verts.size());
+    const glm::vec3 p[4] = { a, b, c, d };
+    const glm::vec2 t[4] = { ta, tb, tc, td };
+    for (int i = 0; i < 4; ++i) {
+        EditorVertex v;
+        v.pos = p[i];
+        v.normal = normal;
+        v.color = glm::vec3(1.0f);
+        v.uv = t[i];
+        verts.push_back(v);
+    }
+    indices.push_back(base);
+    indices.push_back(base + 1);
+    indices.push_back(base + 2);
+    indices.push_back(base);
+    indices.push_back(base + 2);
+    indices.push_back(base + 3);
+}
+
+// Adds the six faces of a box. `right`/`left` map the +X/-X faces,
+// `front`/`back` the +Z/-Z (back flipped so the layout reads correctly),
+// `top`/`bottom` the +Y/-Y. UVs come from the 64-unit layout grid and are
+// normalized by `skinHeight` (64x64 or legacy 64x32).
+void append_character_box(std::vector<EditorVertex>& verts, std::vector<uint32_t>& indices,
+                          float x0, float y0, float z0, float x1, float y1, float z1,
+                          float skinHeight, const CharacterUVRect& right,
+                          const CharacterUVRect& left, const CharacterUVRect& front,
+                          const CharacterUVRect& back, const CharacterUVRect& top,
+                          const CharacterUVRect& bottom) {
+    const auto uv = [&](const CharacterUVRect& r, float u, float v) {
+        return glm::vec2((r.u0 + (r.u1 - r.u0) * u) / 64.0f,
+                         (r.v0 + (r.v1 - r.v0) * v) / skinHeight);
+    };
+    // +Z front
+    append_character_face(verts, indices, { x0, y0, z1 }, { x1, y0, z1 }, { x1, y1, z1 },
+                          { x0, y1, z1 }, uv(front, 0, 1), uv(front, 1, 1), uv(front, 1, 0),
+                          uv(front, 0, 0), { 0, 0, 1 });
+    // -Z back (u flipped)
+    append_character_face(verts, indices, { x1, y0, z0 }, { x0, y0, z0 }, { x0, y1, z0 },
+                          { x1, y1, z0 }, uv(back, 1, 1), uv(back, 0, 1), uv(back, 0, 0),
+                          uv(back, 1, 0), { 0, 0, -1 });
+    // +X right
+    append_character_face(verts, indices, { x1, y0, z0 }, { x1, y0, z1 }, { x1, y1, z1 },
+                          { x1, y1, z0 }, uv(right, 0, 1), uv(right, 1, 1), uv(right, 1, 0),
+                          uv(right, 0, 0), { 1, 0, 0 });
+    // -X left (u flipped)
+    append_character_face(verts, indices, { x0, y0, z1 }, { x0, y0, z0 }, { x0, y1, z0 },
+                          { x0, y1, z1 }, uv(left, 1, 1), uv(left, 0, 1), uv(left, 0, 0),
+                          uv(left, 1, 0), { -1, 0, 0 });
+    // +Y top (z1 -> v0, the front edge of the top rect)
+    append_character_face(verts, indices, { x0, y1, z1 }, { x1, y1, z1 }, { x1, y1, z0 },
+                          { x0, y1, z0 }, uv(top, 0, 0), uv(top, 1, 0), uv(top, 1, 1),
+                          uv(top, 0, 1), { 0, 1, 0 });
+    // -Y bottom
+    append_character_face(verts, indices, { x0, y0, z0 }, { x1, y0, z0 }, { x1, y0, z1 },
+                          { x0, y0, z1 }, uv(bottom, 0, 1), uv(bottom, 1, 1),
+                          uv(bottom, 1, 0), uv(bottom, 0, 0), { 0, -1, 0 });
+}
+} // namespace
+
+void build_character_geometry(float skinHeight, std::vector<EditorVertex>& verts,
+                              std::vector<uint32_t>& indices) {
+    // Skin layout rects in the 64x64 coordinate grid (authoritative: the
+    // reference implementation used by mineatar.io). v is normalized by
+    // skinHeight so legacy 64x32 skins work too.
+    const CharacterUVRect headTop{ 8, 0, 16, 8 }, headBottom{ 16, 0, 24, 8 },
+        headRight{ 0, 8, 8, 16 }, headFront{ 8, 8, 16, 16 },
+        headLeft{ 16, 8, 24, 16 }, headBack{ 24, 8, 32, 16 };
+    const CharacterUVRect bodyTop{ 20, 16, 28, 20 }, bodyBottom{ 28, 16, 36, 20 },
+        bodyRight{ 16, 20, 20, 32 }, bodyFront{ 20, 20, 28, 32 },
+        bodyLeft{ 28, 20, 32, 32 }, bodyBack{ 32, 20, 40, 32 };
+    const CharacterUVRect rightArmTop{ 44, 16, 48, 20 }, rightArmBottom{ 48, 16, 52, 20 },
+        rightArmRight{ 40, 20, 44, 32 }, rightArmFront{ 44, 20, 48, 32 },
+        rightArmLeft{ 48, 20, 52, 32 }, rightArmBack{ 52, 20, 56, 32 };
+    const CharacterUVRect rightLegTop{ 4, 16, 8, 20 }, rightLegBottom{ 8, 16, 12, 20 },
+        rightLegRight{ 0, 20, 4, 32 }, rightLegFront{ 4, 20, 8, 32 },
+        rightLegLeft{ 8, 20, 12, 32 }, rightLegBack{ 12, 20, 16, 32 };
+    CharacterUVRect leftArmTop = rightArmTop, leftArmBottom = rightArmBottom,
+        leftArmRight = rightArmRight, leftArmFront = rightArmFront,
+        leftArmLeft = rightArmLeft, leftArmBack = rightArmBack;
+    CharacterUVRect leftLegTop = rightLegTop, leftLegBottom = rightLegBottom,
+        leftLegRight = rightLegRight, leftLegFront = rightLegFront,
+        leftLegLeft = rightLegLeft, leftLegBack = rightLegBack;
+    if (skinHeight > 32.5f) {
+        // 64x64: dedicated left arm/leg regions.
+        leftArmTop = { 36, 48, 40, 52 }; leftArmBottom = { 40, 48, 44, 52 };
+        leftArmRight = { 32, 52, 36, 64 }; leftArmFront = { 36, 52, 40, 64 };
+        leftArmLeft = { 40, 52, 44, 64 }; leftArmBack = { 44, 52, 48, 64 };
+        leftLegTop = { 20, 48, 24, 52 }; leftLegBottom = { 24, 48, 28, 52 };
+        leftLegRight = { 16, 52, 20, 64 }; leftLegFront = { 20, 52, 24, 64 };
+        leftLegLeft = { 24, 52, 28, 64 }; leftLegBack = { 28, 52, 32, 64 };
+    }
+    verts.clear();
+    indices.clear();
+    // Right leg (+X), left leg (-X): 0.25 x 0.75 x 0.25 m.
+    append_character_box(verts, indices, 0.0f, 0.0f, -0.125f, 0.25f, 0.75f, 0.125f, skinHeight,
+                         rightLegRight, rightLegLeft, rightLegFront, rightLegBack,
+                         rightLegTop, rightLegBottom);
+    append_character_box(verts, indices, -0.25f, 0.0f, -0.125f, 0.0f, 0.75f, 0.125f, skinHeight,
+                         leftLegRight, leftLegLeft, leftLegFront, leftLegBack,
+                         leftLegTop, leftLegBottom);
+    // Body: 0.5 x 0.75 x 0.25 m.
+    append_character_box(verts, indices, -0.25f, 0.75f, -0.125f, 0.25f, 1.5f, 0.125f, skinHeight,
+                         bodyRight, bodyLeft, bodyFront, bodyBack, bodyTop, bodyBottom);
+    // Right arm (+X), left arm (-X): 0.25 x 0.75 x 0.25 m.
+    append_character_box(verts, indices, 0.25f, 0.75f, -0.125f, 0.5f, 1.5f, 0.125f, skinHeight,
+                         rightArmRight, rightArmLeft, rightArmFront, rightArmBack,
+                         rightArmTop, rightArmBottom);
+    append_character_box(verts, indices, -0.5f, 0.75f, -0.125f, -0.25f, 1.5f, 0.125f, skinHeight,
+                         leftArmRight, leftArmLeft, leftArmFront, leftArmBack,
+                         leftArmTop, leftArmBottom);
+    // Head: 0.5 x 0.5 x 0.5 m.
+    append_character_box(verts, indices, -0.25f, 1.5f, -0.25f, 0.25f, 2.0f, 0.25f, skinHeight,
+                         headRight, headLeft, headFront, headBack, headTop, headBottom);
 }
 
 // Appends a cube (from build_cube) transformed by `model`; returns its index range.
@@ -4986,6 +4690,12 @@ Rendering::MaterialGraph material_graph_from_asset(const MaterialAsset& mat) {
 } // namespace
 
 uint32_t EditorApplication::find_memory_type(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+
+
+
+// ===========================================================================
+// Vulkan Infrastructure (split from EditorApplication.cpp)
+// ===========================================================================
     VkPhysicalDeviceMemoryProperties memProperties;
     vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &memProperties);
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
@@ -4998,7 +4708,8 @@ uint32_t EditorApplication::find_memory_type(uint32_t typeFilter, VkMemoryProper
 
 void EditorApplication::create_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage,
                                      VkMemoryPropertyFlags memProps, VkImage& image, VkDeviceMemory& memory,
-                                     uint32_t mipLevels /* = 1 */) {
+                                     uint32_t mipLevels /* = 1 */,
+                                     VkSampleCountFlagBits samples /* = VK_SAMPLE_COUNT_1_BIT */) {
     VkImageCreateInfo info{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     info.imageType = VK_IMAGE_TYPE_2D;
     info.extent = { w, h, 1 };
@@ -5008,7 +4719,7 @@ void EditorApplication::create_image(uint32_t w, uint32_t h, VkFormat format, Vk
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     info.usage = usage;
-    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.samples = samples;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (vkCreateImage(m_device, &info, nullptr, &image) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create image");
@@ -5126,45 +4837,74 @@ void EditorApplication::init_offscreen_target() {
     const VkFormat colorFormat = VK_FORMAT_R8G8B8A8_UNORM;
     const VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
 
-    VkAttachmentDescription colorAttachment{};
-    colorAttachment.format = colorFormat;
-    colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    colorAttachment.initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    // Clamp MSAA to what the device actually supports (4x on virtually all
+    // desktop GPUs; falls back to 2x/1x on weak/software adapters).
+    if (m_physicalDevice != VK_NULL_HANDLE) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(m_physicalDevice, &props);
+        const VkSampleCountFlags counts = props.limits.framebufferColorSampleCounts;
+        m_viewportSamples =
+            (counts & VK_SAMPLE_COUNT_4_BIT) ? VK_SAMPLE_COUNT_4_BIT :
+            (counts & VK_SAMPLE_COUNT_2_BIT) ? VK_SAMPLE_COUNT_2_BIT :
+            VK_SAMPLE_COUNT_1_BIT;
+    }
 
-    VkAttachmentDescription depthAttachment{};
-    depthAttachment.format = depthFormat;
-    depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depthAttachment.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    // Viewport scene render pass with MSAA + resolve:
+    //   0 = scene color (multisampled, transient)
+    //   1 = scene depth (multisampled, transient)
+    //   2 = resolve color (1x, stored, sampled by ImGui)
+    VkAttachmentDescription colorMsaa{};
+    colorMsaa.format = colorFormat;
+    colorMsaa.samples = m_viewportSamples;
+    colorMsaa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorMsaa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorMsaa.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorMsaa.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorMsaa.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorMsaa.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentDescription depthMsaa{};
+    depthMsaa.format = depthFormat;
+    depthMsaa.samples = m_viewportSamples;
+    depthMsaa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthMsaa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthMsaa.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depthMsaa.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthMsaa.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthMsaa.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentDescription resolveColor{};
+    resolveColor.format = colorFormat;
+    resolveColor.samples = VK_SAMPLE_COUNT_1_BIT;
+    resolveColor.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    resolveColor.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    resolveColor.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    resolveColor.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    resolveColor.initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    resolveColor.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
     VkAttachmentReference colorRef{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
     VkAttachmentReference depthRef{ 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    VkAttachmentReference resolveRef{ 2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &colorRef;
+    subpass.pResolveAttachments = &resolveRef;
     subpass.pDepthStencilAttachment = &depthRef;
 
-    VkAttachmentDescription attachments[2] = { colorAttachment, depthAttachment };
+    VkAttachmentDescription attachments[3] = { colorMsaa, depthMsaa, resolveColor };
     VkRenderPassCreateInfo rpInfo{ VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
-    rpInfo.attachmentCount = 2;
+    rpInfo.attachmentCount = 3;
     rpInfo.pAttachments = attachments;
     rpInfo.subpassCount = 1;
     rpInfo.pSubpasses = &subpass;
     if (vkCreateRenderPass(m_device, &rpInfo, nullptr, &m_offscreen.renderPass) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create offscreen render pass");
+        throw std::runtime_error("Failed to create MSAA offscreen render pass");
     }
 
-    // Pick render pass: color only writes, shared depth attachment.
+    // Pick render pass: color-ID pass stays 1x with its OWN 1x depth (the
+    // scene depth is now multisampled and cannot be shared with a 1x pass).
     VkAttachmentDescription pickColor{};
     pickColor.format = colorFormat;
     pickColor.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -5174,22 +4914,48 @@ void EditorApplication::init_offscreen_target() {
     pickColor.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     pickColor.initialLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     pickColor.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    VkAttachmentDescription pickAttachments[2] = { pickColor, depthAttachment };
+    VkAttachmentDescription pickDepth{};
+    pickDepth.format = depthFormat;
+    pickDepth.samples = VK_SAMPLE_COUNT_1_BIT;
+    pickDepth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    pickDepth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    pickDepth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    pickDepth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    pickDepth.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    pickDepth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference pickColorRef{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkAttachmentReference pickDepthRef{ 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription pickSubpass{};
+    pickSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    pickSubpass.colorAttachmentCount = 1;
+    pickSubpass.pColorAttachments = &pickColorRef;
+    pickSubpass.pDepthStencilAttachment = &pickDepthRef;
+    VkAttachmentDescription pickAttachments[2] = { pickColor, pickDepth };
     VkRenderPassCreateInfo pickRpInfo{ VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
     pickRpInfo.attachmentCount = 2;
     pickRpInfo.pAttachments = pickAttachments;
     pickRpInfo.subpassCount = 1;
-    pickRpInfo.pSubpasses = &subpass;
+    pickRpInfo.pSubpasses = &pickSubpass;
     if (vkCreateRenderPass(m_device, &pickRpInfo, nullptr, &m_offscreen.pickRenderPass) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create pick render pass");
     }
 
+    // Material-texture sampler: trilinear mipmapping + 16x anisotropic
+    // filtering so surfaces seen at oblique angles (e.g. ~75°) stop shimmering
+    // and aliasing. The device enables samplerAnisotropy at creation
+    // (Engine.cpp), so this is safe on every supported adapter.
     VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
     samplerInfo.magFilter = VK_FILTER_LINEAR;
     samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
     samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.mipLodBias = 0.0f;
+    samplerInfo.anisotropyEnable = VK_TRUE;
+    samplerInfo.maxAnisotropy = 16.0f;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
     if (vkCreateSampler(m_device, &samplerInfo, nullptr, &m_offscreen.sampler) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create offscreen sampler");
     }
@@ -5206,17 +4972,35 @@ void EditorApplication::create_offscreen_buffers(uint32_t w, uint32_t h) {
     const VkFormat colorFormat = VK_FORMAT_R8G8B8A8_UNORM;
     const VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
 
+    // Resolve target (1x) — what ImGui samples.
     create_image(w, h, colorFormat, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_offscreen.colorImage, m_offscreen.colorMemory);
     m_offscreen.colorView = create_image_view(m_offscreen.colorImage, colorFormat, VK_IMAGE_ASPECT_COLOR_BIT);
 
-    create_image(w, h, depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_offscreen.depthImage, m_offscreen.depthMemory);
+    // Scene color, multisampled.
+    create_image(w, h, colorFormat,
+                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_offscreen.msaaColorImage, m_offscreen.msaaColorMemory,
+                 1, m_viewportSamples);
+    m_offscreen.msaaColorView =
+        create_image_view(m_offscreen.msaaColorImage, colorFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+
+    // Scene depth, multisampled.
+    create_image(w, h, depthFormat,
+                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_offscreen.depthImage, m_offscreen.depthMemory,
+                 1, m_viewportSamples);
     m_offscreen.depthView = create_image_view(m_offscreen.depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
 
+    // Pick buffers stay 1x, with their own 1x depth.
     create_image(w, h, colorFormat, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_offscreen.pickImage, m_offscreen.pickMemory);
     m_offscreen.pickView = create_image_view(m_offscreen.pickImage, colorFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+    create_image(w, h, depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                 m_offscreen.pickDepthImage, m_offscreen.pickDepthMemory);
+    m_offscreen.pickDepthView =
+        create_image_view(m_offscreen.pickDepthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
 
     const VkDeviceSize stagingSize = static_cast<VkDeviceSize>(w) * h * 4;
     create_buffer(stagingSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -5228,18 +5012,19 @@ void EditorApplication::create_offscreen_buffers(uint32_t w, uint32_t h) {
         VkCommandBuffer transitionCmd = begin_single_time_commands();
         transition_image_layout(transitionCmd, m_offscreen.colorImage,
                                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        transition_image_layout(transitionCmd, m_offscreen.depthImage,
-                                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                                VK_IMAGE_ASPECT_DEPTH_BIT);
         transition_image_layout(transitionCmd, m_offscreen.pickImage,
                                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        transition_image_layout(transitionCmd, m_offscreen.pickDepthImage,
+                                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                VK_IMAGE_ASPECT_DEPTH_BIT);
         end_single_time_commands(transitionCmd);
     }
 
-    VkImageView attachments[2] = { m_offscreen.colorView, m_offscreen.depthView };
+    // Scene framebuffer: [MSAA color, MSAA depth, resolve].
+    VkImageView attachments[3] = { m_offscreen.msaaColorView, m_offscreen.depthView, m_offscreen.colorView };
     VkFramebufferCreateInfo fbInfo{ VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
     fbInfo.renderPass = m_offscreen.renderPass;
-    fbInfo.attachmentCount = 2;
+    fbInfo.attachmentCount = 3;
     fbInfo.pAttachments = attachments;
     fbInfo.width = w;
     fbInfo.height = h;
@@ -5248,7 +5033,8 @@ void EditorApplication::create_offscreen_buffers(uint32_t w, uint32_t h) {
         throw std::runtime_error("Failed to create offscreen framebuffer");
     }
 
-    VkImageView pickAttachments[2] = { m_offscreen.pickView, m_offscreen.depthView };
+    // Pick framebuffer: [pick color, pick depth] — both 1x.
+    VkImageView pickAttachments[2] = { m_offscreen.pickView, m_offscreen.pickDepthView };
     VkFramebufferCreateInfo pickFbInfo{ VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
     pickFbInfo.renderPass = m_offscreen.pickRenderPass;
     pickFbInfo.attachmentCount = 2;
@@ -5444,6 +5230,10 @@ void EditorApplication::recreate_offscreen_if_needed(uint32_t w, uint32_t h) {
     if (m_device != VK_NULL_HANDLE) vkDeviceWaitIdle(m_device); // old attachments are in flight
     cleanup_offscreen_target();
     create_offscreen_buffers(w, h);
+    // The offscreen cleanup also destroys the shadow map (size-independent
+    // resources live together in cleanup_offscreen_target); bring it back so a
+    // resize never silently kills the editor shadows.
+    if (m_shadowMap.pipeline == VK_NULL_HANDLE) create_shadow_map();
 }
 
 void EditorApplication::cleanup_offscreen_target() {
@@ -5477,6 +5267,18 @@ void EditorApplication::cleanup_offscreen_target() {
         vkFreeMemory(m_device, m_offscreen.pickMemory, nullptr);
         m_offscreen.pickMemory = VK_NULL_HANDLE;
     }
+    if (m_offscreen.pickDepthView != VK_NULL_HANDLE) {
+        vkDestroyImageView(m_device, m_offscreen.pickDepthView, nullptr);
+        m_offscreen.pickDepthView = VK_NULL_HANDLE;
+    }
+    if (m_offscreen.pickDepthImage != VK_NULL_HANDLE) {
+        vkDestroyImage(m_device, m_offscreen.pickDepthImage, nullptr);
+        m_offscreen.pickDepthImage = VK_NULL_HANDLE;
+    }
+    if (m_offscreen.pickDepthMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(m_device, m_offscreen.pickDepthMemory, nullptr);
+        m_offscreen.pickDepthMemory = VK_NULL_HANDLE;
+    }
     if (m_offscreen.framebuffer != VK_NULL_HANDLE) {
         vkDestroyFramebuffer(m_device, m_offscreen.framebuffer, nullptr);
         m_offscreen.framebuffer = VK_NULL_HANDLE;
@@ -5492,6 +5294,18 @@ void EditorApplication::cleanup_offscreen_target() {
     if (m_offscreen.depthMemory != VK_NULL_HANDLE) {
         vkFreeMemory(m_device, m_offscreen.depthMemory, nullptr);
         m_offscreen.depthMemory = VK_NULL_HANDLE;
+    }
+    if (m_offscreen.msaaColorView != VK_NULL_HANDLE) {
+        vkDestroyImageView(m_device, m_offscreen.msaaColorView, nullptr);
+        m_offscreen.msaaColorView = VK_NULL_HANDLE;
+    }
+    if (m_offscreen.msaaColorImage != VK_NULL_HANDLE) {
+        vkDestroyImage(m_device, m_offscreen.msaaColorImage, nullptr);
+        m_offscreen.msaaColorImage = VK_NULL_HANDLE;
+    }
+    if (m_offscreen.msaaColorMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(m_device, m_offscreen.msaaColorMemory, nullptr);
+        m_offscreen.msaaColorMemory = VK_NULL_HANDLE;
     }
     if (m_offscreen.colorView != VK_NULL_HANDLE) {
         vkDestroyImageView(m_device, m_offscreen.colorView, nullptr);
@@ -5529,16 +5343,17 @@ void EditorApplication::init_scene_pipeline() {
     }
 
     m_scenePipeline = create_scene_pipeline(m_device, m_offscreen.renderPass, m_scenePipelineLayout,
-                                            m_viewportVertShader, m_viewportFragShader,
+                                            m_viewportVertShader, m_viewportFragShader, m_viewportSamples,
                                             false, true, true);
     m_wireframePipeline = create_scene_pipeline(m_device, m_offscreen.renderPass, m_scenePipelineLayout,
-                                                m_viewportVertShader, m_viewportFragShader,
+                                                m_viewportVertShader, m_viewportFragShader, m_viewportSamples,
                                                 true, false, false);
     m_gizmoPipeline = create_scene_pipeline(m_device, m_offscreen.renderPass, m_scenePipelineLayout,
-                                            m_viewportVertShader, m_viewportFragShader,
+                                            m_viewportVertShader, m_viewportFragShader, m_viewportSamples,
                                             false, false, false);
+    // Pick stays 1x (its render pass is 1x — sample counts must match).
     m_pickPipeline = create_scene_pipeline(m_device, m_offscreen.pickRenderPass, m_scenePipelineLayout,
-                                           m_viewportVertShader, m_pickFragShader,
+                                           m_viewportVertShader, m_pickFragShader, VK_SAMPLE_COUNT_1_BIT,
                                            false, true, true);
     if (!m_scenePipeline || !m_wireframePipeline || !m_gizmoPipeline || !m_pickPipeline) {
         throw std::runtime_error("Failed to create viewport pipelines");
@@ -5563,7 +5378,7 @@ void EditorApplication::init_scene_pipeline() {
         throw std::runtime_error("Failed to create grid pipeline layout");
     }
     m_gridPipeline = create_scene_pipeline(m_device, m_offscreen.renderPass, m_gridPipelineLayout,
-                                           m_gridVertShader, m_gridFragShader,
+                                           m_gridVertShader, m_gridFragShader, m_viewportSamples,
                                            false /*wireframe*/, true /*depthTest*/, false /*cull*/,
                                            false /*withUv*/, true /*noVertexInput*/, true /*blend*/,
                                            true /*lessOrEqualDepth*/, true /*depthBias*/,
@@ -5589,10 +5404,78 @@ void EditorApplication::init_scene_pipeline() {
             // Depth test LEQUAL against the cleared depth (1.0), no depth write,
             // opaque — entities and the grid draw over it with LESS.
             m_skyPipeline = create_scene_pipeline(m_device, m_offscreen.renderPass, m_skyPipelineLayout,
-                                                  m_skyVertShader, m_skyFragShader,
+                                                  m_skyVertShader, m_skyFragShader, m_viewportSamples,
                                                   false /*wireframe*/, true /*depthTest*/, false /*cull*/,
                                                   false /*withUv*/, true /*noVertexInput*/, false /*blend*/,
                                                   true /*lessOrEqualDepth*/, false /*depthBias*/);
+        }
+    }
+
+    // Hair strands: LINE_LIST with depth test (the editor viewport shaders
+    // color strands per-vertex; the geometry is rebuilt every frame).
+    m_hairPipeline = create_scene_pipeline(m_device, m_offscreen.renderPass, m_scenePipelineLayout,
+                                           m_viewportVertShader, m_viewportFragShader, m_viewportSamples,
+                                           true /*wireframe*/, true /*depthTest*/, false /*cull*/);
+
+    // Gaussian splats: soft point clouds (POINT_LIST, alpha blend, depth test
+    // without depth write so splats composite like real gaussian primitives).
+    m_splatVertShader = make_module(m_device, read_spv("editor_splat.vert.spv"));
+    m_splatFragShader = make_module(m_device, read_spv("editor_splat.frag.spv"));
+    if (m_splatVertShader && m_splatFragShader) {
+        VkPushConstantRange splatRange{};
+        splatRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        splatRange.offset = 0;
+        splatRange.size = sizeof(SplatPushConstants);
+        VkPipelineLayoutCreateInfo splatLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        splatLayoutInfo.pushConstantRangeCount = 1;
+        splatLayoutInfo.pPushConstantRanges = &splatRange;
+        if (vkCreatePipelineLayout(m_device, &splatLayoutInfo, nullptr, &m_splatPipelineLayout) == VK_SUCCESS) {
+            m_splatPipeline = create_scene_pipeline(m_device, m_offscreen.renderPass, m_splatPipelineLayout,
+                                                    m_splatVertShader, m_splatFragShader, m_viewportSamples,
+                                                    false /*wireframe*/, true /*depthTest*/, false /*cull*/,
+                                                    false /*withUv*/, false /*noVertexInput*/, true /*blend*/,
+                                                    false /*lessOrEqual*/, false /*depthBias*/,
+                                                    false /*depthWrite*/, VK_PRIMITIVE_TOPOLOGY_POINT_LIST);
+        }
+    }
+
+    // Env probe: reflective sphere sampling the captured cubemap.
+    m_envSphereVertShader = make_module(m_device, read_spv("editor_envsphere.vert.spv"));
+    m_envSphereFragShader = make_module(m_device, read_spv("editor_envsphere.frag.spv"));
+    if (m_envSphereVertShader && m_envSphereFragShader) {
+        VkDescriptorSetLayoutBinding envBinding{};
+        envBinding.binding = 0;
+        envBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        envBinding.descriptorCount = 1;
+        envBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo envDescInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        envDescInfo.bindingCount = 1;
+        envDescInfo.pBindings = &envBinding;
+        vkCreateDescriptorSetLayout(m_device, &envDescInfo, nullptr, &m_envSphereDescLayout);
+        VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
+        VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_envSphereDescPool);
+        VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        allocInfo.descriptorPool = m_envSphereDescPool;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &m_envSphereDescLayout;
+        vkAllocateDescriptorSets(m_device, &allocInfo, &m_envCapture.descriptorSet);
+        VkPushConstantRange envRange{};
+        envRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        envRange.offset = 0;
+        envRange.size = sizeof(EnvSpherePushConstants);
+        VkPipelineLayoutCreateInfo envLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+        envLayoutInfo.setLayoutCount = 1;
+        envLayoutInfo.pSetLayouts = &m_envSphereDescLayout;
+        envLayoutInfo.pushConstantRangeCount = 1;
+        envLayoutInfo.pPushConstantRanges = &envRange;
+        if (vkCreatePipelineLayout(m_device, &envLayoutInfo, nullptr, &m_envSpherePipelineLayout) == VK_SUCCESS) {
+            m_envSpherePipeline = create_scene_pipeline(m_device, m_offscreen.renderPass, m_envSpherePipelineLayout,
+                                                        m_envSphereVertShader, m_envSphereFragShader, m_viewportSamples,
+                                                        false /*wireframe*/, true /*depthTest*/, false /*cull*/);
         }
     }
 }
@@ -5641,6 +5524,77 @@ void EditorApplication::init_geometry_buffers() {
     vkMapMemory(m_device, m_cameraIconVB.memory, 0, cameraSize, 0, &data);
     std::memcpy(data, cameraVerts.data(), static_cast<size_t>(cameraSize));
     vkUnmapMemory(m_device, m_cameraIconVB.memory);
+
+    // Env probe preview sphere (UV sphere).
+    {
+        std::vector<EditorVertex> verts;
+        std::vector<uint32_t> indices;
+        constexpr int kSeg = 32, kRings = 18;
+        for (int r = 0; r <= kRings; ++r) {
+            const float v = static_cast<float>(r) / kRings;
+            const float phi = v * glm::pi<float>();
+            for (int s = 0; s <= kSeg; ++s) {
+                const float u = static_cast<float>(s) / kSeg;
+                const float theta = u * glm::two_pi<float>();
+                const glm::vec3 p(std::sin(phi) * std::cos(theta), std::cos(phi),
+                                  std::sin(phi) * std::sin(theta));
+                EditorVertex vert;
+                vert.pos = p;
+                vert.normal = p;
+                vert.color = glm::vec3(1.0f);
+                vert.uv = { u, 1.0f - v };
+                verts.push_back(vert);
+            }
+        }
+        for (int r = 0; r < kRings; ++r) {
+            for (int s = 0; s < kSeg; ++s) {
+                const uint32_t a = static_cast<uint32_t>(r * (kSeg + 1) + s);
+                const uint32_t b = a + static_cast<uint32_t>(kSeg + 1);
+                indices.push_back(a); indices.push_back(b); indices.push_back(a + 1);
+                indices.push_back(a + 1); indices.push_back(b); indices.push_back(b + 1);
+            }
+        }
+        m_envSphereIndexCount = static_cast<uint32_t>(indices.size());
+        const VkDeviceSize vs = sizeof(EditorVertex) * verts.size();
+        const VkDeviceSize is = sizeof(uint32_t) * indices.size();
+        create_buffer(vs, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      m_envSphereVB.buffer, m_envSphereVB.memory);
+        create_buffer(is, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      m_envSphereIB.buffer, m_envSphereIB.memory);
+        void* data = nullptr;
+        vkMapMemory(m_device, m_envSphereVB.memory, 0, vs, 0, &data);
+        std::memcpy(data, verts.data(), static_cast<size_t>(vs));
+        vkUnmapMemory(m_device, m_envSphereVB.memory);
+        vkMapMemory(m_device, m_envSphereIB.memory, 0, is, 0, &data);
+        std::memcpy(data, indices.data(), static_cast<size_t>(is));
+        vkUnmapMemory(m_device, m_envSphereIB.memory);
+    }
+
+    // Decal quad (1x1, facing +Z, UVs 0..1).
+    {
+        std::vector<EditorVertex> verts;
+        std::vector<uint32_t> indices;
+        const float h = 0.5f;
+        verts.push_back({ { -h, -h, 0.0f }, { 0.0f, 0.0f, -1.0f }, { 1, 1, 1 }, { 0.0f, 1.0f } });
+        verts.push_back({ { h, -h, 0.0f }, { 0.0f, 0.0f, -1.0f }, { 1, 1, 1 }, { 1.0f, 1.0f } });
+        verts.push_back({ { h, h, 0.0f }, { 0.0f, 0.0f, -1.0f }, { 1, 1, 1 }, { 1.0f, 0.0f } });
+        verts.push_back({ { -h, h, 0.0f }, { 0.0f, 0.0f, -1.0f }, { 1, 1, 1 }, { 0.0f, 0.0f } });
+        indices = { 0, 1, 2, 0, 2, 3 };
+        m_decalIndexCount = static_cast<uint32_t>(indices.size());
+        const VkDeviceSize vs = sizeof(EditorVertex) * verts.size();
+        const VkDeviceSize is = sizeof(uint32_t) * indices.size();
+        create_buffer(vs, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      m_decalVB.buffer, m_decalVB.memory);
+        create_buffer(is, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      m_decalIB.buffer, m_decalIB.memory);
+        void* data = nullptr;
+        vkMapMemory(m_device, m_decalVB.memory, 0, vs, 0, &data);
+        std::memcpy(data, verts.data(), static_cast<size_t>(vs));
+        vkUnmapMemory(m_device, m_decalVB.memory);
+        vkMapMemory(m_device, m_decalIB.memory, 0, is, 0, &data);
+        std::memcpy(data, indices.data(), static_cast<size_t>(is));
+        vkUnmapMemory(m_device, m_decalIB.memory);
+    }
 
     // Gizmo geometry (all modes)
     generate_gizmo_geometry();
@@ -5888,6 +5842,10 @@ void EditorApplication::render_scene_to_offscreen(VkCommandBuffer cmd) {
     // Scene pass recorded by the compiled graph: begins the offscreen render
     // pass, runs the content callback, ends — same executor the game uses.
     m_viewportRenderGraphExecutor.record(cmd, 0, { m_offscreen.width, m_offscreen.height });
+
+    // Env-probe cubemap capture: recorded AFTER the viewport pass so the
+    // command buffer is free to open its own 6-face render passes.
+    record_env_capture(cmd, renderScene);
 }
 
 void EditorApplication::build_viewport_render_graph() {
@@ -5931,6 +5889,8 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                 (void)id;
                 sunColor = w.sunColor;
                 windSpeed = w.windSpeed;
+                g_fogParams = glm::vec4(w.fogDensity, w.fogStart, w.heightFog ? 1.0f : 0.0f, 0.0f);
+                g_fogColor = glm::vec4(sunColor * 0.3f + glm::vec3(0.5f, 0.6f, 0.7f) * 0.7f, 1.0f);
                 break;
             }
             for (const auto& [id, light] : renderScene->lightComponents) {
@@ -5989,6 +5949,10 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
         for (const auto& [id, ent] : renderScene->get_entities()) {
             const auto transformIt = renderScene->transformComponents.find(id);
             if (transformIt == renderScene->transformComponents.end()) continue;
+            // Layers: entities on a hidden layer are not rendered (the panel
+            // toggle propagates to every entity sharing the layer name).
+            const auto layerIt = renderScene->layerComponents.find(id);
+            if (layerIt != renderScene->layerComponents.end() && !layerIt->second.visible) continue;
             const TransformComponent& t = transformIt->second;
             const bool selected = m_selectedEntity.is_valid() && m_selectedEntity.get_id() == id;
 
@@ -6029,34 +5993,34 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                                 m_liveGraphHash = liveHash;
                             }
                             gmp = m_liveGraphPipeline.valid ? &m_liveGraphPipeline : nullptr;
+                        } else if (const auto vidIt = renderScene->videoComponents.find(id);
+                                   vidIt != renderScene->videoComponents.end() &&
+                                   !vidIt->second.framePaths.empty()) {
+                            // Video flipbook: the mesh's texture is the current
+                            // frame of the image sequence (cached per frame).
+                            const VideoComponent& vc = vidIt->second;
+                            const int frame = std::clamp(vc.currentFrame, 0,
+                                static_cast<int>(vc.framePaths.size()) - 1);
+                            const UUID frameTex =
+                                resolve_texture_asset_by_name(vc.framePaths[frame]);
+                            if (frameTex.is_valid()) {
+                                gmp = ensure_texture_pipeline(frameTex, m_videoGraphPipelines);
+                            }
                         } else if (const auto blockMeta = m_assetRegistry.find(meshComp->second.meshAssetID);
                                    blockMeta && blockMeta->type == AssetType::Block) {
                             // Block model in the scene: a textured cube. The
                             // pipeline binds the block texture (TextureSample,
                             // same path as the Material editor), cached per
-                            // block UUID and rebuilt if the texture changes.
-                            const UUID blockId = meshComp->second.meshAssetID;
-                            const UUID texId = resolve_block_texture(blockId);
-                            auto bit = m_blockGraphPipelines.find(blockId);
-                            if (texId.is_valid()) {
-                                Rendering::MaterialGraph graph;
-                                const auto texNode = graph.add_texture_sample("Block Texture");
-                                if (auto* node = graph.find_node(texNode)) node->value = texId.to_string();
-                                const auto baseOut = graph.add_output("BaseColor", Rendering::MaterialValueType::Vec3);
-                                (void)graph.connect(texNode, baseOut, 0);
-                                const uint64_t graphHash = hash_material_graph(graph);
-                                if (bit == m_blockGraphPipelines.end() ||
-                                    !bit->second.valid || bit->second.graphHash != graphHash) {
-                                    if (bit != m_blockGraphPipelines.end()) destroy_graph_pipeline(bit->second);
-                                    GraphMaterialPipeline built;
-                                    built.graphHash = graphHash;
-                                    if (!build_graph_pipeline(graph, built)) {
-                                        std::cerr << "[Editor] Block pipeline: " << built.lastError << std::endl;
-                                    }
-                                    bit = m_blockGraphPipelines.insert_or_assign(blockId, std::move(built)).first;
-                                }
-                                if (bit->second.valid) gmp = &bit->second;
-                            }
+                            // texture UUID and rebuilt if the texture changes.
+                            const UUID texId = resolve_block_texture(meshComp->second.meshAssetID);
+                            if (texId.is_valid()) gmp = ensure_texture_pipeline(texId, m_blockGraphPipelines);
+                        } else if (const auto skinMeta = m_assetRegistry.find(meshComp->second.meshAssetID);
+                                   skinMeta && skinMeta->type == AssetType::Texture &&
+                                   is_character_texture(*skinMeta)) {
+                            // Minecraft character/mob skin in the scene: the
+                            // humanoid mesh with the skin sampled directly —
+                            // no sidecar, the texture IS the character.
+                            gmp = ensure_texture_pipeline(meshComp->second.meshAssetID, m_skinGraphPipelines);
                         } else if (meshComp->second.materialAssetID.is_valid() &&
                                    load_material_asset(meshComp->second.materialAssetID)) {
                             const UUID matId = meshComp->second.materialAssetID;
@@ -6104,9 +6068,38 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                             }
                             drewMesh = true;
                         } else {
-                            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
-                            draw_mesh_resource(cmd, viewProj * model_from_transform(t), color, *mesh);
-                            drewMesh = true;
+                            // Vertex painting: entities with painted colors
+                            // draw from their per-vertex-color buffer (the
+                            // scene pipeline shades vertex colors).
+                            const auto paintIt = renderScene->paintComponents.find(id);
+                            const bool hasPaint = paintIt != renderScene->paintComponents.end() &&
+                                                  paintIt->second.enabled &&
+                                                  !paintIt->second.vertexColors.empty();
+                            if (hasPaint) {
+                                rebuild_paint_buffer(id, const_cast<PaintComponent&>(paintIt->second), mesh);
+                                const auto pb = m_paintBuffers.find(id);
+                                if (pb != m_paintBuffers.end() && pb->second.vb.buffer != VK_NULL_HANDLE) {
+                                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
+                                    const VkDeviceSize off = 0;
+                                    vkCmdBindVertexBuffers(cmd, 0, 1, &pb->second.vb.buffer, &off);
+                                    if (mesh->ib.buffer != VK_NULL_HANDLE)
+                                        vkCmdBindIndexBuffer(cmd, mesh->ib.buffer, 0, VK_INDEX_TYPE_UINT32);
+                                    push_constants(cmd, m_scenePipelineLayout,
+                                                   viewProj * model_from_transform(t), glm::vec4(1.0f));
+                                    for (const auto& range : mesh->ranges) {
+                                        if (range.indexed)
+                                            vkCmdDrawIndexed(cmd, range.indexCount, 1, range.firstIndex, 0, 0);
+                                        else
+                                            vkCmdDraw(cmd, range.indexCount, 1, range.vertexOffset, 0);
+                                    }
+                                    drewMesh = true;
+                                }
+                            }
+                            if (!drewMesh) {
+                                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
+                                draw_mesh_resource(cmd, viewProj * model_from_transform(t), color, *mesh);
+                                drewMesh = true;
+                            }
                         }
                     }
                 }
@@ -6130,9 +6123,132 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                                            : glm::vec4(0.35f, 0.38f, 0.50f, 1.0f));
             }
 
+            // Hair strands: verlet-simulated LINE_LIST, rebuilt each frame.
+            if (m_hairPipeline != VK_NULL_HANDLE) {
+                const auto hairIt = renderScene->hairParticleComponents.find(id);
+                if (hairIt != renderScene->hairParticleComponents.end() && hairIt->second.enabled) {
+                    const auto sim = m_hairs.find(id);
+                    if (sim != m_hairs.end() && sim->second.vb.buffer != VK_NULL_HANDLE) {
+                        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_hairPipeline);
+                        const VkDeviceSize off = 0;
+                        vkCmdBindVertexBuffers(cmd, 0, 1, &sim->second.vb.buffer, &off);
+                        push_constants(cmd, m_scenePipelineLayout, viewProj, glm::vec4(1.0f));
+                        vkCmdDraw(cmd, sim->second.vertexCount, 1, 0, 0);
+                    }
+                }
+            }
+
+            // Soft body: verlet cloth mesh (local space, entity transform).
+            const auto softIt = renderScene->softBodyComponents.find(id);
+            if (softIt != renderScene->softBodyComponents.end() && softIt->second.enabled) {
+                const auto sim = m_softBodies.find(id);
+                if (sim != m_softBodies.end() && sim->second.vb.buffer != VK_NULL_HANDLE) {
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
+                    const VkDeviceSize off = 0;
+                    vkCmdBindVertexBuffers(cmd, 0, 1, &sim->second.vb.buffer, &off);
+                    vkCmdBindIndexBuffer(cmd, sim->second.ib.buffer, 0, VK_INDEX_TYPE_UINT32);
+                    push_constants(cmd, m_scenePipelineLayout,
+                                   viewProj * model_from_transform(t), glm::vec4(1.0f));
+                    vkCmdDrawIndexed(cmd, sim->second.indexCount, 1, 0, 0, 0);
+                }
+            }
+
+            // Decal: textured quad at the entity transform (texture pipeline).
+            const auto decalIt = renderScene->decalComponents.find(id);
+            if (decalIt != renderScene->decalComponents.end() && decalIt->second.enabled &&
+                m_decalVB.buffer != VK_NULL_HANDLE) {
+                const DecalComponent& dec = decalIt->second;
+                const UUID texId = resolve_texture_asset_by_name(dec.texturePath);
+                if (texId.is_valid()) {
+                    if (GraphMaterialPipeline* dgmp = ensure_texture_pipeline(texId, m_blockGraphPipelines)) {
+                        write_material_ubo(*dgmp, nullptr, nullptr);
+                        write_light_ubo(*dgmp, renderScene, m_editorCamera.position);
+                        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, dgmp->pipeline);
+                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, dgmp->layout,
+                                                0, 1, &dgmp->descriptorSet, 0, nullptr);
+                        glm::mat4 model = model_from_transform(t);
+                        model = model * glm::scale(glm::mat4(1.0f),
+                                                   glm::vec3(std::max(dec.size.x, 0.01f),
+                                                             std::max(dec.size.y, 0.01f), 1.0f));
+                        const Rendering::MaterialPushConstants dpc{ viewProj * model, model };
+                        vkCmdPushConstants(cmd, dgmp->layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                           sizeof(dpc), &dpc);
+                        const VkDeviceSize off = 0;
+                        vkCmdBindVertexBuffers(cmd, 0, 1, &m_decalVB.buffer, &off);
+                        vkCmdBindIndexBuffer(cmd, m_decalIB.buffer, 0, VK_INDEX_TYPE_UINT32);
+                        vkCmdDrawIndexed(cmd, m_decalIndexCount, 1, 0, 0, 0);
+                    }
+                }
+            }
+
             if (m_showColliders && renderScene->rigidbodyComponents.contains(id)) {
                 draw_collider_wireframe(cmd, viewProj, t, selected);
             }
+        }
+    }
+
+    // Gaussian splat clouds: soft point splats (cached per entity, rebuilt
+    // when the parameters change or regenerate is requested).
+    if (m_splatPipeline != VK_NULL_HANDLE) {
+        for (const auto& [id, gs] : renderScene->gaussianSplatComponents) {
+            if (!gs.enabled) continue;
+            const auto tit = renderScene->transformComponents.find(id);
+            if (tit == renderScene->transformComponents.end()) continue;
+            auto& cloud = m_splatClouds[id];
+            if (cloud.dirty || cloud.count != gs.count || cloud.scale != gs.scale) {
+                std::vector<EditorVertex> verts;
+                generate_splat_cloud(gs, verts);
+                const VkDeviceSize vs = sizeof(EditorVertex) * verts.size();
+                if (cloud.vb.buffer != VK_NULL_HANDLE && cloud.vb.size < vs) {
+                    destroy_buffer(cloud.vb);
+                    cloud.vb = GPUBuffer{};
+                }
+                if (cloud.vb.buffer == VK_NULL_HANDLE) {
+                    create_buffer(vs, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                  cloud.vb.buffer, cloud.vb.memory);
+                }
+                void* data = nullptr;
+                vkMapMemory(m_device, cloud.vb.memory, 0, vs, 0, &data);
+                std::memcpy(data, verts.data(), static_cast<size_t>(vs));
+                vkUnmapMemory(m_device, cloud.vb.memory);
+                cloud.count = gs.count;
+                cloud.scale = gs.scale;
+                cloud.dirty = false;
+            }
+            if (cloud.vb.buffer == VK_NULL_HANDLE) continue;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_splatPipeline);
+            const VkDeviceSize off = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &cloud.vb.buffer, &off);
+            const SplatPushConstants spc{ viewProj * model_from_transform(tit->second),
+                glm::vec4(gs.pointSize, static_cast<float>(m_offscreen.height), gs.opacity, 0.0f) };
+            vkCmdPushConstants(cmd, m_splatPipelineLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(spc), &spc);
+            vkCmdDraw(cmd, cloud.count, 1, 0, 0);
+        }
+    }
+
+    // Env probe: the captured cubemap previewed on a reflective sphere at the
+    // probe position (capture happens after the viewport pass, so this frame
+    // samples the previous capture — one frame of latency, like real probes).
+    if (m_envCapture.valid && m_envSpherePipeline != VK_NULL_HANDLE) {
+        const auto tit = renderScene->transformComponents.find(m_envCapture.entity);
+        if (tit != renderScene->transformComponents.end()) {
+            const glm::mat4 model = glm::translate(glm::mat4(1.0f), tit->second.position)
+                                  * glm::scale(glm::mat4(1.0f), glm::vec3(1.4f));
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_envSpherePipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_envSpherePipelineLayout,
+                                    0, 1, &m_envCapture.descriptorSet, 0, nullptr);
+            const EnvSpherePushConstants epc{ viewProj * model, model,
+                                              glm::vec4(m_editorCamera.position, 1.0f) };
+            vkCmdPushConstants(cmd, m_envSpherePipelineLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(epc), &epc);
+            const VkDeviceSize off = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &m_envSphereVB.buffer, &off);
+            vkCmdBindIndexBuffer(cmd, m_envSphereIB.buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, m_envSphereIndexCount, 1, 0, 0, 0);
         }
     }
 
@@ -6299,18 +6415,45 @@ void EditorApplication::perform_pick_readback() {
 
     void* mapped = nullptr;
     vkMapMemory(m_device, m_offscreen.pickStagingMemory, 0, VK_WHOLE_SIZE, 0, &mapped);
+
+    // Click pick
     const size_t x = static_cast<size_t>(m_pickPixel.x);
     const size_t y = static_cast<size_t>(m_pickPixel.y);
     const uint8_t* pixel = static_cast<const uint8_t*>(mapped) + (y * m_offscreen.width + x) * 4;
     const uint32_t id = static_cast<uint32_t>(pixel[0]) |
                         (static_cast<uint32_t>(pixel[1]) << 8) |
                         (static_cast<uint32_t>(pixel[2]) << 16);
+
+    // Hover pick (same buffer, different pixel — no extra GPU pass)
+    const size_t hx = std::clamp(static_cast<size_t>(m_hoverPickPixel.x), size_t(0), static_cast<size_t>(m_offscreen.width) - 1);
+    const size_t hy = std::clamp(static_cast<size_t>(m_hoverPickPixel.y), size_t(0), static_cast<size_t>(m_offscreen.height) - 1);
+    const uint8_t* hp = static_cast<const uint8_t*>(mapped) + (hy * m_offscreen.width + hx) * 4;
+    const uint32_t hoverId = static_cast<uint32_t>(hp[0]) |
+                             (static_cast<uint32_t>(hp[1]) << 8) |
+                             (static_cast<uint32_t>(hp[2]) << 16);
     vkUnmapMemory(m_device, m_offscreen.pickStagingMemory);
 
     const auto found = m_pickColorToEntity.find(id);
     if (found != m_pickColorToEntity.end()) {
         m_selectedEntity = m_editorScene->find_entity_by_id(found->second);
         m_editorGui.select_entity(m_selectedEntity);
+    }
+
+    // Resolve hover entity name for the viewport tooltip
+    if (hoverId != 0) {
+        const auto hIt = m_pickColorToEntity.find(hoverId);
+        if (hIt != m_pickColorToEntity.end()) {
+            const Entity he = m_editorScene->find_entity_by_id(hIt->second);
+            if (he.is_valid()) {
+                m_hoverEntityName = he.get_name();
+            } else {
+                m_hoverEntityName.clear();
+            }
+        } else {
+            m_hoverEntityName.clear();
+        }
+    } else {
+        m_hoverEntityName.clear();
     }
 }
 
@@ -6320,6 +6463,1752 @@ void EditorApplication::perform_pick_readback() {
 
 // Shared executor for Control API commands — used both by the loopback HTTP
 // server and by the Control Console window buttons.
+
+
+
+// ===========================================================================
+// Play Mode, Control API & Gizmo (split from EditorApplication.cpp)
+// ===========================================================================
+void EditorApplication::setup_play_runtime() {
+    teardown_play_runtime();
+    Scene* playScene = m_playMode.get_active_scene();
+    if (!playScene) return;
+    for (const auto& [id, rb] : playScene->rigidbodyComponents) {
+        Physics::BodyDesc desc;
+        desc.motion = rb.isKinematic ? Physics::MotionType::Kinematic : Physics::MotionType::Dynamic;
+        desc.mass = std::max(rb.mass, 0.01f);
+        desc.collider.friction = rb.friction;
+        desc.collider.restitution = rb.restitution;
+        const auto tit = playScene->transformComponents.find(id);
+        if (tit != playScene->transformComponents.end()) {
+            desc.position = tit->second.position;
+            desc.rotation = glm::quat(glm::radians(tit->second.rotation));
+        }
+        const Physics::BodyHandle handle = m_playPhysics.create_body(desc);
+        if (handle != Physics::InvalidBody) m_playBodies[id] = handle;
+    }
+
+    // Wicked-port runtime (formerly TODO(frontend-port)): constraints run as
+    // soft force-based constraints — the runtime solver exposes no rigid-joint
+    // API (PhysicsWorld's joints are a separate, unintegrated world). Each
+    // constraint stores the world anchors captured at play start; the tick
+    // applies spring forces to keep the anchors together (see
+    // tick_play_runtime). Springs just record a rest anchor.
+    for (const auto& [id, cn] : playScene->constraintComponents) {
+        if (!cn.enabled) continue;
+        if (!m_playBodies.contains(id)) continue;
+        const auto tit = playScene->transformComponents.find(id);
+        const glm::vec3 baseA = (tit != playScene->transformComponents.end())
+                                    ? tit->second.position
+                                    : glm::vec3(0.0f);
+        ConstraintRest rest;
+        rest.anchorA = baseA + cn.anchor;
+        rest.anchorB = baseA + cn.anchor; // refined when the other body exists
+        if (const auto bodyBIt = m_playBodies.find(cn.otherEntity); bodyBIt != m_playBodies.end()) {
+            if (Physics::RigidBody* bodyB = m_playPhysics.body(bodyBIt->second)) {
+                rest.anchorB = bodyB->position + cn.anchor;
+            }
+        }
+        rest.restLength = glm::length(rest.anchorB - rest.anchorA);
+        m_constraintRests[id] = rest;
+    }
+    for (const auto& [id, sp] : playScene->springComponents) {
+        if (sp.disabled || !sp.enabled) continue;
+        if (!m_playBodies.contains(id)) continue;
+        const auto tit = playScene->transformComponents.find(id);
+        m_springRests[id] = (tit != playScene->transformComponents.end())
+                                ? tit->second.position
+                                : glm::vec3(0.0f);
+    }
+
+    // Play particles (Fase 8): one ParticleSimulation emitter per
+    // ParticleEmitterComponent entity, positioned at the world transform.
+    for (const auto& [id, pe] : playScene->particleEmitterComponents) {
+        if (!pe.emitting) continue;
+        Engine::Gameplay::ParticleEmitterDesc desc;
+        desc.direction = glm::normalize(pe.direction);
+        desc.coneAngle = pe.coneAngle;
+        desc.rate = pe.rate;
+        desc.speedMin = pe.speedMin;
+        desc.speedMax = pe.speedMax;
+        desc.lifetimeMin = pe.lifetimeMin;
+        desc.lifetimeMax = pe.lifetimeMax;
+        desc.sizeStart = pe.sizeStart;
+        desc.sizeEnd = pe.sizeEnd;
+        desc.colorStart = pe.colorStart;
+        desc.colorEnd = pe.colorEnd;
+        desc.acceleration = pe.acceleration;
+        desc.drag = pe.drag;
+        desc.turbulence = pe.turbulence;
+        desc.restitution = pe.restitution;
+        desc.collide = pe.collide;
+        desc.emitting = pe.emitting;
+        const auto tit = playScene->transformComponents.find(id);
+        desc.position = (tit != playScene->transformComponents.end())
+                            ? tit->second.position + pe.position
+                            : pe.position;
+        m_playEmitters[id] = m_playParticles.add_emitter(desc);
+        if (pe.burstCount > 0) m_playParticles.emit_burst(m_playEmitters[id], pe.burstCount);
+    }
+
+    // Play vehicles (Fase 8): chassis body + four wheels derived from the
+    // component's wheelBase/trackWidth, driven by the arrow keys in play.
+    for (const auto& [id, veh] : playScene->vehicleComponents) {
+        if (!veh.enabled) continue;
+        Physics::BodyDesc chassis;
+        chassis.motion = Physics::MotionType::Dynamic;
+        chassis.mass = std::max(veh.mass, 1.0f);
+        chassis.collider.shape = Physics::BoxShape{{veh.wheelBase * 0.35f, 0.35f, veh.trackWidth * 0.35f}};
+        const auto tit = playScene->transformComponents.find(id);
+        if (tit != playScene->transformComponents.end()) {
+            chassis.position = tit->second.position;
+            chassis.rotation = glm::quat(glm::radians(tit->second.rotation));
+        }
+        const Physics::BodyHandle body = m_playPhysics.create_body(chassis);
+        if (body == Physics::InvalidBody) continue;
+        m_playVehicleChassis[id] = body;
+        const float halfBase = veh.wheelBase * 0.5f;
+        const float halfTrack = veh.trackWidth * 0.5f;
+        const glm::vec3 locals[4] = {
+            {-halfBase, -0.1f, -halfTrack}, {-halfBase, -0.1f, halfTrack},
+            {halfBase, -0.1f, -halfTrack},  {halfBase, -0.1f, halfTrack},
+        };
+        std::vector<Engine::Gameplay::WheelDesc> wheels(4);
+        for (int i = 0; i < 4; ++i) {
+            wheels[i].localPosition = locals[i];
+            wheels[i].radius = veh.wheelRadius;
+            wheels[i].suspensionRestLength = veh.suspensionRest;
+            wheels[i].maxDriveForce = veh.enginePower;
+            wheels[i].maxBrakeForce = veh.brakeForce;
+            wheels[i].maxSteerAngle = veh.maxSteerAngle;
+            wheels[i].steering = i < 2;
+            wheels[i].driven = veh.frontWheelDrive ? i < 2 : i >= 2;
+        }
+        m_playVehicles.emplace(id, Engine::Gameplay::VehicleRuntime(body, std::move(wheels)));
+    }
+
+    // Play ragdolls (Fase 6): physics bodies per bone. With fromSkeleton set,
+    // the bones come from the entity's skin skeleton (a sibling Skeleton asset
+    // matching the mesh stem); otherwise a two-bone fallback is used. The play
+    // physics simulates them each frame; the pose drives skinned rendering.
+    for (const auto& [id, rg] : playScene->ragdollComponents) {
+        if (!rg.enabled) continue;
+        glm::vec3 rootPos{0.0f};
+        const auto tit = playScene->transformComponents.find(id);
+        if (tit != playScene->transformComponents.end()) rootPos = tit->second.position;
+        rootPos += rg.spawnOffset;
+        std::vector<Physics::RagdollBoneDesc> bones;
+        bool fromSkin = false;
+        if (rg.fromSkeleton) {
+            std::string meshStem;
+            if (const auto mit = playScene->meshRendererComponents.find(id); mit != playScene->meshRendererComponents.end()) {
+                for (const AssetMetadata& asset : m_assetRegistry.snapshot()) {
+                    if (asset.type == AssetType::Mesh && asset.id == mit->second.meshAssetID) {
+                        meshStem = asset.sourcePath.stem().string();
+                        break;
+                    }
+                }
+            }
+            if (!meshStem.empty()) {
+                for (const AssetMetadata& asset : m_assetRegistry.snapshot()) {
+                    if (asset.type != AssetType::Skeleton || asset.sourcePath.stem().string() != meshStem) continue;
+                    SkeletonAsset skeleton;
+                    if (AnimationAssetIO::load_skeleton(skeleton, asset.cookedPath)) {
+                        bones = Physics::build_ragdoll_bones(skeleton, rg.massPerBone);
+                        fromSkin = !bones.empty();
+                    }
+                    break;
+                }
+            }
+            if (!fromSkin) {
+                std::cout << "[Editor] Ragdoll entity " << id.to_string() << ": no sibling skeleton for mesh '"
+                          << meshStem << "' — using two-bone fallback\n";
+            }
+        }
+        if (bones.empty()) {
+            bones.push_back(Physics::RagdollBoneDesc{"Root", "", glm::vec3(0.0f), glm::quat(1, 0, 0, 0), 0.6f, 0.12f, rg.massPerBone, glm::vec3(0.0f)});
+            bones.push_back(Physics::RagdollBoneDesc{"Tip", "Root", glm::vec3(1.0f, 0.0f, 0.0f), glm::quat(1, 0, 0, 0), 0.6f, 0.12f, rg.massPerBone, glm::vec3(0.0f)});
+        }
+        Physics::Ragdoll ragdoll;
+        if (ragdoll.create(m_playPhysics, bones, rootPos)) {
+            m_playRagdolls.emplace(id, std::move(ragdoll));
+            std::cout << "[Editor] Play ragdoll active (entity=" << id.to_string() << ", bones="
+                      << bones.size() << (fromSkin ? ", from skin skeleton)\n" : ", fallback)\n");
+        }
+    }
+
+    // Play missions (Fase 8): Start -> SetObjective -> WaitForEvent -> Complete.
+    // The completeEvent is dispatched to the mission system by the play tick
+    // when another component raises it (e.g. a weapon kill or script emit).
+    for (const auto& [id, mc] : playScene->missionComponents) {
+        std::vector<Engine::Gameplay::MissionNode> nodes;
+        nodes.push_back(Engine::Gameplay::start_node("start", "obj"));
+        nodes.push_back(Engine::Gameplay::set_objective_node("obj", "objective", mc.objectiveText, mc.objectiveTarget, "wait"));
+        nodes.push_back(Engine::Gameplay::wait_for_event_node("wait", mc.completeEvent, 1, "done"));
+        nodes.push_back(Engine::Gameplay::complete_mission_node("done"));
+        Engine::Gameplay::Mission mission("mission_" + id.to_string(), mc.missionId, std::move(nodes));
+        m_playMissions.register_mission(std::move(mission));
+        m_playMissionIds[id] = mc.missionId;
+        if (mc.autoStart) m_playMissions.start("mission_" + id.to_string());
+    }
+
+    // Play dialogues (Fase 8): a one-node graph with a single choice that can
+    // chain to another dialogue; played on start when playOnStart is set.
+    for (const auto& [id, dc] : playScene->dialogueComponents) {
+        Engine::Gameplay::DialogueGraph graph;
+        graph.id = dc.dialogueId;
+        Engine::Gameplay::DialogueNode node;
+        node.id = "line";
+        node.line.character = dc.character;
+        node.line.text = dc.line;
+        if (!dc.choiceText.empty()) {
+            Engine::Gameplay::DialogueChoice choice;
+            choice.text = dc.choiceText;
+            choice.nextNode = dc.nextDialogueId;   // empty = end
+            node.choices.push_back(std::move(choice));
+        }
+        graph.nodes.push_back(std::move(node));
+        m_playDialogues.register_graph(std::move(graph));
+        m_playDialogueIds[id] = dc.dialogueId;
+        if (dc.playOnStart) m_playDialogues.play(dc.dialogueId);
+    }
+
+    // Play audio (Fase 8): resolve the .ogg through the asset registry, decode
+    // it into an AudioClip and start a voice on the mixer (spatial vs the
+    // camera listener). Voices advance when the mixer is rendered each tick.
+    for (const auto& [id, ac] : playScene->audioComponents) {
+        if (!ac.playOnStart || ac.clipPath.empty()) continue;
+        std::filesystem::path clipSource;
+        for (const AssetMetadata& asset : m_assetRegistry.snapshot()) {
+            if (asset.type == AssetType::Audio && asset.sourcePath == ac.clipPath) {
+                clipSource = asset.sourcePath;
+                break;
+            }
+        }
+        if (clipSource.empty()) {
+            std::cout << "[Editor] Play audio: no registered asset for '" << ac.clipPath << "'\n";
+            continue;
+        }
+        const auto decoded = Engine::Audio::OggDecoder::decode_file(clipSource);
+        if (!decoded || !decoded->valid()) {
+            std::cout << "[Editor] Play audio: failed to decode '" << clipSource.string() << "'\n";
+            continue;
+        }
+        auto clip = std::make_shared<Engine::Audio::AudioClip>(clipSource.filename().string());
+        Engine::Audio::AudioBuffer buffer;
+        buffer.sampleRate = decoded->sampleRate;
+        buffer.channels = decoded->channels;
+        buffer.samples = decoded->samples;
+        clip->hot_swap(std::move(buffer));
+        Engine::Audio::VoiceDescription desc;
+        desc.clip = std::move(clip);
+        desc.bus = m_playAudio.master_bus();
+        desc.gain = ac.volume;
+        desc.pitch = ac.pitch;
+        desc.looping = ac.looping;
+        desc.spatial = ac.spatial;
+        const auto tit = playScene->transformComponents.find(id);
+        desc.position = (tit != playScene->transformComponents.end()) ? tit->second.position : glm::vec3(0.0f);
+        const Engine::Audio::VoiceId voice = m_playAudio.play(std::move(desc));
+        m_playVoices[id] = voice;
+        std::cout << "[Editor] Play audio voice started ('" << clipSource.filename().string() << "')\n";
+    }
+
+    // Play destructibles (Fase 8): chunkCount boxes laid out in a square grid
+    // around the entity transform; weapon hits apply radial damage.
+    for (const auto& [id, dc] : playScene->destructionComponents) {
+        if (!dc.enabled) continue;
+        const glm::vec3 center = [&]() {
+            const auto tit = playScene->transformComponents.find(id);
+            return (tit != playScene->transformComponents.end()) ? tit->second.position : glm::vec3(0.0f);
+        }();
+        const glm::quat rotation = [&]() {
+            const auto tit = playScene->transformComponents.find(id);
+            return (tit != playScene->transformComponents.end())
+                       ? glm::quat(glm::radians(tit->second.rotation))
+                       : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+        }();
+        const uint32_t n = std::max(dc.chunkCount, 1u);
+        const uint32_t cols = static_cast<uint32_t>(std::ceil(std::sqrt(static_cast<float>(n))));
+        std::vector<Engine::Gameplay::DestructionChunkDesc> chunks;
+        chunks.reserve(n);
+        const glm::vec3 half = dc.chunkSize * 0.5f;
+        for (uint32_t i = 0; i < n; ++i) {
+            const int cx = static_cast<int>(i % cols);
+            const int cy = static_cast<int>(i / cols);
+            const glm::vec3 local = glm::vec3((static_cast<float>(cx) - (cols - 1) * 0.5f) * dc.chunkSize.x,
+                                              (static_cast<float>(cy) - (cols - 1) * 0.5f) * dc.chunkSize.y, 0.0f);
+            Engine::Gameplay::DestructionChunkDesc chunk;
+            chunk.localPosition = local;
+            chunk.halfExtents = half;
+            chunk.mass = 1.0f;
+            chunk.health = dc.chunkHealth;
+            chunks.push_back(chunk);
+        }
+        Engine::Gameplay::DestructibleRuntime runtime;
+        if (runtime.create(m_playPhysics, center, rotation, chunks)) {
+            m_playDestructibles.emplace(id, std::move(runtime));
+        }
+    }
+
+    // Play navigation (Fase 8): bake the public navmesh — one column per grid
+    // cell of the NavigationComponent; cells covered by a play physics body
+    // are omitted (blocked), exactly the footprint the legacy grid used. The
+    // promoted INavigationProvider (Recast + Detour) is the navigation
+    // authority (FALTANTES item 12: the grid track was removed).
+    for (const auto& [id, nc] : playScene->navigationComponents) {
+        if (!nc.enabled) continue;
+        const auto tit = playScene->transformComponents.find(id);
+        const glm::vec3 start = (tit != playScene->transformComponents.end()) ? tit->second.position : glm::vec3(0.0f);
+        if (!m_playNav) m_playNav = engine::navigation::create_recast_navigation_provider();
+
+        engine::navigation::NavmeshConfig config;
+        config.boundsMinX = start.x - nc.gridWidth * nc.cellSize * 0.5f;
+        config.boundsMaxX = start.x + nc.gridWidth * nc.cellSize * 0.5f;
+        config.boundsMinZ = start.z - nc.gridHeight * nc.cellSize * 0.5f;
+        config.boundsMaxZ = start.z + nc.gridHeight * nc.cellSize * 0.5f;
+        config.boundsMinY = start.y - 8.0f;
+        config.boundsMaxY = start.y + 200.0f;
+        config.cellSize = nc.cellSize;
+        config.cellHeight = 0.2f;
+        config.agentRadius = 0.4f;
+        config.agentHeight = 1.8f;
+        config.agentMaxClimb = 1.0f;
+        config.agentMaxSlope = 45.0f;
+
+        std::vector<engine::navigation::VoxelColumn> columns;
+        const float floorY = start.y;
+        for (int gx = 0; gx < nc.gridWidth; ++gx) {
+            for (int gz = 0; gz < nc.gridHeight; ++gz) {
+                const float cx = config.boundsMinX + (gx + 0.5f) * nc.cellSize;
+                const float cz = config.boundsMinZ + (gz + 0.5f) * nc.cellSize;
+                bool blocked = false;
+                for (const auto& [bid, handle] : m_playBodies) {
+                    (void)bid;
+                    Physics::RigidBody* body = m_playPhysics.body(handle);
+                    if (!body) continue;
+                    const glm::vec3 half = std::visit([](const auto& s) -> glm::vec3 {
+                        using T = std::decay_t<decltype(s)>;
+                        if constexpr (std::is_same_v<T, Physics::BoxShape>) return s.halfExtents;
+                        else if constexpr (std::is_same_v<T, Physics::SphereShape>) return glm::vec3(s.radius);
+                        else return glm::vec3(s.radius, s.halfHeight, s.radius);
+                    }, body->collider.shape);
+                    const glm::vec3 min = body->position - half;
+                    const glm::vec3 max = body->position + half;
+                    if (cx >= min.x && cx <= max.x && cz >= min.z && cz <= max.z) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if (blocked) continue;
+                columns.push_back({ cx, cz, floorY, floorY + 1.0f, true });
+            }
+        }
+        if (!columns.empty()) {
+            std::string navError;
+            m_playNav->build(config, columns, navError);
+        }
+        PlayNavAgent agent;
+        agent.position = start;
+        agent.speed = nc.agentSpeed;
+        m_playNavAgents.emplace(id, agent);
+    }
+
+    // Play-mode script: watch the scene's companion .script and compile it into
+    // the play VM. OnStart starts immediately; a "Tick" event runs each frame
+    // (same convention as the packaged game's player controller).
+    m_playScriptPath = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Content" / "Scenes" / "Initial.script";
+    if (m_playScriptReloader.watch(m_playScriptPath)) {
+        ScriptGraphAsset graph;
+        if (graph.load(m_playScriptPath)) {
+            const auto compiled = ScriptCompiler::compile(graph);
+            if (compiled) {
+                m_playScript.load(std::move(compiled.program));
+                m_playScript.start_event("OnStart");
+                m_playScriptLoaded = true;
+                m_scriptDebugGraph = graph;
+                m_scriptDebugger.attach(m_playScript);
+                m_scriptDebuggerAttached = true;
+                m_scriptPauseRequested = false;
+                std::cout << "[Editor] Play script loaded: " << m_playScriptPath.string() << std::endl;
+            }
+        }
+    }
+}
+
+// Play-world animation runtime (Animation/Timeline/IK/Retarget editors now
+// Apply to the scene): the timeline animates transforms from Property tracks,
+// the state machine samples clips into bone-entity transforms (bone order =
+// entity hierarchy order), IK bends a two-bone chain to a target entity, and
+// retargeting copies mapped bone transforms between skeletons. Animated
+// entities are treated as kinematic: their play bodies follow the transforms.
+void EditorApplication::tick_animation_runtime(Scene* playScene, float deltaTime) {
+    if (!playScene) return;
+    const auto syncBody = [&](UUID entityId) {
+        const auto bodyIt = m_playBodies.find(entityId);
+        if (bodyIt == m_playBodies.end()) return;
+        Physics::RigidBody* body = m_playPhysics.body(bodyIt->second);
+        const auto tit = playScene->transformComponents.find(entityId);
+        if (!body || tit == playScene->transformComponents.end()) return;
+        body->position = tit->second.position;
+        body->rotation = glm::quat(glm::radians(tit->second.rotation));
+        body->linearVelocity = glm::vec3(0.0f);
+        body->angularVelocity = glm::vec3(0.0f);
+    };
+    const auto toLower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s;
+    };
+
+    // ------------------------------------------------------------------
+    // Timeline: Property tracks (type 4) animate a transform. Track names
+    // are "Position"/"Rotation"/"Scale" (case-insensitive) and may be
+    // prefixed with an entity name ("Cube.Position") to target another
+    // entity. Key values are "x y z" (position), "rx ry rz" (rotation
+    // degrees) or "sx sy sz" (scale), linearly interpolated.
+    // ------------------------------------------------------------------
+    for (auto& [id, tl] : playScene->timelineComponents) {
+        if (tl.duration <= 0.0f || tl.tracks.empty()) continue;
+        tl.playhead += deltaTime;
+        if (tl.playhead >= tl.duration) {
+            tl.playhead = tl.loop ? std::fmod(tl.playhead, tl.duration) : tl.duration;
+        }
+        const float t = tl.playhead;
+        for (const auto& tr : tl.tracks) {
+            if (tr.muted || tr.type != 4 || tr.keys.size() < 2) continue;
+            size_t i = 0;
+            while (i + 1 < tr.keys.size() && tr.keys[i + 1].time <= t) ++i;
+            const auto& k0 = tr.keys[i];
+            const auto& k1 = (i + 1 < tr.keys.size()) ? tr.keys[i + 1] : tr.keys[i];
+            float f = 0.0f;
+            if (k1.time > k0.time) f = glm::clamp((t - k0.time) / (k1.time - k0.time), 0.0f, 1.0f);
+            glm::vec3 v0(0.0f), v1(0.0f);
+            if (std::sscanf(k0.value.c_str(), "%f %f %f", &v0.x, &v0.y, &v0.z) != 3) continue;
+            if (std::sscanf(k1.value.c_str(), "%f %f %f", &v1.x, &v1.y, &v1.z) != 3) continue;
+            const glm::vec3 value = glm::mix(v0, v1, f);
+            UUID targetId = id;
+            std::string prop = tr.name;
+            const size_t dot = tr.name.find('.');
+            if (dot != std::string::npos) {
+                const std::string entName = tr.name.substr(0, dot);
+                prop = tr.name.substr(dot + 1);
+                for (const auto& [eid, ent] : playScene->get_entities()) {
+                    if (ent.get_name() == entName) { targetId = eid; break; }
+                }
+            }
+            auto target = playScene->transformComponents.find(targetId);
+            if (target == playScene->transformComponents.end()) continue;
+            const std::string lower = toLower(prop);
+            if (lower.find("pos") != std::string::npos) target->second.position = value;
+            else if (lower.find("rot") != std::string::npos) target->second.rotation = value;
+            else if (lower.find("scl") != std::string::npos || lower.find("scale") != std::string::npos) target->second.scale = value;
+            else continue;
+            syncBody(targetId);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // IK: two-bone chain root -> mid -> end reaches the target entity
+    // (weight-blended). If midEntity is invalid it is derived from the
+    // hierarchy (the child of root that is an ancestor of end). The root
+    // entity orients toward the target so the bend is visible.
+    // ------------------------------------------------------------------
+    for (const auto& [id, ik] : playScene->ikComponents) {
+        if (!ik.enabled) continue;
+        const auto rootIt = playScene->transformComponents.find(ik.rootEntity);
+        const auto endIt = playScene->transformComponents.find(ik.endEntity);
+        const auto tgtIt = playScene->transformComponents.find(ik.targetEntity);
+        if (rootIt == playScene->transformComponents.end() ||
+            endIt == playScene->transformComponents.end() ||
+            tgtIt == playScene->transformComponents.end()) {
+            continue;
+        }
+        UUID midId = ik.midEntity;
+        if (!midId.is_valid()) {
+            for (const auto& [eid, hc] : playScene->hierarchyComponents) {
+                if (hc.parentID != ik.rootEntity) continue;
+                UUID cur = ik.endEntity;
+                while (cur.is_valid()) {
+                    if (cur == eid) { midId = eid; break; }
+                    const auto hIt = playScene->hierarchyComponents.find(cur);
+                    if (hIt == playScene->hierarchyComponents.end()) break;
+                    cur = hIt->second.parentID;
+                }
+                if (midId.is_valid()) break;
+            }
+        }
+        const auto midIt = playScene->transformComponents.find(midId);
+        if (midIt == playScene->transformComponents.end()) continue;
+        const glm::vec3 a = rootIt->second.position;
+        const glm::vec3 b = midIt->second.position;
+        const glm::vec3 c = endIt->second.position;
+        const glm::vec3 target = tgtIt->second.position;
+        const float l1 = glm::length(b - a);
+        const float l2 = glm::length(c - b);
+        if (l1 < 1e-5f || l2 < 1e-5f) continue;
+        glm::vec3 toTarget = target - a;
+        const float dist = glm::length(toTarget);
+        const float maxReach = l1 + l2;
+        const glm::vec3 desiredEnd = (dist > maxReach && dist > 1e-5f)
+                                         ? a + toTarget / dist * maxReach
+                                         : target;
+        // Bend axis: perpendicular to the reach direction and the pole.
+        glm::vec3 reachDir = (dist > 1e-5f) ? toTarget / dist : glm::vec3(0.0f, 0.0f, 1.0f);
+        glm::vec3 bend = glm::cross(reachDir, ik.poleVector);
+        if (glm::length(bend) < 1e-5f) bend = glm::cross(reachDir, glm::vec3(0.0f, 1.0f, 0.0f));
+        bend = glm::normalize(bend);
+        // Angle at the root (law of cosines).
+        const float cosA = glm::clamp((l1 * l1 + dist * dist - l2 * l2) / (2.0f * l1 * std::max(dist, 1e-5f)), -1.0f, 1.0f);
+        const float angleA = std::acos(cosA);
+        const glm::vec3 dirAB = glm::normalize(b - a);
+        const glm::quat rotA = glm::angleAxis(angleA, bend);
+        const glm::vec3 newB = a + rotA * dirAB * l1;
+        // Angle at the mid joint.
+        const float cosB = glm::clamp((l1 * l1 + l2 * l2 - dist * dist) / (2.0f * l1 * l2), -1.0f, 1.0f);
+        const float angleB = std::acos(cosB);
+        const glm::vec3 dirBC = glm::normalize(c - b);
+        const glm::vec3 dirB = glm::normalize(desiredEnd - newB);
+        glm::vec3 axisB = glm::cross(dirBC, dirB);
+        if (glm::length(axisB) < 1e-5f) axisB = bend;
+        const glm::quat rotB = glm::angleAxis(angleB, glm::normalize(axisB));
+        const glm::vec3 newC = newB + rotB * dirBC * l2;
+        const float w = glm::clamp(ik.weight, 0.0f, 1.0f);
+        midIt->second.position = glm::mix(b, newB, w);
+        endIt->second.position = glm::mix(c, newC, w);
+        // Root orients toward the target so the bend reads clearly.
+        const glm::vec3 fwd = glm::normalize(desiredEnd - a);
+        rootIt->second.rotation = { glm::degrees(std::asin(glm::clamp(fwd.y, -1.0f, 1.0f))),
+                                    glm::degrees(std::atan2(fwd.x, fwd.z)), 0.0f };
+        syncBody(ik.rootEntity);
+        syncBody(midId);
+        syncBody(ik.endEntity);
+    }
+
+    // ------------------------------------------------------------------
+    // Animation state machine: sample the current state's clip and write the
+    // local pose onto the bone entities under the component entity (hierarchy
+    // order = bone order). Transitions with an empty/"auto"/"true" condition
+    // fire immediately; "name OP value" conditions read the state parameters.
+    // ------------------------------------------------------------------
+    const auto transitionSatisfied = [](const std::string& condition,
+                                        const std::unordered_map<std::string, float>& params) {
+        std::string c = condition;
+        const auto trim = [](std::string& s) {
+            const auto notSpace = [](unsigned char ch) { return !std::isspace(ch); };
+            s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
+            s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
+        };
+        trim(c);
+        if (c.empty() || c == "auto" || c == "true" || c == "1") return true;
+        size_t opPos = std::string::npos;
+        size_t opLen = 0;
+        for (const char* op : {">=", "<=", "==", "!=", ">", "<"}) {
+            const size_t p = c.find(op);
+            if (p != std::string::npos) { opPos = p; opLen = std::strlen(op); break; }
+        }
+        if (opPos == std::string::npos) {
+            const auto it = params.find(c);
+            return it != params.end() && it->second != 0.0f;
+        }
+        std::string name = c.substr(0, opPos);
+        trim(name);
+        std::string rhs = c.substr(opPos + opLen);
+        trim(rhs);
+        const float lhs = [&] { const auto it = params.find(name); return it != params.end() ? it->second : 0.0f; }();
+        const float rhsV = static_cast<float>(std::atof(rhs.c_str()));
+        const std::string op = c.substr(opPos, opLen);
+        if (op == ">") return lhs > rhsV;
+        if (op == "<") return lhs < rhsV;
+        if (op == ">=") return lhs >= rhsV;
+        if (op == "<=") return lhs <= rhsV;
+        if (op == "==") return std::abs(lhs - rhsV) < 1e-4f;
+        return std::abs(lhs - rhsV) >= 1e-4f;
+    };
+    for (const auto& [id, an] : playScene->animationComponents) {
+        if (!an.playing || an.states.empty()) continue;
+        auto& rt = m_animStates[id];
+        if (rt.currentState.empty()) {
+            rt.currentState = an.entryState.empty() ? an.states.front().id : an.entryState;
+        }
+        const AnimationStateDef* state = nullptr;
+        for (const auto& s : an.states) {
+            if (s.id == rt.currentState) { state = &s; break; }
+        }
+        if (!state) {
+            rt.currentState = an.states.front().id;
+            state = &an.states.front();
+        }
+        for (const auto& tr : an.transitions) {
+            if (tr.from != rt.currentState) continue;
+            if (!transitionSatisfied(tr.condition, rt.params)) continue;
+            for (const auto& s : an.states) {
+                if (s.id == tr.to) { rt.currentState = s.id; rt.time = 0.0f; break; }
+            }
+            for (const auto& s : an.states) {
+                if (s.id == rt.currentState) { state = &s; break; }
+            }
+            break;
+        }
+        if (state->clip == UUID{0, 0}) continue;
+        auto clipIt = m_animClips.find(state->clip);
+        if (clipIt == m_animClips.end()) {
+            const auto metaOpt = m_assetRegistry.find(state->clip);
+            if (!metaOpt) continue;
+            AnimationClip clip;
+            clip.id = state->clip;
+            if (!AnimationAssetIO::load_clip(clip, metaOpt->sourcePath)) continue;
+            clipIt = m_animClips.emplace(state->clip, std::move(clip)).first;
+        }
+        const AnimationClip& clip = clipIt->second;
+        rt.time += deltaTime * std::max(state->speed, 0.01f);
+        const float dur = std::max(clip.duration, 0.001f);
+        rt.time = state->loop ? std::fmod(rt.time, dur) : std::min(rt.time, dur);
+        // Build the runtime skeleton from the entity hierarchy (bone order =
+        // hierarchy order) and write the sampled local pose onto the entities.
+        std::vector<UUID> boneIds;
+        SkeletonAsset skeleton;
+        skeleton.id = id;
+        skeleton.name = "PlayRuntime";
+        std::function<void(UUID, int)> collect = [&](UUID eid, int parentIndex) {
+            BoneNode bn;
+            bn.parentIndex = parentIndex;
+            const auto eIt = playScene->get_entities().find(eid);
+            bn.name = (eIt != playScene->get_entities().end()) ? eIt->second.get_name() : "bone";
+            skeleton.bones.push_back(bn);
+            boneIds.push_back(eid);
+            const int idx = static_cast<int>(skeleton.bones.size()) - 1;
+            const auto hc = playScene->hierarchyComponents.find(eid);
+            if (hc != playScene->hierarchyComponents.end()) {
+                for (const auto& child : hc->second.childrenIDs) collect(child, idx);
+            }
+        };
+        collect(id, -1);
+        if (skeleton.bones.empty()) continue;
+        const Pose pose = AnimationSampler::sample(skeleton, clip, rt.time);
+        for (size_t i = 0; i < pose.local.size() && i < boneIds.size(); ++i) {
+            const auto tIt = playScene->transformComponents.find(boneIds[i]);
+            if (tIt == playScene->transformComponents.end()) continue;
+            tIt->second.position = pose.local[i].translation;
+            tIt->second.rotation = glm::degrees(glm::eulerAngles(pose.local[i].rotation));
+            tIt->second.scale = pose.local[i].scale;
+            syncBody(boneIds[i]);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Retarget: copy mapped source-bone transforms onto target-bone entities
+    // (translation scaled, rotation offset applied). Runs independently, so a
+    // mapped "Hand.L" -> "Hand.R" pair mirrors even without an animation.
+    // ------------------------------------------------------------------
+    for (const auto& [id, rt] : playScene->retargetComponents) {
+        for (const auto& m : rt.mapping) {
+            UUID srcId{0, 0}, dstId{0, 0};
+            for (const auto& [eid, ent] : playScene->get_entities()) {
+                if (ent.get_name() == m.sourceBone) srcId = eid;
+                else if (ent.get_name() == m.targetBone) dstId = eid;
+            }
+            if (!srcId.is_valid() || !dstId.is_valid()) continue;
+            const auto src = playScene->transformComponents.find(srcId);
+            const auto dst = playScene->transformComponents.find(dstId);
+            if (src == playScene->transformComponents.end() ||
+                dst == playScene->transformComponents.end()) {
+                continue;
+            }
+            dst->second.position = src->second.position * m.translationScale;
+            dst->second.rotation = src->second.rotation + m.rotationOffset;
+            dst->second.scale = src->second.scale;
+            syncBody(dstId);
+        }
+    }
+}
+
+// ===========================================================================
+// Runtime-wired Wicked-port features (frontend port): hair strands, soft-body
+// cloth, video flipbooks, gaussian splats and env-probe cubemap captures.
+// Runs in Edit AND Play so authored features preview live in the viewport.
+// ===========================================================================
+
+void EditorApplication::tick_special_runtimes(Scene* scene, float deltaTime) {
+    if (!scene || m_device == VK_NULL_HANDLE) return;
+    const float dt = glm::clamp(deltaTime, 0.0f, 1.0f / 20.0f);
+
+    // ---- Hair strands (verlet: gravity * gravityPower, drag, stiffness) ----
+    for (auto& [id, h] : scene->hairParticleComponents) {
+        if (!h.enabled) continue;
+        const auto tit = scene->transformComponents.find(id);
+        if (tit == scene->transformComponents.end()) continue;
+        ensure_hair_sim(id, h, tit->second);
+        auto it = m_hairs.find(id);
+        if (it == m_hairs.end()) continue;
+        HairSim& sim = it->second;
+        const float stiffness = 0.15f + 0.8f * h.stiffness;
+        const float drag = 1.0f - glm::clamp(h.drag, 0.0f, 0.92f);
+        const float g = -9.81f * h.gravityPower;
+        const float windAmp = 0.5f;
+        const float windPhase = m_skyTime * 2.0f;
+        for (size_t i = 0; i < sim.pos.size(); ++i) {
+            const glm::vec3 vel = (sim.pos[i] - sim.prev[i]) * drag;
+            glm::vec3 next = sim.pos[i] + vel;
+            next.y += g * dt;
+            next.x += windAmp * std::sin(windPhase + sim.pos[i].x * 1.3f + sim.pos[i].z * 0.7f) * dt;
+            // Stiffness pulls each segment back toward its rest position.
+            next += (sim.rest[i] - sim.pos[i]) * stiffness * dt;
+            sim.prev[i] = sim.pos[i];
+            sim.pos[i] = next;
+        }
+        upload_hair(sim, h);
+    }
+
+    // ---- Soft body cloth (verlet grid, top row pinned, ground collision) ----
+    for (auto& [id, s] : scene->softBodyComponents) {
+        if (!s.enabled) continue;
+        const auto tit = scene->transformComponents.find(id);
+        if (tit == scene->transformComponents.end()) continue;
+        ensure_softbody_sim(id, s, tit->second);
+        auto it = m_softBodies.find(id);
+        if (it == m_softBodies.end()) continue;
+        SoftBodySim& sim = it->second;
+        const size_t side = static_cast<size_t>(s.detail) + 1;
+        const float drag = 1.0f - glm::clamp(s.friction, 0.0f, 0.9f) * 0.45f;
+        const float g = -9.81f * s.mass;
+        const float windAmp = s.wind ? 1.1f : 0.0f;
+        const float windPhase = m_skyTime * 3.0f;
+        for (size_t i = 0; i < sim.pos.size(); ++i) {
+            glm::vec3 vel = (sim.pos[i] - sim.prev[i]) * drag;
+            vel.y += g * dt;
+            if (windAmp > 0.0f) {
+                vel.x += windAmp * std::sin(windPhase + sim.pos[i].z * 0.9f) * dt;
+                vel.z += windAmp * 0.35f * std::cos(windPhase + sim.pos[i].x * 0.7f) * dt;
+            }
+            glm::vec3 next = sim.pos[i] + vel;
+            sim.prev[i] = sim.pos[i];
+            sim.pos[i] = next;
+        }
+        // Pressure inflates the cloth outward from its center (local space).
+        if (s.pressure > 0.0f) {
+            const glm::vec3 center(0.0f, -0.4f, 0.0f);
+            for (size_t i = 0; i < sim.pos.size(); ++i) {
+                const glm::vec3 dir = sim.pos[i] - center;
+                sim.pos[i] += glm::normalize(dir) * (s.pressure * 0.15f * dt);
+            }
+        }
+        // Structural distance constraints (a few iterations keep it stable).
+        for (int iter = 0; iter < 3; ++iter) {
+            for (size_t r = 0; r < s.detail; ++r) {
+                for (size_t c = 0; c < s.detail; ++c) {
+                    const size_t i = r * side + c;
+                    const size_t right = i + 1;
+                    const float restR = glm::length(sim.rest[right] - sim.rest[i]);
+                    glm::vec3 delta = sim.pos[right] - sim.pos[i];
+                    const float dist = glm::length(delta);
+                    if (dist > 1e-6f && restR > 1e-6f) {
+                        const glm::vec3 corr = delta / dist * (dist - restR) * 0.5f;
+                        sim.pos[i] += corr;
+                        sim.pos[right] -= corr;
+                    }
+                    const size_t down = i + side;
+                    const float restD = glm::length(sim.rest[down] - sim.rest[i]);
+                    delta = sim.pos[down] - sim.pos[i];
+                    const float dist2 = glm::length(delta);
+                    if (dist2 > 1e-6f && restD > 1e-6f) {
+                        const glm::vec3 corr = delta / dist2 * (dist2 - restD) * 0.5f;
+                        sim.pos[i] += corr;
+                        sim.pos[down] -= corr;
+                    }
+                }
+            }
+        }
+        // Pin the top row to the rest pose (a hanging curtain).
+        for (size_t c = 0; c < side; ++c) {
+            sim.pos[c] = sim.rest[c];
+            sim.prev[c] = sim.rest[c];
+        }
+        // Ground collision in local space (entity origin plane).
+        for (size_t i = 0; i < sim.pos.size(); ++i) {
+            if (sim.pos[i].y < 0.0f) {
+                sim.pos[i].y = 0.0f;
+                sim.prev[i].y = 0.0f;
+            }
+        }
+        upload_softbody(sim, s);
+    }
+
+    // ---- Video flipbooks: advance the playhead at fps ----
+    for (auto& [id, v] : scene->videoComponents) {
+        (void)id;
+        if (!v.enabled || !v.playing || v.framePaths.empty()) continue;
+        v.time += dt;
+        const float frameDur = 1.0f / std::max(v.fps, 0.1f);
+        if (v.time >= frameDur) {
+            v.time = 0.0f;
+            v.currentFrame++;
+            if (v.currentFrame >= static_cast<int>(v.framePaths.size())) {
+                if (v.loop) v.currentFrame = 0;
+                else {
+                    v.currentFrame = static_cast<int>(v.framePaths.size()) - 1;
+                    v.playing = false;
+                }
+            }
+        }
+    }
+
+    // ---- Gaussian splats: mark for rebuild when regenerate is requested ----
+    for (auto& [id, gs] : scene->gaussianSplatComponents) {
+        if (!gs.regenerate) continue;
+        gs.regenerate = false;
+        auto it = m_splatClouds.find(id);
+        if (it != m_splatClouds.end()) it->second.dirty = true;
+    }
+
+    // ---- Expressions: apply facial weights as squash/stretch of the head ----
+    for (const auto& [id, ex] : scene->expressionComponents) {
+        (void)id;
+        if (!ex.enabled || !ex.headEntity.is_valid()) continue;
+        const auto hit = scene->transformComponents.find(ex.headEntity);
+        if (hit == scene->transformComponents.end()) continue;
+        const float sx = 1.0f + ex.smile * 0.15f - ex.frown * 0.10f + ex.surprised * 0.22f + ex.anger * 0.06f;
+        const float sy = 1.0f - ex.blink * 0.35f + ex.surprised * 0.26f - ex.smile * 0.06f - ex.frown * 0.04f;
+        const float sz = 1.0f + ex.frown * 0.08f - ex.blink * 0.10f + ex.anger * 0.05f + ex.surprised * 0.06f;
+        hit->second.scale = ex.baseScale * glm::vec3(sx, sy, sz);
+    }
+
+    // ---- Env probes: one-shot capture request + periodic real-time ----
+    m_envCaptureTimer += dt;
+    if (m_envCaptureTimer >= 0.5f) m_envCaptureTimer = 0.0f;
+    for (auto& [id, ep] : scene->envProbeComponents) {
+        if (!ep.enabled) continue;
+        const bool captureNow = ep.captureRequested || (ep.realTime && m_envCaptureTimer <= 0.0f);
+        if (ep.captureRequested) ep.captureRequested = false;
+        if (!captureNow) continue;
+        const auto tit = scene->transformComponents.find(id);
+        if (tit != scene->transformComponents.end()) capture_env_probe(id, ep, tit->second);
+    }
+}
+
+void EditorApplication::ensure_hair_sim(const UUID& id, const HairParticleComponent& h,
+                                        const TransformComponent& t) {
+    auto it = m_hairs.find(id);
+    const uint32_t expectedVerts = (h.segments + 1) * h.count;
+    if (it != m_hairs.end() && it->second.built &&
+        it->second.pos.size() == expectedVerts && h.seed == 0) {
+        return;
+    }
+    HairSim sim;
+    sim.pos.resize(expectedVerts);
+    sim.prev.resize(expectedVerts);
+    sim.rest.resize(expectedVerts);
+    std::mt19937 rng(h.seed != 0 ? h.seed
+                                 : 1337u + static_cast<uint32_t>(id.get_high() ^ id.get_low()));
+    std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+    // Roots: sample the mesh surface (first vertex of the mesh asset) or a
+    // head-like sphere when no mesh is set.
+    const glm::mat4 model = model_from_transform(t);
+    const glm::vec3 up = glm::normalize(glm::mat3(model) * glm::vec3(0, 1, 0));
+    const glm::vec3 tangent = glm::normalize(glm::mat3(model) * glm::vec3(1, 0, 0));
+    const glm::vec3 bitangent = glm::normalize(glm::cross(tangent, up));
+    for (uint32_t s = 0; s < h.count; ++s) {
+        const float u = unit(rng), v = unit(rng);
+        const float theta = u * glm::two_pi<float>();
+        const float phi = std::acos(1.0f - 2.0f * v);
+        // Head shell radius 0.24 (matches the humanoid head box half-extent).
+        const glm::vec3 rootLocal(0.24f * std::sin(phi) * std::cos(theta),
+                                  0.18f + 0.24f * std::cos(phi),
+                                  0.24f * std::sin(phi) * std::sin(theta));
+        const glm::vec3 root = glm::vec3(model * glm::vec4(rootLocal, 1.0f));
+        // Strand direction: mostly up with a random tilt (randomness).
+        const glm::vec3 tilt = glm::normalize(
+            tangent * (unit(rng) - 0.5f) * 2.0f * h.randomness +
+            bitangent * (unit(rng) - 0.5f) * 2.0f * h.randomness);
+        const glm::vec3 dir = glm::normalize(up + tilt * 0.6f);
+        const float segLen = h.length / static_cast<float>(h.segments);
+        for (uint32_t seg = 0; seg <= h.segments; ++seg) {
+            const size_t idx = static_cast<size_t>(s) * (h.segments + 1) + seg;
+            sim.rest[idx] = root + dir * (segLen * static_cast<float>(seg));
+            sim.pos[idx] = sim.rest[idx];
+            sim.prev[idx] = sim.rest[idx];
+        }
+    }
+    sim.built = true;
+    m_hairs[id] = std::move(sim);
+}
+
+void EditorApplication::upload_hair(HairSim& sim, const HairParticleComponent& h) {
+    if (sim.pos.empty()) return;
+    std::vector<EditorVertex> verts;
+    verts.reserve(sim.pos.size() * 2);
+    for (uint32_t s = 0; s < h.count; ++s) {
+        for (uint32_t seg = 0; seg < h.segments; ++seg) {
+            const size_t a = static_cast<size_t>(s) * (h.segments + 1) + seg;
+            const size_t b = a + 1;
+            EditorVertex va, vb;
+            va.pos = sim.pos[a];
+            vb.pos = sim.pos[b];
+            va.normal = vb.normal = glm::vec3(0, 1, 0);
+            va.color = vb.color = h.color;
+            verts.push_back(va);
+            verts.push_back(vb);
+        }
+    }
+    const VkDeviceSize size = sizeof(EditorVertex) * verts.size();
+    if (sim.vb.buffer == VK_NULL_HANDLE || sim.vb.size < size) {
+        if (sim.vb.buffer != VK_NULL_HANDLE) destroy_buffer(sim.vb);
+        create_buffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      sim.vb.buffer, sim.vb.memory);
+    }
+    void* data = nullptr;
+    vkMapMemory(m_device, sim.vb.memory, 0, size, 0, &data);
+    std::memcpy(data, verts.data(), static_cast<size_t>(size));
+    vkUnmapMemory(m_device, sim.vb.memory);
+    sim.vertexCount = static_cast<uint32_t>(verts.size());
+}
+
+void EditorApplication::ensure_softbody_sim(const UUID& id, const SoftBodyComponent& s,
+                                            const TransformComponent& t) {
+    auto it = m_softBodies.find(id);
+    const size_t side = static_cast<size_t>(s.detail) + 1;
+    const size_t expected = side * side;
+    if (it != m_softBodies.end() && it->second.built && it->second.pos.size() == expected) return;
+    (void)t;
+    SoftBodySim sim;
+    sim.pos.resize(expected);
+    sim.prev.resize(expected);
+    sim.rest.resize(expected);
+    const float half = 1.0f;
+    for (size_t r = 0; r < side; ++r) {
+        for (size_t c = 0; c < side; ++c) {
+            const size_t i = r * side + c;
+            const float x = (static_cast<float>(c) / s.detail - 0.5f) * 2.0f * half;
+            const float z = (static_cast<float>(r) / s.detail - 0.5f) * 2.0f * half;
+            sim.rest[i] = glm::vec3(x, 0.0f, z);
+            sim.pos[i] = sim.rest[i];
+            sim.prev[i] = sim.rest[i];
+        }
+    }
+    sim.indices.clear();
+    sim.indices.reserve(s.detail * s.detail * 6);
+    for (size_t r = 0; r < s.detail; ++r) {
+        for (size_t c = 0; c < s.detail; ++c) {
+            const uint32_t a = static_cast<uint32_t>(r * side + c);
+            const uint32_t b = static_cast<uint32_t>(a + 1);
+            const uint32_t cc = static_cast<uint32_t>(a + side);
+            const uint32_t d = static_cast<uint32_t>(cc + 1);
+            sim.indices.push_back(a); sim.indices.push_back(b); sim.indices.push_back(d);
+            sim.indices.push_back(a); sim.indices.push_back(d); sim.indices.push_back(cc);
+        }
+    }
+    sim.indexCount = static_cast<uint32_t>(sim.indices.size());
+    sim.built = true;
+    m_softBodies[id] = std::move(sim);
+}
+
+void EditorApplication::upload_softbody(SoftBodySim& sim, const SoftBodyComponent& s) {
+    if (sim.pos.empty()) return;
+    std::vector<EditorVertex> verts;
+    verts.reserve(sim.pos.size());
+    const glm::vec3 color = glm::vec3(0.75f, 0.45f, 0.95f);
+    for (const glm::vec3& p : sim.pos) {
+        EditorVertex v;
+        v.pos = p;
+        v.normal = glm::vec3(0, 1, 0);
+        v.color = color;
+        verts.push_back(v);
+    }
+    const VkDeviceSize vs = sizeof(EditorVertex) * verts.size();
+    const VkDeviceSize is = sizeof(uint32_t) * sim.indices.size();
+    if (sim.vb.buffer == VK_NULL_HANDLE || sim.vb.size < vs) {
+        if (sim.vb.buffer != VK_NULL_HANDLE) destroy_buffer(sim.vb);
+        create_buffer(vs, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      sim.vb.buffer, sim.vb.memory);
+    }
+    if (sim.ib.buffer == VK_NULL_HANDLE || sim.ib.size < is) {
+        if (sim.ib.buffer != VK_NULL_HANDLE) destroy_buffer(sim.ib);
+        create_buffer(is, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      sim.ib.buffer, sim.ib.memory);
+    }
+    void* data = nullptr;
+    vkMapMemory(m_device, sim.vb.memory, 0, vs, 0, &data);
+    std::memcpy(data, verts.data(), static_cast<size_t>(vs));
+    vkUnmapMemory(m_device, sim.vb.memory);
+    vkMapMemory(m_device, sim.ib.memory, 0, is, 0, &data);
+    std::memcpy(data, sim.indices.data(), static_cast<size_t>(is));
+    vkUnmapMemory(m_device, sim.ib.memory);
+}
+
+void EditorApplication::generate_splat_cloud(const GaussianSplatComponent& gs,
+                                             std::vector<EditorVertex>& verts) const {
+    verts.clear();
+    verts.reserve(gs.count);
+    std::mt19937 rng(gs.seed != 0 ? gs.seed : 1u);
+    std::uniform_real_distribution<float> box(-gs.scale * 0.5f, gs.scale * 0.5f);
+    std::uniform_real_distribution<float> hue(0.0f, 1.0f);
+    for (uint32_t i = 0; i < gs.count; ++i) {
+        EditorVertex v;
+        v.pos = glm::vec3(box(rng), box(rng), box(rng));
+        // Pastel palette via golden-ratio hue.
+        const float hh = hue(rng);
+        const float s = 0.55f + 0.4f * hue(rng);
+        const float l = 0.45f + 0.3f * hue(rng);
+        glm::vec3 rgb;
+        const float c = (1.0f - std::abs(2.0f * l - 1.0f)) * s;
+        const float x = c * (1.0f - std::abs(std::fmod(hh * 6.0f, 2.0f) - 1.0f));
+        const float m = l - c * 0.5f;
+        if (hh < 1.0f / 6.0f) rgb = { c, x, 0 };
+        else if (hh < 2.0f / 6.0f) rgb = { x, c, 0 };
+        else if (hh < 3.0f / 6.0f) rgb = { 0, c, x };
+        else if (hh < 4.0f / 6.0f) rgb = { 0, x, c };
+        else if (hh < 5.0f / 6.0f) rgb = { x, 0, c };
+        else rgb = { c, 0, x };
+        v.color = rgb + m;
+        v.normal = glm::vec3(0, 1, 0);
+        verts.push_back(v);
+    }
+}
+
+void EditorApplication::rebuild_paint_buffer(const UUID& id, PaintComponent& pc,
+                                             const EditorMeshResource* mesh) {
+    auto it = m_paintBuffers.find(id);
+    if (it == m_paintBuffers.end() || it->second.dirty) {
+        if (!mesh || mesh->cpuPositions.empty()) return;
+        const size_t n = mesh->cpuPositions.size();
+        std::vector<EditorVertex> verts;
+        verts.reserve(n);
+        const bool hasColors = pc.vertexColors.size() == n;
+        for (size_t i = 0; i < n; ++i) {
+            EditorVertex v;
+            v.pos = mesh->cpuPositions[i];
+            v.normal = glm::vec3(0, 1, 0);
+            v.color = hasColors ? glm::vec3(pc.vertexColors[i]) : glm::vec3(1.0f);
+            verts.push_back(v);
+        }
+        const VkDeviceSize vs = sizeof(EditorVertex) * verts.size();
+        if (it == m_paintBuffers.end()) it = m_paintBuffers.emplace(id, PaintData{}).first;
+        if (it->second.vb.buffer != VK_NULL_HANDLE && it->second.vb.size < vs) {
+            destroy_buffer(it->second.vb);
+            it->second.vb = GPUBuffer{};
+        }
+        if (it->second.vb.buffer == VK_NULL_HANDLE) {
+            create_buffer(vs, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                          it->second.vb.buffer, it->second.vb.memory);
+        }
+        void* data = nullptr;
+        vkMapMemory(m_device, it->second.vb.memory, 0, vs, 0, &data);
+        std::memcpy(data, verts.data(), static_cast<size_t>(vs));
+        vkUnmapMemory(m_device, it->second.vb.memory);
+        it->second.vertexCount = static_cast<uint32_t>(n);
+        it->second.dirty = false;
+    }
+}
+
+void EditorApplication::capture_env_probe(const UUID& id, const EnvProbeComponent& ep,
+                                          const TransformComponent& t) {
+    if (m_device == VK_NULL_HANDLE) return;
+    const uint32_t size = ep.resolution >= 64 ? ep.resolution : 256;
+    const bool recreate = !m_envCapture.valid || m_envCapture.size != size ||
+                          m_envCapture.entity != id;
+    // Rebuild the cubemap target when the probe/resolution changes.
+    if (recreate) {
+        if (m_envCapture.valid) {
+            for (int i = 0; i < 6; ++i) {
+                if (m_envCapture.framebuffers[i]) vkDestroyFramebuffer(m_device, m_envCapture.framebuffers[i], nullptr);
+                if (m_envCapture.views[i]) vkDestroyImageView(m_device, m_envCapture.views[i], nullptr);
+            }
+            if (m_envCapture.image) vkDestroyImage(m_device, m_envCapture.image, nullptr);
+            if (m_envCapture.memory) vkFreeMemory(m_device, m_envCapture.memory, nullptr);
+            if (m_envCapture.renderPass) vkDestroyRenderPass(m_device, m_envCapture.renderPass, nullptr);
+            if (m_envCapture.sampler) vkDestroySampler(m_device, m_envCapture.sampler, nullptr);
+            m_envCapture = EnvProbeCapture{};
+        }
+        const VkFormat colorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        const VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
+        // Cubemap color image (6 layers).
+        VkImageCreateInfo img{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        img.imageType = VK_IMAGE_TYPE_2D;
+        img.extent = { size, size, 1 };
+        img.mipLevels = 1;
+        img.arrayLayers = 6;
+        img.format = colorFormat;
+        img.tiling = VK_IMAGE_TILING_OPTIMAL;
+        img.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        img.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        img.samples = VK_SAMPLE_COUNT_1_BIT;
+        img.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        img.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+        if (vkCreateImage(m_device, &img, nullptr, &m_envCapture.image) != VK_SUCCESS) return;
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(m_device, m_envCapture.image, &req);
+        VkMemoryAllocateInfo alloc{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (vkAllocateMemory(m_device, &alloc, nullptr, &m_envCapture.memory) != VK_SUCCESS) return;
+        vkBindImageMemory(m_device, m_envCapture.image, m_envCapture.memory, 0);
+        // 2D-array views, one per face.
+        VkImageViewCreateInfo view{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        view.image = m_envCapture.image;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view.format = colorFormat;
+        view.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        for (int i = 0; i < 6; ++i) {
+            view.subresourceRange.baseArrayLayer = static_cast<uint32_t>(i);
+            if (vkCreateImageView(m_device, &view, nullptr, &m_envCapture.views[i]) != VK_SUCCESS) return;
+        }
+        // Depth image (single 2D, shared by all faces).
+        VkImage depthImage = VK_NULL_HANDLE;
+        VkDeviceMemory depthMemory = VK_NULL_HANDLE;
+        VkImageView depthView = VK_NULL_HANDLE;
+        create_image(size, size, depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthImage, depthMemory);
+        depthView = create_image_view(depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
+        // Render pass: color + depth.
+        VkAttachmentDescription attachments[2]{};
+        attachments[0].format = colorFormat;
+        attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+        attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        attachments[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        attachments[1].format = depthFormat;
+        attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+        attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        VkAttachmentReference colorRef{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+        VkAttachmentReference depthRef{ 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &colorRef;
+        subpass.pDepthStencilAttachment = &depthRef;
+        VkRenderPassCreateInfo rpInfo{ VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+        rpInfo.attachmentCount = 2;
+        rpInfo.pAttachments = attachments;
+        rpInfo.subpassCount = 1;
+        rpInfo.pSubpasses = &subpass;
+        if (vkCreateRenderPass(m_device, &rpInfo, nullptr, &m_envCapture.renderPass) != VK_SUCCESS) return;
+        for (int i = 0; i < 6; ++i) {
+            VkImageView fbViews[2] = { m_envCapture.views[i], depthView };
+            VkFramebufferCreateInfo fb{ VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+            fb.renderPass = m_envCapture.renderPass;
+            fb.attachmentCount = 2;
+            fb.pAttachments = fbViews;
+            fb.width = size;
+            fb.height = size;
+            fb.layers = 1;
+            if (vkCreateFramebuffer(m_device, &fb, nullptr, &m_envCapture.framebuffers[i]) != VK_SUCCESS) return;
+        }
+        // Sampler + descriptor update.
+        VkSamplerCreateInfo samp{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+        samp.magFilter = VK_FILTER_LINEAR;
+        samp.minFilter = VK_FILTER_LINEAR;
+        samp.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samp.addressModeU = samp.addressModeV = samp.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        vkCreateSampler(m_device, &samp, nullptr, &m_envCapture.sampler);
+        VkImageView cubeView = VK_NULL_HANDLE;
+        VkImageViewCreateInfo cv{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        cv.image = m_envCapture.image;
+        cv.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+        cv.format = colorFormat;
+        cv.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6 };
+        vkCreateImageView(m_device, &cv, nullptr, &cubeView);
+        VkDescriptorImageInfo descImg{};
+        descImg.sampler = m_envCapture.sampler;
+        descImg.imageView = cubeView;
+        descImg.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        write.dstSet = m_envCapture.descriptorSet;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &descImg;
+        vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+        // Keep the cube view alive for the lifetime of the capture.
+        m_envCubeView = cubeView;
+        m_envDepthView = depthView;
+        m_envDepthImage = depthImage;
+        m_envDepthMemory = depthMemory;
+        m_envCapture.size = size;
+        m_envCapture.entity = id;
+        m_envCapture.valid = true;
+    }
+    m_envCapturePending = true;
+}
+
+UUID EditorApplication::resolve_texture_asset_by_name(const std::string& name) const {
+    for (const AssetMetadata& meta : m_assetRegistry.snapshot()) {
+        if (meta.type == AssetType::Texture && meta.sourcePath.filename().string() == name) {
+            return meta.id;
+        }
+    }
+    return UUID{ 0, 0 };
+}
+
+void EditorApplication::record_env_face(VkCommandBuffer cmd, const glm::mat4& view, const glm::mat4& proj,
+                                        const glm::vec3& pos, Scene* scene) {
+    if (!scene || m_device == VK_NULL_HANDLE) return;
+    (void)pos;
+    const glm::mat4 viewProj = proj * view;
+    // Terrain + voxel volumes (the shared scene helpers).
+    if (m_terrainValid && m_terrainVB.buffer != VK_NULL_HANDLE) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
+        const glm::mat4 model(1.0f);
+        draw_indexed_editor_mesh(cmd, m_scenePipelineLayout, m_terrainVB.buffer, m_terrainIB.buffer,
+                                 m_terrainIndexCount, viewProj * model, glm::vec4(1.0f));
+    }
+    draw_voxel_volumes(cmd, viewProj, scene);
+    // Entities with a mesh renderer (flat shading — the capture is a
+    // geometry/lighting preview for the reflection probe).
+    for (const auto& [id, ent] : scene->get_entities()) {
+        (void)ent;
+        const auto tit = scene->transformComponents.find(id);
+        if (tit == scene->transformComponents.end()) continue;
+        const auto layerIt = scene->layerComponents.find(id);
+        if (layerIt != scene->layerComponents.end() && !layerIt->second.visible) continue;
+        const auto meshIt = scene->meshRendererComponents.find(id);
+        if (meshIt == scene->meshRendererComponents.end()) continue;
+        glm::vec3 baseColor(0.72f, 0.75f, 0.82f);
+        const auto matIt = scene->materialComponents.find(id);
+        if (matIt != scene->materialComponents.end()) baseColor = matIt->second.albedo;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
+        if (const auto* mesh = get_mesh_resource(meshIt->second.meshAssetID)) {
+            draw_mesh_resource(cmd, viewProj * model_from_transform(tit->second),
+                               glm::vec4(baseColor, 1.0f), *mesh);
+        } else {
+            draw_indexed_cube(cmd, m_scenePipelineLayout, m_cubeVB.buffer, m_cubeIB.buffer,
+                              m_cubeIndexCount, viewProj * model_from_transform(tit->second),
+                              glm::vec4(baseColor, 1.0f));
+        }
+    }
+}
+
+glm::vec3 EditorApplication::viewport_mouse_dir(const glm::vec2& mouseScreen) const {
+    const float aspect = static_cast<float>(m_offscreen.width) / std::max(1u, m_offscreen.height);
+    const glm::mat4 invViewProj =
+        glm::inverse(m_editorCamera.get_projection_matrix(aspect) * m_editorCamera.get_view_matrix());
+    const float ndcX = (mouseScreen.x - m_viewportImagePos.x) / std::max(1.0f, m_viewportImageSize.x) * 2.0f - 1.0f;
+    const float ndcY = 1.0f - (mouseScreen.y - m_viewportImagePos.y) / std::max(1.0f, m_viewportImageSize.y) * 2.0f;
+    const glm::vec4 near4 = invViewProj * glm::vec4(ndcX, ndcY, 0.0f, 1.0f);
+    const glm::vec4 far4 = invViewProj * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+    const glm::vec3 nearP = glm::vec3(near4) / near4.w;
+    const glm::vec3 farP = glm::vec3(far4) / far4.w;
+    return glm::normalize(farP - nearP);
+}
+
+bool EditorApplication::paint_mesh_stroke(const glm::vec3& origin, const glm::vec3& dir) {
+    if (!m_editorScene) return false;
+    Scene* scene = m_editorScene.get();
+    const UUID target = m_selectedEntity.is_valid() ? m_selectedEntity.get_id() : UUID{ 0, 0 };
+    if (!target.is_valid() || !scene->paintComponents.contains(target)) return false;
+    const auto meshComp = scene->meshRendererComponents.find(target);
+    if (meshComp == scene->meshRendererComponents.end() ||
+        !meshComp->second.meshAssetID.is_valid()) {
+        return false;
+    }
+    const auto* mesh = get_mesh_resource(meshComp->second.meshAssetID);
+    if (!mesh || mesh->cpuPositions.empty()) return false;
+    const auto tit = scene->transformComponents.find(target);
+    if (tit == scene->transformComponents.end()) return false;
+    const glm::mat4 model = model_from_transform(tit->second);
+    const glm::mat4 invModel = glm::inverse(model);
+    const glm::vec3 localOrigin = glm::vec3(invModel * glm::vec4(origin, 1.0f));
+    const glm::vec3 localDir = glm::normalize(glm::vec3(invModel * glm::vec4(dir, 0.0f)));
+    const std::vector<glm::vec3>& P = mesh->cpuPositions;
+    const std::vector<uint32_t>& idx = mesh->cpuIndices;
+    // Möller–Trumbore against the mesh triangles (local space).
+    const auto rayTri = [](const glm::vec3& o, const glm::vec3& d,
+                           const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
+                           float& t, glm::vec3& bary) -> bool {
+        const glm::vec3 e1 = b - a;
+        const glm::vec3 e2 = c - a;
+        const glm::vec3 pv = glm::cross(d, e2);
+        const float det = glm::dot(e1, pv);
+        if (std::abs(det) < 1e-8f) return false;
+        const float invDet = 1.0f / det;
+        const glm::vec3 tv = o - a;
+        const float u = glm::dot(tv, pv) * invDet;
+        if (u < 0.0f || u > 1.0f) return false;
+        const glm::vec3 qv = glm::cross(tv, e1);
+        const float v = glm::dot(d, qv) * invDet;
+        if (v < 0.0f || u + v > 1.0f) return false;
+        t = glm::dot(e2, qv) * invDet;
+        if (t < 0.0f) return false;
+        bary = { 1.0f - u - v, u, v };
+        return true;
+    };
+    float bestT = 1e30f;
+    glm::vec3 bestHit(0.0f);
+    if (idx.empty()) {
+        for (size_t i = 0; i + 2 < P.size(); i += 3) {
+            float t;
+            glm::vec3 bary;
+            if (rayTri(localOrigin, localDir, P[i], P[i + 1], P[i + 2], t, bary) && t < bestT) {
+                bestT = t;
+                bestHit = P[i] * bary.x + P[i + 1] * bary.y + P[i + 2] * bary.z;
+            }
+        }
+    } else {
+        for (size_t i = 0; i + 2 < idx.size(); i += 3) {
+            const glm::vec3& a = P[idx[i]];
+            const glm::vec3& b = P[idx[i + 1]];
+            const glm::vec3& c = P[idx[i + 2]];
+            float t;
+            glm::vec3 bary;
+            if (rayTri(localOrigin, localDir, a, b, c, t, bary) && t < bestT) {
+                bestT = t;
+                bestHit = a * bary.x + b * bary.y + c * bary.z;
+            }
+        }
+    }
+    if (bestT > 1e29f) return false;
+    PaintComponent& pc = scene->paintComponents[target];
+    if (pc.vertexColors.size() != P.size()) pc.vertexColors.assign(P.size(), glm::vec4(1.0f));
+    const float brush = std::max(pc.brushSize, 0.01f);
+    for (size_t i = 0; i < P.size(); ++i) {
+        const float d = glm::distance(P[i], bestHit);
+        if (d <= brush) {
+            const float falloff = 1.0f - d / brush;
+            const float op = pc.opacity * falloff;
+            const glm::vec3 brushCol = pc.brushColor;
+            const glm::vec3 oldCol(pc.vertexColors[i]);
+            pc.vertexColors[i] = glm::vec4(glm::mix(oldCol, brushCol, glm::clamp(op, 0.0f, 1.0f)), 1.0f);
+        }
+    }
+    const auto pit = m_paintBuffers.find(target);
+    if (pit != m_paintBuffers.end()) pit->second.dirty = true;
+    return true;
+}
+
+void EditorApplication::record_env_capture(VkCommandBuffer cmd, Scene* scene) {
+    if (!m_envCapturePending || !m_envCapture.valid || !scene) return;
+    m_envCapturePending = false;
+    const auto tit = scene->transformComponents.find(m_envCapture.entity);
+    if (tit == scene->transformComponents.end()) return;
+    const glm::vec3 pos = tit->second.position;
+    const glm::mat4 proj = glm::perspective(glm::radians(90.0f), 1.0f, 0.1f, 500.0f);
+    const glm::vec3 faces[6][2] = {
+        { { 1, 0, 0 }, { 0, -1, 0 } }, { { -1, 0, 0 }, { 0, -1, 0 } },
+        { { 0, 1, 0 }, { 0, 0, 1 } },  { { 0, -1, 0 }, { 0, 0, -1 } },
+        { { 0, 0, 1 }, { 0, -1, 0 } }, { { 0, 0, -1 }, { 0, -1, 0 } },
+    };
+    for (int i = 0; i < 6; ++i) {
+        VkRenderPassBeginInfo info{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+        info.renderPass = m_envCapture.renderPass;
+        info.framebuffer = m_envCapture.framebuffers[i];
+        info.renderArea.offset = { 0, 0 };
+        info.renderArea.extent = { m_envCapture.size, m_envCapture.size };
+        VkClearValue clears[2];
+        clears[0].color = { { 0.11f, 0.13f, 0.18f, 1.0f } };
+        clears[1].depthStencil = { 1.0f, 0 };
+        info.clearValueCount = 2;
+        info.pClearValues = clears;
+        vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
+        set_viewport_scissor(cmd, m_envCapture.size, m_envCapture.size);
+        record_env_face(cmd, glm::lookAt(pos, pos + faces[i][0], faces[i][1]), proj, pos, scene);
+        vkCmdEndRenderPass(cmd);
+    }
+}
+
+void EditorApplication::tick_play_runtime(float deltaTime) {
+    const PlayState state = m_playMode.get_state();
+    if (state != PlayState::Play && state != PlayState::Simulate) return;
+    Scene* playScene = m_playMode.get_active_scene();
+    if (!playScene) return;
+
+    // Wicked-port runtime: force fields push/pull bodies within range;
+    // springs pull their body back toward the authored rest anchor. Both run
+    // before the solver step so the forces feed this frame's simulation.
+    for (const auto& [id, ff] : playScene->forceFieldComponents) {
+        if (!ff.enabled) continue;
+        const auto fit = playScene->transformComponents.find(id);
+        const glm::vec3 center = (fit != playScene->transformComponents.end())
+                                     ? fit->second.position
+                                     : glm::vec3(0.0f);
+        glm::vec3 forward(0.0f, 0.0f, 1.0f);
+        if (fit != playScene->transformComponents.end()) {
+            forward = glm::quat(glm::radians(fit->second.rotation)) * glm::vec3(0.0f, 0.0f, 1.0f);
+        }
+        for (const auto& [bid, handle] : m_playBodies) {
+            Physics::RigidBody* body = m_playPhysics.body(handle);
+            if (!body || !body->dynamic()) continue;
+            const glm::vec3 delta = body->position - center;
+            const float dist = glm::length(delta);
+            if (dist > ff.range) continue;
+            const float falloff = 1.0f - (ff.range > 0.01f ? dist / ff.range : 0.0f);
+            glm::vec3 force(0.0f);
+            switch (ff.type) {
+                case ForceFieldType::Gravity:
+                    force = glm::vec3(0.0f, -ff.strength * 9.81f, 0.0f);
+                    break;
+                case ForceFieldType::Push:
+                    force = forward * (ff.strength * 40.0f);
+                    break;
+                case ForceFieldType::Wind:
+                    force = forward * (ff.strength * 15.0f);
+                    break;
+                case ForceFieldType::Vortex: {
+                    const glm::vec3 tangent = glm::normalize(glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), delta));
+                    force = tangent * (ff.strength * 30.0f) + glm::vec3(0.0f, ff.strength * 2.0f, 0.0f);
+                    break;
+                }
+            }
+            m_playPhysics.add_force(handle, force * falloff);
+        }
+    }
+    for (const auto& [id, sp] : playScene->springComponents) {
+        if (sp.disabled || !sp.enabled) continue;
+        const auto restIt = m_springRests.find(id);
+        const auto bodyIt = m_playBodies.find(id);
+        if (restIt == m_springRests.end() || bodyIt == m_playBodies.end()) continue;
+        Physics::RigidBody* body = m_playPhysics.body(bodyIt->second);
+        if (!body || !body->dynamic()) continue;
+        const glm::vec3 force = (restIt->second - body->position) * (12.0f * sp.stiffness)
+                              - body->linearVelocity * (2.0f * sp.drag);
+        m_playPhysics.add_force(bodyIt->second, force);
+    }
+    // Wicked-port runtime: constraints as soft point-to-point springs between
+    // the entity's anchor and the target body's anchor (fixed when the other
+    // entity is missing). Broken when the required force exceeds breakForce.
+    for (const auto& [id, cn] : playScene->constraintComponents) {
+        if (!cn.enabled) continue;
+        auto restIt = m_constraintRests.find(id);
+        const auto bodyIt = m_playBodies.find(id);
+        if (restIt == m_constraintRests.end() || bodyIt == m_playBodies.end()) continue;
+        ConstraintRest& rest = restIt->second;
+        if (rest.broken) continue;
+        Physics::RigidBody* bodyA = m_playPhysics.body(bodyIt->second);
+        if (!bodyA || !bodyA->dynamic()) continue;
+        Physics::RigidBody* bodyB = nullptr;
+        Physics::BodyHandle bodyBHandle = Physics::InvalidBody;
+        if (const auto bodyBIt = m_playBodies.find(cn.otherEntity); bodyBIt != m_playBodies.end()) {
+            bodyB = m_playPhysics.body(bodyBIt->second);
+            bodyBHandle = bodyBIt->second;
+        }
+        const glm::vec3 anchorA = bodyA->position + cn.anchor;
+        glm::vec3 anchorB = rest.anchorB;
+        if (bodyB && bodyB->dynamic()) anchorB = bodyB->position + cn.anchor;
+        const glm::vec3 delta = anchorB - anchorA;
+        const float dist = glm::length(delta);
+        glm::vec3 force(0.0f);
+        if (dist > 1e-5f) {
+            const glm::vec3 dir = delta / dist;
+            if (cn.type == ConstraintType::Spring) {
+                force = dir * ((dist - rest.restLength) * 25.0f);
+            } else {
+                // Fixed / Hinge / Point: pull the anchors together (stiff).
+                force = dir * (dist * 40.0f);
+            }
+        }
+        force -= bodyA->linearVelocity * 0.8f; // axial damping, no ringing
+        if (cn.breakForce > 0.0f && glm::length(force) > cn.breakForce) {
+            rest.broken = true;
+            continue;
+        }
+        m_playPhysics.add_force(bodyIt->second, force);
+        if (bodyB && bodyB->dynamic() && bodyBHandle != Physics::InvalidBody) {
+            m_playPhysics.add_force(bodyBHandle, -force);
+        }
+    }
+
+    m_playPhysics.step(deltaTime);
+    for (const auto& [id, handle] : m_playBodies) {
+        Physics::RigidBody* body = m_playPhysics.body(handle);
+        if (!body) continue;
+        auto tit = playScene->transformComponents.find(id);
+        if (tit == playScene->transformComponents.end()) continue;
+        tit->second.position = body->position;
+        tit->second.rotation = glm::degrees(glm::eulerAngles(body->rotation));
+    }
+
+    // Wicked-port runtime: spline followers drive their entity along the
+    // Catmull-Rom path (looped) in play mode; kinematic bodies follow too.
+    for (const auto& [id, sp] : playScene->splineComponents) {
+        if (!sp.enabled || sp.points.size() < 2) continue;
+        auto tit = playScene->transformComponents.find(id);
+        if (tit == playScene->transformComponents.end()) continue;
+        auto [progIt, inserted] = m_splineProgress.try_emplace(id, 0.0f);
+        (void)inserted;
+        float total = 0.0f;
+        for (size_t i = 1; i < sp.points.size(); ++i) {
+            total += glm::length(sp.points[i] - sp.points[i - 1]);
+        }
+        if (total < 1e-4f) continue;
+        constexpr float kSplineSpeed = 2.0f; // m/s
+        progIt->second += kSplineSpeed * deltaTime / total;
+        if (sp.looped) {
+            progIt->second -= std::floor(progIt->second);
+        } else {
+            progIt->second = glm::clamp(progIt->second, 0.0f, 1.0f);
+        }
+        const float t = progIt->second * static_cast<float>(sp.points.size() - 1);
+        const size_t i = std::min<size_t>(static_cast<size_t>(t), sp.points.size() - 2);
+        const float f = t - static_cast<float>(i);
+        const glm::vec3& p0 = sp.points[i > 0 ? i - 1 : i];
+        const glm::vec3& p1 = sp.points[i];
+        const glm::vec3& p2 = sp.points[i + 1];
+        const glm::vec3& p3 = sp.points[std::min(i + 2, sp.points.size() - 1)];
+        const float f2 = f * f, f3 = f2 * f;
+        const glm::vec3 pos = 0.5f * ((2.0f * p1) + (-p0 + p2) * f
+            + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * f2
+            + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * f3);
+        tit->second.position = pos;
+        const auto bodyIt = m_playBodies.find(id);
+        if (bodyIt != m_playBodies.end()) {
+            Physics::RigidBody* body = m_playPhysics.body(bodyIt->second);
+            if (body) {
+                body->position = pos;
+                body->linearVelocity = glm::vec3(0.0f);
+                body->angularVelocity = glm::vec3(0.0f);
+            }
+        }
+    }
+
+    // Play-world animation (Animation/Timeline/IK/Retarget): the editors now
+    // Apply to the scene, so the runtime advances timelines, samples clips
+    // into bone-entity transforms, solves IK chains and mirrors retarget
+    // mappings. Runs after physics so animation wins over the solver.
+    tick_animation_runtime(playScene, deltaTime);
+
+    // Hot reload: recompile + swap the program when the .script changes on
+    // disk (variables survive — load() keeps the variable map).
+    if (m_playScriptLoaded) {
+        std::string reloadError;
+        if (m_playScriptReloader.reload_if_changed(m_playScript, &reloadError)) {
+            std::cout << "[Editor] Script hot-reloaded: " << m_playScriptPath.filename().string()
+                      << (reloadError.empty() ? "" : " (" + reloadError + ")") << std::endl;
+            m_playScript.start_event("OnStart");
+        }
+        // Debugger-aware tick: hold on a panel pause or a breakpoint pause;
+        // otherwise drive the VM through the debugger so breakpoints halt it
+        // and the panel stays in sync (variables/ip/call stack).
+        const bool breakpointPaused = m_playScript.status() == VMStatus::Paused;
+        if (!m_scriptPauseRequested && !breakpointPaused) {
+            if (m_scriptDebuggerAttached) m_scriptDebugger.continue_run(10000, deltaTime);
+            else m_playScript.run(deltaTime, 10000);
+            if (m_playScript.status() == VMStatus::Paused) return; // hit a breakpoint
+            std::vector<std::string> emitted;
+            m_playScript.consume_emitted_events(emitted);
+            for (const std::string& event : emitted) m_playScript.start_event(event);
+        if (m_playScript.has_event("Tick")) {
+            m_playScript.start_event("Tick");
+            if (m_scriptDebuggerAttached) m_scriptDebugger.continue_run(10000, deltaTime);
+            else m_playScript.run(deltaTime, 10000);
+        }
+    }
+
+    // Play weapons (Fase 8): one WeaponRuntime per WeaponComponent entity,
+    // fired with the viewport camera ray against the play physics on SPACE.
+    const bool fireHeld = glfwGetKey(m_window, GLFW_KEY_SPACE) == GLFW_PRESS;
+    const glm::mat4 camView = m_editorCamera.get_view_matrix();
+    const glm::vec3 camFront = glm::normalize(
+        glm::vec3(-camView[2][0], -camView[2][1], -camView[2][2]));
+    for (const auto& [id, comp] : playScene->weaponComponents) {
+        auto it = m_playWeapons.find(id);
+        if (it == m_playWeapons.end()) {
+            Engine::WeaponDefinition def;
+            def.id = id;
+            def.name = "Scene Weapon";
+            def.fireMode = comp.automatic ? Engine::FireMode::Automatic : Engine::FireMode::Single;
+            def.magazineSize = comp.magazineSize;
+            def.reserveAmmo = comp.reserveAmmo;
+            def.roundsPerMinute = comp.roundsPerMinute;
+            def.damage = comp.damage;
+            def.range = 120.0f;
+            def.spreadDegrees = comp.spreadDegrees;
+            def.hitscan = comp.hitscan;
+            it = m_playWeapons.emplace(id, Engine::WeaponRuntime(std::move(def))).first;
+            it->second.set_raycast([this](const glm::vec3& o, const glm::vec3& d, float maxDist)
+                                       -> std::optional<Engine::WeaponHit> {
+                const auto hit = m_playPhysics.raycast(o, d, maxDist);
+                if (!hit) return std::nullopt;
+                Engine::WeaponHit out;
+                out.position = hit->point;
+                out.normal = hit->normal;
+                out.distance = hit->distance;
+                return out;
+            });
+        }
+        if (fireHeld) it->second.trigger_pressed(m_editorCamera.position, camFront);
+        else it->second.trigger_released();
+        it->second.update(deltaTime, m_editorCamera.position, camFront);
+    }
+    if (fireHeld && !m_playWeaponStatusLogged && !m_playWeapons.empty()) {
+        m_playWeaponStatusLogged = true;
+        std::cout << "[Editor] Play weapon firing via physics raycast ("
+                  << m_playWeapons.size() << " weapon entity/entities)\n";
+    }
+
+    // Play particles (Fase 8): keep each emitter at its entity's world
+    // position and step the simulation against the play physics.
+    for (const auto& [id, emitter] : m_playEmitters) {
+        auto* desc = m_playParticles.emitter(emitter);
+        if (!desc) continue;
+        const auto tit = playScene->transformComponents.find(id);
+        const auto pe = playScene->particleEmitterComponents.find(id);
+        const glm::vec3 localPos =
+            (pe != playScene->particleEmitterComponents.end()) ? pe->second.position : glm::vec3(0.0f);
+        desc->position = (tit != playScene->transformComponents.end())
+                             ? tit->second.position + localPos
+                             : localPos;
+    }
+    m_playParticles.update(deltaTime, &m_playPhysics);
+
+    // Play vehicles (Fase 8): drive with the arrow keys.
+    const bool throttle = glfwGetKey(m_window, GLFW_KEY_UP) == GLFW_PRESS;
+    const bool brake = glfwGetKey(m_window, GLFW_KEY_DOWN) == GLFW_PRESS;
+    const float steer = (glfwGetKey(m_window, GLFW_KEY_RIGHT) == GLFW_PRESS ? 1.0f : 0.0f) -
+                        (glfwGetKey(m_window, GLFW_KEY_LEFT) == GLFW_PRESS ? 1.0f : 0.0f);
+    for (auto& [id, vehicle] : m_playVehicles) {
+        (void)id;
+        Engine::Gameplay::VehicleInput input;
+        input.throttle = throttle ? 1.0f : 0.0f;
+        input.brake = brake ? 1.0f : 0.0f;
+        input.steering = steer;
+        vehicle.set_input(input);
+        vehicle.update(m_playPhysics, deltaTime);
+    }
+
+    // Play missions (Fase 8): step the graph and mirror the live state back
+    // to the component. Events emitted by the play script (consume_emitted)
+    // are dispatched to the mission system, so authored script events can
+    // complete missions.
+    m_playMissions.update(deltaTime);
+    for (auto& [id, mc] : playScene->missionComponents) {
+        const Engine::Gameplay::Mission* mission = m_playMissions.mission("mission_" + id.to_string());
+        mc.active = mission && mission->is_active();
+    }
+    {
+        std::vector<std::string> emitted;
+        if (m_playScriptLoaded) m_playScript.consume_emitted_events(emitted);
+        for (const std::string& event : emitted) m_playMissions.dispatch_event(event);
+    }
+
+    // Play dialogues (Fase 8): mirror the playing state.
+    for (auto& [id, dc] : playScene->dialogueComponents) {
+        dc.playing = m_playDialogues.is_playing();
+    }
+
+    // Play audio (Fase 8): keep the listener on the camera and render one
+    // mix block per frame so voices advance; drop voices that finished.
+    m_playAudio.set_listener(m_editorCamera.position, camFront);
+    for (const auto& [id, voice] : m_playVoices) {
+        const auto tit = playScene->transformComponents.find(id);
+        if (tit != playScene->transformComponents.end()) {
+            m_playAudio.set_voice_position(voice, tit->second.position);
+        }
+        auto ac = playScene->audioComponents.find(id);
+        if (ac != playScene->audioComponents.end()) ac->second.playing = m_playAudio.is_active(voice);
+    }
+
+    // Play destructibles (Fase 8): weapon hits from this frame apply radial
+    // damage (chunks detach with an impulse) and the destroyed flag syncs.
+    std::vector<glm::vec3> hitPoints;
+    for (const auto& [id, comp] : playScene->weaponComponents) {
+        (void)id;
+        auto it = m_playWeapons.find(id);
+        if (it == m_playWeapons.end()) continue;
+        for (const Engine::WeaponHit& hit : it->second.hits()) hitPoints.push_back(hit.position);
+        it->second.clear_hits();
+    }
+    for (auto& [id, runtime] : m_playDestructibles) {
+        auto dc = playScene->destructionComponents.find(id);
+        for (const glm::vec3& point : hitPoints) {
+            runtime.apply_radial_damage(m_playPhysics, point, dc->second.damageRadius, 25.0f, dc->second.damageImpulse);
+        }
+        if (dc != playScene->destructionComponents.end()) {
+            dc->second.destroyed = runtime.fully_destroyed();
+        }
+    }
+
+    // Play navigation (Fase 8): repath toward the camera entity when the agent
+    // arrives (or the target moved), then write the agent position back.
+    glm::vec3 target{0.0f};
+    bool haveTarget = false;
+    for (const auto& [cid, cam] : playScene->cameraComponents) {
+        (void)cam;
+        const auto tit = playScene->transformComponents.find(cid);
+        if (tit != playScene->transformComponents.end()) {
+            target = tit->second.position;
+            haveTarget = true;
+            break;
+        }
+    }
+    if (!haveTarget) target = m_editorCamera.position;
+    for (auto& [id, agent] : m_playNavAgents) {
+        if (m_playNav &&
+            (agent.reached_destination() ||
+             glm::distance(agent.position, target) > 1.0f)) {
+            engine::navigation::PathResult result;
+            if (m_playNav->find_path(agent.position.x, agent.position.y,
+                                     agent.position.z, target.x, target.y,
+                                     target.z, result) && result.found) {
+                std::vector<glm::vec3> points;
+                points.reserve(result.waypoints.size() / 3);
+                for (std::size_t i = 0; i + 2 < result.waypoints.size(); i += 3) {
+                    points.emplace_back(result.waypoints[i], result.waypoints[i + 1],
+                                        result.waypoints[i + 2]);
+                }
+                agent.set_path(std::move(points));
+            }
+        }
+        agent.update(deltaTime);
+        auto tit = playScene->transformComponents.find(id);
+        if (tit != playScene->transformComponents.end()) tit->second.position = agent.position;
+    }
+}
+}
+
+void EditorApplication::teardown_play_runtime() {
+    m_constraintRests.clear();
+    m_springRests.clear();
+    m_splineProgress.clear();
+    m_animStates.clear();
+    m_animClips.clear();
+    for (const auto& [id, handle] : m_playBodies) {
+        (void)id;
+        m_playPhysics.destroy_body(handle);
+    }
+    m_playBodies.clear();        m_playScriptLoaded = false;
+    m_scriptDebugger.detach();
+    m_scriptDebuggerAttached = false;
+    m_scriptPauseRequested = false;
+    m_playWeapons.clear();
+    m_playWeaponStatusLogged = false;
+    for (const auto& [id, handle] : m_playVehicleChassis) {
+        (void)id;
+        m_playPhysics.destroy_body(handle);
+    }
+    m_playVehicleChassis.clear();
+    m_playVehicles.clear();
+    m_playParticles.clear();
+    m_playEmitters.clear();
+    for (auto& [id, ragdoll] : m_playRagdolls) {
+        (void)id;
+        ragdoll.destroy(m_playPhysics);
+    }
+    m_playRagdolls.clear();
+    m_playMissions.clear();
+    m_playMissionIds.clear();
+    m_playDialogues.clear();
+    m_playDialogueIds.clear();
+    for (const auto& [id, voice] : m_playVoices) {
+        (void)id;
+        m_playAudio.stop(voice);
+    }
+    m_playVoices.clear();
+    for (auto& [id, runtime] : m_playDestructibles) {
+        (void)id;
+        runtime.destroy(m_playPhysics);
+    }
+    m_playDestructibles.clear();
+    m_playNavAgents.clear();
+    m_playNav.reset();
+}
+
+
 void EditorApplication::handle_control_command(const std::string& cmd) {
     if (cmd == "play" && m_playMode.get_state() == PlayState::Edit) {
         m_playMode.start_play(m_editorScene.get());
@@ -6398,8 +8287,19 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         init_default_scene();
         std::cout << "[ControlApi] new scene" << std::endl;
     } else if (cmd.rfind("open-scene ", 0) == 0) {
-        load_scene_file(cmd.substr(11));
-        std::cout << "[ControlApi] open scene '" << cmd.substr(11) << "'" << std::endl;
+        // Resolve relative paths against the source root: the editor process
+        // cwd is not guaranteed to be the engine folder.
+        std::string scenePath = cmd.substr(11);
+        std::filesystem::path rel(scenePath);
+        if (rel.is_relative()) {
+            const auto abs = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / rel;
+            if (std::filesystem::exists(abs)) scenePath = abs.string();
+        }
+        load_scene_file(scenePath);
+        // API-driven scene open must leave the launcher hub: the control-API
+        // drain and play runtime are gated on !m_inLauncherMode.
+        m_inLauncherMode = false;
+        std::cout << "[ControlApi] open scene '" << scenePath << "'" << std::endl;
     } else if (cmd == "save-scene") {
         // API-safe: never open a blocking native dialog from the HTTP thread
         // path (that would wedge the main loop). If there is no active scene
@@ -6486,6 +8386,10 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         else if (type == "audio") scene->audioComponents[id] = AudioComponent{};
         else if (type == "mission") scene->missionComponents[id] = MissionComponent{};
         else if (type == "dialogue") scene->dialogueComponents[id] = DialogueComponent{};
+        else if (type == "animation") scene->animationComponents[id] = AnimationComponent{};
+        else if (type == "timeline") scene->timelineComponents[id] = TimelineComponent{};
+        else if (type == "ik") scene->ikComponents[id] = IKComponent{};
+        else if (type == "retarget") scene->retargetComponents[id] = RetargetComponent{};
 #if VC_ENABLE_VOXEL_PLUGIN
         else if (type == "voxel") scene->voxelVolumeComponents[id] = VoxelVolumeComponent{};
 #endif
@@ -6573,6 +8477,9 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
             const ImportResult result = m_assetPipeline->import({ cmd.substr(7), cookedRoot, 1 });
             std::cout << "[ControlApi] import -> " << (result ? "ok" : result.error) << std::endl;
         }
+    } else if (cmd.rfind("import-pack ", 0) == 0) {
+        const size_t count = import_texture_pack(std::filesystem::path(cmd.substr(12)));
+        std::cout << "[ControlApi] import-pack -> " << count << " assets imported" << std::endl;
     } else if (cmd.rfind("block-model ", 0) == 0) {
         const UUID texId = UUID::from_string(cmd.substr(12));
         const auto meta = m_assetRegistry.find(texId);
@@ -6586,6 +8493,170 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         const UUID blockId = UUID::from_string(cmd.substr(12));
         spawn_block_entity(blockId, m_editorCamera.position + m_editorCamera.get_front() * 2.0f);
         std::cout << "[ControlApi] spawn-block " << blockId.to_string() << std::endl;
+    } else if (cmd.rfind("spawn-character ", 0) == 0) {
+        const UUID texId = UUID::from_string(cmd.substr(16));
+        const auto meta = m_assetRegistry.find(texId);
+        if (meta && meta->type == AssetType::Texture && is_character_texture(*meta)) {
+            spawn_character_entity(texId, m_editorCamera.position + m_editorCamera.get_front() * 2.0f);
+            std::cout << "[ControlApi] spawn-character " << texId.to_string() << std::endl;
+        } else {
+            std::cout << "[ControlApi] spawn-character: skin texture not found" << std::endl;
+        }
+    } else if (cmd.rfind("layer ", 0) == 0) {
+        // layer {uuid} {name} — sets the entity's layer name.
+        Scene* scene = m_editorScene.get();
+        std::istringstream ss(cmd.substr(6));
+        std::string uuidStr, name;
+        ss >> uuidStr;
+        std::getline(ss, name);
+        while (!name.empty() && (name.front() == ' ')) name.erase(name.begin());
+        if (scene && !uuidStr.empty() && !name.empty()) {
+            const UUID id = UUID::from_string(uuidStr);
+            scene->layerComponents[id].name = name;
+            std::cout << "[ControlApi] layer " << uuidStr << " -> '" << name << "'" << std::endl;
+        }
+    } else if (cmd.rfind("layer-vis ", 0) == 0) {
+        // layer-vis {name} {0|1} — show/hide every entity on that layer.
+        Scene* scene = m_editorScene.get();
+        std::istringstream ss(cmd.substr(10));
+        std::string name;
+        int visible = 1;
+        std::getline(ss, name, '|');
+        ss >> visible;
+        while (!name.empty() && name.back() == ' ') name.pop_back();
+        while (!name.empty() && name.front() == ' ') name.erase(name.begin());
+        if (scene && !name.empty()) {
+            for (auto& [id, lc] : scene->layerComponents) {
+                if (lc.name == name) lc.visible = visible != 0;
+            }
+            std::cout << "[ControlApi] layer-vis '" << name << "' visible=" << visible << std::endl;
+        }
+    } else if (cmd.rfind("decal-add ", 0) == 0) {
+        Scene* scene = m_editorScene.get();
+        std::istringstream ss(cmd.substr(10));
+        std::string uuidStr, texture;
+        ss >> uuidStr;
+        std::getline(ss, texture);
+        while (!texture.empty() && texture.front() == ' ') texture.erase(texture.begin());
+        if (scene && !uuidStr.empty()) {
+            DecalComponent dec;
+            dec.texturePath = texture;
+            scene->decalComponents[UUID::from_string(uuidStr)] = dec;
+            std::cout << "[ControlApi] decal-add " << uuidStr << " texture='" << texture << "'" << std::endl;
+        }
+    } else if (cmd.rfind("hair-add ", 0) == 0) {
+        Scene* scene = m_editorScene.get();
+        const UUID id = UUID::from_string(cmd.substr(9));
+        if (scene && id.is_valid()) {
+            scene->hairParticleComponents[id] = HairParticleComponent{};
+            std::cout << "[ControlApi] hair-add " << id.to_string() << std::endl;
+        }
+    } else if (cmd.rfind("softbody-add ", 0) == 0) {
+        Scene* scene = m_editorScene.get();
+        const UUID id = UUID::from_string(cmd.substr(13));
+        if (scene && id.is_valid()) {
+            scene->softBodyComponents[id] = SoftBodyComponent{};
+            std::cout << "[ControlApi] softbody-add " << id.to_string() << std::endl;
+        }
+    } else if (cmd.rfind("env-add ", 0) == 0) {
+        Scene* scene = m_editorScene.get();
+        const UUID id = UUID::from_string(cmd.substr(8));
+        if (scene && id.is_valid()) {
+            scene->envProbeComponents[id] = EnvProbeComponent{};
+            std::cout << "[ControlApi] env-add " << id.to_string() << std::endl;
+        }
+    } else if (cmd.rfind("env-capture ", 0) == 0) {
+        Scene* scene = m_editorScene.get();
+        const UUID id = UUID::from_string(cmd.substr(12));
+        if (scene && scene->envProbeComponents.contains(id)) {
+            scene->envProbeComponents[id].captureRequested = true;
+            std::cout << "[ControlApi] env-capture " << id.to_string() << std::endl;
+        }
+    } else if (cmd.rfind("paint-add ", 0) == 0) {
+        Scene* scene = m_editorScene.get();
+        const UUID id = UUID::from_string(cmd.substr(10));
+        if (scene && id.is_valid()) {
+            scene->paintComponents[id] = PaintComponent{};
+            std::cout << "[ControlApi] paint-add " << id.to_string() << std::endl;
+        }
+    } else if (cmd.rfind("paint-mode ", 0) == 0) {
+        Scene* scene = m_editorScene.get();
+        std::istringstream ss(cmd.substr(11));
+        std::string uuidStr;
+        int mode = 0;
+        ss >> uuidStr >> mode;
+        const UUID id = UUID::from_string(uuidStr);
+        if (scene && scene->paintComponents.contains(id)) {
+            scene->paintComponents[id].paintMode = mode != 0;
+            std::cout << "[ControlApi] paint-mode " << uuidStr << " " << mode << std::endl;
+        }
+    } else if (cmd.rfind("paint-color ", 0) == 0) {
+        Scene* scene = m_editorScene.get();
+        std::istringstream ss(cmd.substr(12));
+        std::string uuidStr;
+        float r = 1.0f, g = 0.3f, b = 0.22f;
+        ss >> uuidStr >> r >> g >> b;
+        const UUID id = UUID::from_string(uuidStr);
+        if (scene && scene->paintComponents.contains(id)) {
+            scene->paintComponents[id].brushColor = { r, g, b };
+            std::cout << "[ControlApi] paint-color " << uuidStr << " " << r << " " << g << " " << b << std::endl;
+        }
+    } else if (cmd.rfind("video-add ", 0) == 0) {
+        Scene* scene = m_editorScene.get();
+        const UUID id = UUID::from_string(cmd.substr(10));
+        if (scene && id.is_valid()) {
+            scene->videoComponents[id] = VideoComponent{};
+            std::cout << "[ControlApi] video-add " << id.to_string() << std::endl;
+        }
+    } else if (cmd.rfind("video-frame ", 0) == 0) {
+        Scene* scene = m_editorScene.get();
+        std::istringstream ss(cmd.substr(12));
+        std::string uuidStr, name;
+        ss >> uuidStr;
+        std::getline(ss, name);
+        while (!name.empty() && name.front() == ' ') name.erase(name.begin());
+        const UUID id = UUID::from_string(uuidStr);
+        if (scene && scene->videoComponents.contains(id) && !name.empty()) {
+            scene->videoComponents[id].framePaths.push_back(name);
+            std::cout << "[ControlApi] video-frame " << uuidStr << " '" << name << "'" << std::endl;
+        }
+    } else if (cmd.rfind("video-play ", 0) == 0) {
+        Scene* scene = m_editorScene.get();
+        std::istringstream ss(cmd.substr(11));
+        std::string uuidStr;
+        int mode = 1;
+        ss >> uuidStr >> mode;
+        const UUID id = UUID::from_string(uuidStr);
+        if (scene && scene->videoComponents.contains(id)) {
+            scene->videoComponents[id].playing = mode != 0;
+            std::cout << "[ControlApi] video-play " << uuidStr << " " << mode << std::endl;
+        }
+    } else if (cmd.rfind("gaussian-add ", 0) == 0) {
+        Scene* scene = m_editorScene.get();
+        const UUID id = UUID::from_string(cmd.substr(13));
+        if (scene && id.is_valid()) {
+            scene->gaussianSplatComponents[id] = GaussianSplatComponent{};
+            std::cout << "[ControlApi] gaussian-add " << id.to_string() << std::endl;
+        }
+    } else if (cmd.rfind("gaussian-regen ", 0) == 0) {
+        Scene* scene = m_editorScene.get();
+        const UUID id = UUID::from_string(cmd.substr(15));
+        if (scene && scene->gaussianSplatComponents.contains(id)) {
+            scene->gaussianSplatComponents[id].regenerate = true;
+            std::cout << "[ControlApi] gaussian-regen " << id.to_string() << std::endl;
+        }
+    } else if (cmd.rfind("expression-add ", 0) == 0) {
+        Scene* scene = m_editorScene.get();
+        std::istringstream ss(cmd.substr(15));
+        std::string uuidStr, headStr;
+        ss >> uuidStr >> headStr;
+        const UUID id = UUID::from_string(uuidStr);
+        if (scene && id.is_valid()) {
+            ExpressionComponent ex;
+            ex.headEntity = UUID::from_string(headStr);
+            scene->expressionComponents[id] = ex;
+            std::cout << "[ControlApi] expression-add " << uuidStr << " head=" << headStr << std::endl;
+        }
     } else if (cmd.rfind("asset-duplicate ", 0) == 0) {
         const UUID id = UUID::from_string(cmd.substr(16));
         const auto meta = m_assetRegistry.find(id);
@@ -6753,9 +8824,25 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
             std::cout << "[ControlApi] weather applied" << std::endl;
         }
     } else if (cmd.rfind("selftest ", 0) == 0) {
-        const int which = std::stoi(cmd.substr(9));
-        m_lastSelfTestResult = run_editor_self_test(which);
-        std::cout << "[ControlApi] selftest " << which << " -> " << m_lastSelfTestResult << std::endl;
+        // Accept both numeric indices (0-4) and the friendly names
+        // (rendergraph/hdr/material/play/build) so a typo like "material"
+        // never crashes the editor with a std::stoi exception.
+        std::string arg = cmd.substr(9);
+        int which = -1;
+        try {
+            which = std::stoi(arg);
+        } catch (...) {
+            static const char* kTestNames[] = { "rendergraph", "hdr", "material", "play", "build" };
+            for (int i = 0; i < 5; ++i) {
+                if (arg == kTestNames[i]) { which = i; break; }
+            }
+        }
+        if (which < 0 || which >= 5) {
+            std::cout << "[ControlApi] selftest: invalid test '" << arg << "'" << std::endl;
+        } else {
+            m_lastSelfTestResult = run_editor_self_test(which);
+            std::cout << "[ControlApi] selftest " << arg << " -> " << m_lastSelfTestResult << std::endl;
+        }
     } else if (cmd == "package") {
         const std::string result = package_assets_only();
         std::cout << "[ControlApi] package -> " << result << std::endl;
@@ -7105,6 +9192,11 @@ void EditorApplication::update_gizmo_drag(glm::vec2 mouseScreen) {
 // Cooked mesh resources (real imported geometry in the viewport)
 // ===========================================================================
 
+
+
+// ===========================================================================
+// Assets, Materials, Thumbnails, Block/Character (split from EditorApplication.cpp)
+// ===========================================================================
 bool EditorApplication::load_mesh_resource(const UUID& assetId) {
     const auto cached = m_meshResources.find(assetId);
     if (cached != m_meshResources.end()) return cached->second.valid;
@@ -7156,6 +9248,8 @@ bool EditorApplication::load_mesh_resource(const UUID& assetId) {
     }
     resource.vertexCount = static_cast<uint32_t>(verts.size());
     resource.valid = true;
+    resource.cpuPositions.reserve(verts.size());
+    for (const EditorVertex& v : verts) resource.cpuPositions.push_back(v.pos);
 
     const VkDeviceSize vbSize = sizeof(EditorVertex) * verts.size();
     const VkDeviceSize ibSize = indices.empty() ? 0 : sizeof(uint32_t) * indices.size();
@@ -7176,6 +9270,7 @@ bool EditorApplication::load_mesh_resource(const UUID& assetId) {
         std::memcpy(data, indices.data(), static_cast<size_t>(ibSize));
         vkUnmapMemory(m_device, resource.ib.memory);
     }
+    resource.cpuIndices = std::move(indices);
 
     m_meshResources[assetId] = std::move(resource);
     return true;
@@ -7189,6 +9284,15 @@ const EditorApplication::EditorMeshResource* EditorApplication::get_mesh_resourc
     if (const auto blockFound = m_assetRegistry.find(assetId);
         blockFound && blockFound->type == AssetType::Block) {
         ensure_block_cube_resource(assetId);
+        const auto it = m_meshResources.find(assetId);
+        return (it != m_meshResources.end() && it->second.valid) ? &it->second : nullptr;
+    }
+    // Minecraft character/mob skins: the texture IS the character. The
+    // humanoid mesh is generated from the skin's UV layout (64x64 or legacy
+    // 64x32) and cached per texture UUID, same on-demand pattern as blocks.
+    if (const auto skinFound = m_assetRegistry.find(assetId);
+        skinFound && skinFound->type == AssetType::Texture && is_character_texture(*skinFound)) {
+        ensure_character_mesh_resource(assetId);
         const auto it = m_meshResources.find(assetId);
         return (it != m_meshResources.end() && it->second.valid) ? &it->second : nullptr;
     }
@@ -7232,6 +9336,89 @@ void EditorApplication::ensure_block_cube_resource(const UUID& blockId) {
     m_meshResources[blockId] = std::move(cube);
 }
 
+// GPU mesh for a Minecraft-style character: the humanoid (head/body/arms/legs
+// boxes UV-mapped to the standard skin layout) built from skinHeight (64 for
+// 64x64/HD skins, 32 for legacy 64x32) and uploaded on demand.
+void EditorApplication::ensure_character_mesh_resource(const UUID& texId) {
+    const auto cached = m_meshResources.find(texId);
+    if (cached != m_meshResources.end()) {
+        if (cached->second.valid) return;
+        if (cached->second.vb.buffer != VK_NULL_HANDLE) vkDestroyBuffer(m_device, cached->second.vb.buffer, nullptr);
+        if (cached->second.vb.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, cached->second.vb.memory, nullptr);
+        if (cached->second.ib.buffer != VK_NULL_HANDLE) vkDestroyBuffer(m_device, cached->second.ib.buffer, nullptr);
+        if (cached->second.ib.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, cached->second.ib.memory, nullptr);
+        m_meshResources.erase(cached);
+    }
+    float skinHeight = 64.0f;
+    if (const auto meta = m_assetRegistry.find(texId); meta && meta->height > 0) {
+        skinHeight = static_cast<float>(meta->height);
+    }
+    std::vector<EditorVertex> verts;
+    std::vector<uint32_t> indices;
+    build_character_geometry(skinHeight, verts, indices);
+    EditorMeshResource character;
+    character.vertexCount = static_cast<uint32_t>(verts.size());
+    character.ranges.push_back({ 0, static_cast<uint32_t>(indices.size()), 0, true });
+    const VkDeviceSize vbSize = sizeof(EditorVertex) * verts.size();
+    const VkDeviceSize ibSize = sizeof(uint32_t) * indices.size();
+    create_buffer(vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  character.vb.buffer, character.vb.memory);
+    create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  character.ib.buffer, character.ib.memory);
+    void* data = nullptr;
+    vkMapMemory(m_device, character.vb.memory, 0, vbSize, 0, &data);
+    std::memcpy(data, verts.data(), static_cast<size_t>(vbSize));
+    vkUnmapMemory(m_device, character.vb.memory);
+    vkMapMemory(m_device, character.ib.memory, 0, ibSize, 0, &data);
+    std::memcpy(data, indices.data(), static_cast<size_t>(ibSize));
+    vkUnmapMemory(m_device, character.ib.memory);
+    character.valid = true;
+    m_meshResources[texId] = std::move(character);
+}
+
+// A Minecraft character/mob skin becomes a humanoid entity in the scene: the
+// MeshRenderer references the texture asset directly (the renderer builds the
+// humanoid mesh + skin pipeline on demand), so there is no sidecar file and no
+// duplicate asset in the browser.
+void EditorApplication::spawn_character_entity(const UUID& texId, const glm::vec3& position) {
+    if (!m_editorScene) return;
+    const auto meta = m_assetRegistry.find(texId);
+    if (!meta || meta->type != AssetType::Texture) return;
+    Entity e = m_editorScene->create_entity(meta->sourcePath.stem().string());
+    m_editorScene->transformComponents[e.get_id()].position = position;
+    m_editorScene->meshRendererComponents[e.get_id()] =
+        MeshRendererComponent{ texId, UUID{ 0, 0 }, true, true };
+    m_selectedEntity = e;
+    m_editorGui.select_entity(e);
+}
+
+// Shared material-graph pipeline that samples one texture (block faces and
+// character skins both land here). Cached per texture UUID so two blocks that
+// share a texture reuse the same pipeline; rebuilt when the graph hash changes.
+EditorApplication::GraphMaterialPipeline* EditorApplication::ensure_texture_pipeline(
+    const UUID& texId, std::unordered_map<UUID, GraphMaterialPipeline>& cache) {
+    if (!texId.is_valid()) return nullptr;
+    auto it = cache.find(texId);
+    Rendering::MaterialGraph graph;
+    const auto texNode = graph.add_texture_sample("Texture");
+    if (auto* node = graph.find_node(texNode)) node->value = texId.to_string();
+    const auto baseOut = graph.add_output("BaseColor", Rendering::MaterialValueType::Vec3);
+    (void)graph.connect(texNode, baseOut, 0);
+    const uint64_t graphHash = hash_material_graph(graph);
+    if (it == cache.end() || !it->second.valid || it->second.graphHash != graphHash) {
+        if (it != cache.end()) destroy_graph_pipeline(it->second);
+        GraphMaterialPipeline built;
+        built.graphHash = graphHash;
+        if (!build_graph_pipeline(graph, built)) {
+            std::cerr << "[Editor] Texture pipeline: " << built.lastError << std::endl;
+        }
+        it = cache.insert_or_assign(texId, std::move(built)).first;
+    }
+    return it->second.valid ? &it->second : nullptr;
+}
+
 void EditorApplication::spawn_block_entity(const UUID& blockId, const glm::vec3& position) {
     if (!m_editorScene) return;
     const auto meta = m_assetRegistry.find(blockId);
@@ -7245,9 +9432,7 @@ void EditorApplication::spawn_block_entity(const UUID& blockId, const glm::vec3&
         MeshRendererComponent{ blockId, UUID{ 0, 0 }, true, true };
     m_selectedEntity = e;
     m_editorGui.select_entity(e);
-}
-
-void EditorApplication::draw_mesh_resource(VkCommandBuffer cmd, const glm::mat4& mvp, const glm::vec4& color,
+}void EditorApplication::draw_mesh_resource(VkCommandBuffer cmd, const glm::mat4& mvp, const glm::vec4& color,
                                            const EditorMeshResource& resource) {
     if (!resource.valid || resource.vb.buffer == VK_NULL_HANDLE) return;
     const VkDeviceSize offset = 0;
@@ -7433,6 +9618,154 @@ void downscale_half4(const uint8_t* src, uint32_t w, uint32_t h, uint32_t maxDim
 }
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Cooked-texture CPU decode (shared by the viewport material path and the
+// async Content Browser thumbnails). Pure file I/O + WIC decode + box
+// downscale — safe to call from a worker thread.
+// ---------------------------------------------------------------------------
+
+struct DecodedTexturePixels {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t mipCount = 1;
+    bool srgb = false;
+    bool halfFloat = false; // true => rgba holds RGBA16F half-float pairs
+    std::vector<uint8_t> rgba;
+};
+
+bool decode_cooked_texture_pixels(const std::filesystem::path& cookedPath, uint32_t maxDim,
+                                  DecodedTexturePixels& out, std::string& error) {
+    std::ifstream in(cookedPath, std::ios::binary);
+    if (!in) {
+        error = "cannot open cooked texture: " + cookedPath.string();
+        return false;
+    }
+    std::array<char, 5> magic{};
+    in.read(magic.data(), magic.size());
+    uint32_t version = 0, width = 0, height = 0, channels = 0;
+    uint8_t bitDepth = 0; // the importer stores bitDepth as a single byte
+    uint32_t mipCount = 1; // v2 = single level; v3 reads mipCount + flags
+    uint8_t flags = 0;
+    uint64_t payloadSize = 0;
+    in.read(reinterpret_cast<char*>(&version), sizeof(version));
+    in.read(reinterpret_cast<char*>(&width), sizeof(width));
+    in.read(reinterpret_cast<char*>(&height), sizeof(height));
+    in.read(reinterpret_cast<char*>(&channels), sizeof(channels));
+    in.read(reinterpret_cast<char*>(&bitDepth), sizeof(bitDepth));
+    if (version == 2) {
+        mipCount = 1;
+        flags = 0;
+    } else if (version == 3) {
+        in.read(reinterpret_cast<char*>(&mipCount), sizeof(mipCount));
+        in.read(reinterpret_cast<char*>(&flags), sizeof(flags));
+    }
+    in.read(reinterpret_cast<char*>(&payloadSize), sizeof(payloadSize));
+    if (!in || std::string_view(magic.data(), magic.size()) != "VCTEX" ||
+        (version != 2 && version != 3) || width == 0 || height == 0 || mipCount == 0 ||
+        payloadSize == 0 || payloadSize > (1ull << 30)) {
+        error = "invalid or unsupported VCTEX cooked texture (magic=" +
+                std::string(magic.data(), magic.size()) + " version=" + std::to_string(version) +
+                " size=" + std::to_string(width) + "x" + std::to_string(height) +
+                " ch=" + std::to_string(channels) + " mips=" + std::to_string(mipCount) +
+                " payload=" + std::to_string(payloadSize) +
+                " path=" + cookedPath.string() + ")";
+        return false;
+    }
+    std::vector<uint8_t> payload(static_cast<size_t>(payloadSize));
+    in.read(reinterpret_cast<char*>(payload.data()), static_cast<std::streamsize>(payloadSize));
+    if (!in) {
+        error = "truncated VCTEX payload";
+        return false;
+    }
+    out.width = width;
+    out.height = height;
+    out.mipCount = mipCount;
+    out.srgb = (flags & 1u) != 0;
+    const bool isPng = payload.size() >= 8 &&
+                       std::memcmp(payload.data(), "\x89PNG\r\n\x1a\n", 8) == 0;
+    if (isPng) {
+        if (!decode_png_rgba(payload, out.rgba)) {
+            error = "PNG decode failed (WIC)";
+            return false;
+        }
+        // PNG stays a single level (raw payload); srgb is still applied.
+        // Thumbnails: box-downscale before upload so a full-res texture never
+        // gets copied to VRAM just to be shown at 135x48 in the asset grid.
+        out.mipCount = 1;
+        if (maxDim > 0 && (out.width > maxDim || out.height > maxDim)) {
+            std::vector<uint8_t> thumb;
+            downscale_rgba8(out.rgba.data(), out.width, out.height, maxDim, thumb, out.width, out.height);
+            out.rgba = std::move(thumb);
+        }
+        return true;
+    }
+    // TGA/HDR importers store decoded pixels in the payload. Radiance HDR
+    // (bitDepth 32, channels 4) stores RGBA16F half-float pairs (w*h*8 bytes)
+    // and is uploaded as an R16G16B16A16_SFLOAT image; TGA stores 8-bit
+    // RGB/RGBA (w*h*3/4 bytes per level, mip chain when mipCount > 1).
+    if (bitDepth == 32 && channels == 4 &&
+        payload.size() == static_cast<size_t>(width) * height * 8) {
+        out.halfFloat = true;
+        out.mipCount = 1;
+        if (maxDim > 0 && (width > maxDim || height > maxDim)) {
+            uint32_t tw = width, th = height;
+            downscale_half4(payload.data(), width, height, maxDim, out.rgba, tw, th);
+            out.width = tw;
+            out.height = th;
+        } else {
+            out.rgba = std::move(payload);
+        }
+        return true;
+    }
+    uint64_t expectedTotal = 0;
+    for (uint32_t m = 0; m < mipCount; ++m) {
+        const uint32_t mw = std::max(width >> m, 1u);
+        const uint32_t mh = std::max(height >> m, 1u);
+        expectedTotal += static_cast<uint64_t>(mw) * mh * channels;
+    }
+    if (payload.size() != expectedTotal) {
+        error = "unsupported cooked texture payload layout (expected " +
+                std::to_string(expectedTotal) + " bytes, got " + std::to_string(payload.size()) +
+                " mips=" + std::to_string(mipCount) + ")";
+        return false;
+    }
+    out.rgba.reserve(static_cast<size_t>(expectedTotal) / channels * 4);
+    size_t offset = 0;
+    for (uint32_t m = 0; m < mipCount; ++m) {
+        const uint32_t mw = std::max(width >> m, 1u);
+        const uint32_t mh = std::max(height >> m, 1u);
+        const size_t levelBytes = static_cast<size_t>(mw) * mh * channels;
+        const uint8_t* level = payload.data() + offset;
+        if (channels == 4) {
+            out.rgba.insert(out.rgba.end(), level, level + levelBytes);
+        } else if (channels == 3) {
+            for (size_t i = 0; i < levelBytes; i += 3) {
+                out.rgba.push_back(level[i]);
+                out.rgba.push_back(level[i + 1]);
+                out.rgba.push_back(level[i + 2]);
+                out.rgba.push_back(255);
+            }
+        } else {
+            error = "unsupported cooked texture channel count";
+            return false;
+        }
+        offset += levelBytes;
+    }
+    if (maxDim > 0 && (width > maxDim || height > maxDim)) {
+        // Thumbnail: keep only level 0 (mip chain is irrelevant at 192 px) and
+        // box-downscale it before the upload.
+        std::vector<uint8_t> level0(out.rgba.begin(),
+                                    out.rgba.begin() + static_cast<size_t>(width) * height * 4);
+        std::vector<uint8_t> thumb;
+        downscale_rgba8(level0.data(), width, height, maxDim, thumb, width, height);
+        out.rgba = std::move(thumb);
+        out.width = width;
+        out.height = height;
+        out.mipCount = 1;
+    }
+    return true;
+}
+
 void EditorApplication::destroy_graph_texture(GraphTexture& t) {
     if (m_device == VK_NULL_HANDLE) return;
     if (t.view != VK_NULL_HANDLE) vkDestroyImageView(m_device, t.view, nullptr);
@@ -7445,29 +9778,103 @@ void EditorApplication::destroy_graph_texture(GraphTexture& t) {
 // Asset previews (Content Browser)
 // ---------------------------------------------------------------------------
 
-// Lazy GPU thumbnail for a cooked texture: decoded once, cached forever. A
-// texture the pipeline already cooked goes straight to a small ImGui texture
-// (default sampler), so the card shows the real image instead of an icon.
-VkDescriptorSet EditorApplication::get_asset_thumbnail(const AssetMetadata& asset) {
-    const auto found = m_assetThumbnails.find(asset.id);
-    if (found != m_assetThumbnails.end()) return found->second.imguiId;
-    if (m_assetThumbnailFailed.contains(asset.id)) return VK_NULL_HANDLE;
+// Lazy texture thumbnails, on demand: the grid only requests assets whose
+// cards are visible; the decode runs on a worker thread and the main thread
+// uploads one small image per frame (see pump_asset_thumbnail_decodes).
+void EditorApplication::request_asset_thumbnail_decode(const AssetMetadata& asset) {
     if (asset.type != AssetType::Texture || asset.cookedPath.empty()) {
         m_assetThumbnailFailed.insert(asset.id);
-        return VK_NULL_HANDLE;
+        return;
     }
-    GraphTexture gt;
-    std::string error;
-    // Thumbnail size: the grid card is ~135x48, so 192 px is more than enough
-    // and keeps VRAM + upload time flat regardless of source resolution.
-    if (!load_viewport_texture(asset.id, gt, error, 192)) {
-        m_assetThumbnailFailed.insert(asset.id);
-        return VK_NULL_HANDLE;
+    if (m_assetThumbnails.contains(asset.id) || m_assetThumbnailFailed.contains(asset.id)) return;
+    std::lock_guard<std::mutex> lock(m_thumbDecodeMutex);
+    if (m_thumbDecodeRequested.contains(asset.id)) return;
+    // Bound the queue: if the user scrolls very fast, drop the oldest pending
+    // request (it is re-requested when that row scrolls back into view).
+    if (m_thumbDecodeQueue.size() >= 256) m_thumbDecodeQueue.pop_front();
+    m_thumbDecodeRequested.insert(asset.id);
+    m_thumbDecodeQueue.push_back(asset.id);
+}
+
+// Consumes finished decodes on the main thread (one small GPU upload per
+// frame — no multi-second stalls) and starts one worker decode at a time.
+// The queue only ever contains visible assets, so a big folder loads the
+// screenful lazily and the rest stays as placeholders until scrolled into
+// view, exactly like lazy loading in a web UI.
+void EditorApplication::pump_asset_thumbnail_decodes() {
+    PendingThumbDecode ready;
+    bool haveReady = false;
+    {
+        std::lock_guard<std::mutex> lock(m_thumbDecodeMutex);
+        if (m_thumbDecodeReady) {
+            ready = std::move(*m_thumbDecodeReady);
+            m_thumbDecodeReady.reset();
+            haveReady = true;
+        }
     }
-    const VkDescriptorSet imguiId =
-        ImGui_ImplVulkan_AddTexture(gt.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    m_assetThumbnails[asset.id] = AssetThumbnail{ gt.image, gt.memory, gt.view, imguiId };
-    return imguiId;
+    if (haveReady) {
+        if (!ready.rgba.empty()) {
+            GraphTexture gt;
+            std::string error;
+            const bool ok = ready.halfFloat
+                ? upload_texture_half_pixels(ready.width, ready.height, ready.rgba, gt, error)
+                : upload_texture_pixels(ready.width, ready.height, ready.rgba, 1, ready.srgb, gt, error);
+            if (ok) {
+                const VkDescriptorSet imguiId =
+                    ImGui_ImplVulkan_AddTexture(gt.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                m_assetThumbnails[ready.assetId] =
+                    AssetThumbnail{ gt.image, gt.memory, gt.view, imguiId };
+            } else {
+                destroy_graph_texture(gt);
+                m_assetThumbnailFailed.insert(ready.assetId);
+            }
+        } else {
+            // Corrupt/undecodable cooked file: remember so we never retry it.
+            m_assetThumbnailFailed.insert(ready.assetId);
+        }
+        std::lock_guard<std::mutex> lock(m_thumbDecodeMutex);
+        m_thumbDecodeRequested.erase(ready.assetId);
+    }
+    UUID next;
+    {
+        std::lock_guard<std::mutex> lock(m_thumbDecodeMutex);
+        if (m_thumbDecodeBusy.load() || m_thumbDecodeQueue.empty()) return;
+        next = m_thumbDecodeQueue.front();
+        m_thumbDecodeQueue.pop_front();
+        m_thumbDecodeBusy.store(true);
+    }
+    const auto meta = m_assetRegistry.find(next);
+    if (!meta || meta->type != AssetType::Texture || meta->cookedPath.empty()) {
+        m_assetThumbnailFailed.insert(next);
+        {
+            std::lock_guard<std::mutex> lock(m_thumbDecodeMutex);
+            m_thumbDecodeRequested.erase(next);
+            m_thumbDecodeBusy.store(false);
+        }
+        return;
+    }
+    const std::filesystem::path cookedPath = meta->cookedPath;
+    // Join previous worker before launching a new one (cheap: the previous
+    // one already signaled m_thumbDecodeBusy=false by the time we get here).
+    if (m_thumbDecodeThread.joinable()) m_thumbDecodeThread.join();
+    m_thumbDecodeThread = std::thread([this, id = next, cookedPath]() {
+        PendingThumbDecode pending;
+        pending.assetId = id;
+        DecodedTexturePixels px;
+        std::string error;
+        if (decode_cooked_texture_pixels(cookedPath, 192, px, error)) {
+            pending.width = px.width;
+            pending.height = px.height;
+            pending.srgb = px.srgb;
+            pending.halfFloat = px.halfFloat;
+            pending.rgba = std::move(px.rgba);
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_thumbDecodeMutex);
+            m_thumbDecodeReady = std::move(pending);
+        }
+        m_thumbDecodeBusy.store(false);
+    });
 }
 
 // Single active audio preview: clicking ▶ on another asset stops the current
@@ -7581,6 +9988,16 @@ void EditorApplication::init_audio_output() {
     m_audioDeviceStarted = true;
 }
 
+// Join any in-flight worker threads before we tear down Vulkan resources.
+// Called at the very top of cleanup() so no detached thread is accessing
+// member data while we destroy GPU buffers, images, and pipelines.
+void EditorApplication::join_worker_threads() {
+    m_thumbDecodeBusy.store(true);   // prevent new launches
+    m_audioDecodeBusy.store(true);
+    if (m_thumbDecodeThread.joinable()) m_thumbDecodeThread.join();
+    if (m_audioDecodeThread.joinable()) m_audioDecodeThread.join();
+}
+
 void EditorApplication::shutdown_audio_output() {
     if (m_audioDevice != nullptr) {
         delete static_cast<EditorAudioSink*>(m_audioDevice);
@@ -7620,7 +10037,8 @@ void EditorApplication::pump_audio_preview_decodes() {
         const UUID id = m_audioPreviewRequest;
         const auto meta = m_assetRegistry.find(id);
         if (meta && !meta->cookedPath.empty()) {
-            std::thread([this, id, path = meta->cookedPath]() {
+            if (m_audioDecodeThread.joinable()) m_audioDecodeThread.join();
+            m_audioDecodeThread = std::thread([this, id, path = meta->cookedPath]() {
                 const auto decoded = Engine::Audio::OggDecoder::decode_file(path);
                 PendingAudioDecode pending;
                 pending.assetId = id;
@@ -7634,7 +10052,7 @@ void EditorApplication::pump_audio_preview_decodes() {
                     m_audioDecodeReady = std::move(pending);
                 }
                 m_audioDecodeBusy.store(false);
-            }).detach();
+            });
         } else {
             m_audioDecodeBusy.store(false);
             m_audioPreviewRequest = UUID{ 0, 0 };
@@ -7709,6 +10127,13 @@ void EditorApplication::destroy_asset_thumbnails() {
     }
     m_asset3dThumbnails.clear();
     m_assetThumbnailFailed.clear();
+    {
+        std::lock_guard<std::mutex> lock(m_thumbDecodeMutex);
+        m_thumbDecodeQueue.clear();
+        m_thumbDecodeRequested.clear();
+        m_thumbDecodeReady.reset();
+        m_thumbDecodeBusy.store(false);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7716,24 +10141,33 @@ void EditorApplication::destroy_asset_thumbnails() {
 // ---------------------------------------------------------------------------
 
 // Small dedicated offscreen (thumbSize x thumbSize) that reuses the viewport
-// render pass, so any viewport pipeline (scene / block) can render one asset
-// into it. The result becomes an ImGui texture cached in m_asset3dThumbnails.
+// MSAA render pass, so any viewport pipeline (scene / block) can render one
+// asset into it. The result becomes an ImGui texture cached in m_asset3dThumbnails.
 void EditorApplication::init_thumbnail_target() {
     if (m_device == VK_NULL_HANDLE || m_offscreen.renderPass == VK_NULL_HANDLE) return;
     if (m_thumbImage != VK_NULL_HANDLE) return;
     const VkFormat colorFormat = VK_FORMAT_R8G8B8A8_UNORM;
     const VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
+    // Resolve target (1x) — what ImGui shows as the thumbnail.
     create_image(m_thumbSize, m_thumbSize, colorFormat,
                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_thumbImage, m_thumbMemory);
     m_thumbView = create_image_view(m_thumbImage, colorFormat, VK_IMAGE_ASPECT_COLOR_BIT);
-    create_image(m_thumbSize, m_thumbSize, depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_thumbDepthImage, m_thumbDepthMemory);
+    // Multisampled color + depth (same render pass as the viewport).
+    create_image(m_thumbSize, m_thumbSize, colorFormat,
+                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                 m_thumbMsaaImage, m_thumbMsaaMemory, 1, m_viewportSamples);
+    m_thumbMsaaView = create_image_view(m_thumbMsaaImage, colorFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+    create_image(m_thumbSize, m_thumbSize, depthFormat,
+                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                 m_thumbDepthImage, m_thumbDepthMemory, 1, m_viewportSamples);
     m_thumbDepthView = create_image_view(m_thumbDepthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
-    VkImageView attachments[2] = { m_thumbView, m_thumbDepthView };
+    VkImageView attachments[3] = { m_thumbMsaaView, m_thumbDepthView, m_thumbView };
     VkFramebufferCreateInfo fbInfo{ VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
     fbInfo.renderPass = m_offscreen.renderPass;
-    fbInfo.attachmentCount = 2;
+    fbInfo.attachmentCount = 3;
     fbInfo.pAttachments = attachments;
     fbInfo.width = m_thumbSize;
     fbInfo.height = m_thumbSize;
@@ -7744,6 +10178,9 @@ void EditorApplication::init_thumbnail_target() {
 void EditorApplication::destroy_thumbnail_target() {
     if (m_device == VK_NULL_HANDLE) return;
     if (m_thumbFramebuffer != VK_NULL_HANDLE) { vkDestroyFramebuffer(m_device, m_thumbFramebuffer, nullptr); m_thumbFramebuffer = VK_NULL_HANDLE; }
+    if (m_thumbMsaaView != VK_NULL_HANDLE) { vkDestroyImageView(m_device, m_thumbMsaaView, nullptr); m_thumbMsaaView = VK_NULL_HANDLE; }
+    if (m_thumbMsaaImage != VK_NULL_HANDLE) { vkDestroyImage(m_device, m_thumbMsaaImage, nullptr); m_thumbMsaaImage = VK_NULL_HANDLE; }
+    if (m_thumbMsaaMemory != VK_NULL_HANDLE) { vkFreeMemory(m_device, m_thumbMsaaMemory, nullptr); m_thumbMsaaMemory = VK_NULL_HANDLE; }
     if (m_thumbView != VK_NULL_HANDLE) { vkDestroyImageView(m_device, m_thumbView, nullptr); m_thumbView = VK_NULL_HANDLE; }
     if (m_thumbImage != VK_NULL_HANDLE) { vkDestroyImage(m_device, m_thumbImage, nullptr); m_thumbImage = VK_NULL_HANDLE; }
     if (m_thumbMemory != VK_NULL_HANDLE) { vkFreeMemory(m_device, m_thumbMemory, nullptr); m_thumbMemory = VK_NULL_HANDLE; }
@@ -7860,7 +10297,8 @@ void EditorApplication::init_block_cube() {
     raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     raster.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo multisample{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    multisample.rasterizationSamples = m_viewportSamples;
+    multisample.alphaToCoverageEnable = VK_FALSE;
     VkPipelineDepthStencilStateCreateInfo depth{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
     depth.depthTestEnable = VK_TRUE;
     depth.depthWriteEnable = VK_TRUE;
@@ -7979,6 +10417,12 @@ void EditorApplication::pump_asset_thumbnails(int budget) {
             const VkDescriptorSet desc = get_block_descriptor(tex);
             if (desc == VK_NULL_HANDLE) { m_assetThumbnailFailed.insert(id); continue; }
             render_block_thumbnail(id, desc);
+        } else if (meta->type == AssetType::Texture && is_block_texture(*meta)) {
+            // The PNG is the block: its card shows the textured cube instead
+            // of the flat image.
+            const VkDescriptorSet desc = get_block_descriptor(meta->id);
+            if (desc == VK_NULL_HANDLE) { m_assetThumbnailFailed.insert(id); continue; }
+            render_block_thumbnail(id, desc);
         } else {
             m_assetThumbnailFailed.insert(id);
         }
@@ -7989,6 +10433,7 @@ void EditorApplication::pump_asset_thumbnails(int budget) {
 // (neutral material color), framed from its bounds, and caches an ImGui
 // texture. The color image itself stays owned by the thumbnail target.
 void EditorApplication::render_mesh_thumbnail(const UUID& assetId, const EditorMeshResource& mesh) {
+    if (m_scenePipeline == VK_NULL_HANDLE) return;
     const glm::vec3 center = (mesh.boundsMin + mesh.boundsMax) * 0.5f;
     const float radius = std::max(glm::length(mesh.boundsMax - mesh.boundsMin) * 0.5f, 1e-4f);
     const float camDist = radius * 2.6f;
@@ -8013,6 +10458,9 @@ void EditorApplication::render_mesh_thumbnail(const UUID& assetId, const EditorM
     vkCmdSetViewport(cmd, 0, 1, &vp);
     const VkRect2D sc{ { 0, 0 }, { m_thumbSize, m_thumbSize } };
     vkCmdSetScissor(cmd, 0, 1, &sc);
+    // The thumbnail shares the viewport's MSAA render pass, so the scene
+    // pipeline (same samples) renders the mesh into it.
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
     draw_mesh_resource(cmd, proj * view, glm::vec4(0.62f, 0.66f, 0.75f, 1.0f), mesh);
     vkCmdEndRenderPass(cmd);
     transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -8027,8 +10475,11 @@ void EditorApplication::render_mesh_thumbnail(const UUID& assetId, const EditorM
 // PNG face texture (block pipeline).
 void EditorApplication::render_block_thumbnail(const UUID& assetId, VkDescriptorSet textureDesc) {
     if (m_blockPipeline == VK_NULL_HANDLE) return;
+    // Frame the full character: look at its vertical center (the model spans
+    // y 0..2 with the feet at the origin) from a bit further out.
+    const glm::vec3 charCenter(0.0f, 1.0f, 0.0f);
     const glm::mat4 proj = glm::perspective(glm::radians(45.0f), 1.0f, 0.01f, 50.0f);
-    const glm::mat4 view = glm::lookAt(glm::vec3(2.2f, 1.8f, 2.6f), glm::vec3(0.0f), glm::vec3(0, 1, 0));
+    const glm::mat4 view = glm::lookAt(charCenter + glm::vec3(2.6f, 2.2f, 3.0f), charCenter, glm::vec3(0, 1, 0));
     const glm::mat4 mvp = proj * view;
 
     VkCommandBuffer cmd = begin_single_time_commands();
@@ -8071,21 +10522,178 @@ void EditorApplication::render_block_thumbnail(const UUID& assetId, VkDescriptor
 // Minecraft-style block model assets
 // ---------------------------------------------------------------------------
 
+// Minecraft character/mob skins are square POT too (player 64x64, mobs
+// 64x64...), so entity/mob path + filename signals classify them as MODELS.
+// Resource-pack block folders ("/textures/block/", "/blocks/") always win —
+// vanilla names like mob_spawner live there and ARE blocks.
+bool EditorApplication::is_character_texture(const AssetMetadata& meta) const {
+    if (meta.type != AssetType::Texture || meta.sourcePath.empty()) return false;
+    std::string p = meta.sourcePath.generic_string();
+    std::transform(p.begin(), p.end(), p.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    static const char* kSkinPathMarkers[] = {
+        "/entity/", "/entities/", "/mob/", "/mobs/", "/char/", "/chars/",
+        "/character/", "/characters/", "/player/", "/players/", "/actor/",
+        "/actors/", "/humanoid/", "/creature/", "/creatures/", "/monster/",
+        "/monsters/", "/npc/", "/npcs/", "/zombie/", "/villager/", "/village/",
+    };
+    for (const char* marker : kSkinPathMarkers) {
+        if (p.find(marker) != std::string::npos) return true;
+    }
+    std::string stem = meta.sourcePath.stem().string();
+    std::transform(stem.begin(), stem.end(), stem.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    static const char* kSkinNameMarkers[] = {
+        "skin", "char", "player", "npc", "actor", "humanoid", "steve",
+        "alex", "villager", "zombie", "creeper", "skeleton", "enderman",
+        "spider", "chicken", "wolf", "horse", "rabbit", "squid", "slime",
+        "ghast", "blaze", "witch", "wither", "dragon", "guardian",
+        "shulker", "phantom", "drowned", "husk", "stray", "vex",
+        "pillager", "ravager", "panda", "parrot", "turtle", "dolphin",
+        "llama", "salmon", "pufferfish", "hoglin", "piglin", "zoglin",
+        "strider", "trader", "golem", "silverfish", "magma", "sheep",
+        "cow", "pig", "bee", "fox", "bat",
+    };
+    // Word-boundary match: "char_01" is a skin, but "charcoal" (a block) is
+    // not — the marker must sit between non-alphanumeric separators.
+    const auto hasMarker = [](const std::string& s, const char* marker) {
+        const size_t pos = s.find(marker);
+        if (pos == std::string::npos) return false;
+        if (pos > 0 && std::isalnum(static_cast<unsigned char>(s[pos - 1]))) return false;
+        const size_t end = pos + std::strlen(marker);
+        if (end < s.size() && std::isalnum(static_cast<unsigned char>(s[end]))) return false;
+        return true;
+    };
+    for (const char* marker : kSkinNameMarkers) {
+        if (hasMarker(stem, marker)) return true;
+    }
+    return false;
+}
+
 // Heuristic: small square power-of-two textures are the classic Minecraft
-// block face format (16/32/64/128/256). Not a guarantee — just a strong hint
-// that the Content Browser surfaces under "Modelos" with a block badge.
+// block face format (16/32/64/128/256). Character/mob skins are excluded
+// (they are models, not blocks); block folders always win.
 bool EditorApplication::looks_like_block_texture(const AssetMetadata& meta) const {
     if (meta.type != AssetType::Texture || meta.width == 0 || meta.height == 0) return false;
     if (meta.width != meta.height) return false;
     const uint32_t s = meta.width;
     if (s < 8 || s > 256) return false;
-    return (s & (s - 1)) == 0;
+    if ((s & (s - 1)) != 0) return false;
+    std::string p = meta.sourcePath.generic_string();
+    std::transform(p.begin(), p.end(), p.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (p.find("/block/") != std::string::npos || p.find("/blocks/") != std::string::npos ||
+        p.find("/tile/") != std::string::npos) {
+        return true;
+    }
+    if (is_character_texture(meta)) return false;
+    return true;
 }
 
-// Writes a .vblock sidecar (JSON: texture UUID per face; all default to the
-// source texture) and registers it as an AssetType::Block asset.
-void EditorApplication::create_block_asset(const AssetMetadata& textureMeta) {
-    if (!textureMeta.id.is_valid() || textureMeta.type != AssetType::Texture) return;
+// The PNG is the block: a texture counts as a block when it looks like one
+// (square POT 8-256, excluding character/mob skins) or when an existing
+// .vblock sidecar references it (the explicit user mark). The registry scan
+// is cached per texture UUID — it runs once, and sidecars are permanent once
+// created.
+bool EditorApplication::is_block_texture(const AssetMetadata& meta) {
+    if (meta.type != AssetType::Texture || !meta.id.is_valid()) return false;
+    // Explicit "not a block" (user override) wins over everything. The marker
+    // file is stat()'d once per texture UUID (cached), so restarts honor it.
+    if (!m_noblockChecked.contains(meta.id)) {
+        m_noblockChecked.insert(meta.id);
+        if (!meta.sourcePath.empty()) {
+            std::error_code ec;
+            if (std::filesystem::exists(meta.sourcePath.string() + ".noblock", ec)) {
+                m_noblockTextures.insert(meta.id);
+            }
+        }
+    }
+    if (m_noblockTextures.contains(meta.id)) return false;
+    if (looks_like_block_texture(meta)) return true;
+    if (m_blockSidecarChecked.contains(meta.id)) return m_blockTextureSet.contains(meta.id);
+    bool found = false;
+    for (const AssetMetadata& candidate : m_assetRegistry.snapshot()) {
+        if (candidate.type != AssetType::Block) continue;
+        BlockAssetData data;
+        if (load_block_asset(candidate.id, data) &&
+            (data.texture == meta.id || data.top == meta.id ||
+             data.side == meta.id || data.bottom == meta.id)) {
+            found = true;
+            break;
+        }
+    }
+    m_blockSidecarChecked.insert(meta.id);
+    if (found) m_blockTextureSet.insert(meta.id);
+    return found;
+}
+
+// User override: delete the .vblock sidecar (file + registry entry) so a
+// texture that was misclassified as a block (a character/mob skin) becomes a
+// plain texture again. The texture card then shows the flat image and stops
+// spawning cubes.
+void EditorApplication::unmark_block_texture(const AssetMetadata& textureMeta) {
+    if (!textureMeta.id.is_valid()) return;
+    // Remove the .vblock sidecar if one exists (the positive block mark).
+    for (const AssetMetadata& candidate : m_assetRegistry.snapshot()) {
+        if (candidate.type != AssetType::Block) continue;
+        BlockAssetData data;
+        if (!load_block_asset(candidate.id, data)) continue;
+        if (data.texture != textureMeta.id && data.top != textureMeta.id &&
+            data.side != textureMeta.id && data.bottom != textureMeta.id) {
+            continue;
+        }
+        AssetBrowserModel browser(m_assetRegistry);
+        const AssetFileOperationResult removed = browser.delete_asset(candidate.id);
+        if (!removed) {
+            std::cerr << "[ContentBrowser] Could not unmark block: " << removed.error << std::endl;
+        } else {
+            m_blockAssetCache.erase(candidate.id);
+            m_blockAssetFailed.erase(candidate.id);
+            const auto registryPath =
+                std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db";
+            if (!m_assetRegistry.save(registryPath))
+                std::cerr << "[AssetRegistry] Could not persist unmarked block" << std::endl;
+        }
+        break;
+    }
+    // Negative marker: even a heuristic block (e.g. inside a /block/ folder)
+    // stops being one. The file is checked once per texture UUID (cached).
+    if (!textureMeta.sourcePath.empty()) {
+        const std::filesystem::path marker = textureMeta.sourcePath.string() + ".noblock";
+        std::error_code ec;
+        std::ofstream out(marker, std::ios::trunc);
+        out << "noblock\n";
+        out.close();
+    }
+    m_noblockTextures.insert(textureMeta.id);
+    m_blockSidecarChecked.erase(textureMeta.id);
+    m_blockTextureSet.erase(textureMeta.id);
+    std::cout << "[ContentBrowser] Unmarked '" << textureMeta.sourcePath.filename().string()
+              << "' as a block" << std::endl;
+}
+
+// Find-or-create the .vblock sidecar for a texture (JSON: texture UUID per
+// face; all default to the source texture) and register it as AssetType::Block.
+// The PNG itself IS the Minecraft-style block, so a texture that already has a
+// sidecar referencing it is returned as-is instead of duplicating.
+UUID EditorApplication::create_block_asset(const AssetMetadata& textureMeta) {
+    if (!textureMeta.id.is_valid() || textureMeta.type != AssetType::Texture) return UUID{ 0, 0 };
+    // "Marcar como Bloco" also clears a previous "noblock" override.
+    if (m_noblockTextures.erase(textureMeta.id) > 0 && !textureMeta.sourcePath.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(textureMeta.sourcePath.string() + ".noblock", ec);
+    }
+    // Reuse an existing sidecar that already references this texture (repeat
+    // drops/clicks/API calls must not pile up grass_2.vblock, grass_3.vblock…).
+    for (const AssetMetadata& candidate : m_assetRegistry.snapshot()) {
+        if (candidate.type != AssetType::Block) continue;
+        BlockAssetData data;
+        if (load_block_asset(candidate.id, data) &&
+            (data.texture == textureMeta.id || data.top == textureMeta.id ||
+             data.side == textureMeta.id || data.bottom == textureMeta.id)) {
+            return candidate.id;
+        }
+    }
     std::filesystem::path blockPath = textureMeta.sourcePath.parent_path() /
         (textureMeta.sourcePath.stem().string() + ".vblock");
     unsigned suffix = 2;
@@ -8106,7 +10714,7 @@ void EditorApplication::create_block_asset(const AssetMetadata& textureMeta) {
     meta.contentHash = textureMeta.contentHash;
     if (!m_assetRegistry.register_asset(meta)) {
         std::cerr << "[ContentBrowser] Failed to register block asset " << blockPath.string() << std::endl;
-        return;
+        return UUID{ 0, 0 };
     }
     m_blockAssetCache[meta.id] = BlockAssetData{ textureMeta.id, textureMeta.id, textureMeta.id, textureMeta.id };
     m_blockAssetFailed.erase(meta.id);
@@ -8114,6 +10722,7 @@ void EditorApplication::create_block_asset(const AssetMetadata& textureMeta) {
     if (!m_assetRegistry.save(registryPath)) {
         std::cerr << "[AssetRegistry] Could not persist block asset" << std::endl;
     }
+    return meta.id;
 }
 
 // Parses the .vblock sidecar (JSON is simple enough for a targeted string
@@ -8391,125 +11000,12 @@ bool EditorApplication::load_viewport_texture(const UUID& assetId, GraphTexture&
         error = "asset is not a cooked texture";
         return false;
     }
-    std::ifstream in(meta.cookedPath, std::ios::binary);
-    if (!in) {
-        error = "cannot open cooked texture: " + meta.cookedPath.string();
-        return false;
+    DecodedTexturePixels px;
+    if (!decode_cooked_texture_pixels(meta.cookedPath, maxDim, px, error)) return false;
+    if (px.halfFloat) {
+        return upload_texture_half_pixels(px.width, px.height, px.rgba, out, error);
     }
-    std::array<char, 5> magic{};
-    in.read(magic.data(), magic.size());
-    uint32_t version = 0, width = 0, height = 0, channels = 0;
-    uint8_t bitDepth = 0; // the importer stores bitDepth as a single byte
-    uint32_t mipCount = 1; // v2 = single level; v3 reads mipCount + flags
-    uint8_t flags = 0;
-    uint64_t payloadSize = 0;
-    in.read(reinterpret_cast<char*>(&version), sizeof(version));
-    in.read(reinterpret_cast<char*>(&width), sizeof(width));
-    in.read(reinterpret_cast<char*>(&height), sizeof(height));
-    in.read(reinterpret_cast<char*>(&channels), sizeof(channels));
-    in.read(reinterpret_cast<char*>(&bitDepth), sizeof(bitDepth));
-    if (version == 2) {
-        mipCount = 1;
-        flags = 0;
-    } else if (version == 3) {
-        in.read(reinterpret_cast<char*>(&mipCount), sizeof(mipCount));
-        in.read(reinterpret_cast<char*>(&flags), sizeof(flags));
-    }
-    in.read(reinterpret_cast<char*>(&payloadSize), sizeof(payloadSize));
-    if (!in || std::string_view(magic.data(), magic.size()) != "VCTEX" ||
-        (version != 2 && version != 3) || width == 0 || height == 0 || mipCount == 0 ||
-        payloadSize == 0 || payloadSize > (1ull << 30)) {
-        error = "invalid or unsupported VCTEX cooked texture (magic=" +
-                std::string(magic.data(), magic.size()) + " version=" + std::to_string(version) +
-                " size=" + std::to_string(width) + "x" + std::to_string(height) +
-                " ch=" + std::to_string(channels) + " mips=" + std::to_string(mipCount) +
-                " payload=" + std::to_string(payloadSize) +
-                " path=" + meta.cookedPath.string() + " fileSize=" +
-                std::to_string(std::filesystem::file_size(meta.cookedPath)) + ")";
-        return false;
-    }
-    std::vector<uint8_t> payload(static_cast<size_t>(payloadSize));
-    in.read(reinterpret_cast<char*>(payload.data()), static_cast<std::streamsize>(payloadSize));
-    if (!in) {
-        error = "truncated VCTEX payload";
-        return false;
-    }
-    std::vector<uint8_t> rgba;
-    const bool isPng = payload.size() >= 8 &&
-                       std::memcmp(payload.data(), "\x89PNG\r\n\x1a\n", 8) == 0;
-    if (isPng) {
-        if (!decode_png_rgba(payload, rgba)) {
-            error = "PNG decode failed (WIC)";
-            return false;
-        }
-        // PNG stays a single level (raw payload); srgb is still applied.
-        // Thumbnails: box-downscale before upload so a full-res texture never
-        // gets copied to VRAM just to be shown at 135x48 in the asset grid.
-        if (maxDim > 0 && (width > maxDim || height > maxDim)) {
-            std::vector<uint8_t> thumb;
-            downscale_rgba8(rgba.data(), width, height, maxDim, thumb, width, height);
-            rgba = std::move(thumb);
-        }
-        return upload_texture_pixels(width, height, rgba, 1, (flags & 1u) != 0, out, error);
-    }
-    // TGA/HDR importers store decoded pixels in the payload. Radiance HDR
-    // (bitDepth 32, channels 4) stores RGBA16F half-float pairs (w*h*8 bytes)
-    // and is uploaded as an R16G16B16A16_SFLOAT image; TGA stores 8-bit
-    // RGB/RGBA (w*h*3/4 bytes per level, mip chain when mipCount > 1).
-    if (bitDepth == 32 && channels == 4 &&
-        payload.size() == static_cast<size_t>(width) * height * 8) {
-        if (maxDim > 0 && (width > maxDim || height > maxDim)) {
-            std::vector<uint8_t> thumb;
-            uint32_t tw = width, th = height;
-            downscale_half4(payload.data(), width, height, maxDim, thumb, tw, th);
-            return upload_texture_half_pixels(tw, th, thumb, out, error);
-        }
-        return upload_texture_half_pixels(width, height, payload, out, error);
-    }
-    uint64_t expectedTotal = 0;
-    for (uint32_t m = 0; m < mipCount; ++m) {
-        const uint32_t mw = std::max(width >> m, 1u);
-        const uint32_t mh = std::max(height >> m, 1u);
-        expectedTotal += static_cast<uint64_t>(mw) * mh * channels;
-    }
-    if (payload.size() != expectedTotal) {
-        error = "unsupported cooked texture payload layout (expected " +
-                std::to_string(expectedTotal) + " bytes, got " + std::to_string(payload.size()) +
-                " mips=" + std::to_string(mipCount) + ")";
-        return false;
-    }
-    rgba.reserve(static_cast<size_t>(expectedTotal) / channels * 4);
-    size_t offset = 0;
-    for (uint32_t m = 0; m < mipCount; ++m) {
-        const uint32_t mw = std::max(width >> m, 1u);
-        const uint32_t mh = std::max(height >> m, 1u);
-        const size_t levelBytes = static_cast<size_t>(mw) * mh * channels;
-        const uint8_t* level = payload.data() + offset;
-        if (channels == 4) {
-            rgba.insert(rgba.end(), level, level + levelBytes);
-        } else if (channels == 3) {
-            for (size_t i = 0; i < levelBytes; i += 3) {
-                rgba.push_back(level[i]);
-                rgba.push_back(level[i + 1]);
-                rgba.push_back(level[i + 2]);
-                rgba.push_back(255);
-            }
-        } else {
-            error = "unsupported cooked texture channel count";
-            return false;
-        }
-        offset += levelBytes;
-    }
-    if (maxDim > 0 && (width > maxDim || height > maxDim)) {
-        // Thumbnail: keep only level 0 (mip chain is irrelevant at 192 px) and
-        // box-downscale it before the upload.
-        std::vector<uint8_t> level0(rgba.begin(), rgba.begin() + static_cast<size_t>(width) * height * 4);
-        std::vector<uint8_t> thumb;
-        downscale_rgba8(level0.data(), width, height, maxDim, thumb, width, height);
-        rgba = std::move(thumb);
-        mipCount = 1;
-    }
-    return upload_texture_pixels(width, height, rgba, mipCount, (flags & 1u) != 0, out, error);
+    return upload_texture_pixels(px.width, px.height, px.rgba, px.mipCount, px.srgb, out, error);
 }
 
 bool EditorApplication::upload_texture_pixels(uint32_t width, uint32_t height,
@@ -8851,7 +11347,8 @@ bool EditorApplication::build_graph_pipeline(const Rendering::MaterialGraph& gra
 
     // Graphics pipeline: same EditorVertex layout, no culling (glTF winding varies).
     out.pipeline = create_scene_pipeline(m_device, m_offscreen.renderPass, out.layout,
-                                         vertModule, fragModule, false, true, false, true);
+                                         vertModule, fragModule, m_viewportSamples,
+                                         false, true, false, true);
     vkDestroyShaderModule(m_device, vertModule, nullptr);
     vkDestroyShaderModule(m_device, fragModule, nullptr);
     if (out.pipeline == VK_NULL_HANDLE) {
@@ -8891,6 +11388,16 @@ void EditorApplication::destroy_graph_material_pipelines() {
         destroy_graph_pipeline(p);
     }
     m_blockGraphPipelines.clear();
+    for (auto& [id, p] : m_skinGraphPipelines) {
+        (void)id;
+        destroy_graph_pipeline(p);
+    }
+    m_skinGraphPipelines.clear();
+    for (auto& [id, p] : m_videoGraphPipelines) {
+        (void)id;
+        destroy_graph_pipeline(p);
+    }
+    m_videoGraphPipelines.clear();
     destroy_graph_pipeline(m_liveGraphPipeline);
     m_liveGraphHash = 0;
 }
@@ -9007,6 +11514,7 @@ void EditorApplication::destroy_mesh_resources() {
 }
 
 void EditorApplication::cleanup() {
+    join_worker_threads();
     shutdown_audio_output();
     if (m_device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(m_device);
@@ -9041,6 +11549,44 @@ void EditorApplication::cleanup() {
         destroy_buffer(m_terrainVB);
         destroy_buffer(m_terrainIB);
         m_terrainValid = false;
+        // Runtime-wired Wicked-port resources.
+        destroy_buffer(m_envSphereVB);
+        destroy_buffer(m_envSphereIB);
+        destroy_buffer(m_decalVB);
+        destroy_buffer(m_decalIB);
+        for (auto& [id, sim] : m_hairs) { (void)id; destroy_buffer(sim.vb); }
+        m_hairs.clear();
+        for (auto& [id, sim] : m_softBodies) { (void)id; destroy_buffer(sim.vb); destroy_buffer(sim.ib); }
+        m_softBodies.clear();
+        for (auto& [id, cloud] : m_splatClouds) { (void)id; destroy_buffer(cloud.vb); }
+        m_splatClouds.clear();
+        for (auto& [id, pb] : m_paintBuffers) { (void)id; destroy_buffer(pb.vb); }
+        m_paintBuffers.clear();
+        if (m_envCapture.valid) {
+            for (int i = 0; i < 6; ++i) {
+                if (m_envCapture.framebuffers[i]) vkDestroyFramebuffer(m_device, m_envCapture.framebuffers[i], nullptr);
+                if (m_envCapture.views[i]) vkDestroyImageView(m_device, m_envCapture.views[i], nullptr);
+            }
+            if (m_envCapture.image) vkDestroyImage(m_device, m_envCapture.image, nullptr);
+            if (m_envCapture.memory) vkFreeMemory(m_device, m_envCapture.memory, nullptr);
+            if (m_envCapture.renderPass) vkDestroyRenderPass(m_device, m_envCapture.renderPass, nullptr);
+            if (m_envCapture.sampler) vkDestroySampler(m_device, m_envCapture.sampler, nullptr);
+        }
+        if (m_envCubeView) vkDestroyImageView(m_device, m_envCubeView, nullptr);
+        if (m_envDepthView) vkDestroyImageView(m_device, m_envDepthView, nullptr);
+        if (m_envDepthImage) vkDestroyImage(m_device, m_envDepthImage, nullptr);
+        if (m_envDepthMemory) vkFreeMemory(m_device, m_envDepthMemory, nullptr);
+        if (m_envSphereDescLayout) vkDestroyDescriptorSetLayout(m_device, m_envSphereDescLayout, nullptr);
+        if (m_envSphereDescPool) vkDestroyDescriptorPool(m_device, m_envSphereDescPool, nullptr);
+        if (m_envSpherePipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_device, m_envSpherePipeline, nullptr);
+        if (m_envSpherePipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_device, m_envSpherePipelineLayout, nullptr);
+        if (m_envSphereFragShader != VK_NULL_HANDLE) vkDestroyShaderModule(m_device, m_envSphereFragShader, nullptr);
+        if (m_envSphereVertShader != VK_NULL_HANDLE) vkDestroyShaderModule(m_device, m_envSphereVertShader, nullptr);
+        if (m_splatPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_device, m_splatPipeline, nullptr);
+        if (m_splatPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(m_device, m_splatPipelineLayout, nullptr);
+        if (m_splatFragShader != VK_NULL_HANDLE) vkDestroyShaderModule(m_device, m_splatFragShader, nullptr);
+        if (m_splatVertShader != VK_NULL_HANDLE) vkDestroyShaderModule(m_device, m_splatVertShader, nullptr);
+        if (m_hairPipeline != VK_NULL_HANDLE) vkDestroyPipeline(m_device, m_hairPipeline, nullptr);
 
         if (m_pickPipeline != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_pickPipeline, nullptr); m_pickPipeline = VK_NULL_HANDLE; }
         if (m_gizmoPipeline != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_gizmoPipeline, nullptr); m_gizmoPipeline = VK_NULL_HANDLE; }
@@ -9232,7 +11778,7 @@ void EditorApplication::save_current_scene() {
 void EditorApplication::save_scene_as() {
     if (!m_editorScene) return;
     std::string path;
-    if (!pick_save_file_dialog(path, L"Cenas Vulkan Engine (*.scene)\0*.scene\0Todos (*.*)\0*.*\0",
+    if (!pick_save_file_dialog(path, L"Cenas VulkanCraft (*.scene)\0*.scene\0Todos (*.*)\0*.*\0",
                                L"Salvar Cena Como", L"scene")) {
         return;
     }

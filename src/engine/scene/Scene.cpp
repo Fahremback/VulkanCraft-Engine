@@ -54,6 +54,15 @@ Scene::Scene(Scene&& other) noexcept
       envProbeComponents(std::move(other.envProbeComponents)),
       weatherComponents(std::move(other.weatherComponents)),
       hairParticleComponents(std::move(other.hairParticleComponents)),
+      layerComponents(std::move(other.layerComponents)),
+      paintComponents(std::move(other.paintComponents)),
+      videoComponents(std::move(other.videoComponents)),
+      gaussianSplatComponents(std::move(other.gaussianSplatComponents)),
+      expressionComponents(std::move(other.expressionComponents)),
+      animationComponents(std::move(other.animationComponents)),
+      timelineComponents(std::move(other.timelineComponents)),
+      ikComponents(std::move(other.ikComponents)),
+      retargetComponents(std::move(other.retargetComponents)),
       m_genericComponents(std::move(other.m_genericComponents)) {
     rebind_entities();
 }
@@ -90,6 +99,15 @@ Scene& Scene::operator=(Scene&& other) noexcept {
     envProbeComponents     = std::move(other.envProbeComponents);
     weatherComponents      = std::move(other.weatherComponents);
     hairParticleComponents = std::move(other.hairParticleComponents);
+    layerComponents        = std::move(other.layerComponents);
+    paintComponents        = std::move(other.paintComponents);
+    videoComponents        = std::move(other.videoComponents);
+    gaussianSplatComponents= std::move(other.gaussianSplatComponents);
+    expressionComponents   = std::move(other.expressionComponents);
+    animationComponents    = std::move(other.animationComponents);
+    timelineComponents     = std::move(other.timelineComponents);
+    ikComponents           = std::move(other.ikComponents);
+    retargetComponents     = std::move(other.retargetComponents);
     m_genericComponents    = std::move(other.m_genericComponents);
     rebind_entities();
     return *this;
@@ -143,6 +161,10 @@ void Scene::destroy_entity(UUID id) {
     materialComponents.erase(id);
     hierarchyComponents.erase(id);
     voxelVolumeComponents.erase(id);
+    animationComponents.erase(id);
+    timelineComponents.erase(id);
+    ikComponents.erase(id);
+    retargetComponents.erase(id);
 
     // Remove all generic components for this entity
     clear_generic_components(id);
@@ -262,6 +284,15 @@ Scene Scene::clone_for_play() const {
     clone.envProbeComponents     = envProbeComponents;
     clone.weatherComponents      = weatherComponents;
     clone.hairParticleComponents = hairParticleComponents;
+    clone.layerComponents        = layerComponents;
+    clone.paintComponents        = paintComponents;
+    clone.videoComponents        = videoComponents;
+    clone.gaussianSplatComponents= gaussianSplatComponents;
+    clone.expressionComponents   = expressionComponents;
+    clone.animationComponents    = animationComponents;
+    clone.timelineComponents     = timelineComponents;
+    clone.ikComponents           = ikComponents;
+    clone.retargetComponents     = retargetComponents;
 
     // Clone generic component stores
     for (const auto& [typeId, entityMap] : m_genericComponents) {

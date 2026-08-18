@@ -39,6 +39,23 @@ Os schemas exportados (draft-07) são o artefato para editor/IDE (intellisense),
 
 ## Ferramentas
 
+### Controle do editor ao vivo (Control API, 48 ferramentas)
+
+Todas as funcionalidades interativas do editor rodando (o mesmo conjunto da Control API HTTP em `127.0.0.1:8321`) estão expostas como ferramentas MCP tipadas — o agente pode **dirigir o editor aberto** em vez de só escrever arquivos:
+
+- **Estado**: `editor_status` (JSON ao vivo de `/state` + `/health`).
+- **Play/Simulação**: `editor_play`, `editor_pause`, `editor_resume`, `editor_step` (PASSO de 1 frame), `editor_stop`, `editor_simulate`.
+- **Câmera**: `editor_camera_zoom`, `editor_camera_move`, `editor_camera_turn`, `editor_camera_focus`.
+- **Cena**: `editor_new_scene`, `editor_open_scene`, `editor_save_scene`, `editor_add_entity` (16 tipos), `editor_select_entity`, `editor_delete_entity`, `editor_rename_entity`, `editor_set_transform`, `editor_add_component` (15 tipos).
+- **Gizmos**: `editor_set_gizmo`, `editor_set_gizmo_space`, `editor_set_snap`.
+- **Assets**: `editor_import_asset`, `editor_create_block_model`, `editor_spawn_block`, `editor_duplicate_asset`, `editor_delete_asset`, `editor_reimport_asset`.
+- **Voxel**: `editor_voxel_generate`, `editor_voxel_paint`, `editor_voxel_clear`.
+- **Scripts**: `editor_script_event`, `editor_script_pause`, `editor_script_continue`, `editor_script_step`.
+- **Janelas/Editores/Tema/Clima**: `editor_toggle_window` (42 janelas), `editor_open_specialized_editor` (16 abas), `editor_set_theme`, `editor_set_weather`.
+- **Terreno/Gráficas/Projeto/Malha/Dev**: `editor_generate_terrain`, `editor_set_graphics`, `editor_save_settings`, `editor_create_project`, `editor_apply_mesh`, `editor_run_self_test` (5 testes, timeout 120s), `editor_package_assets`, `editor_hot_reload`.
+
+Cada resultado devolve `endpoint` e `command` para o agente repetir via curl e manter trilha. Se o editor não estiver aberto, as ferramentas respondem com erro claro: *"start VulkanEngineEditor first"* — nunca travam.
+
 ### Criação de jogos sem alterar a engine
 
 - `game_capabilities`: contrato de recursos, componentes e scripts suportados.

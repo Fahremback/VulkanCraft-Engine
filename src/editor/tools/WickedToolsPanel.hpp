@@ -19,6 +19,7 @@
 #include <string>
 #include <memory>
 #include <functional>
+#include <unordered_map>
 
 #include <glm/glm.hpp>
 #include "../engine/scene/Scene.hpp"
@@ -249,6 +250,9 @@ private:
     glm::vec3 m_paintColor{ 1.0f, 1.0f, 1.0f };
     bool m_meshDoubleSided{ false };
     bool m_videoLoop{ true };
+    // Armature: rest poses captured by the panel (session-scoped).
+    std::unordered_map<UUID, TransformComponent> m_boneRestPose;
+    void create_humanoid_rig(UUID parentId);
     glm::vec3 m_themeBg{ 0.10f, 0.11f, 0.14f };
     glm::vec3 m_themePanel{ 0.20f, 0.20f, 0.20f };
     bool m_gfxVSync{ true };

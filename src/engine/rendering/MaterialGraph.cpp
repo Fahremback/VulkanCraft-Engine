@@ -224,8 +224,14 @@ MaterialCompileResult MaterialGraph::compile() const {
         bool valid = true;
         for (const auto& input : node.inputs) {
             if (input.source == InvalidMaterialNode) {
-                if (input.required) result.errors.push_back({node.id, "Required input '" + input.name + "' is not connected"});
-                valid = false;
+                // Optional inputs (e.g. TextureSample's Texture/UV, which the
+                // editor binds via the node value + mesh UVs) stay unconnected
+                // by design: they must NOT invalidate the node. Only required
+                // inputs are hard errors.
+                if (input.required) {
+                    result.errors.push_back({node.id, "Required input '" + input.name + "' is not connected"});
+                    valid = false;
+                }
                 continue;
             }
             const auto sourceIt = byId.find(input.source);

@@ -269,11 +269,13 @@ struct SpringComponent {
     bool enabled{ true };
 };
 
-// Projected texture authored in the Decal panel. Runtime integration:
-// TODO(frontend-port) — decal pass in the deferred/forward renderer.
+// Projected texture authored in the Decal panel. The editor renders the decal
+// as a textured quad at the entity's transform (depth-tested, tinted by
+// color); the texture comes from the asset registry by file name.
 struct DecalComponent {
     std::string texturePath;
     glm::vec3 color{ 1.0f, 1.0f, 1.0f };
+    glm::vec2 size{ 2.0f, 2.0f };
     float slopeBlendPower{ 1.0f };
     bool projectOnStatic{ true };
     bool onlyAlpha{ false };
@@ -302,12 +304,14 @@ struct ForceFieldComponent {
     bool enabled{ true };
 };
 
-// Reflection probe authored in the Env Probe panel. Runtime integration:
-// TODO(frontend-port) — cubemap capture pass in the renderer.
+// Reflection probe authored in the Env Probe panel. The editor captures the
+// scene 6 faces from the probe position into a cubemap (on demand, or
+// periodically when realTime) and previews it on a reflective sphere.
 struct EnvProbeComponent {
     bool realTime{ false };
     float viewDistance{ 100.0f };
     uint32_t resolution{ 256 };
+    bool captureRequested{ false };  // one-shot capture (button/API)
     bool enabled{ true };
 };
 
@@ -326,8 +330,8 @@ struct WeatherComponent {
     bool enabled{ true };
 };
 
-// Hair/strand system authored in the Hair panel. Runtime integration:
-// TODO(frontend-port) — strand rendering in the renderer.
+// Hair/strand system authored in the Hair panel. The editor simulates the
+// strands (verlet: stiffness/drag/gravity) and renders them as line strips.
 struct HairParticleComponent {
     std::string meshPath;
     uint32_t count{ 1000 };
@@ -339,6 +343,80 @@ struct HairParticleComponent {
     float randomness{ 0.2f };
     uint32_t segments{ 8 };
     uint32_t seed{ 0 };
+    glm::vec3 color{ 0.95f, 0.88f, 0.78f };
+    bool enabled{ true };
+};
+
+// ---------------------------------------------------------------------------
+// Runtime-wired component set (added by the frontend port): each of these
+// used to be a TODO(frontend-port) and now has REAL runtime behaviour:
+//   - Layer: per-entity named layer; the editor/play world skip rendering,
+//     physics and picking of hidden/locked layers.
+//   - Paint: per-vertex colors painted on a mesh in the viewport.
+//   - Video: flipbook playback (image sequence as a dynamic texture).
+//   - GaussianSplat: point-splat cloud rendered with a soft gaussian falloff.
+// ---------------------------------------------------------------------------
+
+// Named layer authored in the Layers panel. Entities on a hidden layer are
+// not rendered (and not simulated in play); locked layers can't be selected.
+struct LayerComponent {
+    std::string name{ "Default" };
+    int index{ 0 };
+    bool visible{ true };
+    bool locked{ false };
+    bool enabled{ true };
+};
+
+// Vertex painting authored with the Paint tool in the viewport. vertexColors
+// is parallel to the painted mesh's vertex buffer (colors written only for
+// vertices within brushSize of the paint stroke, blended by opacity).
+struct PaintComponent {
+    glm::vec3 brushColor{ 1.0f, 0.30f, 0.22f };
+    float brushSize{ 0.5f };
+    float opacity{ 1.0f };
+    bool paintMode{ false };
+    std::vector<glm::vec4> vertexColors;   // empty = unpainted
+    bool enabled{ true };
+};
+
+// Flipbook video authored in the Video panel. framePaths are texture asset
+// names in the registry; the runtime advances currentFrame at fps and the
+// mesh draws the current frame's texture (cached per frame, downscaled).
+struct VideoComponent {
+    std::vector<std::string> framePaths;
+    float fps{ 24.0f };
+    int currentFrame{ 0 };
+    float time{ 0.0f };
+    bool playing{ true };
+    bool loop{ true };
+    bool enabled{ true };
+};
+
+// Gaussian splat cloud authored in the Gaussian Splat panel. The runtime
+// generates `count` deterministic splats (seed) inside a `scale` box and
+// renders them as soft gaussian points.
+struct GaussianSplatComponent {
+    uint32_t count{ 8000 };
+    float scale{ 3.0f };
+    float pointSize{ 6.0f };
+    float opacity{ 0.6f };
+    uint32_t seed{ 1 };
+    bool regenerate{ false };
+    bool enabled{ true };
+};
+
+// Facial expression weights authored in the Expressions panel. The runtime
+// applies each expression as a visible squash/stretch of the head entity
+// (relative to its authored base scale), so authoring has a REAL effect in
+// the editor and in play mode.
+struct ExpressionComponent {
+    UUID headEntity{ 0, 0 };
+    glm::vec3 baseScale{ 1.0f, 1.0f, 1.0f };
+    float smile{ 0.0f };
+    float frown{ 0.0f };
+    float blink{ 0.0f };
+    float surprised{ 0.0f };
+    float anger{ 0.0f };
     bool enabled{ true };
 };
 
@@ -378,6 +456,84 @@ REFLECT_BEGIN(MaterialComponent)
     REFLECT_FIELD(emissiveColor, FieldType::Color, "Emissive Color")
     REFLECT_FIELD_RANGE(emissiveIntensity, FieldType::Float, "Emissive Intensity", 0.0f, 10000.0f)
 REFLECT_END(MaterialComponent)
+
+// ---------------------------------------------------------------------------
+// Animation stack (Playback: Timeline / Animation state machine / IK /
+// Retarget). These are the Apply targets of the four specialized editors
+// (Animation / Timeline / IK / Retarget). All four have REAL runtime effects
+// in Play mode: Timeline animates entity transforms, IK resolves an entity
+// chain toward a target, the state machine plays AnimationClip assets over an
+// entity-chain skeleton, and Retarget remaps bones during playback.
+// ---------------------------------------------------------------------------
+
+// Animation state machine authored in the Animation editor: states reference
+// AnimationClip assets (UUID) and transitions switch between them.
+struct AnimationStateDef {
+    std::string id;
+    UUID clip{ 0, 0 };
+    bool loop{ true };
+    float speed{ 1.0f };
+};
+struct AnimationTransitionDef {
+    std::string from;
+    std::string to;
+    std::string condition;   // "speed > 0" style expression (informational today)
+    float blendSeconds{ 0.2f };
+};
+struct AnimationComponent {
+    std::string entryState;
+    std::vector<AnimationStateDef> states;
+    std::vector<AnimationTransitionDef> transitions;
+    bool playing{ true };
+};
+
+// Timeline authored in the Timeline editor. Property tracks animate the
+// entity's transform in Play mode; key value formats: "x y z" (position),
+// "rx ry rz" (rotation degrees), "sx sy sz" (scale). Other track types
+// (Audio/Event/Camera/Animation) are stored for authoring but not simulated.
+struct TimelineKeyDef { float time{ 0.0f }; std::string value; };
+struct TimelineTrackDef {
+    std::string name;
+    uint8_t type{ 0 }; // 0 Animation, 1 Audio, 2 Event, 3 Camera, 4 Property
+    bool muted{ false };
+    std::vector<TimelineKeyDef> keys;
+};
+struct TimelineComponent {
+    float duration{ 1.0f };
+    float playhead{ 0.0f };
+    bool loop{ false };
+    std::vector<TimelineTrackDef> tracks;
+};
+
+// Two-bone IK chain authored in the IK editor. In Play mode the chain
+// root -> mid -> end (scene entities) bends so the end entity reaches the
+// target entity's position (weight-blended).
+struct IKComponent {
+    UUID rootEntity{ 0, 0 };
+    UUID midEntity{ 0, 0 };
+    UUID endEntity{ 0, 0 };
+    UUID targetEntity{ 0, 0 };
+    glm::vec3 poleVector{ 0.0f, 1.0f, 0.0f };
+    float weight{ 1.0f };
+    int iterations{ 8 };
+    bool enabled{ true };
+};
+
+// Retarget mapping authored in the Retarget editor. During animation playback
+// the sampled pose of mapped source bones is scaled/offset before being
+// written to the target bone (entity name).
+struct RetargetBoneMapDef {
+    std::string sourceBone;
+    std::string targetBone;
+    float translationScale{ 1.0f };
+    glm::vec3 rotationOffset{ 0.0f };
+};
+struct RetargetComponent {
+    UUID sourceSkeleton{ 0, 0 };
+    UUID targetSkeleton{ 0, 0 };
+    std::vector<RetargetBoneMapDef> mapping;
+    bool preserveRootMotion{ true };
+};
 
 inline void register_builtin_component_reflection() {
     static std::once_flag registered;

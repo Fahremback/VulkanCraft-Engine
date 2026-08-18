@@ -27,7 +27,7 @@ export const ENTITY_TYPES = Object.freeze([
 export const COMPONENT_TYPES = Object.freeze([
   "light", "camera", "mesh", "material", "rigidbody", "weapon", "vehicle",
   "ragdoll", "destructible", "navigation", "particle", "audio", "mission",
-  "dialogue", "voxel"
+  "dialogue", "voxel", "animation", "timeline", "ik", "retarget"
 ]);
 
 export const GIZMO_MODES = Object.freeze(["select", "move", "rotate", "scale"]);
@@ -357,7 +357,7 @@ export function controlApiToolDefinitions() {
         required: ["uuid", "type"],
         properties: {
           uuid: { type: "string" },
-          type: { type: "string", enum: COMPONENT_TYPES, description: "light, camera, mesh, material, rigidbody, weapon, vehicle, ragdoll, destructible, navigation, particle, audio, mission, dialogue, voxel" }
+          type: { type: "string", enum: COMPONENT_TYPES, description: "light, camera, mesh, material, rigidbody, weapon, vehicle, ragdoll, destructible, navigation, particle, audio, mission, dialogue, voxel, animation, timeline, ik, retarget" }
         },
         additionalProperties: false
       }
@@ -403,6 +403,16 @@ export function controlApiToolDefinitions() {
       }
     },
     {
+      name: "editor_import_pack",
+      description: "Batch-import a folder of textures/meshes/audio (Minecraft texture packs, asset bundles). All compatible files are cooked and registered; square POT textures auto-create block models.",
+      inputSchema: {
+        type: "object",
+        required: ["path"],
+        properties: { path: { type: "string", description: "Absolute path to the texture pack folder" } },
+        additionalProperties: false
+      }
+    },
+    {
       name: "editor_create_block_model",
       description: "Create a Minecraft-style block model asset (.vblock) from a square POT texture (8-256px) by texture UUID.",
       inputSchema: {
@@ -419,6 +429,202 @@ export function controlApiToolDefinitions() {
         type: "object",
         required: ["block_uuid"],
         properties: { block_uuid: { type: "string", description: "UUID of the block asset (.vblock)" } },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_spawn_character",
+      description: "Spawn a Minecraft-style character humanoid in the scene, in front of the camera, from a character/mob skin texture UUID (the PNG itself is the character — no sidecar file).",
+      inputSchema: {
+        type: "object",
+        required: ["texture_uuid"],
+        properties: { texture_uuid: { type: "string", description: "UUID of the skin texture asset (classified as character/mob)" } },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_layer_set",
+      description: "Set the named layer of an entity. Entities on a hidden layer are not rendered/simulated; locked layers can't be selected.",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid", "name"],
+        properties: {
+          entity_uuid: { type: "string" },
+          name: { type: "string", description: "Layer name (grouping key)" }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_layer_visibility",
+      description: "Show or hide every entity on a named layer (0/1).",
+      inputSchema: {
+        type: "object",
+        required: ["name", "visible"],
+        properties: {
+          name: { type: "string" },
+          visible: { type: "boolean", description: "true = show, false = hide" }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_decal_add",
+      description: "Add a Decal component to an entity, rendering a textured quad at its transform.",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid"],
+        properties: {
+          entity_uuid: { type: "string" },
+          texture: { type: "string", description: "Texture asset file name (registry)" }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_hair_add",
+      description: "Add a Hair component to an entity (verlet strands rendered as lines).",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid"],
+        properties: { entity_uuid: { type: "string" } },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_softbody_add",
+      description: "Add a Soft Body (cloth) component to an entity (verlet cloth mesh).",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid"],
+        properties: { entity_uuid: { type: "string" } },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_envprobe_add",
+      description: "Add an Environment Probe to an entity (cubemap capture + reflective sphere).",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid"],
+        properties: { entity_uuid: { type: "string" } },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_envprobe_capture",
+      description: "Capture the cubemap of an existing environment probe now.",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid"],
+        properties: { entity_uuid: { type: "string" } },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_paint_add",
+      description: "Add a Paint component to an entity (vertex painting in the viewport).",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid"],
+        properties: { entity_uuid: { type: "string" } },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_paint_mode",
+      description: "Enable/disable the paint tool for an entity (1 = hold-click paints the mesh in the viewport).",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid", "enabled"],
+        properties: {
+          entity_uuid: { type: "string" },
+          enabled: { type: "boolean" }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_paint_color",
+      description: "Set the paint brush color for an entity (r g b in 0..1).",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid"],
+        properties: {
+          entity_uuid: { type: "string" },
+          r: { type: "number", default: 1 },
+          g: { type: "number", default: 0.3 },
+          b: { type: "number", default: 0.22 }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_video_add",
+      description: "Add a Video (flipbook) component to an entity.",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid"],
+        properties: { entity_uuid: { type: "string" } },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_video_add_frame",
+      description: "Append a frame (texture asset file name) to an entity's video flipbook.",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid", "texture_name"],
+        properties: {
+          entity_uuid: { type: "string" },
+          texture_name: { type: "string", description: "Texture asset file name (registry)" }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_video_play",
+      description: "Play (true) or pause (false) an entity's video flipbook.",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid", "playing"],
+        properties: {
+          entity_uuid: { type: "string" },
+          playing: { type: "boolean" }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_gaussian_add",
+      description: "Add a Gaussian Splat cloud to an entity (soft point splats).",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid"],
+        properties: { entity_uuid: { type: "string" } },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_gaussian_regenerate",
+      description: "Regenerate an entity's gaussian splat cloud (applies count/scale/seed).",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid"],
+        properties: { entity_uuid: { type: "string" } },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_expression_add",
+      description: "Add facial Expressions to an entity targeting a head entity (squash/stretch in editor and play).",
+      inputSchema: {
+        type: "object",
+        required: ["entity_uuid"],
+        properties: {
+          entity_uuid: { type: "string" },
+          head_uuid: { type: "string", description: "Head entity UUID" }
+        },
         additionalProperties: false
       }
     },
@@ -754,6 +960,10 @@ export async function callControlApiTool(name, args = {}) {
       const p = requireText(args.path, "path");
       return callEditor(name, `/import?path=${queryEscape(p)}`);
     }
+    case "editor_import_pack": {
+      const p = requireText(args.path, "path");
+      return callEditor(name, `/import-pack?path=${queryEscape(p)}`);
+    }
     case "editor_create_block_model": {
       const uuid = requireUuid(args.texture_uuid, "texture_uuid");
       return callEditor(name, `/block-model/${uuid}`);
@@ -761,6 +971,85 @@ export async function callControlApiTool(name, args = {}) {
     case "editor_spawn_block": {
       const uuid = requireUuid(args.block_uuid, "block_uuid");
       return callEditor(name, `/spawn-block/${uuid}`);
+    }
+    case "editor_spawn_character": {
+      const uuid = requireUuid(args.texture_uuid, "texture_uuid");
+      return callEditor(name, `/spawn-character/${uuid}`);
+    }
+    // ---- Runtime-wired Wicked-port features --------------------------------
+    case "editor_layer_set": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      const name = requireText(args.name, "name");
+      return callEditor(name, `/layer/${uuid}/${queryEscape(name)}`);
+    }
+    case "editor_layer_visibility": {
+      const name = requireText(args.name, "name");
+      const visible = args.visible ? 1 : 0;
+      return callEditor(name, `/layer-vis?name=${queryEscape(name)}&visible=${visible}`);
+    }
+    case "editor_decal_add": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      const texture = args.texture ? queryEscape(String(args.texture)) : "";
+      return callEditor(name, `/decal-add/${uuid}?texture=${texture}`);
+    }
+    case "editor_hair_add": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      return callEditor(name, `/hair-add/${uuid}`);
+    }
+    case "editor_softbody_add": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      return callEditor(name, `/softbody-add/${uuid}`);
+    }
+    case "editor_envprobe_add": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      return callEditor(name, `/env-add/${uuid}`);
+    }
+    case "editor_envprobe_capture": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      return callEditor(name, `/env-capture/${uuid}`);
+    }
+    case "editor_paint_add": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      return callEditor(name, `/paint-add/${uuid}`);
+    }
+    case "editor_paint_mode": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      const mode = args.enabled ? 1 : 0;
+      return callEditor(name, `/paint-mode/${uuid}/${mode}`);
+    }
+    case "editor_paint_color": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      const r = pickNumber(args.r, 1, { min: 0, max: 1 });
+      const g = pickNumber(args.g, 0.3, { min: 0, max: 1 });
+      const b = pickNumber(args.b, 0.22, { min: 0, max: 1 });
+      return callEditor(name, `/paint-color/${uuid}/${r}/${g}/${b}`);
+    }
+    case "editor_video_add": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      return callEditor(name, `/video-add/${uuid}`);
+    }
+    case "editor_video_add_frame": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      const textureName = requireText(args.texture_name, "texture_name");
+      return callEditor(name, `/video-frame/${uuid}?name=${queryEscape(textureName)}`);
+    }
+    case "editor_video_play": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      const mode = args.playing ? 1 : 0;
+      return callEditor(name, `/video-play/${uuid}/${mode}`);
+    }
+    case "editor_gaussian_add": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      return callEditor(name, `/gaussian-add/${uuid}`);
+    }
+    case "editor_gaussian_regenerate": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      return callEditor(name, `/gaussian-regen/${uuid}`);
+    }
+    case "editor_expression_add": {
+      const uuid = requireUuid(args.entity_uuid, "entity_uuid");
+      const head = args.head_uuid ? requireUuid(args.head_uuid, "head_uuid") : "00000000-0000-0000-0000-000000000000";
+      return callEditor(name, `/expression-add/${uuid}/${head}`);
     }
     case "editor_duplicate_asset": {
       const uuid = requireUuid(args.uuid);

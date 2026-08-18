@@ -1,0 +1,1408 @@
+#include "EditorApplication.hpp"
+// Frontend port from the Wicked Engine Editor (MIT, commit 2aa9fdf…): Font
+// Awesome 6 icon font + codepoint macros, and the Liberation Sans UI font
+// (zstd-compressed, same font Wicked ships). See frontend/PORTS.md.
+#include "frontend/FontAwesomeV6.h"
+#include "frontend/IconsFontAwesome6.h"
+#include "frontend/liberation_sans.h"
+#include "frontend/ForgeTheme.hpp"
+#include "frontend/ForgeWidgets.hpp"
+#include "engine/compression/ICompressionProvider.hpp"
+#include "../engine/assets/GltfGeometry.hpp"
+#include "../engine/animation/AnimationAssets.hpp"
+#include "../engine/rendering/vulkan/MaterialPipeline.hpp"
+#include "../engine/audio/AudioRuntime.hpp"
+#include "../engine/audio/OggDecoder.hpp"
+#include "../engine/gameplay/DialogueSystem.hpp"
+#include "../engine/gameplay/DestructionRuntime.hpp"
+#include "../engine/gameplay/MissionSystem.hpp"
+#include "engine/navigation/INavigationProvider.hpp"
+#include <array>
+#include <random>
+#include <cctype>
+#include <cstdlib>
+#include <sstream>
+#include <filesystem>
+#include <iostream>
+#include <type_traits>
+#include <stdexcept>
+#include <algorithm>
+#include <functional>
+#include <unordered_set>
+#include <cstddef>
+#include <cstring>
+#include <cmath>
+#include <fstream>
+#include <chrono>
+#include <ctime>
+
+#include <imgui.h>
+#include <imgui_internal.h>
+#include <imgui_impl_glfw.h>
+
+// Local copies of the file-scope render helpers (the originals live in a
+// nested anonymous namespace inside `namespace Engine`, later in this TU, so
+// they are not visible to the runtime-wired Wicked-port code below). These
+// global-scope versions share the same implementations.
+namespace {
+glm::mat4 model_from_transform(const Engine::TransformComponent& t) {
+    glm::mat4 model(1.0f);
+    model = glm::translate(model, t.position);
+    model = glm::rotate(model, glm::radians(t.rotation.z), glm::vec3(0, 0, 1));
+    model = glm::rotate(model, glm::radians(t.rotation.y), glm::vec3(0, 1, 0));
+    model = glm::rotate(model, glm::radians(t.rotation.x), glm::vec3(1, 0, 0));
+    model = glm::scale(model, t.scale);
+    return model;
+}
+void push_constants(VkCommandBuffer cmd, VkPipelineLayout layout, const glm::mat4& mvp, const glm::vec4& color) {
+    const Engine::ScenePushConstants pc{ mvp, color };
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       static_cast<uint32_t>(sizeof(pc)), &pc);
+}
+void set_viewport_scissor(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
+    VkViewport viewport{ 0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h), 0.0f, 1.0f };
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    VkRect2D scissor{ { 0, 0 }, { w, h } };
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+}
+void draw_indexed_cube(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb, const VkBuffer& ib,
+                       uint32_t indexCount, const glm::mat4& mvp, const glm::vec4& color) {
+    const VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
+    vkCmdBindIndexBuffer(cmd, ib, 0, VK_INDEX_TYPE_UINT32);
+    push_constants(cmd, layout, mvp, color);
+    vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
+}
+void draw_indexed_editor_mesh(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb,
+                              const VkBuffer& ib, uint32_t indexCount, const glm::mat4& mvp,
+                              const glm::vec4& color) {
+    draw_indexed_cube(cmd, layout, vb, ib, indexCount, mvp, color);
+}
+} // namespace
+#include <imgui_impl_vulkan.h>
+#include <VkBootstrap.h>
+#include <miniaudio.h>
+#include <thread>
+
+// PlayNavAgent — the public provider's path follower (mirrors the legacy
+// NavigationAgent stepping so the Fase 8 behavior is preserved).
+void PlayNavAgent::set_path(std::vector<glm::vec3> points) {
+    path = std::move(points);
+    waypoint = 0;
+    reached = path.empty();
+}
+
+void PlayNavAgent::update(float deltaTime) {
+    if (reached) return;
+    if (waypoint >= path.size()) {
+        reached = true;
+        return;
+    }
+    float remaining = speed * deltaTime;
+    while (remaining > 0.0f && waypoint < path.size()) {
+        const glm::vec3 target = path[waypoint];
+        const glm::vec3 dir = target - position;
+        const float dist = glm::length(dir);
+        if (dist <= stoppingDistance) {
+            position = target;
+            ++waypoint;
+            continue;
+        }
+        const float step = std::min(remaining, dist);
+        position += (dir / dist) * step;
+        remaining -= step;
+        if (step >= dist - 1e-4f) {
+            position = target;
+            ++waypoint;
+        }
+    }
+    if (waypoint >= path.size()) reached = true;
+}
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <commdlg.h>
+#include <shlobj.h>
+#include <wincodec.h>
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+#include <wrl/client.h>
+using Microsoft::WRL::ComPtr;
+#endif
+
+namespace Engine {
+
+EditorApplication::EditorApplication() {
+    // Loopback HTTP control API: drive the editor from a terminal or an agent
+    // via curl http://127.0.0.1:8321/{play,pause,resume,stop,step,state}.
+    m_controlApi.start(8321);
+
+    // Playback sink for the play-in-editor mixer (audio previews + play-mode
+    // audio components). Before this the Mixer rendered into a buffer that was
+    // never sent to a device, so nothing produced sound.
+    init_audio_output();
+
+    const std::filesystem::path registryPath =
+        std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db";
+    if (std::filesystem::exists(registryPath) && !m_assetRegistry.load(registryPath)) {
+        std::cerr << "[AssetRegistry] Ignoring invalid database: " << registryPath << std::endl;
+    }
+    m_assetPipeline = std::make_unique<AssetPipeline>(m_assetRegistry);
+    m_assetPipeline->add_importer(std::make_unique<TextureImporter>());
+    m_assetPipeline->add_importer(std::make_unique<BinaryCopyImporter>(
+        AssetType::Texture, std::vector<std::string>{".jpg", ".jpeg", ".exr"}, ".texturebin"));
+    m_assetPipeline->add_importer(std::make_unique<MeshImporter>());
+    m_assetPipeline->add_importer(std::make_unique<SkeletonImporter>());
+    m_assetPipeline->add_importer(std::make_unique<AnimationClipImporter>());
+    m_assetPipeline->add_importer(std::make_unique<BinaryCopyImporter>(
+        AssetType::Unknown, std::vector<std::string>{".bin"}, ".blobbin"));
+    m_assetPipeline->add_importer(std::make_unique<AudioImporter>());
+    m_assetPipeline->add_importer(std::make_unique<BinaryCopyImporter>(
+        AssetType::Audio, std::vector<std::string>{".ogg"}, ".audiobin"));
+    m_assetPipeline->add_importer(std::make_unique<TextMaterialImporter>());
+    m_assetHotReload = std::make_unique<AssetHotReloadService>(
+        *m_assetPipeline, m_assetRegistry,
+        std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "DerivedDataCache");
+}
+
+EditorApplication::~EditorApplication() {
+    // Stop the loopback control API first so its thread never outlives the
+    // main loop / teardown (it only talks to 127.0.0.1).
+    m_controlApi.stop();
+    cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// Editor camera (orbit around a target; free-fly via WASD while orbiting)
+// ---------------------------------------------------------------------------
+namespace {
+
+glm::vec3 euler_direction(float yawDeg, float pitchDeg) {
+    const float yawRad = glm::radians(yawDeg);
+    const float pitchRad = glm::radians(pitchDeg);
+    return glm::normalize(glm::vec3(
+        std::cos(yawRad) * std::cos(pitchRad),
+        std::sin(pitchRad),
+        std::sin(yawRad) * std::cos(pitchRad)));
+}
+
+// Distance from a point to a 2D segment (screen space).
+float dist_point_segment(glm::vec2 p, glm::vec2 a, glm::vec2 b) {
+    const glm::vec2 ab = b - a;
+    const float len2 = glm::dot(ab, ab);
+    if (len2 < 1e-8f) return glm::length(p - a);
+    const float t = glm::clamp(glm::dot(p - a, ab) / len2, 0.0f, 1.0f);
+    return glm::length(p - (a + ab * t));
+}
+
+constexpr glm::vec3 kAxisDirs[3] = { {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f} };
+constexpr glm::vec3 kAxisColors[3] = { {1.0f, 0.25f, 0.25f}, {0.30f, 1.0f, 0.45f}, {0.35f, 0.62f, 1.0f} };
+
+} // namespace
+
+glm::vec3 EditorCamera::get_front() const {
+    return euler_direction(yaw, pitch);
+}
+
+glm::vec3 EditorCamera::get_right() const {
+    const glm::vec3 front = get_front();
+    const glm::vec3 right = glm::normalize(glm::cross(front, glm::vec3(0.0f, 1.0f, 0.0f)));
+    return right;
+}
+
+glm::vec3 EditorCamera::get_up() const {
+    return glm::normalize(glm::cross(get_right(), get_front()));
+}
+
+glm::mat4 EditorCamera::get_view_matrix() const {
+    return glm::lookAt(position, orbitTarget, glm::vec3(0.0f, 1.0f, 0.0f));
+}
+
+glm::mat4 EditorCamera::get_projection_matrix(float aspectRatio) const {
+    return glm::perspective(glm::radians(fov), aspectRatio, nearPlane, farPlane);
+}
+
+int EditorApplication::run() {
+    try {
+        init_window();
+        init_vulkan();
+        init_imgui();
+        init_offscreen_target();
+        init_scene_pipeline();
+        init_geometry_buffers();
+        init_default_scene();
+        // Persisted editor preferences (language, VSync, shadows, theme).
+        load_settings();
+
+        // VC_EDITOR_TEST_RENDERGRAPH=1: exercise the render graph executor on
+        // the real device — a two-pass graph (Scene → Composite) is recorded
+        // and submitted headlessly before the main loop, asserting the compiled
+        // pass order and barriers drive the frame.
+        if (std::getenv("VC_EDITOR_TEST_RENDERGRAPH") != nullptr) {
+            std::exit(run_render_graph_self_test());
+        }
+
+        // VC_EDITOR_TEST_HDR=1: cook a tiny Radiance HDR, load it through the
+        // material-graph texture path (must produce a real R16G16B16A16_SFLOAT
+        // image, not the old solid fallback), read the pixel back and bind it
+        // in a material-graph pipeline.
+        if (std::getenv("VC_EDITOR_TEST_HDR") != nullptr) {
+            std::exit(run_hdr_texture_self_test());
+        }
+
+        main_loop();
+        cleanup();
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "[Editor Fatal Error] " << e.what() << std::endl;
+        return -1;
+    }
+}
+
+void EditorApplication::init_window() {
+    if (!glfwInit()) throw std::runtime_error("Failed to initialize GLFW");
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    m_window = glfwCreateWindow(m_windowWidth, m_windowHeight, tr("VulkanCraft Studio - Gerenciador de Jogos", "VulkanCraft Studio - Game Launcher"), nullptr, nullptr);
+    if (!m_window) throw std::runtime_error("Failed to create GLFW window");
+    // Own scroll callback (chained by the ImGui backend, which stores it as its
+    // previous callback and forwards events). The camera consumes the delta
+    // when the 3D view is hovered; io.MouseWheel alone is useless there because
+    // ImGui clears it at the end of NewFrame, after the camera update.
+    glfwSetWindowUserPointer(m_window, this);
+    glfwSetScrollCallback(m_window, [](GLFWwindow* win, double /*xoff*/, double yoff) {
+        if (auto* app = static_cast<EditorApplication*>(glfwGetWindowUserPointer(win))) {
+            app->m_scrollAccum += yoff;
+        }
+    });
+    // Seed the mouse position so the first camera frame has no fake jump.
+    double mx = 0.0, my = 0.0;
+    glfwGetCursorPos(m_window, &mx, &my);
+    m_lastMousePos = glm::vec2(static_cast<float>(mx), static_cast<float>(my));
+}
+
+void EditorApplication::init_vulkan() {
+    // VC_EDITOR_VALIDATION=1 enables the Vulkan validation layers + default
+    // debug messenger (messages go to stderr). VC_EDITOR_SKIP_LAUNCHER=1 skips
+    // the launcher hub so the 3D viewport is exercised immediately.
+    const bool validate = std::getenv("VC_EDITOR_VALIDATION") != nullptr;
+    vkb::InstanceBuilder builder;
+    builder.set_app_name("VulkanCraft Studio")
+           .require_api_version(1, 3, 0);
+    if (validate) {
+        builder.request_validation_layers(true);
+        builder.use_default_debug_messenger();
+    } else {
+        builder.request_validation_layers(false);
+    }
+    auto inst_ret = builder.build();
+    if (!inst_ret) throw std::runtime_error("Failed to create Vulkan instance");
+    vkb::Instance vkb_inst = inst_ret.value();
+    m_instance = vkb_inst.instance;
+
+    glfwCreateWindowSurface(m_instance, m_window, nullptr, &m_surface);
+
+    vkb::PhysicalDeviceSelector selector{ vkb_inst };
+    auto phys_ret = selector.set_surface(m_surface)
+                            .set_minimum_version(1, 3)
+                            .select();
+    if (!phys_ret) throw std::runtime_error("Failed to select physical GPU");
+    vkb::PhysicalDevice vkb_gpu = phys_ret.value();
+    m_physicalDevice = vkb_gpu.physical_device;
+    VkPhysicalDeviceProperties deviceProps{};
+    vkGetPhysicalDeviceProperties(m_physicalDevice, &deviceProps);
+    m_gpuName = deviceProps.deviceName ? deviceProps.deviceName : "Unknown GPU";
+
+    vkb::DeviceBuilder device_builder{ vkb_gpu };
+    auto dev_ret = device_builder.build();
+    if (!dev_ret) throw std::runtime_error("Failed to create logical device");
+    vkb::Device vkb_dev = dev_ret.value();
+    m_device = vkb_dev.device;
+    m_graphicsQueue = vkb_dev.get_queue(vkb::QueueType::graphics).value();
+    m_graphicsQueueFamily = vkb_dev.get_queue_index(vkb::QueueType::graphics).value();
+
+    // Swapchain creation with UNORM format (prevents washed-out sRGB gamma colors)
+    vkb::SwapchainBuilder swapchain_builder{ vkb_dev };
+    auto swap_ret = swapchain_builder
+        .set_desired_format({ VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
+        .set_desired_extent(m_windowWidth, m_windowHeight)
+        .build();
+    if (!swap_ret) throw std::runtime_error("Failed to build swapchain");
+    vkb::Swapchain vkb_swap = swap_ret.value();
+    m_swapchain = vkb_swap.swapchain;
+    m_swapchainFormat = vkb_swap.image_format;
+    m_swapchainExtent = vkb_swap.extent;
+    m_swapchainImages = vkb_swap.get_images().value();
+    m_swapchainViews = vkb_swap.get_image_views().value();
+
+    // Render pass creation
+    VkAttachmentDescription colorAttachment{};
+    colorAttachment.format = m_swapchainFormat;
+    colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    VkAttachmentReference colorAttachmentRef{};
+    colorAttachmentRef.attachment = 0;
+    colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorAttachmentRef;
+
+    VkRenderPassCreateInfo renderPassInfo{};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    renderPassInfo.attachmentCount = 1;
+    renderPassInfo.pAttachments = &colorAttachment;
+    renderPassInfo.subpassCount = 1;
+    renderPassInfo.pSubpasses = &subpass;
+
+    if (vkCreateRenderPass(m_device, &renderPassInfo, nullptr, &m_renderPass) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create render pass");
+    }
+
+    // Framebuffers
+    m_framebuffers.resize(m_swapchainViews.size());
+    for (size_t i = 0; i < m_swapchainViews.size(); i++) {
+        VkImageView attachments[] = { m_swapchainViews[i] };
+        VkFramebufferCreateInfo framebufferInfo{};
+        framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        framebufferInfo.renderPass = m_renderPass;
+        framebufferInfo.attachmentCount = 1;
+        framebufferInfo.pAttachments = attachments;
+        framebufferInfo.width = m_swapchainExtent.width;
+        framebufferInfo.height = m_swapchainExtent.height;
+        framebufferInfo.layers = 1;
+        if (vkCreateFramebuffer(m_device, &framebufferInfo, nullptr, &m_framebuffers[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create framebuffer");
+        }
+    }
+
+    // Command pool and buffers
+    VkCommandPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = m_graphicsQueueFamily;
+    if (vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_commandPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create command pool");
+    }
+
+    m_commandBuffers.resize(2);
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = m_commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 2;
+    if (vkAllocateCommandBuffers(m_device, &allocInfo, m_commandBuffers.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate command buffers");
+    }
+
+    // Synchronization primitives
+    m_imageAvailableSemaphores.resize(2);
+    m_renderFinishedSemaphores.resize(2);
+    m_inFlightFences.resize(2);
+
+    VkSemaphoreCreateInfo semaphoreInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT };
+
+    for (size_t i = 0; i < 2; i++) {
+        vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &m_imageAvailableSemaphores[i]);
+        vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &m_renderFinishedSemaphores[i]);
+        vkCreateFence(m_device, &fenceInfo, nullptr, &m_inFlightFences[i]);
+    }
+}
+
+void EditorApplication::init_imgui() {
+    VkDescriptorPoolSize pool_sizes[] = {
+        { VK_DESCRIPTOR_TYPE_SAMPLER, 1000 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000 },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1000 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1000 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000 },
+        { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000 }
+    };
+    VkDescriptorPoolCreateInfo pool_info = {};
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pool_info.maxSets = 1000 * 11;
+    pool_info.poolSizeCount = static_cast<uint32_t>(sizeof(pool_sizes)/sizeof(pool_sizes[0]));
+    pool_info.pPoolSizes = pool_sizes;
+    vkCreateDescriptorPool(m_device, &pool_info, nullptr, &m_imguiDescriptorPool);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    io.FontGlobalScale = 1.0f; // Forge design system: roomy, not oversized
+
+    // Frontend port (Wicked Editor, MIT): the base UI font is Liberation Sans
+    // (the same font the Wicked editor ships, embedded zstd-compressed here),
+    // decompressed through the public compression provider. Static storage
+    // keeps the TTF alive for the atlas; the atlas must NOT take ownership.
+    {
+        auto provider = ::engine::compression::create_zstd_compression_provider();
+        std::string uiFontData = provider->decompress(std::string(
+            reinterpret_cast<const char*>(liberation_sans_zstd), sizeof(liberation_sans_zstd)));
+        if (!uiFontData.empty()) {
+            static std::string s_uiFont = std::move(uiFontData);
+            ImFontConfig baseConfig{};
+            baseConfig.FontDataOwnedByAtlas = false;
+            io.Fonts->AddFontFromMemoryTTF(const_cast<char*>(s_uiFont.data()),
+                                           static_cast<int>(s_uiFont.size()), 15.0f,
+                                           &baseConfig, io.Fonts->GetGlyphRangesDefault());
+        } else {
+            io.Fonts->AddFontDefault();
+        }
+    }
+    // Merge the Font Awesome 6 Solid icon font into the base font so ICON_FA_*
+    // strings render inline. Glyph range from IconsFontAwesome6.h (0xe005–0xf8ff).
+    static const ImWchar s_iconRanges[] = { ICON_MIN_FA, ICON_MAX_16_FA, 0 };
+    ImFontConfig iconConfig{};
+    iconConfig.MergeMode = true;
+    iconConfig.GlyphMinAdvanceX = 16.0f;
+    iconConfig.GlyphOffset = ImVec2(0.0f, 1.0f);
+    iconConfig.FontDataOwnedByAtlas = false;
+    io.Fonts->AddFontFromMemoryTTF(const_cast<uint8_t*>(font_awesome_v6),
+                                   static_cast<int>(sizeof(font_awesome_v6)), 15.0f,
+                                   &iconConfig, s_iconRanges);
+
+    // Forge design system (light, product-grade). WindowMinSize (no panel can
+    // shrink below this) is set inside applyForgeTheme.
+    UI::applyForgeTheme();
+
+    ImGui_ImplGlfw_InitForVulkan(m_window, true);
+    ImGui_ImplVulkan_InitInfo init_info = {};
+    init_info.ApiVersion = VK_API_VERSION_1_3;
+    init_info.Instance = m_instance;
+    init_info.PhysicalDevice = m_physicalDevice;
+    init_info.Device = m_device;
+    init_info.QueueFamily = m_graphicsQueueFamily;
+    init_info.Queue = m_graphicsQueue;
+    init_info.PipelineCache = VK_NULL_HANDLE;
+    init_info.DescriptorPool = m_imguiDescriptorPool;
+    init_info.MinImageCount = 2;
+    init_info.ImageCount = 2;
+    init_info.PipelineInfoMain.RenderPass = m_renderPass;
+    init_info.PipelineInfoMain.Subpass = 0;
+    init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    ImGui_ImplVulkan_Init(&init_info);
+
+    // Diagnostic (post-atlas-build): which console glyphs are missing?
+    {
+        const char* probe = "Português (Brasil) | Memória RAM | Placa de Vídeo | çãõéêáíóúâôàü";
+        std::string missing;
+        for (const unsigned char* p = reinterpret_cast<const unsigned char*>(probe); *p; ++p) {
+            if (*p < 0x20) continue;
+            ImFont* font = io.Fonts->Fonts.empty() ? nullptr : io.Fonts->Fonts[0];
+            if (!font || !font->IsGlyphInFont(*p)) {
+                char b[16];
+                snprintf(b, sizeof(b), "U+%04X ", *p);
+                missing += b;
+            }
+        }
+        std::cout << "[Font] " << (missing.empty() ? "All console glyphs covered" : ("Missing glyphs: " + missing)) << std::endl;
+    }
+}
+
+void EditorApplication::init_default_scene() {
+    m_editorScene = std::make_unique<Scene>("Untitled Scene");
+
+    Entity camera = m_editorScene->create_entity(tr("Câmera Principal", "Main Camera"));
+    m_editorScene->transformComponents[camera.get_id()].position = glm::vec3(0.0f, 2.0f, 5.0f);
+    m_editorScene->cameraComponents[camera.get_id()] = CameraComponent{ 70.0f, 0.1f, 2000.0f, true };
+
+    Entity sun = m_editorScene->create_entity(tr("Luz Direcional", "Directional Light"));
+    m_editorScene->lightComponents[sun.get_id()] = LightComponent{ glm::vec3(1.0f, 0.95f, 0.85f), 10000.0f, 1000.0f, true };
+    m_editorScene->transformComponents[sun.get_id()].rotation = glm::vec3(-45.0f, 30.0f, 0.0f);
+
+    m_selectedEntity = camera;
+    m_editorGui.init(m_editorScene.get(), &m_undo);
+    m_editorGui.set_asset_registry(&m_assetRegistry);
+    m_editorGui.select_entity(m_selectedEntity);
+    // Disable the EditorGUI's own (English, undocked) panels: the real panels
+    // are the Portuguese ones drawn by EditorApplication. Keeping the flags
+    // false prevents duplicate floating windows ("World Outliner", "Inspector"...).
+    m_editorGui.showOutliner = false;
+    m_editorGui.showInspector = false;
+    m_editorGui.showContentBrowser = false;
+    m_editorGui.showConsole = false;
+    m_editorGui.showVoxelTools = false;
+    m_editorGui.showProfiler = false;
+
+    if (std::getenv("VC_EDITOR_SKIP_LAUNCHER") != nullptr) {
+        m_inLauncherMode = false;
+        glfwSetWindowTitle(m_window, ("VulkanCraft Studio - [" + m_currentProjectName + "]").c_str());
+    }
+
+    // VC_EDITOR_TEST_MATERIAL=1: exercise the material-graph viewport path
+    // (graph → GLSL → glslc → pipeline → per-entity UBO → draw) headlessly.
+    if (std::getenv("VC_EDITOR_TEST_MATERIAL") != nullptr) {
+        // The material graph pipeline is built by the viewport pass, which
+        // only runs outside the launcher hub — leave the hub for this test.
+        m_inLauncherMode = false;
+        m_materialTestMatId = UUID();
+        m_materialTestMeshId = UUID();
+        Entity matCube = m_editorScene->create_entity("Material Test Cube");
+        m_editorScene->transformComponents[matCube.get_id()].position = glm::vec3(2.0f, 1.0f, 0.0f);
+        m_editorScene->materialComponents[matCube.get_id()] = MaterialComponent{
+            glm::vec3(0.9f, 0.25f, 0.15f), 0.35f, 0.1f, glm::vec3(0.0f), 0.0f };
+        m_editorScene->meshRendererComponents[matCube.get_id()] =
+            MeshRendererComponent{ m_materialTestMeshId, m_materialTestMatId, true, true };
+        // GPU mesh resource built from cube geometry (no asset round-trip).
+        std::vector<EditorVertex> verts;
+        std::vector<uint32_t> indices;
+        generate_cube_geometry(verts, indices);
+        EditorMeshResource cubeRes;
+        cubeRes.vertexCount = static_cast<uint32_t>(verts.size());
+        cubeRes.ranges.push_back({ 0, static_cast<uint32_t>(indices.size()), 0, true });
+        const VkDeviceSize vbSize = sizeof(EditorVertex) * verts.size();
+        const VkDeviceSize ibSize = sizeof(uint32_t) * indices.size();
+        create_buffer(vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      cubeRes.vb.buffer, cubeRes.vb.memory);
+        create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      cubeRes.ib.buffer, cubeRes.ib.memory);
+        void* data = nullptr;
+        vkMapMemory(m_device, cubeRes.vb.memory, 0, vbSize, 0, &data);
+        std::memcpy(data, verts.data(), static_cast<size_t>(vbSize));
+        vkUnmapMemory(m_device, cubeRes.vb.memory);
+        vkMapMemory(m_device, cubeRes.ib.memory, 0, ibSize, 0, &data);
+        std::memcpy(data, indices.data(), static_cast<size_t>(ibSize));
+        vkUnmapMemory(m_device, cubeRes.ib.memory);
+        cubeRes.valid = true;
+        m_meshResources[m_materialTestMeshId] = std::move(cubeRes);
+        // Material asset values become the graph's parameter defaults.
+        MaterialAsset testMat;
+        testMat.albedo = glm::vec3(0.2f, 0.6f, 0.9f);
+        testMat.roughness = 0.7f;
+        testMat.metallic = 0.0f;
+        m_materialAssets[m_materialTestMatId] = testMat;
+        m_materialTestFramesLeft = 150;
+    }
+
+    // VC_EDITOR_TEST_PLAY=1: a cube with a rigidbody is dropped into the play
+    // world; the test asserts gravity moved it down while the viewport renders
+    // the play scene.
+    if (std::getenv("VC_EDITOR_TEST_PLAY") != nullptr) {
+        // The play world only ticks outside the launcher hub (main_loop gates
+        // tick_play_runtime on !m_inLauncherMode), so leave the hub for this
+        // headless verification of the in-engine game.
+        m_inLauncherMode = false;
+        Entity fallingCube = m_editorScene->create_entity("Falling Cube");
+        m_editorScene->transformComponents[fallingCube.get_id()].position = glm::vec3(0.0f, 5.0f, 0.0f);
+        m_editorScene->rigidbodyComponents[fallingCube.get_id()] =
+            RigidbodyComponent{ 1.0f, 0.5f, 0.1f, false, true };
+        m_playTestEntityId = fallingCube.get_id();
+        m_playMode.start_play(m_editorScene.get());
+        setup_play_runtime();
+        m_playTestFramesLeft = 120;
+    }
+
+    // VC_EDITOR_TEST_BUILD=1: run the full Build Game pipeline headlessly and
+    // exit with the build result. A visible mesh entity is added first so the
+    // packaged initial scene actually renders something.
+    if (std::getenv("VC_EDITOR_TEST_BUILD") != nullptr) {
+        Entity buildCube = m_editorScene->create_entity("Build Cube");
+        m_editorScene->transformComponents[buildCube.get_id()].position = glm::vec3(0.0f, 0.5f, 0.0f);
+        m_editorScene->materialComponents[buildCube.get_id()] = MaterialComponent{
+            glm::vec3(0.25f, 0.65f, 0.90f), 0.35f, 0.1f, glm::vec3(0.0f), 0.0f };
+        m_editorScene->meshRendererComponents[buildCube.get_id()] = MeshRendererComponent{};
+        m_editorScene->rigidbodyComponents[buildCube.get_id()] = RigidbodyComponent{};
+        run_game_build();
+        const bool buildOk = std::none_of(m_buildLog.begin(), m_buildLog.end(),
+                                          [](const std::string& line) { return line.rfind("Build failed", 0) == 0; });
+        std::cout << "[Editor] BUILD_TEST " << (buildOk ? "PASS" : "FAIL") << std::endl;
+        std::exit(buildOk ? 0 : 1);
+    }
+}
+
+
+// ===========================================================================
+// Core (constructor, init, main loop, render frame)
+// Panels → EditorApplication_Panels.cpp
+// Vulkan  → EditorApplication_Vulkan.cpp
+// Play    → EditorApplication_PlayMode.cpp
+// Assets  → EditorApplication_Assets.cpp
+// ===========================================================================
+
+int EditorApplication::run_render_graph_self_test() {
+    using namespace Engine::Rendering;
+
+    // Match the offscreen viewport target to the swapchain so a single render
+    // area extent serves both passes.
+    recreate_offscreen_if_needed(m_swapchainExtent.width, m_swapchainExtent.height);
+    if (m_offscreen.framebuffer == VK_NULL_HANDLE) {
+        std::cerr << "[Editor] RENDERGRAPH_TEST FAIL (no offscreen framebuffer)" << std::endl;
+        return 1;
+    }
+
+    // Two-pass graph: Scene writes the offscreen color+depth; Composite reads
+    // the color and writes the swapchain.
+    RenderGraph graph;
+    const auto sceneColor = graph.add_resource({ "Scene Color", RenderResourceKind::Image, 0,
+        m_offscreen.width, m_offscreen.height, 1, true, false, RenderResourceState::Undefined });
+    const auto sceneDepth = graph.add_resource({ "Scene Depth", RenderResourceKind::Image, 0,
+        m_offscreen.width, m_offscreen.height, 1, true, false, RenderResourceState::Undefined });
+    const auto swap = graph.add_resource({ "Swapchain", RenderResourceKind::Image, 0,
+        m_swapchainExtent.width, m_swapchainExtent.height, 1, false, true, RenderResourceState::Present });
+    const auto scenePass = graph.add_pass({ "Scene", RenderQueue::Graphics,
+        { { sceneColor, RenderAccess::Write, RenderResourceState::ColorAttachment },
+          { sceneDepth, RenderAccess::Write, RenderResourceState::DepthAttachment } }, true });
+    const auto compositePass = graph.add_pass({ "Composite", RenderQueue::Graphics,
+        { { sceneColor, RenderAccess::Read, RenderResourceState::ShaderRead },
+          { swap, RenderAccess::Write, RenderResourceState::Present } }, true });
+    (void)graph.add_dependency(scenePass, compositePass);
+
+    VulkanRenderGraphExecutor executor;
+    std::string error;
+    if (!executor.initialize(m_device, graph, &error)) {
+        std::cerr << "[Editor] RENDERGRAPH_TEST FAIL (init: " << error << ")" << std::endl;
+        return 1;
+    }
+    const RenderGraphCompileResult& compiled = executor.compile_result();
+    if (compiled.order.size() != 2 || compiled.barriers.empty()) {
+        std::cerr << "[Editor] RENDERGRAPH_TEST FAIL (order=" << compiled.order.size()
+                  << ", barriers=" << compiled.barriers.size() << ")" << std::endl;
+        return 1;
+    }
+
+    // The executor begins each pass itself, so the draw callbacks must record
+    // content only (no render-pass begin) — here both passes are clear-only.
+    // The game runtime (main_game.cpp) drives real content through these
+    // callbacks (drawScene/drawComposite).
+    VulkanRenderGraphExecutor::PassFrame sceneFrame;
+    sceneFrame.renderPass = m_offscreen.renderPass;
+    sceneFrame.framebuffers = { m_offscreen.framebuffer };
+    sceneFrame.clearValues.resize(2);
+    sceneFrame.clearValues[0].color = { { 0.2f, 0.3f, 0.4f, 1.0f } };
+    sceneFrame.clearValues[1].depthStencil = { 1.0f, 0 };
+    sceneFrame.draw = [](VkCommandBuffer /*cb*/) {};
+    executor.register_pass(scenePass, std::move(sceneFrame));
+
+    VulkanRenderGraphExecutor::PassFrame compositeFrame;
+    compositeFrame.renderPass = m_renderPass;
+    compositeFrame.framebuffers = m_framebuffers;
+    compositeFrame.clearValues.resize(1);
+    compositeFrame.clearValues[0].color = { { 0.08f, 0.09f, 0.12f, 1.0f } };
+    compositeFrame.draw = [](VkCommandBuffer /*cb*/) {};
+    executor.register_pass(compositePass, std::move(compositeFrame));
+
+    // Record one full frame through the executor and submit it.
+    VkCommandBuffer cb = m_commandBuffers[0];
+    vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(cb, &begin);
+    executor.record(cb, 0, m_swapchainExtent);
+    vkEndCommandBuffer(cb);
+    VkSubmitInfo submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cb;
+    const VkResult result = vkQueueSubmit(m_graphicsQueue, 1, &submit, VK_NULL_HANDLE);
+    vkDeviceWaitIdle(m_device);
+    vkQueueWaitIdle(m_graphicsQueue);
+
+    const bool ok = result == VK_SUCCESS && executor.executed_pass_count() == 2 &&
+                    executor.total_barriers() >= 1;
+    std::cout << "[Editor] RENDERGRAPH_TEST " << (ok ? "PASS" : "FAIL")
+              << " (passes=" << executor.executed_pass_count()
+              << ", barriers=" << executor.total_barriers() << ")" << std::endl;
+    return ok ? 0 : 1;
+}
+
+// VC_EDITOR_TEST_HDR=1: cooks a tiny Radiance HDR (2x1, left pixel red = 4.0),
+// loads it through load_viewport_texture — which must produce a real
+// R16G16B16A16_SFLOAT image instead of the old flat-shading fallback — then
+// reads the first pixel back (half 0x4800 = 4.0) and builds a material-graph
+// pipeline bound to the HDR texture.
+int EditorApplication::run_hdr_texture_self_test() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path();
+    const std::filesystem::path src = dir / "vc_hdr_selftest.hdr";
+    const std::filesystem::path cookedDir = dir / "vc_hdr_selftest_cooked";
+    std::ofstream out(src, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        std::cerr << "[Editor] HDR_TEST FAIL (cannot write " << src << ")" << std::endl;
+        return 1;
+    }
+    // Radiance RGBE header; orientation line "-Y 1 +X 2" => 2x1, top-left first.
+    const std::string header = "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 2\n";
+    out.write(header.data(), static_cast<std::streamsize>(header.size()));
+    // Pixel 0: RGBE {1,0,0,138} => r = 2^(138-136) = 4.0 (half 0x4400).
+    // Pixel 1: black.
+    const uint8_t pixels[8] = { 1, 0, 0, 138, 0, 0, 0, 0 };
+    out.write(reinterpret_cast<const char*>(pixels), 8);
+    out.close();
+
+    ImportRequest request;
+    request.source = src;
+    request.cookedDirectory = cookedDir;
+    const ImportResult cooked = m_assetPipeline->import(request);
+    if (!cooked) {
+        std::cerr << "[Editor] HDR_TEST FAIL (cook: " << cooked.error << ")" << std::endl;
+        return 1;
+    }
+
+    GraphTexture tex;
+    std::string error;
+    if (!load_viewport_texture(cooked.asset.id, tex, error)) {
+        std::cerr << "[Editor] HDR_TEST FAIL (load: " << error << ")" << std::endl;
+        return 1;
+    }
+    if (tex.format != VK_FORMAT_R16G16B16A16_SFLOAT) {
+        std::cerr << "[Editor] HDR_TEST FAIL (format " << static_cast<int>(tex.format)
+                  << " != R16G16B16A16_SFLOAT)" << std::endl;
+        destroy_graph_texture(tex);
+        return 1;
+    }
+
+    // Read pixel 0 back and verify the half-float value survived (r = 4.0).
+    const VkDeviceSize size = static_cast<VkDeviceSize>(2) * 1 * 8;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    create_buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  staging, stagingMemory);
+    if (staging == VK_NULL_HANDLE) {
+        std::cerr << "[Editor] HDR_TEST FAIL (staging alloc)" << std::endl;
+        destroy_graph_texture(tex);
+        return 1;
+    }
+    VkCommandBuffer cmd = begin_single_time_commands();
+    transition_image_layout(cmd, tex.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageExtent = { 2, 1, 1 };
+    vkCmdCopyImageToBuffer(cmd, tex.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging, 1, &region);
+    transition_image_layout(cmd, tex.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    end_single_time_commands(cmd);
+    void* data = nullptr;
+    vkMapMemory(m_device, stagingMemory, 0, size, 0, &data);
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    const uint16_t halfR = static_cast<uint16_t>(bytes[0]) | (static_cast<uint16_t>(bytes[1]) << 8);
+    vkUnmapMemory(m_device, stagingMemory);
+    vkDestroyBuffer(m_device, staging, nullptr);
+    vkFreeMemory(m_device, stagingMemory, nullptr);
+    if (halfR != 0x4400) {
+        std::cerr << "[Editor] HDR_TEST FAIL (pixel r half = 0x" << std::hex << halfR
+                  << ", expected 0x4400 = 4.0)" << std::dec << std::endl;
+        destroy_graph_texture(tex);
+        return 1;
+    }
+
+    // Build a material-graph pipeline with the HDR texture bound to BaseColor
+    // (reconnect the BaseColor output of the standard PBR graph).
+    Rendering::MaterialGraph graph = Rendering::material_graph_from_pbr(MaterialAsset{});
+    const auto texNode = graph.add_texture_sample("HDR Texture");
+    if (auto* node = graph.find_node(texNode)) node->value = cooked.asset.id.to_string();
+    bool connected = false;
+    for (const auto& candidate : graph.nodes()) {
+        if (candidate.kind != Rendering::MaterialNodeKind::Output ||
+            candidate.parameter != "BaseColor")
+            continue;
+        connected = graph.connect(texNode, candidate.id, 0);
+        break;
+    }
+    GraphMaterialPipeline pipeline;
+    if (!connected || !build_graph_pipeline(graph, pipeline)) {
+        std::cerr << "[Editor] HDR_TEST FAIL (pipeline: "
+                  << (pipeline.lastError.empty() ? "texture not connected" : pipeline.lastError) << ")" << std::endl;
+        destroy_graph_texture(tex);
+        return 1;
+    }
+    destroy_graph_pipeline(pipeline);
+    destroy_graph_texture(tex);
+    std::cout << "[Editor] HDR_TEST PASS (RGBA16F, pixel r=4.0 half=0x4400, texture pipeline bound)" << std::endl;
+    return 0;
+}
+
+void EditorApplication::main_loop() {
+    double lastTime = glfwGetTime();
+    while (!glfwWindowShouldClose(m_window)) {
+        glfwPollEvents();
+
+        double currentTime = glfwGetTime();
+        float deltaTime = static_cast<float>(currentTime - lastTime);
+        lastTime = currentTime;
+        m_fps = 1.0f / std::max(deltaTime, 0.001f);
+        m_frameTimeMs = deltaTime * 1000.0f;
+
+        // Graphics changes (Opções Gráficas) are deferred to here — before
+        // acquire, with nothing in flight — so the swapchain and shadow map
+        // can be recreated safely.
+        if (m_recreateSwapchain) {
+            m_recreateSwapchain = false;
+            recreate_swapchain();
+        }
+        if (m_recreateShadowMap) {
+            m_recreateShadowMap = false;
+            const uint32_t newSize = shadow_size_from_quality(m_shadowQuality);
+            if (m_shadowMap.size != newSize) {
+                vkDeviceWaitIdle(m_device);
+                m_shadowMap.size = newSize;
+                create_shadow_map();
+            }
+        }
+
+        // Control API: execute queued commands (play/pause/resume/stop/step)
+        // from the loopback HTTP server. The drain runs even while the
+        // launcher hub is open so API-driven actions (open-scene, new-scene,
+        // create-project) can leave the hub; then publish live state for
+        // /state.
+        {
+            for (const std::string& cmd : m_controlApi.drain_commands()) {
+                std::cout << "[API-DEBUG] " << cmd << std::endl;
+                handle_control_command(cmd);
+            }
+        }
+
+        if (!m_inLauncherMode) {
+            {
+                EditorApiState api;
+                switch (m_playMode.get_state()) {
+                    case PlayState::Play: api.state = "play"; break;
+                    case PlayState::Pause: api.state = "pause"; break;
+                    case PlayState::Simulate: api.state = "simulate"; break;
+                    default: break;
+                }
+                Scene* s = m_playMode.get_active_scene();
+                api.fps = m_fps;
+                api.entities = s ? s->get_entities().size() : 0u;
+                api.orbitDistance = m_editorCamera.orbitDistance;
+                api.viewportHovered = m_viewportHovered;
+                api.imageHovered = m_viewportImageHovered;
+                ImGuiIO& io = ImGui::GetIO();
+                api.keyboardCapture = io.WantCaptureKeyboard;
+                api.typing = io.WantTextInput;
+                api.camX = m_editorCamera.position.x;
+                api.camY = m_editorCamera.position.y;
+                api.camZ = m_editorCamera.position.z;
+                api.yaw = m_editorCamera.yaw;
+                api.pitch = m_editorCamera.pitch;
+                api.vsync = m_vsyncEnabled;
+                api.shadowQuality = m_shadowQuality;
+                api.terrainValid = m_terrainValid;
+                if (m_terrainValid) {
+                    const int seg = m_terrainParams.segments;
+                    api.terrainVertices = static_cast<std::size_t>(seg + 1) * (seg + 1);
+                    api.terrainTriangles = m_terrainIndexCount / 3;
+                }
+                api.meshEdited = m_meshEdited;
+                api.settingsPath = m_settingsPath;
+                api.selectedEntity = m_selectedEntity.is_valid()
+                    ? m_selectedEntity.get_id().to_string() : std::string();
+                switch (m_gizmoMode) {
+                    case GizmoMode::Select: api.gizmoMode = "select"; break;
+                    case GizmoMode::Translate: api.gizmoMode = "translate"; break;
+                    case GizmoMode::Rotate: api.gizmoMode = "rotate"; break;
+                    case GizmoMode::Scale: api.gizmoMode = "scale"; break;
+                }
+                if (m_gizmoLocal) api.gizmoMode += ":local";
+                api.snap = m_snapTranslate;
+                api.camTargetX = m_editorCamera.orbitTarget.x;
+                api.camTargetY = m_editorCamera.orbitTarget.y;
+                api.camTargetZ = m_editorCamera.orbitTarget.z;
+                api.lastSelfTest = m_lastSelfTestResult;
+                switch (m_playScript.status()) {
+                    case VMStatus::Idle: api.scriptState = "idle"; break;
+                    case VMStatus::Running: api.scriptState = "running"; break;
+                    case VMStatus::Waiting: api.scriptState = "waiting"; break;
+                    case VMStatus::Paused: api.scriptState = "paused"; break;
+                    case VMStatus::Completed: api.scriptState = "completed"; break;
+                    case VMStatus::Error: api.scriptState = "error"; break;
+                }
+                m_controlApi.publish_state(api);
+            }
+            update_editor_camera(deltaTime);
+            process_viewport_input();
+            if (m_stepRequested && m_playMode.get_state() == PlayState::Pause) {
+                // Advance the play world a single frame (Pause → Play → tick →
+                // Pause) so the PASSO button works.
+                m_stepRequested = false;
+                m_playMode.set_state(PlayState::Play);
+                tick_play_runtime(deltaTime);
+                m_playMode.set_state(PlayState::Pause);
+            } else {
+                m_stepRequested = false;
+            }
+            tick_play_runtime(deltaTime);
+        }
+
+        // Audio preview: pick up background decodes and start the requested
+        // voice. Must run every frame in EVERY mode (the asset browser is used
+        // in edit mode, where tick_play_runtime early-returns). The miniaudio
+        // device drives the mixer in real time when available; without a
+        // device we still advance it so voice state (▶/⏸) stays truthful.
+        pump_audio_preview_decodes();
+        pump_asset_thumbnail_decodes();
+        if (!m_audioDeviceStarted) m_playAudio.render(1024);
+
+        // 3D asset thumbnails (mesh + block cubes): a few renders per frame.
+        pump_asset_thumbnails(4);
+
+        // Runtime-wired Wicked-port features (hair strands, soft-body cloth,
+        // video flipbooks, gaussian splats, env-probe captures): preview in
+        // Edit and keep simulating in Play (the same scene the viewport draws).
+        Scene* simScene = m_playMode.get_active_scene();
+        if (!simScene) simScene = m_editorScene.get();
+        tick_special_runtimes(simScene, deltaTime);
+
+        render_frame();
+
+        if (m_playTestFramesLeft > 0 && --m_playTestFramesLeft == 0) {
+            Scene* playScene = m_playMode.get_active_scene();
+            bool fell = false;
+            float y = -1.0f;
+            if (playScene) {
+                const auto tit = playScene->transformComponents.find(m_playTestEntityId);
+                if (tit != playScene->transformComponents.end()) {
+                    y = tit->second.position.y;
+                    fell = y < 4.0f;
+                }
+            }
+            std::cout << "[Editor] PLAY_TEST " << (fell ? "PASS" : "FAIL")
+                      << " (cube y=" << y << ")" << std::endl;
+            vkDeviceWaitIdle(m_device);
+            std::exit(fell ? 0 : 1);
+        }
+
+        if (m_materialTestFramesLeft > 0 && --m_materialTestFramesLeft == 0) {
+            const auto it = m_graphMaterialPipelines.find(m_materialTestMatId);
+            bool ok = false;
+            std::string error;
+            if (it != m_graphMaterialPipelines.end()) {
+                ok = it->second.valid;
+                error = it->second.lastError;
+            }
+            // Texture path: rebuild the live preview graph with a TextureSample
+            // feeding BaseColor and verify a texture pipeline builds and binds.
+            UUID textureId;
+            std::string textureName;
+            for (const AssetMetadata& meta : m_assetRegistry.snapshot()) {
+                if (meta.type == AssetType::Texture && meta.isCooked) {
+                    textureId = meta.id;
+                    textureName = meta.sourcePath.filename().string();
+                    break;
+                }
+            }
+            if (ok && textureId.is_valid()) {
+                auto& live = m_specializedEditors.live_material_graph_mutable();
+                const auto texNode = live.add_texture_sample("Test Texture");
+                if (auto* node = live.find_node(texNode)) node->value = textureId.to_string();
+                for (const auto& candidate : live.nodes()) {
+                    if (candidate.kind != Rendering::MaterialNodeKind::Output ||
+                        candidate.parameter != "BaseColor")
+                        continue;
+                    auto* outNode = live.find_node(candidate.id);
+                    if (!outNode || outNode->inputs.empty()) continue;
+                    const auto* src = outNode->inputs[0].source != Rendering::InvalidMaterialNode
+                        ? live.find_node(outNode->inputs[0].source) : nullptr;
+                    if (src && src->kind == Rendering::MaterialNodeKind::Constant) {
+                        (void)live.connect(texNode, outNode->id, 0);
+                        break;
+                    }
+                }
+                m_liveGraphHash = 0;
+                destroy_graph_pipeline(m_liveGraphPipeline);
+                if (!build_graph_pipeline(live, m_liveGraphPipeline)) {
+                    ok = false;
+                    error = m_liveGraphPipeline.lastError;
+                } else if (m_liveGraphPipeline.textures.empty()) {
+                    ok = false;
+                    error = "texture pipeline has no bound textures";
+                } else {
+                    error = "texture: " + textureName;
+                }
+            } else if (ok) {
+                ok = false;
+                error = (error.empty() ? "" : error + "; ") + "no cooked texture asset found";
+            }
+            std::cout << "[Editor] MATERIAL_TEST " << (ok ? "PASS" : "FAIL")
+                      << (error.empty() ? "" : " (" + error + ")") << std::endl;
+            vkDeviceWaitIdle(m_device);
+            std::exit(ok ? 0 : 1);
+        }
+    }
+    vkDeviceWaitIdle(m_device);
+}
+
+void EditorApplication::render_frame() {
+    vkWaitForFences(m_device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE, UINT64_MAX);
+
+    // A pick requested from the previous frame is resolved before this frame's
+    // scene pass so the freshly selected entity is highlighted immediately.
+    // Hover pick uses the same pass (one extra pixel read, zero extra GPU cost).
+    if ((m_pickRequested || m_hoverPickPending) && !m_inLauncherMode) {
+        perform_pick_readback();
+        m_pickRequested = false;
+        m_hoverPickPending = false;
+    }
+
+
+    uint32_t imageIndex;
+    VkResult result = vkAcquireNextImageKHR(m_device, m_swapchain, UINT64_MAX, m_imageAvailableSemaphores[m_currentFrame], VK_NULL_HANDLE, &imageIndex);
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+            recreate_swapchain();
+        }
+        return;
+    }
+
+    vkResetFences(m_device, 1, &m_inFlightFences[m_currentFrame]);
+
+    VkCommandBuffer cmd = m_commandBuffers[m_currentFrame];
+    vkResetCommandBuffer(cmd, 0);
+
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    if (!m_inLauncherMode) {
+        // Size the offscreen to the panel (not the fitted image) so its aspect
+        // ratio tracks the panel instead of locking onto its own previous size.
+        recreate_offscreen_if_needed(
+            static_cast<uint32_t>(std::max(1.0f, m_viewportPanelSize.x)),
+            static_cast<uint32_t>(std::max(1.0f, m_viewportPanelSize.y)));
+        if (m_offscreen.framebuffer != VK_NULL_HANDLE) {
+            render_scene_to_offscreen(cmd);
+        }
+    }
+
+    VkRenderPassBeginInfo renderPassInfo{};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    renderPassInfo.renderPass = m_renderPass;
+    renderPassInfo.framebuffer = m_framebuffers[imageIndex];
+    renderPassInfo.renderArea.offset = { 0, 0 };
+    renderPassInfo.renderArea.extent = m_swapchainExtent;
+
+    VkClearValue clearColor = { {{0.08f, 0.09f, 0.12f, 1.0f}} };
+    renderPassInfo.clearValueCount = 1;
+    renderPassInfo.pClearValues = &clearColor;
+
+    vkCmdBeginRenderPass(cmd, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+
+    if (m_inLauncherMode) {
+        draw_project_launcher();
+    } else {
+        // Ctrl+K: focus the global search box (the command palette).
+        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_K)) {
+            m_focusGlobalSearch = true;
+        }
+
+        // Draw order matters for the shell: main menu bar on top, then the
+        // app bar, then the dockspace fills the remaining area (each positioned
+        // from viewport->Pos/Size, so nothing is double-offset).
+        draw_menu_bar();
+        draw_app_bar();
+        draw_dockspace();
+        if (m_showHierarchy) draw_hierarchy_panel();
+        if (m_showInspector) draw_inspector_panel();
+        if (m_showViewport) draw_viewport_panel();
+        if (m_showContentBrowser) draw_content_browser_panel();
+#if VC_ENABLE_VOXEL_PLUGIN
+        if (m_showVoxelTools) draw_voxel_tool_panel();
+#endif
+        if (m_showConsole) draw_console_panel();
+        if (m_showScriptDebugger) draw_script_debugger_panel();
+        if (m_showScriptCanvas) { if (!m_scriptCanvasLoaded) load_script_canvas(); draw_script_canvas_panel(); }
+        {
+            // Feed cooked texture assets to the Material Editor texture pickers.
+            std::vector<std::pair<std::string, UUID>> textureAssets;
+            for (const AssetMetadata& meta : m_assetRegistry.snapshot()) {
+                if (meta.type == AssetType::Texture && meta.isCooked)
+                    textureAssets.emplace_back(meta.sourcePath.filename().string(), meta.id);
+            }
+            m_specializedEditors.set_texture_assets(std::move(textureAssets));
+        }
+        Scene* activeScene = m_playMode.get_active_scene();
+        if (!activeScene) activeScene = m_editorScene.get();
+        m_specializedEditors.set_scene_context(activeScene, m_selectedEntity.get_id());
+        m_specializedEditors.draw();
+        {
+            // Wicked-port tool windows: refresh the live context every frame.
+            m_wickedTools.set_context(activeScene, m_selectedEntity.get_id(), &m_currentLanguage);
+            // Paint tool state mirrors the selected entity's paintMode so the
+            // viewport click handler paints without an extra callback.
+            if (m_selectedEntity.is_valid()) {
+                const auto paintIt = activeScene->paintComponents.find(m_selectedEntity.get_id());
+                m_paintToolActive = paintIt != activeScene->paintComponents.end() &&
+                                    paintIt->second.enabled && paintIt->second.paintMode;
+            } else {
+                m_paintToolActive = false;
+            }
+            m_wickedTools.set_asset_registry(&m_assetRegistry);
+            m_wickedTools.set_open_specialized_editors(&m_specializedEditors.open);
+            m_wickedTools.set_on_entity_deleted([this](UUID doomed) {
+                // A tool panel deleted the entity: clear the editor selection so
+                // the Inspector/hierarchy don't keep a dangling reference.
+                if (m_selectedEntity.is_valid() && m_selectedEntity.get_id() == doomed) {
+                    m_selectedEntity = Entity();
+                    m_editorGui.select_entity(m_selectedEntity);
+                }
+            });
+            m_wickedTools.set_create_project_callback([this](const std::string& name,
+                                                             const std::string& folder) -> std::string {
+                return create_project(name, folder);
+            });
+            m_wickedTools.set_terrain_callback([this](float scale, int octaves, float amount, float falloff) {
+                generate_terrain_mesh(TerrainParams{ scale, octaves, amount, falloff });
+            });
+            m_wickedTools.set_graphics_callback([this](bool vsync, int quality) {
+                apply_graphics_settings(vsync, quality);
+            });
+            m_wickedTools.set_save_settings_callback([this]() { save_settings(); });
+            m_wickedTools.set_mesh_callback([this](int mode) -> std::string { return apply_mesh_normals(mode); });
+            // Dev panel: route Control-API commands through the same handler the
+            // HTTP API uses, and run headless self-tests on demand.
+            m_wickedTools.set_control_command_callback([this](const std::string& cmd) {
+                handle_control_command(cmd);
+            });
+            m_wickedTools.set_self_test_callback([this](int which) -> std::string {
+                return run_editor_self_test(which);
+            });
+            m_wickedTools.set_package_assets_callback([this]() -> std::string {
+                return package_assets_only();
+            });
+            m_wickedTools.set_hot_reload_status_callback([this]() -> std::string {
+                if (!m_assetHotReload) return tr("inativo", "inactive");
+                const size_t watched = m_assetRegistry.snapshot().size();
+                return tr("ativo — vigia ", "active — watches ") + std::to_string(watched) +
+                       tr(" asset(s) e reimporta mudanças nos arquivos de origem",
+                          " asset(s) and reimports source-file changes");
+            });
+            m_wickedTools.set_play_state(static_cast<int>(m_playMode.get_state()));
+            // Profiler: feed frame stats every frame for the graph window.
+            m_wickedTools.set_frame_stats(m_fps, m_frameTimeMs);
+            m_wickedTools.set_import_asset_callback([this](const std::string& requested) -> std::string {
+                // "" = ask for a file via the editor's Windows dialog.
+                std::string path = requested;
+                if (path.empty()) {
+                    if (!pick_file_dialog(path, L"Modelos (*.gltf;*.fbx;*.obj;*.ply)\0*.gltf;*.fbx;*.obj;*.ply\0Todos (*.*)\0*.*\0",
+                                           L"Importar Modelo", nullptr)) {
+                        return std::string();
+                    }
+                }
+                if (!m_assetPipeline) return "Sem pipeline de assets.";
+                const std::filesystem::path cookedRoot =
+                    std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "DerivedDataCache";
+                const ImportResult result = m_assetPipeline->import({ path, cookedRoot, 1 });
+                if (!result) return "Falha: " + result.error;
+                std::cout << "[Editor] Modelo importado: " << path << " (" << result.asset.id.to_string() << ")" << std::endl;
+                return "OK: " + result.asset.sourcePath.filename().string();
+            });
+            m_wickedTools.draw();
+        }
+    }
+
+    ImGui::Render();
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
+
+    vkCmdEndRenderPass(cmd);
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    VkSemaphore waitSemaphores[] = { m_imageAvailableSemaphores[m_currentFrame] };
+    VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+    submitInfo.waitSemaphoreCount = 1;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitStages;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+
+    VkSemaphore signalSemaphores[] = { m_renderFinishedSemaphores[m_currentFrame] };
+    submitInfo.signalSemaphoreCount = 1;
+    submitInfo.pSignalSemaphores = signalSemaphores;
+
+    vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, m_inFlightFences[m_currentFrame]);
+
+    VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+    presentInfo.waitSemaphoreCount = 1;
+    presentInfo.pWaitSemaphores = signalSemaphores;
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = &m_swapchain;
+    presentInfo.pImageIndices = &imageIndex;
+
+    const VkResult presentResult = vkQueuePresentKHR(m_graphicsQueue, &presentInfo);
+    if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) {
+        recreate_swapchain();
+    }
+    m_currentFrame = (m_currentFrame + 1) % 2;
+}
+
+void EditorApplication::recreate_swapchain() {
+    vkDeviceWaitIdle(m_device);
+    for (auto fb : m_framebuffers) vkDestroyFramebuffer(m_device, fb, nullptr);
+    for (auto view : m_swapchainViews) vkDestroyImageView(m_device, view, nullptr);
+    m_framebuffers.clear();
+    m_swapchainViews.clear();
+    m_swapchainImages.clear();
+
+    int width = 0, height = 0;
+    glfwGetFramebufferSize(m_window, &width, &height);
+    while (width == 0 || height == 0) {
+        glfwGetFramebufferSize(m_window, &width, &height);
+        glfwWaitEvents();
+    }
+    vkDeviceWaitIdle(m_device);
+
+    VkSurfaceCapabilitiesKHR capabilities{};
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(m_physicalDevice, m_surface, &capabilities) != VK_SUCCESS) {
+        return;
+    }
+    VkExtent2D extent = capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max()
+        ? capabilities.currentExtent
+        : VkExtent2D{ static_cast<uint32_t>(width), static_cast<uint32_t>(height) };
+    extent.width = std::clamp(extent.width, std::max(1u, capabilities.minImageExtent.width), capabilities.maxImageExtent.width);
+    extent.height = std::clamp(extent.height, std::max(1u, capabilities.minImageExtent.height), capabilities.maxImageExtent.height);
+
+    // Prefer UNORM (matches the initial swapchain: no sRGB gamma washout).
+    VkFormat imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
+    VkColorSpaceKHR colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    uint32_t formatCount = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(m_physicalDevice, m_surface, &formatCount, nullptr);
+    std::vector<VkSurfaceFormatKHR> formats(formatCount);
+    vkGetPhysicalDeviceSurfaceFormatsKHR(m_physicalDevice, m_surface, &formatCount, formats.data());
+    for (const VkSurfaceFormatKHR& candidate : formats) {
+        if (candidate.format == VK_FORMAT_B8G8R8A8_UNORM) {
+            imageFormat = candidate.format;
+            colorSpace = candidate.colorSpace;
+            break;
+        }
+    }
+
+    uint32_t imageCount = capabilities.minImageCount + 1;
+    if (capabilities.maxImageCount > 0 && imageCount > capabilities.maxImageCount) {
+        imageCount = capabilities.maxImageCount;
+    }
+
+    VkSwapchainKHR oldSwapchain = m_swapchain;
+    VkSwapchainCreateInfoKHR createInfo{ VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
+    createInfo.surface = m_surface;
+    createInfo.minImageCount = imageCount;
+    createInfo.imageFormat = imageFormat;
+    createInfo.imageColorSpace = colorSpace;
+    createInfo.imageExtent = extent;
+    createInfo.imageArrayLayers = 1;
+    createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    createInfo.preTransform = capabilities.currentTransform;
+    createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    // VSync (Opções Gráficas): FIFO when on; MAILBOX (preferred) or IMMEDIATE
+    // when off — queried from the surface so unsupported modes never break.
+    createInfo.presentMode = m_vsyncEnabled ? VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_IMMEDIATE_KHR;
+    if (!m_vsyncEnabled) {
+        uint32_t modeCount = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(m_physicalDevice, m_surface, &modeCount, nullptr);
+        std::vector<VkPresentModeKHR> modes(modeCount);
+        vkGetPhysicalDeviceSurfacePresentModesKHR(m_physicalDevice, m_surface, &modeCount, modes.data());
+        for (const VkPresentModeKHR mode : modes) {
+            if (mode == VK_PRESENT_MODE_MAILBOX_KHR) { createInfo.presentMode = mode; break; }
+        }
+    }
+    createInfo.clipped = VK_TRUE;
+    createInfo.oldSwapchain = oldSwapchain;
+    if (vkCreateSwapchainKHR(m_device, &createInfo, nullptr, &m_swapchain) != VK_SUCCESS) {
+        m_swapchain = oldSwapchain;
+        return;
+    }
+    vkDestroySwapchainKHR(m_device, oldSwapchain, nullptr);
+
+    m_swapchainFormat = imageFormat;
+    m_swapchainExtent = extent;
+    uint32_t swapImageCount = 0;
+    vkGetSwapchainImagesKHR(m_device, m_swapchain, &swapImageCount, nullptr);
+    m_swapchainImages.resize(swapImageCount);
+    vkGetSwapchainImagesKHR(m_device, m_swapchain, &swapImageCount, m_swapchainImages.data());
+    m_swapchainViews.resize(swapImageCount);
+    m_framebuffers.resize(swapImageCount);
+    for (uint32_t i = 0; i < swapImageCount; ++i) {
+        VkImageViewCreateInfo viewInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        viewInfo.image = m_swapchainImages[i];
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = imageFormat;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(m_device, &viewInfo, nullptr, &m_swapchainViews[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to recreate swapchain image view");
+        }
+        VkImageView attachments[] = { m_swapchainViews[i] };
+        VkFramebufferCreateInfo framebufferInfo{ VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+        framebufferInfo.renderPass = m_renderPass;
+        framebufferInfo.attachmentCount = 1;
+        framebufferInfo.pAttachments = attachments;
+        framebufferInfo.width = extent.width;
+        framebufferInfo.height = extent.height;
+        framebufferInfo.layers = 1;
+        if (vkCreateFramebuffer(m_device, &framebufferInfo, nullptr, &m_framebuffers[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to recreate framebuffer");
+        }
+    }
+}
+
+
+size_t EditorApplication::import_texture_pack(const std::filesystem::path& folder) {
+    if (!m_assetPipeline || !std::filesystem::is_directory(folder)) return 0;
+    const std::filesystem::path cookedRoot =
+        std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "DerivedDataCache";
+    size_t imported = 0;
+    std::error_code ec;
+    for (std::filesystem::recursive_directory_iterator it(folder, ec), end; it != end && !ec; it.increment(ec)) {
+        if (!it->is_regular_file()) continue;
+        std::string ext = it->path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext != ".png" && ext != ".tga" && ext != ".jpg" && ext != ".jpeg" &&
+            ext != ".bmp" && ext != ".hdr" && ext != ".dds" &&
+            ext != ".glb" && ext != ".gltf" && ext != ".fbx" &&
+            ext != ".obj" && ext != ".ply" &&
+            ext != ".wav" && ext != ".ogg" && ext != ".mp3" &&
+            ext != ".vmat") continue;
+        const ImportResult result = m_assetPipeline->import({it->path(), cookedRoot, 1});
+        if (result) {
+            ++imported;
+            if ((ext == ".png" || ext == ".tga" || ext == ".bmp" || ext == ".dds") &&
+                result.asset.width > 0 && result.asset.height > 0 &&
+                result.asset.width == result.asset.height) {
+                const uint32_t s = result.asset.width;
+                if (s >= 8 && s <= 256 && (s & (s - 1)) == 0) {
+                    if (!is_character_texture(result.asset)) {
+                        create_block_asset(result.asset);
+                    }
+                }
+            }
+        } else if (result.error.rfind("No importer supports", 0) != 0) {
+            std::cerr << "[PackImport] " << it->path().filename().string()
+                      << ": " << result.error << std::endl;
+        }
+    }
+    if (imported > 0) {
+        m_assetHotReload->watch_registered_assets();
+        const auto registryPath = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) /
+            "Intermediate" / "AssetRegistry.db";
+        if (!m_assetRegistry.save(registryPath))
+            std::cerr << "[PackImport] Could not persist registry" << std::endl;
+        std::cout << "[PackImport] Imported " << imported << " assets from "
+                  << folder.string() << std::endl;
+    }
+    return imported;
+}
+
+} // namespace Engine
