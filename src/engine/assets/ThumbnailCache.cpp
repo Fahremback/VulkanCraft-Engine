@@ -26,10 +26,18 @@ std::optional<ThumbnailCache::Thumbnail> ThumbnailCache::get(
     const std::function<void(std::uint32_t, std::uint32_t, std::vector<std::uint8_t>&)>& generator) {
     if (assetKey.empty() || !generator) return std::nullopt;
 
+    // The source hash identifies the asset's *content*, not the renderer that
+    // produced the thumbnail. Mix in a renderer version so fixing/improving a
+    // thumbnail generator invalidates every stale preview (memory + disk)
+    // instead of returning the old broken image forever.
+    constexpr std::uint64_t kThumbnailRendererVersion = 2;
+    const std::uint64_t effectiveHash =
+        sourceHash ^ (kThumbnailRendererVersion * 0x9E3779B97F4A7C15ull);
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = entries_.find(assetKey);
-        if (it != entries_.end() && it->second.thumbnail.sourceHash == sourceHash) {
+        if (it != entries_.end() && it->second.thumbnail.sourceHash == effectiveHash) {
             it->second.lastAccess = static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -39,7 +47,7 @@ std::optional<ThumbnailCache::Thumbnail> ThumbnailCache::get(
 
     // Disk fallback (persisted cache): only if hashes match.
     Thumbnail diskThumb;
-    if (options_.persist && load_from_disk(assetKey, diskThumb) && diskThumb.sourceHash == sourceHash) {
+    if (options_.persist && load_from_disk(assetKey, diskThumb) && diskThumb.sourceHash == effectiveHash) {
         std::lock_guard<std::mutex> lock(mutex_);
         entries_[assetKey] = {diskThumb, 0};
         return diskThumb;
@@ -51,7 +59,7 @@ std::optional<ThumbnailCache::Thumbnail> ThumbnailCache::get(
     thumb.height = options_.size;
     generator(thumb.width, thumb.height, thumb.rgba);
     if (thumb.rgba.size() != static_cast<std::size_t>(thumb.width) * thumb.height * 4) return std::nullopt;
-    thumb.sourceHash = sourceHash;
+    thumb.sourceHash = effectiveHash;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);

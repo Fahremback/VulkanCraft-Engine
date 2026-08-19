@@ -534,6 +534,10 @@ private:
         // Combined image samplers, binding i+1 for textures[i] (node-id order).
         std::vector<GraphTexture> textures;
         uint64_t graphHash{ 0 };
+        // Content hash of the sampled texture when the pipeline was built, so a
+        // reimported texture rebuilds the pipeline instead of sampling a stale
+        // GPU copy.
+        uint64_t textureContentHash{ 0 };
         std::string lastError;
         bool valid{ false };
     };
@@ -557,6 +561,9 @@ private:
         VkDescriptorSet imguiId{ VK_NULL_HANDLE };
     };
     std::unordered_map<UUID, AssetThumbnail> m_assetThumbnails;
+    // Content hash per cached thumbnail: reimports/hot reloads invalidate the
+    // stale GPU preview instead of showing the old image forever.
+    std::unordered_map<UUID, std::uint64_t> m_assetThumbnailHashes;
     std::unordered_set<UUID> m_assetThumbnailFailed;
     // Async texture thumbnails: the cooked file is decoded + downscaled on a
     // worker thread (one at a time); the main thread uploads one small image
@@ -602,12 +609,14 @@ private:
     std::deque<UUID> m_thumbnailQueue;
     std::unordered_set<UUID> m_thumbnailQueued;
     std::unordered_map<UUID, VkDescriptorSet> m_asset3dThumbnails;
+    std::unordered_map<UUID, std::uint64_t> m_asset3dThumbnailHashes; // content hash per 3D thumbnail
     void init_thumbnail_target();
     void destroy_thumbnail_target();
     void request_3d_thumbnail(const UUID& assetId);
     void pump_asset_thumbnails(int budget);
     void render_mesh_thumbnail(const UUID& assetId, const EditorMeshResource& mesh);
     void render_block_thumbnail(const UUID& assetId, VkDescriptorSet textureDesc);
+    void render_character_thumbnail(const UUID& assetId, const EditorMeshResource& mesh);
 
     // Textured unit cube (block pipeline): renders Minecraft-style block
     // models assembled from a PNG texture, both as thumbnails and (via the
@@ -623,6 +632,7 @@ private:
     uint32_t m_blockCubeIndexCount{ 0 };
     std::unordered_map<UUID, VkDescriptorSet> m_blockDescriptors;
     std::unordered_map<UUID, GraphTexture> m_blockTextures; // keeps the views alive
+    std::unordered_map<UUID, std::uint64_t> m_blockTextureHashes; // content hash per block texture
     void init_block_cube();
     void destroy_block_cube();
     VkDescriptorSet get_block_descriptor(const UUID& textureAsset);
@@ -644,6 +654,17 @@ private:
     // and any sidecar, so a misclassified character/mob skin stays a texture.
     std::unordered_set<UUID> m_noblockTextures;
     std::unordered_set<UUID> m_noblockChecked; // one stat() per texture UUID
+    // Auxiliary material maps (_n, _s, _normal, _spec… ) are never blocks;
+    // m_auxBlockHealed remembers which ones already had their bogus sidecars
+    // removed (one registry scan per texture UUID).
+    [[nodiscard]] bool is_aux_map_texture(const AssetMetadata& meta) const;
+    void heal_aux_block_sidecars(const AssetMetadata& textureMeta);
+    // One-time pass after indexing: base blocks created before material-map
+    // grouping existed get their sibling _n/_s textures recorded in the
+    // .vblock sidecar (normal/specular), so the whole material set belongs to
+    // the block asset.
+    void enrich_block_material_maps();
+    std::unordered_set<UUID> m_auxBlockHealed;
     // Minecraft character/mob skins are also square POT (player 64x64, mobs
     // 64x64...): entity/mob path + filename signals classify them as MODELS,
     // not blocks (resource-pack block folders like /textures/block/ win).
@@ -659,6 +680,9 @@ private:
     struct BlockAssetData {
         UUID texture{ 0, 0 }; // all faces default to this
         UUID top{ 0, 0 }, bottom{ 0, 0 }, side{ 0, 0 };
+        // Material maps grouped into the block (aux sibling textures like
+        // andesite_n.png / andesite_s.png) — stored in the .vblock sidecar.
+        UUID normal{ 0, 0 }, specular{ 0, 0 };
     };
     std::unordered_map<UUID, BlockAssetData> m_blockAssetCache;
     std::unordered_set<UUID> m_blockAssetFailed;

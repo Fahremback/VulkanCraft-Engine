@@ -115,12 +115,12 @@ int main() {
         rich.constraintComponents[hid] = ConstraintComponent{ ConstraintType::Hinge, UUID(), {1.0f, 2.0f, 3.0f}, {0.0f, 1.0f, 0.0f}, 500.0f, true };
         rich.softBodyComponents[hid] = SoftBodyComponent{ 12, 2.5f, 0.3f, 0.2f, 0.4f, 0.08f, false, true };
         rich.springComponents[hid] = SpringComponent{ 0.6f, 0.15f, 0.2f, 0.9f, 0.7f, false, true, true };
-        rich.decalComponents[hid] = DecalComponent{ "decal.png", {0.5f, 0.4f, 0.3f}, 2.0f, false, true, true };
+        rich.decalComponents[hid] = DecalComponent{ "decal.png", {0.5f, 0.4f, 0.3f}, {2.0f, 2.0f}, 2.0f, false, true, true };
         rich.splineComponents[hid] = SplineComponent{ { {0.0f, 0.0f, 0.0f}, {1.0f, 2.0f, 3.0f}, {4.0f, 5.0f, 6.0f} }, true, true, 2.0f, 0.5f, 24, true };
         rich.forceFieldComponents[hid] = ForceFieldComponent{ ForceFieldType::Vortex, 3.5f, 25.0f, true };
         rich.envProbeComponents[hid] = EnvProbeComponent{ true, 150.0f, 512, true };
         rich.weatherComponents[hid] = WeatherComponent{ {1.0f, 0.9f, 0.8f}, 0.002f, 50.0f, 1.2f, 0.3f, 12.0f, 0.4f, 2.0f, true, true };
-        rich.hairParticleComponents[hid] = HairParticleComponent{ "head.fbx", 5000, 0.4f, 0.02f, 0.6f, 0.2f, 1.5f, 0.3f, 12, 7, true };
+        rich.hairParticleComponents[hid] = HairParticleComponent{ "head.fbx", 5000, 0.4f, 0.02f, 0.6f, 0.2f, 1.5f, 0.3f, 12, 7, {0.95f, 0.88f, 0.78f}, true };
 
         const std::filesystem::path richFile = temporary / "rich.scene";
         if (!Serializer::serialize_scene(rich, richFile)) return EXIT_FAILURE;
@@ -408,6 +408,27 @@ int main() {
     }
     if (audioPipeline.import({temporary / "invalid.wav", temporary / "audio-cache", 1}) ||
         audioRegistry.size() != 1) return EXIT_FAILURE;
+
+    // Mislabeled audio: an Ogg Vorbis stream stored with a .wav extension must
+    // still import. Detection is by CONTENT, not extension — several shipped
+    // assets (assets/audio/*.wav) are Ogg streams that used to fail with
+    // "Invalid RIFF/WAVE header", and this also requires the miniaudio Vorbis
+    // backend (stb_vorbis) to be wired in (MiniaudioImpl.cpp).
+    {
+        const std::filesystem::path oggSample =
+            std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "assets" / "audio" / "step.wav";
+        const std::filesystem::path mislabeled = temporary / "mislabeled.wav";
+        std::error_code copyError;
+        if (!std::filesystem::copy_file(oggSample, mislabeled, copyError)) return EXIT_FAILURE;
+        AssetRegistry oggRegistry;
+        AssetPipeline oggPipeline(oggRegistry);
+        oggPipeline.add_importer(std::make_unique<AudioImporter>());
+        const ImportResult importedOgg = oggPipeline.import({mislabeled, temporary / "ogg-cache", 1});
+        if (!importedOgg || importedOgg.asset.type != AssetType::Audio ||
+            importedOgg.asset.sampleRate == 0 || importedOgg.asset.audioChannels == 0 ||
+            importedOgg.asset.durationSeconds <= 0.0f ||
+            importedOgg.asset.cookedPath.extension() != ".vcaudio") return EXIT_FAILURE;
+    }
 
     // Reimport must preserve the persistent asset UUID while refreshing cooked data.
     const UUID importedTextureID = imported.asset.id;
@@ -1041,8 +1062,10 @@ int main() {
         if (shader.find("inJoints") == std::string::npos || shader.find("inWeights") == std::string::npos) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
     }
 
-    // Audio importer: compressed formats decode to float PCM with real
-    // sample rate / channel metadata in the cooked asset.
+    // Audio importer: detection is by CONTENT, not extension. A file whose
+    // bytes are RIFF/WAV is cooked through the WAV path (format 1, raw copy)
+    // even when named .ogg; true Ogg/FLAC/MP3 streams decode to float PCM
+    // (format 2) — covered by the Ogg-in-wav regression test further below.
     {
         const std::filesystem::path audioRoot = temporary / "audio_ogg";
         std::error_code aec;
@@ -1064,8 +1087,8 @@ int main() {
             std::ofstream out(wavPath, std::ios::binary);
             out.write(reinterpret_cast<const char*>(wav.data()), static_cast<std::streamsize>(wav.size()));
         }
-        // Route through the AudioImporter with the compressed path by renaming
-        // the source extension to .ogg (decoder is format-agnostic here).
+        // Renaming the extension must NOT change the routing: the payload is
+        // still RIFF/WAV, so the importer uses the WAV path (content wins).
         AssetRegistry audioReg;
         AssetPipeline audioPipeline(audioReg);
         audioPipeline.add_importer(std::make_unique<AudioImporter>());
@@ -1078,10 +1101,11 @@ int main() {
         std::ifstream cookedAudio(audioResult.asset.cookedPath, std::ios::binary);
         const std::vector<uint8_t> cookedBytes((std::istreambuf_iterator<char>(cookedAudio)), {});
         if (cookedBytes.size() < 7 + 4 + 4 + 2 + 2 + 4 + 8) { std::cerr << "Failure at line " << __LINE__ << '\n'; return EXIT_FAILURE; }
-        // formatVersion == 2 (float PCM).
+        // formatVersion == 1 (raw WAV copy): RIFF content is never treated as
+        // a compressed stream, regardless of the .ogg extension.
         uint32_t cookedFormat{};
         std::memcpy(&cookedFormat, cookedBytes.data() + 7, 4);
-        if (cookedFormat != 2) { std::cerr << "Failure at line " << __LINE__ << " fmt=" << cookedFormat << '\n'; return EXIT_FAILURE; }
+        if (cookedFormat != 1) { std::cerr << "Failure at line " << __LINE__ << " fmt=" << cookedFormat << '\n'; return EXIT_FAILURE; }
         std::filesystem::remove_all(audioRoot, aec);
     }
 

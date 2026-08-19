@@ -35,7 +35,6 @@ layout (push_constant) uniform PushConstants {
 // Cells of the current grid frequency span roughly this many pixels before the
 // grid steps up to the next decade. Raise to 96 for even earlier transitions.
 const float TARGET_PIXELS_PER_CELL = 64.0;
-const float MAX_DISTANCE = 5000.0;
 
 // One family of parallel grid lines with a constant screen-space width.
 float gridLine1D(float worldCoord, float step, float pixelWidth) {
@@ -68,15 +67,22 @@ void main() {
     // ----------------------------------------------------------------------
     // Ray -> ground (Y = 0). No early discard: every fragment runs the same
     // path so the 2x2 quads used by fwidth stay intact.
+    //
+    // This is an INFINITE ray, not a near->far segment: the fullscreen
+    // triangle already projects the camera ray, and extrapolating past the
+    // far plane is the same straight line, so the grid never stops at a
+    // distance cutoff — it runs to the horizon.
     // ----------------------------------------------------------------------
-    float denom = farPoint.y - nearPoint.y;
+    vec3 rayOrigin = nearPoint;
+    vec3 rayDirection = farPoint - nearPoint;
+    float denom = rayDirection.y;
     bool valid = abs(denom) > 1e-6;
     float safeDenom = valid ? denom : 1.0;
-    float t = -nearPoint.y / safeDenom;
-    valid = valid && t >= 0.0 && t <= 1.0;
+    float t = -rayOrigin.y / safeDenom;
+    valid = valid && t >= 0.0;
     float safeT = valid ? t : 0.0; // keep the ray math finite for the quad
 
-    vec3 p = nearPoint + safeT * (farPoint - nearPoint);
+    vec3 p = rayOrigin + safeT * rayDirection;
 
     // ----------------------------------------------------------------------
     // How much world does one pixel cover? (screen-space footprint)
@@ -110,19 +116,15 @@ void main() {
     float grid = mix(fineGrid, coarseGrid, transition);
 
     // ----------------------------------------------------------------------
-    // Distance fade
-    // ----------------------------------------------------------------------
-    float distanceFromOrigin = length(p.xz);
-    float distanceFade = 1.0 - smoothstep(MAX_DISTANCE * 0.72, MAX_DISTANCE, distanceFromOrigin);
-
-    // ----------------------------------------------------------------------
-    // Horizon: more aggressive than the previous version only where the
-    // projection cannot produce useful spatial information.
+    // Horizon: only the extreme grazing angle fades, to fight numerical
+    // instability at the exact horizon line. The adaptive LOD (fine/coarse
+    // decade crossfade above) already keeps the grid readable at any distance,
+    // so no radial MAX_DISTANCE cutoff is needed — the grid is infinite.
     // ----------------------------------------------------------------------
     vec3 ray = normalize(farPoint - nearPoint);
     float incidence = abs(ray.y);
     if (isnan(incidence) || isinf(incidence)) incidence = 1.0;
-    float horizonFade = smoothstep(0.025, 0.085, incidence);
+    float horizonFade = smoothstep(0.001, 0.006, incidence);
 
     // ----------------------------------------------------------------------
     // Visual: the grid gets discretely stronger with distance so it stays
@@ -152,7 +154,6 @@ void main() {
     // and avoids pixels popping in/out between frames.
     // ----------------------------------------------------------------------
     alpha *= valid ? 1.0 : 0.0;
-    alpha *= distanceFade;
     alpha *= horizonFade;
     if (isnan(alpha) || isinf(alpha)) alpha = 0.0;
     alpha = max(alpha, 0.0);

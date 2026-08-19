@@ -1,10 +1,11 @@
 #version 450
 
-// Analytic infinite grid (anti-aliased, distance-faded).
+// Analytic infinite grid (anti-aliased).
 // Draws a single fullscreen triangle (no vertex buffer); each fragment
 // intersects its view ray with the ground plane (Y = 0) in the fragment
 // shader. The near/far endpoints are unprojected here so the fragment
-// can interpolate the ray in world space.
+// can interpolate the ray in world space; the fragment treats it as an
+// infinite ray (no far-plane cutoff) so the grid runs to the horizon.
 
 layout (location = 0) out vec3 nearPoint;
 layout (location = 1) out vec3 farPoint;

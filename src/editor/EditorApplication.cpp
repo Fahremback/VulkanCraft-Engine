@@ -1439,7 +1439,7 @@ size_t EditorApplication::import_texture_pack(const std::filesystem::path& folde
                 result.asset.width == result.asset.height) {
                 const uint32_t s = result.asset.width;
                 if (s >= 8 && s <= 256 && (s & (s - 1)) == 0) {
-                    if (!is_character_texture(result.asset)) {
+                    if (!is_character_texture(result.asset) && !is_aux_map_texture(result.asset)) {
                         create_block_asset(result.asset);
                     }
                 }
@@ -3100,6 +3100,31 @@ void EditorApplication::draw_content_browser_panel() {
             }
         }
         m_assetHotReload->watch_registered_assets();
+        // Auxiliary maps (_n/_s/…) are never blocks: heal sidecars created by
+        // older builds right after indexing (idempotent, once per texture),
+        // then record sibling material maps on base blocks created before
+        // grouping existed.
+        for (const AssetMetadata& candidate : m_assetRegistry.snapshot()) {
+            if (candidate.type == AssetType::Texture && is_aux_map_texture(candidate) &&
+                !m_auxBlockHealed.contains(candidate.id)) {
+                m_auxBlockHealed.insert(candidate.id);
+                heal_aux_block_sidecars(candidate);
+            }
+        }
+        enrich_block_material_maps();
+        // Sweep orphan .vblock sidecars: files created by older builds but not
+        // present in the registry (dead plumbing). They caused the duplicate
+        // pile-up (gold_ore_2/3/4/5.vblock) on every drop of the same texture.
+        std::error_code sweepEc;
+        for (std::filesystem::recursive_directory_iterator it(sourceRoot, sweepEc), end; it != end && !sweepEc; it.increment(sweepEc)) {
+            if (!it->is_regular_file()) continue;
+            if (it->path().extension().string() != ".vblock") continue;
+            if (!m_assetRegistry.find_id(it->path())) {
+                std::filesystem::remove(it->path(), sweepEc);
+                std::cout << "[ContentBrowser] Removed orphan sidecar '"
+                          << it->path().filename().string() << "'" << std::endl;
+            }
+        }
         const std::filesystem::path registryPath =
             std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db";
         if (!m_assetRegistry.save(registryPath))
@@ -3254,14 +3279,14 @@ void EditorApplication::draw_content_browser_panel() {
         const bool isSkinTexture = isTexture && !isBlockTexture && is_character_texture(asset);
         const bool isModel = (asset.type == AssetType::Mesh);
         VkDescriptorSet thumb = VK_NULL_HANDLE;
-        if (isTexture && !isBlockTexture) {
+        if (isTexture && !isBlockTexture && !isSkinTexture) {
             const auto found = m_assetThumbnails.find(asset.id);
             if (found != m_assetThumbnails.end()) {
                 thumb = found->second.imguiId;
             } else if (isVisible) {
                 request_asset_thumbnail_decode(asset); // async, 1 upload/frame
             }
-        } else if ((isModel || isBlockTexture) && isVisible) {
+        } else if ((isModel || isBlockTexture || isSkinTexture) && isVisible) {
             const auto thumbIt = m_asset3dThumbnails.find(asset.id);
             if (thumbIt != m_asset3dThumbnails.end()) {
                 thumb = thumbIt->second;
@@ -6727,8 +6752,16 @@ void EditorApplication::setup_play_runtime() {
     for (const auto& [id, ac] : playScene->audioComponents) {
         if (!ac.playOnStart || ac.clipPath.empty()) continue;
         std::filesystem::path clipSource;
+        std::error_code clipEc;
+        const std::filesystem::path clipCanonical = std::filesystem::weakly_canonical(ac.clipPath, clipEc);
+        const std::filesystem::path clipName = std::filesystem::path(ac.clipPath).filename();
         for (const AssetMetadata& asset : m_assetRegistry.snapshot()) {
-            if (asset.type == AssetType::Audio && asset.sourcePath == ac.clipPath) {
+            if (asset.type != AssetType::Audio) continue;
+            // Match the authored clip path robustly: exact string, canonical
+            // equivalence, or the same file name (the user may have typed a
+            // relative path or a different separator style).
+            if (asset.sourcePath == ac.clipPath || asset.sourcePath == clipCanonical ||
+                asset.sourcePath.filename() == clipName) {
                 clipSource = asset.sourcePath;
                 break;
             }
@@ -9450,13 +9483,19 @@ EditorApplication::GraphMaterialPipeline* EditorApplication::ensure_texture_pipe
     const auto baseOut = graph.add_output("BaseColor", Rendering::MaterialValueType::Vec3);
     (void)graph.connect(texNode, baseOut, 0);
     const uint64_t graphHash = hash_material_graph(graph);
-    if (it == cache.end() || !it->second.valid || it->second.graphHash != graphHash) {
+    // Rebuild when the sampled texture's content changed (hot reload) — the
+    // graph hash alone cannot see that, so pipelines kept stale GPU copies.
+    uint64_t contentHash = 0;
+    if (const auto meta = m_assetRegistry.find(texId)) contentHash = meta->contentHash;
+    if (it == cache.end() || !it->second.valid || it->second.graphHash != graphHash ||
+        it->second.textureContentHash != contentHash) {
         if (it != cache.end()) destroy_graph_pipeline(it->second);
         GraphMaterialPipeline built;
         built.graphHash = graphHash;
         if (!build_graph_pipeline(graph, built)) {
             std::cerr << "[Editor] Texture pipeline: " << built.lastError << std::endl;
         }
+        built.textureContentHash = contentHash;
         it = cache.insert_or_assign(texId, std::move(built)).first;
     }
     return it->second.valid ? &it->second : nullptr;
@@ -9829,6 +9868,25 @@ void EditorApplication::request_asset_thumbnail_decode(const AssetMetadata& asse
         m_assetThumbnailFailed.insert(asset.id);
         return;
     }
+    // Content-hash invalidation: a reimported texture (hot reload) must not
+    // keep showing its stale flat thumbnail.
+    const auto hashIt = m_assetThumbnailHashes.find(asset.id);
+    if (hashIt != m_assetThumbnailHashes.end() && hashIt->second != asset.contentHash) {
+        const auto thumbIt = m_assetThumbnails.find(asset.id);
+        if (thumbIt != m_assetThumbnails.end()) {
+            if (thumbIt->second.imguiId != VK_NULL_HANDLE)
+                ImGui_ImplVulkan_RemoveTexture(thumbIt->second.imguiId);
+            if (thumbIt->second.view != VK_NULL_HANDLE)
+                vkDestroyImageView(m_device, thumbIt->second.view, nullptr);
+            if (thumbIt->second.image != VK_NULL_HANDLE)
+                vkDestroyImage(m_device, thumbIt->second.image, nullptr);
+            if (thumbIt->second.memory != VK_NULL_HANDLE)
+                vkFreeMemory(m_device, thumbIt->second.memory, nullptr);
+            m_assetThumbnails.erase(thumbIt);
+        }
+        m_assetThumbnailFailed.erase(asset.id);
+        m_assetThumbnailHashes.erase(hashIt);
+    }
     if (m_assetThumbnails.contains(asset.id) || m_assetThumbnailFailed.contains(asset.id)) return;
     std::lock_guard<std::mutex> lock(m_thumbDecodeMutex);
     if (m_thumbDecodeRequested.contains(asset.id)) return;
@@ -9875,6 +9933,10 @@ void EditorApplication::pump_asset_thumbnail_decodes() {
             // Corrupt/undecodable cooked file: remember so we never retry it.
             m_assetThumbnailFailed.insert(ready.assetId);
         }
+        // Remember the content this preview was made from, so a reimport
+        // invalidates it (success and failure alike — a fixed file retries).
+        if (const auto meta = m_assetRegistry.find(ready.assetId))
+            m_assetThumbnailHashes[ready.assetId] = meta->contentHash;
         std::lock_guard<std::mutex> lock(m_thumbDecodeMutex);
         m_thumbDecodeRequested.erase(ready.assetId);
     }
@@ -10169,11 +10231,13 @@ void EditorApplication::destroy_asset_thumbnails() {
         if (thumb.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, thumb.memory, nullptr);
     }
     m_assetThumbnails.clear();
+    m_assetThumbnailHashes.clear();
     for (auto& [id, desc] : m_asset3dThumbnails) {
         (void)id;
         if (desc != VK_NULL_HANDLE) ImGui_ImplVulkan_RemoveTexture(desc);
     }
     m_asset3dThumbnails.clear();
+    m_asset3dThumbnailHashes.clear();
     m_assetThumbnailFailed.clear();
     {
         std::lock_guard<std::mutex> lock(m_thumbDecodeMutex);
@@ -10384,6 +10448,7 @@ void EditorApplication::destroy_block_cube() {
     }
     m_blockTextures.clear();
     m_blockDescriptors.clear();
+    m_blockTextureHashes.clear();
     if (m_blockPipeline != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_blockPipeline, nullptr); m_blockPipeline = VK_NULL_HANDLE; }
     if (m_blockPipelineLayout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(m_device, m_blockPipelineLayout, nullptr); m_blockPipelineLayout = VK_NULL_HANDLE; }
     if (m_blockDescSetLayout != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(m_device, m_blockDescSetLayout, nullptr); m_blockDescSetLayout = VK_NULL_HANDLE; }
@@ -10397,6 +10462,22 @@ void EditorApplication::destroy_block_cube() {
 // Lazy descriptor set for a block texture (my layout, allocated from the ImGui
 // descriptor pool which carries COMBINED_IMAGE_SAMPLER).
 VkDescriptorSet EditorApplication::get_block_descriptor(const UUID& textureAsset) {
+    // Content-hash invalidation: a reimported texture (hot reload) must not
+    // keep its stale GPU copy (thumbnails and scene block faces share it).
+    uint64_t contentHash = 0;
+    if (const auto meta = m_assetRegistry.find(textureAsset)) contentHash = meta->contentHash;
+    const auto hashIt = m_blockTextureHashes.find(textureAsset);
+    if (hashIt != m_blockTextureHashes.end() && hashIt->second != contentHash) {
+        const auto descIt = m_blockDescriptors.find(textureAsset);
+        if (descIt != m_blockDescriptors.end()) {
+            if (descIt->second != VK_NULL_HANDLE && m_imguiDescriptorPool != VK_NULL_HANDLE)
+                vkFreeDescriptorSets(m_device, m_imguiDescriptorPool, 1, &descIt->second);
+            m_blockDescriptors.erase(descIt);
+        }
+        const auto texIt = m_blockTextures.find(textureAsset);
+        if (texIt != m_blockTextures.end()) { destroy_graph_texture(texIt->second); m_blockTextures.erase(texIt); }
+        m_blockTextureHashes.erase(hashIt);
+    }
     const auto cached = m_blockDescriptors.find(textureAsset);
     if (cached != m_blockDescriptors.end()) return cached->second;
     if (m_blockDescSetLayout == VK_NULL_HANDLE || m_blockSampler == VK_NULL_HANDLE) return VK_NULL_HANDLE;
@@ -10422,6 +10503,7 @@ VkDescriptorSet EditorApplication::get_block_descriptor(const UUID& textureAsset
     vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
     m_blockTextures[textureAsset] = gt; // keeps image/view alive
     m_blockDescriptors[textureAsset] = set;
+    m_blockTextureHashes[textureAsset] = contentHash;
     return set;
 }
 
@@ -10449,6 +10531,17 @@ void EditorApplication::pump_asset_thumbnails(int budget) {
         }
         const auto meta = m_assetRegistry.find(id);
         if (!meta) { m_assetThumbnailFailed.insert(id); continue; }
+        // Content-hash invalidation: a reimported asset (hot reload) must not
+        // keep showing its stale 3D thumbnail.
+        const auto hashIt = m_asset3dThumbnailHashes.find(id);
+        if (hashIt != m_asset3dThumbnailHashes.end() && hashIt->second != meta->contentHash) {
+            const auto thumbIt = m_asset3dThumbnails.find(id);
+            if (thumbIt != m_asset3dThumbnails.end()) {
+                if (thumbIt->second != VK_NULL_HANDLE) ImGui_ImplVulkan_RemoveTexture(thumbIt->second);
+                m_asset3dThumbnails.erase(thumbIt);
+            }
+            m_asset3dThumbnailHashes.erase(hashIt);
+        }
         if (meta->type == AssetType::Mesh) {
             if (!load_mesh_resource(id)) { m_assetThumbnailFailed.insert(id); continue; }
             const EditorMeshResource* mesh = get_mesh_resource(id);
@@ -10466,6 +10559,13 @@ void EditorApplication::pump_asset_thumbnails(int budget) {
             const VkDescriptorSet desc = get_block_descriptor(meta->id);
             if (desc == VK_NULL_HANDLE) { m_assetThumbnailFailed.insert(id); continue; }
             render_block_thumbnail(id, desc);
+        } else if (meta->type == AssetType::Texture && is_character_texture(*meta)) {
+            // The PNG is the character: its card shows the humanoid mesh with
+            // the skin applied (same pipeline the viewport uses), not the flat
+            // skin atlas.
+            const EditorMeshResource* mesh = get_mesh_resource(id);
+            if (!mesh || !mesh->valid) { m_assetThumbnailFailed.insert(id); continue; }
+            render_character_thumbnail(id, *mesh);
         } else {
             m_assetThumbnailFailed.insert(id);
         }
@@ -10512,6 +10612,8 @@ void EditorApplication::render_mesh_thumbnail(const UUID& assetId, const EditorM
 
     m_asset3dThumbnails[assetId] =
         ImGui_ImplVulkan_AddTexture(m_thumbView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (const auto meta = m_assetRegistry.find(assetId))
+        m_asset3dThumbnailHashes[assetId] = meta->contentHash;
 }
 
 // Same, but a textured unit cube: the Minecraft-style block assembled from its
@@ -10559,6 +10661,67 @@ void EditorApplication::render_block_thumbnail(const UUID& assetId, VkDescriptor
 
     m_asset3dThumbnails[assetId] =
         ImGui_ImplVulkan_AddTexture(m_thumbView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (const auto meta = m_assetRegistry.find(assetId))
+        m_asset3dThumbnailHashes[assetId] = meta->contentHash;
+}
+
+// A Minecraft character/mob skin rendered as the humanoid mesh with the skin
+// applied (material-graph texture pipeline, the exact path the viewport uses
+// for character entities) — the card shows the 3D character instead of the
+// flat skin atlas PNG.
+void EditorApplication::render_character_thumbnail(const UUID& assetId, const EditorMeshResource& mesh) {
+    GraphMaterialPipeline* gmp = ensure_texture_pipeline(assetId, m_skinGraphPipelines);
+    if (!gmp) { m_assetThumbnailFailed.insert(assetId); return; }
+    write_material_ubo(*gmp, nullptr, nullptr);
+    write_light_ubo(*gmp, m_editorScene.get(), m_editorCamera.position);
+    // Frame the humanoid: the model spans y 0..2 with the feet at the origin.
+    const glm::vec3 center(0.0f, 1.0f, 0.0f);
+    const glm::mat4 proj = glm::perspective(glm::radians(45.0f), 1.0f, 0.01f, 100.0f);
+    const glm::mat4 view = glm::lookAt(center + glm::vec3(0.85f, 0.55f, 1.10f) * 3.0f,
+                                       center, glm::vec3(0, 1, 0));
+    const Rendering::MaterialPushConstants pc{ proj * view, glm::mat4(1.0f) };
+
+    VkCommandBuffer cmd = begin_single_time_commands();
+    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkRenderPassBeginInfo rp{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    rp.renderPass = m_offscreen.renderPass;
+    rp.framebuffer = m_thumbFramebuffer;
+    rp.renderArea = { { 0, 0 }, { m_thumbSize, m_thumbSize } };
+    const VkClearValue clears[2] = {
+        { { { 0.10f, 0.11f, 0.14f, 1.0f } } },
+        { { 1.0f, 0 } },
+    };
+    rp.clearValueCount = 2;
+    rp.pClearValues = clears;
+    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    const VkViewport vp{ 0, 0, static_cast<float>(m_thumbSize), static_cast<float>(m_thumbSize), 0, 1 };
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    const VkRect2D sc{ { 0, 0 }, { m_thumbSize, m_thumbSize } };
+    vkCmdSetScissor(cmd, 0, 1, &sc);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gmp->pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gmp->layout,
+                            0, 1, &gmp->descriptorSet, 0, nullptr);
+    vkCmdPushConstants(cmd, gmp->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
+    const VkDeviceSize vertexOffset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vb.buffer, &vertexOffset);
+    if (mesh.ib.buffer != VK_NULL_HANDLE)
+        vkCmdBindIndexBuffer(cmd, mesh.ib.buffer, 0, VK_INDEX_TYPE_UINT32);
+    for (const EditorMeshResource::DrawRange& range : mesh.ranges) {
+        if (range.indexed)
+            vkCmdDrawIndexed(cmd, range.indexCount, 1, range.firstIndex, 0, 0);
+        else
+            vkCmdDraw(cmd, range.indexCount, 1, range.vertexOffset, 0);
+    }
+    vkCmdEndRenderPass(cmd);
+    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    end_single_time_commands(cmd);
+
+    m_asset3dThumbnails[assetId] =
+        ImGui_ImplVulkan_AddTexture(m_thumbView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (const auto meta = m_assetRegistry.find(assetId))
+        m_asset3dThumbnailHashes[assetId] = meta->contentHash;
 }
 
 // ---------------------------------------------------------------------------
@@ -10579,6 +10742,7 @@ bool EditorApplication::is_character_texture(const AssetMetadata& meta) const {
         "/character/", "/characters/", "/player/", "/players/", "/actor/",
         "/actors/", "/humanoid/", "/creature/", "/creatures/", "/monster/",
         "/monsters/", "/npc/", "/npcs/", "/zombie/", "/villager/", "/village/",
+        "/skin/", "/skins/",
     };
     for (const char* marker : kSkinPathMarkers) {
         if (p.find(marker) != std::string::npos) return true;
@@ -10616,12 +10780,38 @@ bool EditorApplication::is_character_texture(const AssetMetadata& meta) const {
 // Heuristic: small square power-of-two textures are the classic Minecraft
 // block face format (16/32/64/128/256). Character/mob skins are excluded
 // (they are models, not blocks); block folders always win.
+// Auxiliary material maps follow the classic <base>_<suffix> naming
+// (andesite_n.png = normal, _s = specular, _h = height, _e = emissive, …).
+// They are material inputs for a block, never a block face themselves — the
+// heuristic used to classify every square POT texture as a Block, flooding the
+// browser with fake "blocks" that were really normal/specular maps.
+bool EditorApplication::is_aux_map_texture(const AssetMetadata& meta) const {
+    if (meta.type != AssetType::Texture || meta.sourcePath.empty()) return false;
+    std::string stem = meta.sourcePath.stem().string();
+    std::transform(stem.begin(), stem.end(), stem.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (stem.size() < 3) return false;
+    static const char* kAuxSuffixes[] = {
+        "_n", "_s", "_h", "_e", "_bump", "_bumpmap", "_normal", "_normalmap",
+        "_spec", "_specular", "_specmap", "_height", "_heightmap", "_emissive",
+        "_emission", "_glow", "_ao", "_ambientocclusion", "_rough", "_roughness",
+        "_metal", "_metallic", "_metalness", "_disp", "_displacement", "_mask",
+        "_detail", "_overlay", "_gloss", "_glossmap",
+    };
+    for (const char* suffix : kAuxSuffixes) {
+        const size_t n = std::strlen(suffix);
+        if (stem.size() > n && stem.compare(stem.size() - n, n, suffix) == 0) return true;
+    }
+    return false;
+}
+
 bool EditorApplication::looks_like_block_texture(const AssetMetadata& meta) const {
     if (meta.type != AssetType::Texture || meta.width == 0 || meta.height == 0) return false;
     if (meta.width != meta.height) return false;
     const uint32_t s = meta.width;
     if (s < 8 || s > 256) return false;
     if ((s & (s - 1)) != 0) return false;
+    if (is_aux_map_texture(meta)) return false;
     std::string p = meta.sourcePath.generic_string();
     std::transform(p.begin(), p.end(), p.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -10652,6 +10842,15 @@ bool EditorApplication::is_block_texture(const AssetMetadata& meta) {
         }
     }
     if (m_noblockTextures.contains(meta.id)) return false;
+    if (is_aux_map_texture(meta)) {
+        // Aux maps are never blocks. Heal registries created before this rule
+        // existed (their .vblock sidecar made andesite_n.png a "Block").
+        if (!m_auxBlockHealed.contains(meta.id)) {
+            m_auxBlockHealed.insert(meta.id);
+            heal_aux_block_sidecars(meta);
+        }
+        return false;
+    }
     if (looks_like_block_texture(meta)) return true;
     if (m_blockSidecarChecked.contains(meta.id)) return m_blockTextureSet.contains(meta.id);
     bool found = false;
@@ -10668,6 +10867,90 @@ bool EditorApplication::is_block_texture(const AssetMetadata& meta) {
     m_blockSidecarChecked.insert(meta.id);
     if (found) m_blockTextureSet.insert(meta.id);
     return found;
+}
+
+// Removes .vblock sidecars that were auto-created for an auxiliary map (a
+// sidecar whose main face IS the aux texture, e.g. andesite_n.vblock). Blocks
+// that merely reference the aux texture as their normal/specular are kept.
+// Runs once per texture UUID (see is_block_texture).
+void EditorApplication::heal_aux_block_sidecars(const AssetMetadata& textureMeta) {
+    if (!textureMeta.id.is_valid()) return;
+    AssetBrowserModel browser(m_assetRegistry);
+    bool changed = false;
+    for (const AssetMetadata& candidate : m_assetRegistry.snapshot()) {
+        if (candidate.type != AssetType::Block) continue;
+        BlockAssetData data;
+        if (!load_block_asset(candidate.id, data)) continue;
+        const bool isMainFace = data.texture == textureMeta.id || data.top == textureMeta.id ||
+                                data.side == textureMeta.id || data.bottom == textureMeta.id;
+        if (!isMainFace) continue;
+        const AssetFileOperationResult removed = browser.delete_asset(candidate.id);
+        if (!removed) {
+            std::cerr << "[ContentBrowser] Could not remove aux-map block: " << removed.error << std::endl;
+        } else {
+            m_blockAssetCache.erase(candidate.id);
+            m_blockAssetFailed.erase(candidate.id);
+            changed = true;
+        }
+    }
+    if (changed) {
+        const auto registryPath =
+            std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db";
+        if (!m_assetRegistry.save(registryPath))
+            std::cerr << "[AssetRegistry] Could not persist aux-map block cleanup" << std::endl;
+        std::cout << "[ContentBrowser] Removed block sidecar(s) for aux map '"
+                  << textureMeta.sourcePath.filename().string() << "'" << std::endl;
+    }
+}
+
+// One-time pass (after the Content Browser indexes): base blocks whose sidecar
+// predates material-map grouping get their sibling _n/_s textures recorded as
+// normal/specular, so andesite.vblock owns the whole material set even when it
+// was created in an older session.
+void EditorApplication::enrich_block_material_maps() {
+    bool changed = false;
+    for (const AssetMetadata& candidate : m_assetRegistry.snapshot()) {
+        if (candidate.type != AssetType::Block || candidate.sourcePath.empty()) continue;
+        BlockAssetData data;
+        if (!load_block_asset(candidate.id, data)) continue;
+        if (data.normal.is_valid() && data.specular.is_valid()) continue;
+        if (!data.texture.is_valid()) continue;
+        const auto texMeta = m_assetRegistry.find(data.texture);
+        if (!texMeta || texMeta->sourcePath.empty()) continue;
+        UUID normalId = data.normal, specularId = data.specular;
+        std::string baseLower = texMeta->sourcePath.stem().string();
+        std::transform(baseLower.begin(), baseLower.end(), baseLower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        for (const AssetMetadata& cand : m_assetRegistry.snapshot()) {
+            if (cand.type != AssetType::Texture || cand.sourcePath.empty()) continue;
+            std::string cStem = cand.sourcePath.stem().string();
+            std::transform(cStem.begin(), cStem.end(), cStem.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (cStem == baseLower + "_n" || cStem == baseLower + "_normal" ||
+                cStem == baseLower + "_normalmap") {
+                normalId = cand.id;
+            } else if (cStem == baseLower + "_s" || cStem == baseLower + "_spec" ||
+                       cStem == baseLower + "_specular") {
+                specularId = cand.id;
+            }
+        }
+        if (normalId == data.normal && specularId == data.specular) continue;
+        data.normal = normalId;
+        data.specular = specularId;
+        m_blockAssetCache[candidate.id] = data;
+        std::ofstream out(candidate.sourcePath);
+        out << "{\"texture\":\"" << data.texture.to_string() << "\"";
+        if (data.top.is_valid()) out << ",\"top\":\"" << data.top.to_string() << "\"";
+        if (data.bottom.is_valid()) out << ",\"bottom\":\"" << data.bottom.to_string() << "\"";
+        if (data.side.is_valid()) out << ",\"side\":\"" << data.side.to_string() << "\"";
+        if (normalId.is_valid()) out << ",\"normal\":\"" << normalId.to_string() << "\"";
+        if (specularId.is_valid()) out << ",\"specular\":\"" << specularId.to_string() << "\"";
+        out << "}";
+        changed = true;
+    }
+    if (changed) {
+        std::cout << "[ContentBrowser] Enriched block sidecars with material maps" << std::endl;
+    }
 }
 
 // User override: delete the .vblock sidecar (file + registry entry) so a
@@ -10744,9 +11027,33 @@ UUID EditorApplication::create_block_asset(const AssetMetadata& textureMeta) {
         blockPath = textureMeta.sourcePath.parent_path() /
             (textureMeta.sourcePath.stem().string() + "_" + std::to_string(suffix++) + ".vblock");
     }
+    // Group the block's material set: sibling <base>_n / <base>_s textures
+    // (normal/specular maps, already registered as plain textures) are recorded
+    // in the sidecar so the block asset owns its maps, not just the albedo
+    // face — andesite_n.png is no longer a separate "Block".
+    UUID normalId, specularId;
+    std::string baseLower = textureMeta.sourcePath.stem().string();
+    std::transform(baseLower.begin(), baseLower.end(), baseLower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const AssetMetadata& candidate : m_assetRegistry.snapshot()) {
+        if (candidate.type != AssetType::Texture || candidate.sourcePath.empty()) continue;
+        std::string cStem = candidate.sourcePath.stem().string();
+        std::transform(cStem.begin(), cStem.end(), cStem.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (cStem == baseLower + "_n" || cStem == baseLower + "_normal" ||
+            cStem == baseLower + "_normalmap") {
+            normalId = candidate.id;
+        } else if (cStem == baseLower + "_s" || cStem == baseLower + "_spec" ||
+                   cStem == baseLower + "_specular") {
+            specularId = candidate.id;
+        }
+    }
     {
         std::ofstream out(blockPath);
-        out << "{\"texture\":\"" << textureMeta.id.to_string() << "\"}";
+        out << "{\"texture\":\"" << textureMeta.id.to_string() << "\"";
+        if (normalId.is_valid()) out << ",\"normal\":\"" << normalId.to_string() << "\"";
+        if (specularId.is_valid()) out << ",\"specular\":\"" << specularId.to_string() << "\"";
+        out << "}";
     }
     AssetMetadata meta;
     meta.id = UUID();
@@ -10759,7 +11066,8 @@ UUID EditorApplication::create_block_asset(const AssetMetadata& textureMeta) {
         std::cerr << "[ContentBrowser] Failed to register block asset " << blockPath.string() << std::endl;
         return UUID{ 0, 0 };
     }
-    m_blockAssetCache[meta.id] = BlockAssetData{ textureMeta.id, textureMeta.id, textureMeta.id, textureMeta.id };
+    m_blockAssetCache[meta.id] =
+        BlockAssetData{ textureMeta.id, textureMeta.id, textureMeta.id, textureMeta.id, normalId, specularId };
     m_blockAssetFailed.erase(meta.id);
     const auto registryPath = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db";
     if (!m_assetRegistry.save(registryPath)) {
@@ -10799,6 +11107,8 @@ bool EditorApplication::load_block_asset(const UUID& blockAssetId, BlockAssetDat
     data.top = grab("top");
     data.bottom = grab("bottom");
     data.side = grab("side");
+    data.normal = grab("normal");
+    data.specular = grab("specular");
     if (!data.texture.is_valid() && !data.top.is_valid() && !data.side.is_valid() && !data.bottom.is_valid()) {
         m_blockAssetFailed.insert(blockAssetId);
         return false;
