@@ -1309,13 +1309,22 @@ ImportResult AudioImporter::import(const ImportRequest& request) const {
     const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(source)), {});
 
     const std::string ext = lower(request.source.extension().string());
+    const auto magic = [&](size_t offset, size_t length) -> std::string_view {
+        return (offset + length <= bytes.size())
+                   ? std::string_view(reinterpret_cast<const char*>(bytes.data() + offset), length)
+                   : std::string_view{};
+    };
     // Compressed formats (OGG/FLAC/MP3) are decoded to float PCM via miniaudio
-    // so the cooked asset is always uncompressed and runtime-ready.
-    if (ext == ".ogg" || ext == ".flac" || ext == ".mp3") {
-        std::ofstream rawSource(request.source, std::ios::binary | std::ios::trunc);
-        if (!rawSource) return {false, {}, "Cannot re-open audio source"};
-        rawSource.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-        rawSource.close();
+    // so the cooked asset is always uncompressed and runtime-ready. Detection
+    // is by CONTENT, not extension: several shipped assets are Ogg Vorbis
+    // streams stored in .wav files, which used to fail the RIFF check below.
+    const bool isRiffWav = magic(0, 4) == "RIFF" && magic(8, 4) == "WAVE";
+    const bool isOggStream = magic(0, 4) == "OggS";
+    const bool isFlacStream = magic(0, 4) == "fLaC";
+    const bool isMp3Stream = magic(0, 3) == "ID3" ||
+                             (bytes.size() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0);
+    if (!isRiffWav && (isOggStream || isFlacStream || isMp3Stream ||
+                       ext == ".ogg" || ext == ".flac" || ext == ".mp3")) {
         const auto decoded = Engine::Audio::OggDecoder::decode_file(request.source);
         if (!decoded || !decoded->valid()) {
             return {false, {}, "Decoding compressed audio failed: " + (decoded ? decoded->error : "unknown")};

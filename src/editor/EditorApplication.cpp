@@ -46,6 +46,14 @@
 // global-scope versions share the same implementations.
 namespace {
 glm::mat4 model_from_transform(const Engine::TransformComponent& t) {
+    const auto finite = [](float v) { return std::isfinite(v); };
+    if (!finite(t.position.x) || !finite(t.position.y) || !finite(t.position.z) ||
+        !finite(t.rotation.x) || !finite(t.rotation.y) || !finite(t.rotation.z) ||
+        !finite(t.scale.x) || !finite(t.scale.y) || !finite(t.scale.z)) {
+        // NaN/inf guard: a non-finite transform would poison the MVP matrix and
+        // black out the viewport. Draw this entity at the origin instead.
+        return glm::mat4(1.0f);
+    }
     glm::mat4 model(1.0f);
     model = glm::translate(model, t.position);
     model = glm::rotate(model, glm::radians(t.rotation.z), glm::vec3(0, 0, 1));
@@ -81,11 +89,35 @@ void draw_indexed_editor_mesh(VkCommandBuffer cmd, VkPipelineLayout layout, cons
                               const glm::vec4& color) {
     draw_indexed_cube(cmd, layout, vb, ib, indexCount, mvp, color);
 }
+
 } // namespace
+
 #include <imgui_impl_vulkan.h>
 #include <VkBootstrap.h>
 #include <miniaudio.h>
 #include <thread>
+
+// ---------------------------------------------------------------------------
+// Safe Vulkan helpers (avoid null-pointer dereferences on mapping failure)
+// ---------------------------------------------------------------------------
+static bool safe_vkMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset,
+                             VkDeviceSize size, VkFlags flags, void** ppData) {
+    *ppData = nullptr;
+    const VkResult result = vkMapMemory(device, memory, offset, size, flags, ppData);
+    if (result != VK_SUCCESS) {
+        std::cerr << "[Vulkan] vkMapMemory failed (" << result << ")" << std::endl;
+        return false;
+    }
+    return true;
+}
+static bool safe_map_and_copy(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset,
+                              VkDeviceSize size, const void* source) {
+    void* data = nullptr;
+    if (!safe_vkMapMemory(device, memory, offset, size, 0, &data)) return false;
+    std::memcpy(data, source, static_cast<size_t>(size));
+    vkUnmapMemory(device, memory);
+    return true;
+}
 
 // PlayNavAgent — the public provider's path follower (mirrors the legacy
 // NavigationAgent stepping so the Fase 8 behavior is preserved).
@@ -579,13 +611,8 @@ void EditorApplication::init_default_scene() {
         create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       cubeRes.ib.buffer, cubeRes.ib.memory);
-        void* data = nullptr;
-        vkMapMemory(m_device, cubeRes.vb.memory, 0, vbSize, 0, &data);
-        std::memcpy(data, verts.data(), static_cast<size_t>(vbSize));
-        vkUnmapMemory(m_device, cubeRes.vb.memory);
-        vkMapMemory(m_device, cubeRes.ib.memory, 0, ibSize, 0, &data);
-        std::memcpy(data, indices.data(), static_cast<size_t>(ibSize));
-        vkUnmapMemory(m_device, cubeRes.ib.memory);
+        safe_map_and_copy(m_device, cubeRes.vb.memory, 0, vbSize, verts.data());
+        safe_map_and_copy(m_device, cubeRes.ib.memory, 0, ibSize, indices.data());
         cubeRes.valid = true;
         m_meshResources[m_materialTestMeshId] = std::move(cubeRes);
         // Material asset values become the graph's parameter defaults.
@@ -795,6 +822,13 @@ int EditorApplication::run_hdr_texture_self_test() {
     end_single_time_commands(cmd);
     void* data = nullptr;
     vkMapMemory(m_device, stagingMemory, 0, size, 0, &data);
+    if (!data) {
+        std::cerr << "[Editor] HDR_TEST FAIL (staging map)" << std::endl;
+        vkDestroyBuffer(m_device, staging, nullptr);
+        vkFreeMemory(m_device, stagingMemory, nullptr);
+        destroy_graph_texture(tex);
+        return 1;
+    }
     const uint8_t* bytes = static_cast<const uint8_t*>(data);
     const uint16_t halfR = static_cast<uint16_t>(bytes[0]) | (static_cast<uint16_t>(bytes[1]) << 8);
     vkUnmapMemory(m_device, stagingMemory);
@@ -1044,7 +1078,20 @@ void EditorApplication::main_loop() {
 }
 
 void EditorApplication::render_frame() {
-    vkWaitForFences(m_device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE, UINT64_MAX);
+    // Bounded wait: a GPU stall must degrade the frame, not hang the editor
+    // forever (the previous UINT64_MAX wait froze input and left the window
+    // black when a presentation fence never signalled).
+    constexpr std::uint64_t kFenceTimeoutNs = 2'000'000'000ull; // 2s
+    const VkResult fenceResult =
+        vkWaitForFences(m_device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE, kFenceTimeoutNs);
+    if (fenceResult == VK_TIMEOUT) {
+        std::cerr << "[Vulkan] fence wait timed out; skipping frame\n";
+        return;
+    }
+    if (fenceResult != VK_SUCCESS) {
+        std::cerr << "[Vulkan] fence wait failed: " << static_cast<int>(fenceResult) << "\n";
+        return;
+    }
 
     // A pick requested from the previous frame is resolved before this frame's
     // scene pass so the freshly selected entity is highlighted immediately.
@@ -1062,6 +1109,12 @@ void EditorApplication::render_frame() {
         if (result == VK_ERROR_OUT_OF_DATE_KHR) {
             recreate_swapchain();
         }
+        return;
+    }
+    if (result != VK_SUCCESS) {
+        // VK_ERROR_DEVICE_LOST / VK_TIMEOUT / others: don't submit on a broken
+        // swapchain (it would never present). Log and let the next frame retry.
+        std::cerr << "[Vulkan] acquire next image failed: " << static_cast<int>(result) << "\n";
         return;
     }
 
@@ -4505,6 +4558,14 @@ glm::mat3 rotation_axis_from_y(const glm::vec3& axis) {
 }
 
 glm::mat4 model_from_transform(const TransformComponent& t) {
+    const auto finite = [](float v) { return std::isfinite(v); };
+    if (!finite(t.position.x) || !finite(t.position.y) || !finite(t.position.z) ||
+        !finite(t.rotation.x) || !finite(t.rotation.y) || !finite(t.rotation.z) ||
+        !finite(t.scale.x) || !finite(t.scale.y) || !finite(t.scale.z)) {
+        // NaN/inf guard: a non-finite transform would poison the MVP matrix and
+        // black out the viewport. Draw this entity at the origin instead.
+        return glm::mat4(1.0f);
+    }
     glm::mat4 model(1.0f);
     model = glm::translate(model, t.position);
     model = glm::rotate(model, glm::radians(t.rotation.z), glm::vec3(0, 0, 1));
@@ -5492,13 +5553,8 @@ void EditorApplication::init_geometry_buffers() {
                   m_cubeVB.buffer, m_cubeVB.memory);
     create_buffer(cubeIBsize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   m_cubeIB.buffer, m_cubeIB.memory);
-    void* data = nullptr;
-    vkMapMemory(m_device, m_cubeVB.memory, 0, cubeVBsize, 0, &data);
-    std::memcpy(data, cubeVerts.data(), static_cast<size_t>(cubeVBsize));
-    vkUnmapMemory(m_device, m_cubeVB.memory);
-    vkMapMemory(m_device, m_cubeIB.memory, 0, cubeIBsize, 0, &data);
-    std::memcpy(data, cubeIndices.data(), static_cast<size_t>(cubeIBsize));
-    vkUnmapMemory(m_device, m_cubeIB.memory);
+    safe_map_and_copy(m_device, m_cubeVB.memory, 0, cubeVBsize, cubeVerts.data());
+    safe_map_and_copy(m_device, m_cubeIB.memory, 0, cubeIBsize, cubeIndices.data());
 
     // (No grid vertex buffer: the grid is now analytic — a fullscreen
     // triangle rasterized by editor_grid.vert/frag with fwidth AA.)
@@ -5510,9 +5566,7 @@ void EditorApplication::init_geometry_buffers() {
     VkDeviceSize lightSize = sizeof(EditorVertex) * lightVerts.size();
     create_buffer(lightSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   m_lightIconVB.buffer, m_lightIconVB.memory);
-    vkMapMemory(m_device, m_lightIconVB.memory, 0, lightSize, 0, &data);
-    std::memcpy(data, lightVerts.data(), static_cast<size_t>(lightSize));
-    vkUnmapMemory(m_device, m_lightIconVB.memory);
+    safe_map_and_copy(m_device, m_lightIconVB.memory, 0, lightSize, lightVerts.data());
 
     // Camera icon (pyramid edges)
     std::vector<EditorVertex> cameraVerts;
@@ -5521,9 +5575,7 @@ void EditorApplication::init_geometry_buffers() {
     VkDeviceSize cameraSize = sizeof(EditorVertex) * cameraVerts.size();
     create_buffer(cameraSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   m_cameraIconVB.buffer, m_cameraIconVB.memory);
-    vkMapMemory(m_device, m_cameraIconVB.memory, 0, cameraSize, 0, &data);
-    std::memcpy(data, cameraVerts.data(), static_cast<size_t>(cameraSize));
-    vkUnmapMemory(m_device, m_cameraIconVB.memory);
+    safe_map_and_copy(m_device, m_cameraIconVB.memory, 0, cameraSize, cameraVerts.data());
 
     // Env probe preview sphere (UV sphere).
     {
@@ -5561,13 +5613,8 @@ void EditorApplication::init_geometry_buffers() {
                       m_envSphereVB.buffer, m_envSphereVB.memory);
         create_buffer(is, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       m_envSphereIB.buffer, m_envSphereIB.memory);
-        void* data = nullptr;
-        vkMapMemory(m_device, m_envSphereVB.memory, 0, vs, 0, &data);
-        std::memcpy(data, verts.data(), static_cast<size_t>(vs));
-        vkUnmapMemory(m_device, m_envSphereVB.memory);
-        vkMapMemory(m_device, m_envSphereIB.memory, 0, is, 0, &data);
-        std::memcpy(data, indices.data(), static_cast<size_t>(is));
-        vkUnmapMemory(m_device, m_envSphereIB.memory);
+        safe_map_and_copy(m_device, m_envSphereVB.memory, 0, vs, verts.data());
+        safe_map_and_copy(m_device, m_envSphereIB.memory, 0, is, indices.data());
     }
 
     // Decal quad (1x1, facing +Z, UVs 0..1).
@@ -5587,13 +5634,8 @@ void EditorApplication::init_geometry_buffers() {
                       m_decalVB.buffer, m_decalVB.memory);
         create_buffer(is, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       m_decalIB.buffer, m_decalIB.memory);
-        void* data = nullptr;
-        vkMapMemory(m_device, m_decalVB.memory, 0, vs, 0, &data);
-        std::memcpy(data, verts.data(), static_cast<size_t>(vs));
-        vkUnmapMemory(m_device, m_decalVB.memory);
-        vkMapMemory(m_device, m_decalIB.memory, 0, is, 0, &data);
-        std::memcpy(data, indices.data(), static_cast<size_t>(is));
-        vkUnmapMemory(m_device, m_decalIB.memory);
+        safe_map_and_copy(m_device, m_decalVB.memory, 0, vs, verts.data());
+        safe_map_and_copy(m_device, m_decalIB.memory, 0, is, indices.data());
     }
 
     // Gizmo geometry (all modes)
@@ -5697,13 +5739,8 @@ void EditorApplication::generate_gizmo_geometry() {
                   m_gizmoVB.buffer, m_gizmoVB.memory);
     create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   m_gizmoIB.buffer, m_gizmoIB.memory);
-    void* data = nullptr;
-    vkMapMemory(m_device, m_gizmoVB.memory, 0, vbSize, 0, &data);
-    std::memcpy(data, verts.data(), static_cast<size_t>(vbSize));
-    vkUnmapMemory(m_device, m_gizmoVB.memory);
-    vkMapMemory(m_device, m_gizmoIB.memory, 0, ibSize, 0, &data);
-    std::memcpy(data, indices.data(), static_cast<size_t>(ibSize));
-    vkUnmapMemory(m_device, m_gizmoIB.memory);
+    safe_map_and_copy(m_device, m_gizmoVB.memory, 0, vbSize, verts.data());
+    safe_map_and_copy(m_device, m_gizmoIB.memory, 0, ibSize, indices.data());
 }
 
 // ===========================================================================
@@ -6208,10 +6245,7 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                   cloud.vb.buffer, cloud.vb.memory);
                 }
-                void* data = nullptr;
-                vkMapMemory(m_device, cloud.vb.memory, 0, vs, 0, &data);
-                std::memcpy(data, verts.data(), static_cast<size_t>(vs));
-                vkUnmapMemory(m_device, cloud.vb.memory);
+                safe_map_and_copy(m_device, cloud.vb.memory, 0, vs, verts.data());
                 cloud.count = gs.count;
                 cloud.scale = gs.scale;
                 cloud.dirty = false;
@@ -6415,6 +6449,7 @@ void EditorApplication::perform_pick_readback() {
 
     void* mapped = nullptr;
     vkMapMemory(m_device, m_offscreen.pickStagingMemory, 0, VK_WHOLE_SIZE, 0, &mapped);
+    if (!mapped) return;
 
     // Click pick
     const size_t x = static_cast<size_t>(m_pickPixel.x);
@@ -6473,6 +6508,19 @@ void EditorApplication::setup_play_runtime() {
     teardown_play_runtime();
     Scene* playScene = m_playMode.get_active_scene();
     if (!playScene) return;
+
+    // Static ground plane at y=0: terrain and voxel volumes are visual-only
+    // (no collision), so without this every dynamic body falls forever. A wide
+    // thin box keeps the solver cheap and gives vehicles/destructibles a floor.
+    {
+        Physics::BodyDesc ground;
+        ground.motion = Physics::MotionType::Static;
+        ground.position = glm::vec3(0.0f, -0.5f, 0.0f);
+        ground.collider.shape = Physics::BoxShape{ glm::vec3(2000.0f, 0.5f, 2000.0f) };
+        ground.collider.friction = 0.7f;
+        ground.collider.restitution = 0.05f;
+        m_playGroundBody = m_playPhysics.create_body(ground);
+    }
     for (const auto& [id, rb] : playScene->rigidbodyComponents) {
         Physics::BodyDesc desc;
         desc.motion = rb.isKinematic ? Physics::MotionType::Kinematic : Physics::MotionType::Dynamic;
@@ -7357,10 +7405,7 @@ void EditorApplication::upload_hair(HairSim& sim, const HairParticleComponent& h
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       sim.vb.buffer, sim.vb.memory);
     }
-    void* data = nullptr;
-    vkMapMemory(m_device, sim.vb.memory, 0, size, 0, &data);
-    std::memcpy(data, verts.data(), static_cast<size_t>(size));
-    vkUnmapMemory(m_device, sim.vb.memory);
+    safe_map_and_copy(m_device, sim.vb.memory, 0, size, verts.data());
     sim.vertexCount = static_cast<uint32_t>(verts.size());
 }
 
@@ -7429,13 +7474,8 @@ void EditorApplication::upload_softbody(SoftBodySim& sim, const SoftBodyComponen
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       sim.ib.buffer, sim.ib.memory);
     }
-    void* data = nullptr;
-    vkMapMemory(m_device, sim.vb.memory, 0, vs, 0, &data);
-    std::memcpy(data, verts.data(), static_cast<size_t>(vs));
-    vkUnmapMemory(m_device, sim.vb.memory);
-    vkMapMemory(m_device, sim.ib.memory, 0, is, 0, &data);
-    std::memcpy(data, sim.indices.data(), static_cast<size_t>(is));
-    vkUnmapMemory(m_device, sim.ib.memory);
+    safe_map_and_copy(m_device, sim.vb.memory, 0, vs, verts.data());
+    safe_map_and_copy(m_device, sim.ib.memory, 0, is, sim.indices.data());
 }
 
 void EditorApplication::generate_splat_cloud(const GaussianSplatComponent& gs,
@@ -7495,10 +7535,7 @@ void EditorApplication::rebuild_paint_buffer(const UUID& id, PaintComponent& pc,
                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                           it->second.vb.buffer, it->second.vb.memory);
         }
-        void* data = nullptr;
-        vkMapMemory(m_device, it->second.vb.memory, 0, vs, 0, &data);
-        std::memcpy(data, verts.data(), static_cast<size_t>(vs));
-        vkUnmapMemory(m_device, it->second.vb.memory);
+        safe_map_and_copy(m_device, it->second.vb.memory, 0, vs, verts.data());
         it->second.vertexCount = static_cast<uint32_t>(n);
         it->second.dirty = false;
     }
@@ -7917,6 +7954,23 @@ void EditorApplication::tick_play_runtime(float deltaTime) {
     for (const auto& [id, handle] : m_playBodies) {
         Physics::RigidBody* body = m_playPhysics.body(handle);
         if (!body) continue;
+        // NaN/inf guard: a solver blow-up (e.g. a body catapulted by a broken
+        // constraint) must never poison a transform, or the view/projection
+        // matrices become NaN and the whole viewport renders black.
+        const auto finite3 = [](const glm::vec3& v) {
+            return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+        };
+        const auto finiteQ = [](const glm::quat& q) {
+            return std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z) && std::isfinite(q.w);
+        };
+        if (!finite3(body->position) || !finiteQ(body->rotation)) {
+            // Reset the body to a sane resting state instead of propagating NaN.
+            body->position = glm::vec3(0.0f, 1.0f, 0.0f);
+            body->linearVelocity = glm::vec3(0.0f);
+            body->angularVelocity = glm::vec3(0.0f);
+            body->rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+            continue;
+        }
         auto tit = playScene->transformComponents.find(id);
         if (tit == playScene->transformComponents.end()) continue;
         tit->second.position = body->position;
@@ -8167,6 +8221,10 @@ void EditorApplication::teardown_play_runtime() {
     m_splineProgress.clear();
     m_animStates.clear();
     m_animClips.clear();
+    if (m_playGroundBody != Physics::InvalidBody) {
+        m_playPhysics.destroy_body(m_playGroundBody);
+        m_playGroundBody = Physics::InvalidBody;
+    }
     for (const auto& [id, handle] : m_playBodies) {
         (void)id;
         m_playPhysics.destroy_body(handle);
@@ -9150,9 +9208,9 @@ void EditorApplication::update_gizmo_drag(glm::vec2 mouseScreen) {
         const glm::vec3 newPos = m_gizmoDragEntityStart + m_gizmoAxisWorld * delta;
         m_undo.execute_or_merge_property(
             "Move Entity",
-            [this, id, newPos] { m_editorScene->transformComponents.at(id).position = newPos; },
+            [this, id, newPos] { auto it = m_editorScene->transformComponents.find(id); if (it != m_editorScene->transformComponents.end()) it->second.position = newPos; },
             [this, id, start = m_gizmoDragEntityStart] {
-                m_editorScene->transformComponents.at(id).position = start;
+                auto it = m_editorScene->transformComponents.find(id); if (it != m_editorScene->transformComponents.end()) it->second.position = start;
             });
     } else if (m_gizmoMode == GizmoMode::Rotate) {
         glm::vec3 toPoint = planePoint - m_gizmoDragEntityStart;
@@ -9168,9 +9226,9 @@ void EditorApplication::update_gizmo_drag(glm::vec2 mouseScreen) {
         newRot[axisIndex] += snapped;
         m_undo.execute_or_merge_property(
             "Rotate Entity",
-            [this, id, newRot] { m_editorScene->transformComponents.at(id).rotation = newRot; },
+            [this, id, newRot] { auto it = m_editorScene->transformComponents.find(id); if (it != m_editorScene->transformComponents.end()) it->second.rotation = newRot; },
             [this, id, start = m_gizmoDragRotStart] {
-                m_editorScene->transformComponents.at(id).rotation = start;
+                auto it = m_editorScene->transformComponents.find(id); if (it != m_editorScene->transformComponents.end()) it->second.rotation = start;
             });
     } else if (m_gizmoMode == GizmoMode::Scale) {
         float delta = glm::dot(planePoint - m_gizmoDragPlanePoint, m_gizmoAxisWorld);
@@ -9181,9 +9239,9 @@ void EditorApplication::update_gizmo_drag(glm::vec2 mouseScreen) {
         newScale[axisIndex] = m_gizmoDragScaleStart[axisIndex] * factor;
         m_undo.execute_or_merge_property(
             "Scale Entity",
-            [this, id, newScale] { m_editorScene->transformComponents.at(id).scale = newScale; },
+            [this, id, newScale] { auto it = m_editorScene->transformComponents.find(id); if (it != m_editorScene->transformComponents.end()) it->second.scale = newScale; },
             [this, id, start = m_gizmoDragScaleStart] {
-                m_editorScene->transformComponents.at(id).scale = start;
+                auto it = m_editorScene->transformComponents.find(id); if (it != m_editorScene->transformComponents.end()) it->second.scale = start;
             });
     }
 }
@@ -9261,14 +9319,9 @@ bool EditorApplication::load_mesh_resource(const UUID& assetId) {
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       resource.ib.buffer, resource.ib.memory);
     }
-    void* data = nullptr;
-    vkMapMemory(m_device, resource.vb.memory, 0, vbSize, 0, &data);
-    std::memcpy(data, verts.data(), static_cast<size_t>(vbSize));
-    vkUnmapMemory(m_device, resource.vb.memory);
+    safe_map_and_copy(m_device, resource.vb.memory, 0, vbSize, verts.data());
     if (ibSize > 0) {
-        vkMapMemory(m_device, resource.ib.memory, 0, ibSize, 0, &data);
-        std::memcpy(data, indices.data(), static_cast<size_t>(ibSize));
-        vkUnmapMemory(m_device, resource.ib.memory);
+        safe_map_and_copy(m_device, resource.ib.memory, 0, ibSize, indices.data());
     }
     resource.cpuIndices = std::move(indices);
 
@@ -9325,13 +9378,8 @@ void EditorApplication::ensure_block_cube_resource(const UUID& blockId) {
     create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   cube.ib.buffer, cube.ib.memory);
-    void* data = nullptr;
-    vkMapMemory(m_device, cube.vb.memory, 0, vbSize, 0, &data);
-    std::memcpy(data, verts.data(), static_cast<size_t>(vbSize));
-    vkUnmapMemory(m_device, cube.vb.memory);
-    vkMapMemory(m_device, cube.ib.memory, 0, ibSize, 0, &data);
-    std::memcpy(data, indices.data(), static_cast<size_t>(ibSize));
-    vkUnmapMemory(m_device, cube.ib.memory);
+    safe_map_and_copy(m_device, cube.vb.memory, 0, vbSize, verts.data());
+    safe_map_and_copy(m_device, cube.ib.memory, 0, ibSize, indices.data());
     cube.valid = true;
     m_meshResources[blockId] = std::move(cube);
 }
@@ -9367,13 +9415,8 @@ void EditorApplication::ensure_character_mesh_resource(const UUID& texId) {
     create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   character.ib.buffer, character.ib.memory);
-    void* data = nullptr;
-    vkMapMemory(m_device, character.vb.memory, 0, vbSize, 0, &data);
-    std::memcpy(data, verts.data(), static_cast<size_t>(vbSize));
-    vkUnmapMemory(m_device, character.vb.memory);
-    vkMapMemory(m_device, character.ib.memory, 0, ibSize, 0, &data);
-    std::memcpy(data, indices.data(), static_cast<size_t>(ibSize));
-    vkUnmapMemory(m_device, character.ib.memory);
+    safe_map_and_copy(m_device, character.vb.memory, 0, vbSize, verts.data());
+    safe_map_and_copy(m_device, character.ib.memory, 0, ibSize, indices.data());
     character.valid = true;
     m_meshResources[texId] = std::move(character);
 }
@@ -10036,9 +10079,14 @@ void EditorApplication::pump_audio_preview_decodes() {
         !m_audioDecodeBusy.exchange(true)) {
         const UUID id = m_audioPreviewRequest;
         const auto meta = m_assetRegistry.find(id);
-        if (meta && !meta->cookedPath.empty()) {
+        if (meta && !meta->sourcePath.empty()) {
             if (m_audioDecodeThread.joinable()) m_audioDecodeThread.join();
-            m_audioDecodeThread = std::thread([this, id, path = meta->cookedPath]() {
+            // Decode the SOURCE file (wav/ogg/flac/mp3), not the cooked
+            // .vcaudio: the cooked file has a custom "VCAUDIO" header that
+            // miniaudio does not understand, so previewing used to fail for
+            // every audio asset. miniaudio sniffs the container, so files
+            // whose extension does not match their content still work.
+            m_audioDecodeThread = std::thread([this, id, path = meta->sourcePath]() {
                 const auto decoded = Engine::Audio::OggDecoder::decode_file(path);
                 PendingAudioDecode pending;
                 pending.assetId = id;
@@ -10222,13 +10270,8 @@ void EditorApplication::init_block_cube() {
     create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   m_blockCubeIB.buffer, m_blockCubeIB.memory);
-    void* data = nullptr;
-    vkMapMemory(m_device, m_blockCubeVB.memory, 0, vbSize, 0, &data);
-    std::memcpy(data, verts, vbSize);
-    vkUnmapMemory(m_device, m_blockCubeVB.memory);
-    vkMapMemory(m_device, m_blockCubeIB.memory, 0, ibSize, 0, &data);
-    std::memcpy(data, indices, ibSize);
-    vkUnmapMemory(m_device, m_blockCubeIB.memory);
+    safe_map_and_copy(m_device, m_blockCubeVB.memory, 0, vbSize, verts);
+    safe_map_and_copy(m_device, m_blockCubeIB.memory, 0, ibSize, indices);
     m_blockCubeIndexCount = 36;
 
     VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -10847,6 +10890,29 @@ void EditorApplication::rebuild_voxel_mesh(const UUID& entityId) {
         if (mesh.ib.buffer != VK_NULL_HANDLE) destroy_buffer(mesh.ib);
         mesh = EditorVoxelMesh{};
     }
+
+    // Surface-only meshing: emit a face only when the neighbouring voxel is
+    // air (or out of bounds). This renders the visible shell with per-face
+    // normals (correct shading) instead of every solid cell as an up-shaded
+    // box — the old version looked shapeless and wasted ~6x the geometry on
+    // internal faces that were never visible.
+    const auto solid = [&](int x, int y, int z) -> bool {
+        if (x < 0 || y < 0 || z < 0 ||
+            x >= kVoxelSizeX || y >= kVoxelSizeY || z >= kVoxelSizeZ) return false;
+        return !grid.get(Engine::Voxel::Int3{ x, y, z }).empty();
+    };
+    struct Face { glm::vec3 n; glm::vec3 c[4]; };
+    const Face faces[6] = {
+        { { 0, 0,-1 }, { {0,0,0},{1,0,0},{1,1,0},{0,1,0} } }, // -Z
+        { { 0, 0, 1 }, { {1,0,1},{0,0,1},{0,1,1},{1,1,1} } }, // +Z
+        { {-1, 0, 0 }, { {0,0,1},{0,0,0},{0,1,0},{0,1,1} } }, // -X
+        { { 1, 0, 0 }, { {1,0,0},{1,0,1},{1,1,1},{1,1,0} } }, // +X
+        { { 0,-1, 0 }, { {0,0,0},{1,0,0},{1,0,1},{0,0,1} } }, // -Y
+        { { 0, 1, 0 }, { {0,1,1},{1,1,1},{1,1,0},{0,1,0} } }, // +Y
+    };
+    const int noff[6][3] = {
+        { 0, 0,-1 }, { 0, 0, 1 }, {-1, 0, 0 }, { 1, 0, 0 }, { 0,-1, 0 }, { 0, 1, 0 },
+    };
     for (int x = 0; x < kVoxelSizeX; ++x) {
         for (int y = 0; y < kVoxelSizeY; ++y) {
             for (int z = 0; z < kVoxelSizeZ; ++z) {
@@ -10854,27 +10920,24 @@ void EditorApplication::rebuild_voxel_mesh(const UUID& entityId) {
                 if (v.empty()) continue;
                 const glm::vec3 base = origin + glm::vec3(x - kVoxelSizeX / 2, y, z - kVoxelSizeZ / 2);
                 const glm::vec3 color = voxel_type_color(v.type);
-                const uint32_t first = static_cast<uint32_t>(verts.size());
-                // 8 corners, 12 triangles (indexed cubes with per-vertex color).
-                const glm::vec3 c[8] = {
-                    base + glm::vec3(0, 0, 0), base + glm::vec3(1, 0, 0),
-                    base + glm::vec3(1, 1, 0), base + glm::vec3(0, 1, 0),
-                    base + glm::vec3(0, 0, 1), base + glm::vec3(1, 0, 1),
-                    base + glm::vec3(1, 1, 1), base + glm::vec3(0, 1, 1),
-                };
-                for (const glm::vec3& p : c) {
-                    EditorVertex ev;
-                    ev.pos = p;
-                    ev.normal = glm::vec3(0, 1, 0);
-                    ev.color = color;
-                    ev.uv = glm::vec2(0.0f);
-                    verts.push_back(ev);
+                for (int f = 0; f < 6; ++f) {
+                    if (solid(x + noff[f][0], y + noff[f][1], z + noff[f][2])) continue;
+                    const uint32_t first = static_cast<uint32_t>(verts.size());
+                    for (int c = 0; c < 4; ++c) {
+                        EditorVertex ev;
+                        ev.pos = base + faces[f].c[c];
+                        ev.normal = faces[f].n;
+                        ev.color = color;
+                        ev.uv = glm::vec2(0.0f);
+                        verts.push_back(ev);
+                    }
+                    indices.push_back(first);
+                    indices.push_back(first + 1);
+                    indices.push_back(first + 2);
+                    indices.push_back(first);
+                    indices.push_back(first + 2);
+                    indices.push_back(first + 3);
                 }
-                const uint32_t idx[36] = {
-                    0,1,2, 0,2,3, 4,5,6, 4,6,7, 0,1,5, 0,5,4, 2,3,7, 2,7,6,
-                    1,2,6, 1,6,5, 0,3,7, 0,7,4,
-                };
-                for (uint32_t i : idx) indices.push_back(first + i);
             }
         }
     }
@@ -10887,13 +10950,8 @@ void EditorApplication::rebuild_voxel_mesh(const UUID& entityId) {
     create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   mesh.ib.buffer, mesh.ib.memory);
-    void* data = nullptr;
-    vkMapMemory(m_device, mesh.vb.memory, 0, vbSize, 0, &data);
-    std::memcpy(data, verts.data(), static_cast<size_t>(vbSize));
-    vkUnmapMemory(m_device, mesh.vb.memory);
-    vkMapMemory(m_device, mesh.ib.memory, 0, ibSize, 0, &data);
-    std::memcpy(data, indices.data(), static_cast<size_t>(ibSize));
-    vkUnmapMemory(m_device, mesh.ib.memory);
+    safe_map_and_copy(m_device, mesh.vb.memory, 0, vbSize, verts.data());
+    safe_map_and_copy(m_device, mesh.ib.memory, 0, ibSize, indices.data());
     mesh.indexCount = static_cast<uint32_t>(indices.size());
     mesh.valid = true;
 }
@@ -11041,9 +11099,7 @@ bool EditorApplication::upload_texture_pixels(uint32_t width, uint32_t height,
         return false;
     }
     void* data = nullptr;
-    vkMapMemory(m_device, stagingMemory, 0, imageSize, 0, &data);
-    std::memcpy(data, rgba.data(), static_cast<size_t>(imageSize));
-    vkUnmapMemory(m_device, stagingMemory);
+    safe_map_and_copy(m_device, stagingMemory, 0, imageSize, rgba.data());
     std::vector<VkBufferImageCopy> regions;
     regions.reserve(mips);
     VkDeviceSize offset = 0;
@@ -11101,9 +11157,7 @@ bool EditorApplication::upload_texture_half_pixels(uint32_t width, uint32_t heig
         return false;
     }
     void* data = nullptr;
-    vkMapMemory(m_device, stagingMemory, 0, imageSize, 0, &data);
-    std::memcpy(data, halfRgba.data(), static_cast<size_t>(imageSize));
-    vkUnmapMemory(m_device, stagingMemory);
+    safe_map_and_copy(m_device, stagingMemory, 0, imageSize, halfRgba.data());
     VkCommandBuffer cmd = begin_single_time_commands();
     transition_image_layout(cmd, out.image, VK_IMAGE_LAYOUT_UNDEFINED,
                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -11936,13 +11990,8 @@ void EditorApplication::generate_terrain_mesh(const TerrainParams& params) {
                   m_terrainIB.buffer, m_terrainIB.memory);
     m_terrainVB.size = vbSize;
     m_terrainIB.size = ibSize;
-    void* data = nullptr;
-    vkMapMemory(m_device, m_terrainVB.memory, 0, vbSize, 0, &data);
-    std::memcpy(data, verts.data(), static_cast<size_t>(vbSize));
-    vkUnmapMemory(m_device, m_terrainVB.memory);
-    vkMapMemory(m_device, m_terrainIB.memory, 0, ibSize, 0, &data);
-    std::memcpy(data, indices.data(), static_cast<size_t>(ibSize));
-    vkUnmapMemory(m_device, m_terrainIB.memory);
+    safe_map_and_copy(m_device, m_terrainVB.memory, 0, vbSize, verts.data());
+    safe_map_and_copy(m_device, m_terrainIB.memory, 0, ibSize, indices.data());
     m_terrainIndexCount = static_cast<uint32_t>(indices.size());
     m_terrainValid = true;
     std::cout << "[Editor] Terreno gerado: " << cols * cols << " vértices, "
@@ -12186,9 +12235,7 @@ std::string EditorApplication::apply_mesh_normals(int mode) {
         const VkDeviceSize expected = sizeof(EditorVertex) * it->second.vertexCount;
         if (vbSize == expected && it->second.vb.buffer != VK_NULL_HANDLE) {
             void* data = nullptr;
-            vkMapMemory(m_device, it->second.vb.memory, 0, vbSize, 0, &data);
-            std::memcpy(data, verts.data(), static_cast<size_t>(vbSize));
-            vkUnmapMemory(m_device, it->second.vb.memory);
+            safe_map_and_copy(m_device, it->second.vb.memory, 0, vbSize, verts.data());
         }
     }
 
