@@ -27,6 +27,11 @@ public:
     // Runtime block ids (builtin prefix + dynamic registry blocks).
     RuntimeBlockId get_block(int x, int y, int z) const;
     void set_block(int x, int y, int z, RuntimeBlockId type);
+    // Per-voxel block state index (FALTANTES item 2 "variantes de modelo"):
+    // 0 = default state (states[0] in BlockDefinition); >0 = named state.
+    // Stored alongside blocks so transitions/state queries are O(1).
+    uint8_t get_state(int x, int y, int z) const;
+    void set_state(int x, int y, int z, uint8_t stateIndex);
     uint8_t get_water_level(int x, int y, int z) const;
     void set_water(int x, int y, int z, uint8_t level);
     // Generic fluid-level byte (META section 13): the same per-cell byte that

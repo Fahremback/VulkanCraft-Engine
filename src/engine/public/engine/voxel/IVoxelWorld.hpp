@@ -411,6 +411,36 @@ public:
     virtual std::string serialize_world(std::string& errorOut) = 0;
     virtual bool deserialize_world(const std::string& data, std::string& errorOut) = 0;
 
+    // World identity + content provenance (FALTANTES §4 item 4): the engine
+    // stores these on the world (set_world_metadata) and rides them with the
+    // world save (v5 `meta`), restoring them on load. `seed` is the per-world
+    // generator/behavior RNG seed, `worldName`/`rulesJson` the project's
+    // identity, `pluginVersions` the (name, version) pairs of the plugins
+    // that produced the content. A save written without metadata (or a legacy
+    // v1-v4 save) loads with the defaults, and the caller's set_world_metadata
+    // values are kept. Interpretation is the caller's; the engine never
+    // guesses the payloads.
+    struct WorldMetadata {
+        uint64_t seed{ 0 };
+        std::string worldName;
+        std::string rulesJson;
+        std::vector<std::pair<std::string, std::string>> pluginVersions;
+    };
+    virtual void set_world_metadata(const WorldMetadata& metadata) = 0;
+    virtual WorldMetadata world_metadata() const = 0;
+
+    // Registry fingerprint (FALTANTES §4 item 4 "registries/paletas"): a
+    // deterministic hash of the attached block registry (uuid + definition
+    // version + namespaced name per entry, sorted by uuid — independent of
+    // load order). registry_version() is the CURRENT registry's fingerprint;
+    // saved_registry_version() is the fingerprint carried by the last loaded
+    // save (0 when nothing was loaded or the save had no metadata). A
+    // mismatch means the registry changed since the save was written — the
+    // UUID palette still restores identities, but callers can warn instead of
+    // guessing.
+    virtual uint64_t registry_version() const = 0;
+    virtual uint64_t saved_registry_version() const = 0;
+
     // Schema versioning + migration (FALTANTES §4 item 9): the save format is
     // versioned (v1-v5, see the format comment in the SDK). world_save_schema_
     // version reads the version field WITHOUT a full parse (0 = not a world
@@ -474,6 +504,13 @@ public:
     // Headless simulation tick (server/tests): generation, meshing and fluid
     // simulation run without any renderer attached.
     virtual void update(const glm::vec3& playerPosition, float deltaTime) = 0;
+
+    // The registry currently driving the world's runtime block table (never
+    // null — an empty/default registry when none was attached). Replication
+    // reads it to negotiate the block palette: the server ships every
+    // catalog-only block's definition so a client reconstructs the same
+    // dynamic runtime ids without recompiling (FALTANTES item 1).
+    virtual std::shared_ptr<const registry::BlockRegistry> block_registry() const = 0;
 };
 
 // Creates the default engine world (builtin generator, headless bridge).

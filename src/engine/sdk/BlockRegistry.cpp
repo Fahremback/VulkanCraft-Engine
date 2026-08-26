@@ -7,6 +7,7 @@
 #include "../../simulation/voxel/core/Voxel.hpp"
 
 #include <algorithm>
+#include <iomanip>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -595,6 +596,241 @@ bool BlockRegistry::add(BlockDefinition definition, std::string& errorOut) {
     }
     errorOut.clear();
     return true;
+}
+
+namespace {
+
+std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (const char c : s) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out.push_back(c); break;
+        }
+    }
+    return out;
+}
+
+// Emits one field value with %.9g (9 significant digits round-trip float32
+// bit-exactly — the project's established precision for JSON float round-trip).
+std::string json_float(float v) {
+    std::ostringstream ss;
+    ss << std::setprecision(9) << v;
+    return ss.str();
+}
+
+const char* block_class_str(BlockClass value) {
+    switch (value) {
+        case BlockClass::Fluid: return "fluid";
+        case BlockClass::Transparent: return "transparent";
+        case BlockClass::NonSolid: return "nonsolid";
+        default: return "solid";
+    }
+}
+const char* block_tool_str(BlockTool value) {
+    switch (value) {
+        case BlockTool::Pickaxe: return "pickaxe";
+        case BlockTool::Axe: return "axe";
+        case BlockTool::Shovel: return "shovel";
+        case BlockTool::Hoe: return "hoe";
+        case BlockTool::Sword: return "sword";
+        default: return "any";
+    }
+}
+const char* collision_shape_str(CollisionShape value) {
+    switch (value) {
+        case CollisionShape::Cross: return "cross";
+        case CollisionShape::None: return "none";
+        default: return "full";
+    }
+}
+const char* selection_shape_str(SelectionShape value) {
+    switch (value) {
+        case SelectionShape::Cross: return "cross";
+        case SelectionShape::None: return "none";
+        default: return "full";
+    }
+}
+
+// Serializes a definition to the single-object JSON asset load_from_json
+// parses. Emission mirrors the parser field by field: fields that carry the
+// parser's default are omitted (the parser re-applies the same default), so
+// a catalog-only block round-trips bit-exactly through load(serialize(d)).
+std::string serialize_definition_json(const BlockDefinition& d) {
+    std::ostringstream out;
+    out << '{';
+    bool first = true;
+    const auto key = [&](const char* k) {
+        if (!first) out << ',';
+        first = false;
+        out << '"' << k << '"' << ':';
+    };
+    const auto str = [&](const char* k, const std::string& v) {
+        key(k);
+        out << '"' << json_escape(v) << '"';
+    };
+    const auto num = [&](const char* k, double v) {
+        key(k);
+        out << std::setprecision(9) << v;
+    };
+    const auto boolean = [&](const char* k, bool v) {
+        key(k);
+        out << (v ? "true" : "false");
+    };
+    const auto vec = [&](const char* k, const glm::vec4& v) {
+        key(k);
+        out << '[' << json_float(v.x) << ',' << json_float(v.y) << ','
+            << json_float(v.z);
+        if (v.w != 1.0f) out << ',' << json_float(v.w);
+        out << ']';
+    };
+    const auto fluid = [&] {
+        key("fluid");
+        out << '{';
+        bool ffirst = true;
+        const auto fkey = [&](const char* k) {
+            if (!ffirst) out << ',';
+            ffirst = false;
+            out << '"' << k << '"' << ':';
+        };
+        const auto fnum = [&](const char* k, double v) {
+            fkey(k);
+            out << std::setprecision(9) << v;
+        };
+        const auto fbool = [&](const char* k, bool v) {
+            fkey(k);
+            out << (v ? "true" : "false");
+        };
+        fnum("viscosity", d.fluid.viscosity);
+        fnum("density", d.fluid.density);
+        fnum("range", d.fluid.range);
+        fnum("tickInterval", d.fluid.tickInterval);
+        fbool("source", d.fluid.source);
+        fbool("falling", d.fluid.falling);
+        fbool("evaporation", d.fluid.evaporation);
+        fnum("damagePerTick", d.fluid.damagePerTick);
+        fbool("compressible", d.fluid.compressible);
+        out << '}';
+    };
+
+    str("namespace", d.ns);
+    str("name", d.name);
+    if (!d.uuid.empty()) str("id", d.uuid);
+    if (d.blockClass != BlockClass::Solid) str("class", block_class_str(d.blockClass));
+    if (d.hardness != 1.0f) num("hardness", d.hardness);
+    if (d.lightEmission != 0.0f) num("lightEmission", d.lightEmission);
+    if (d.lightAbsorption != 1.0f) num("lightAbsorption", d.lightAbsorption);
+    if (!d.opaque) boolean("opaque", d.opaque);
+    if (!d.collidable) boolean("collidable", d.collidable);
+    if (d.collisionShape != CollisionShape::Full) {
+        str("collisionShape", collision_shape_str(d.collisionShape));
+    }
+    if (d.selectionShape != SelectionShape::Full) {
+        str("selectionShape", selection_shape_str(d.selectionShape));
+    }
+    if (d.hasBuiltinMapping) num("builtinId", d.builtinId);
+    if (d.color != glm::vec4(1.0f)) vec("color", d.color);
+    if (d.faceTopSet) vec("faceTop", d.faceTop);
+    if (d.faceBottomSet) vec("faceBottom", d.faceBottom);
+    if (d.faceSideSet) vec("faceSide", d.faceSide);
+    if (!d.occludes) boolean("occlusion", d.occludes);
+    if (d.renderLayer != 0) num("renderLayer", d.renderLayer);
+    if (!d.states.empty()) {
+        key("states");
+        out << '[';
+        for (std::size_t i = 0; i < d.states.size(); ++i) {
+            if (i != 0) out << ',';
+            const BlockState& s = d.states[i];
+            out << '{';
+            bool sfirst = true;
+            const auto skey = [&](const char* k) {
+                if (!sfirst) out << ',';
+                sfirst = false;
+                out << '"' << k << '"' << ':';
+            };
+            const auto sstr = [&](const char* k, const std::string& v) {
+                skey(k);
+                out << '"' << json_escape(v) << '"';
+            };
+            const auto svec = [&](const char* k, const glm::vec4& v) {
+                skey(k);
+                out << '[' << json_float(v.x) << ',' << json_float(v.y) << ','
+                    << json_float(v.z);
+                if (v.w != 1.0f) out << ',' << json_float(v.w);
+                out << ']';
+            };
+            const auto snum = [&](const char* k, double v) {
+                skey(k);
+                out << std::setprecision(9) << v;
+            };
+            sstr("name", s.name);
+            if (s.color != glm::vec4(1.0f)) svec("color", s.color);
+            if (s.faceTopSet) svec("faceTop", s.faceTop);
+            if (s.faceBottomSet) svec("faceBottom", s.faceBottom);
+            if (s.faceSideSet) svec("faceSide", s.faceSide);
+            if (s.lightEmission != 0.0f) snum("lightEmission", s.lightEmission);
+            out << '}';
+        }
+        out << ']';
+    }
+    if (!d.transitions.empty()) {
+        key("transitions");
+        out << '[';
+        for (std::size_t i = 0; i < d.transitions.size(); ++i) {
+            if (i != 0) out << ',';
+            const BlockTransition& t = d.transitions[i];
+            out << "{\"from\":\"" << json_escape(t.fromState)
+                << "\",\"to\":\"" << json_escape(t.toState)
+                << "\",\"trigger\":\"" << json_escape(t.trigger) << "\"}";
+        }
+        out << ']';
+    }
+    if (d.fluid.declared) fluid();
+    if (!d.soundPlace.empty()) str("soundPlace", d.soundPlace);
+    if (!d.soundBreak.empty()) str("soundBreak", d.soundBreak);
+    if (!d.soundStep.empty()) str("soundStep", d.soundStep);
+    if (!d.soundHit.empty()) str("soundHit", d.soundHit);
+    if (!d.particleBreak.empty()) str("particleBreak", d.particleBreak);
+    if (d.tool != BlockTool::Any) str("tool", block_tool_str(d.tool));
+    if (d.toolTier != 0) num("toolTier", d.toolTier);
+    if (d.resistance != 0.0f) num("resistance", d.resistance);
+    if (d.friction != 0.5f) num("friction", d.friction);
+    if (d.bounciness != 0.0f) num("bounciness", d.bounciness);
+    if (d.density != 1.0f) num("density", d.density);
+    if (d.flammability != 0.0f) num("flammability", d.flammability);
+    if (!d.behaviorId.empty()) str("behaviorId", d.behaviorId);
+    if (!d.tags.empty()) {
+        key("tags");
+        out << '[';
+        for (std::size_t i = 0; i < d.tags.size(); ++i) {
+            if (i != 0) out << ',';
+            out << '"' << json_escape(d.tags[i]) << '"';
+        }
+        out << ']';
+    }
+    if (!d.drops.empty()) {
+        key("drops");
+        out << '[';
+        for (std::size_t i = 0; i < d.drops.size(); ++i) {
+            if (i != 0) out << ',';
+            out << '"' << json_escape(d.drops[i]) << '"';
+        }
+        out << ']';
+    }
+    num("version", d.version);
+    out << '}';
+    return out.str();
+}
+
+}  // namespace
+
+std::string serialize_block_definition(const BlockDefinition& definition) {
+    return serialize_definition_json(definition);
 }
 
 }  // namespace registry

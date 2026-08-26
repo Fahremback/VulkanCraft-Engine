@@ -398,6 +398,16 @@ struct WorldSaveData {
     // save leaves it empty (legacy saves have no scheduler state and the
     // migrated save starts a fresh clock).
     std::vector<std::byte> schedulerState;
+    // World identity + content provenance (FALTANTES §4 item 4): seed, world
+    // name, rules JSON, plugin versions and the block-registry fingerprint at
+    // save time. The LIVE serializer captures the facade's metadata and the
+    // registry stamp; a migrated v1-v4 save carries the migrating world's
+    // metadata (the migrated bytes are emitted by this world).
+    uint64_t seed{ 0 };
+    std::string worldName;
+    std::string rulesJson;
+    std::vector<std::pair<std::string, std::string>> pluginVersions;
+    uint64_t registryVersion{ 0 };
 };
 
 // Headless bridge: generation/meshing run to completion but nothing is ever
@@ -556,6 +566,10 @@ public:
     float fluid_damage_per_second_at(int x, int y, int z) const override {
         const FluidParams* params = world_.fluid_params_at(glm::ivec3(x, y, z));
         return params != nullptr ? params->damagePerTick : 0.0f;
+    }
+
+    std::shared_ptr<const engine::registry::BlockRegistry> block_registry() const override {
+        return registry_;
     }
 
     void set_block_registry(
@@ -1032,6 +1046,90 @@ public:
         world_.set_block_entity_listener(std::move(listener));
     }
 
+    // ---- World identity + content provenance (FALTANTES §4 item 4) ----
+    // The facade stores the project's identity (seed/name/rules/plugins),
+    // rides it with every v5 save (`meta`) and restores it on load. The
+    // registry fingerprint is derived deterministically at save time so a
+    // caller can detect "the registry changed since this save was written".
+    void set_world_metadata(
+        const engine::voxel::IVoxelWorld::WorldMetadata& metadata) override {
+        metadata_ = metadata;
+    }
+
+    engine::voxel::IVoxelWorld::WorldMetadata world_metadata() const override {
+        return metadata_;
+    }
+
+    uint64_t registry_version() const override {
+        return compute_registry_version(*registry_);
+    }
+
+    uint64_t saved_registry_version() const override {
+        return savedRegistryVersion_;
+    }
+
+    // Shared v5 `meta` builder (FALTANTES §4 item 4): world identity +
+    // content provenance (seed, name, rules, plugin versions, registry
+    // fingerprint). Used by BOTH the monolithic emitter (emit_world_save_
+    // body) and the region manifest page (build_region_manifest_body) so the
+    // two can never drift.
+    static flatbuffers::Offset<engine::voxel::save::WorldMeta>
+    build_meta_offset(
+        flatbuffers::FlatBufferBuilder& builder, uint64_t seed,
+        const std::string& worldName, const std::string& rulesJson,
+        const std::vector<std::pair<std::string, std::string>>& pluginVersions,
+        uint64_t registryVersion) {
+        std::vector<flatbuffers::Offset<
+            engine::voxel::save::PluginVersionEntry>> pluginOffsets;
+        pluginOffsets.reserve(pluginVersions.size());
+        for (const auto& [name, version] : pluginVersions) {
+            const auto nameStr = builder.CreateString(name);
+            const auto versionStr = builder.CreateString(version);
+            engine::voxel::save::PluginVersionEntryBuilder entry(builder);
+            entry.add_name(nameStr);
+            entry.add_version(versionStr);
+            pluginOffsets.push_back(entry.Finish());
+        }
+        engine::voxel::save::WorldMetaBuilder metaBuilder(builder);
+        metaBuilder.add_seed(seed);
+        if (!worldName.empty()) {
+            metaBuilder.add_world_name(builder.CreateString(worldName));
+        }
+        if (!rulesJson.empty()) {
+            metaBuilder.add_rules_json(builder.CreateString(rulesJson));
+        }
+        metaBuilder.add_registry_version(registryVersion);
+        if (!pluginOffsets.empty()) {
+            metaBuilder.add_plugins(builder.CreateVector(pluginOffsets));
+        }
+        return metaBuilder.Finish();
+    }
+
+    // Deterministic fingerprint of a block registry: FNV-1a 64 over the
+    // concatenation of (uuid, definition version, namespaced name) of every
+    // definition sorted by uuid (the order all_definitions() already uses), so
+    // the stamp is independent of JSON load order and changes whenever any
+    // definition's identity or version does.
+    static uint64_t compute_registry_version(
+        const engine::registry::BlockRegistry& registry) {
+        std::string stream;
+        for (const engine::registry::BlockDefinition& definition :
+             registry.all_definitions()) {
+            stream.append(definition.uuid);
+            stream.append(1, '\0');
+            stream.append(definition.namespaced());
+            stream.append(1, '\0');
+            stream.append(reinterpret_cast<const char*>(&definition.version),
+                          sizeof(definition.version));
+        }
+        uint64_t hash = 1469598103934665603ull;  // FNV-1a 64 offset basis
+        for (const char c : stream) {
+            hash ^= static_cast<unsigned char>(c);
+            hash *= 1099511628211ull;
+        }
+        return hash;
+    }
+
     // ---- Persistence (META section 10) ----
 
     std::string serialize_world(std::string& errorOut) override {
@@ -1126,6 +1224,16 @@ public:
         // headless server continues tick work where the session was. The
         // scheduler's binary capture is versioned and self-validating.
         data.schedulerState = world_.scheduler().serialize_state();
+
+        // World identity + content provenance (FALTANTES §4 item 4): seed,
+        // world name, rules JSON, plugin versions and the block-registry
+        // fingerprint ride with the save so identity survives load and a
+        // caller can detect a registry change since the save was written.
+        data.seed = metadata_.seed;
+        data.worldName = metadata_.worldName;
+        data.rulesJson = metadata_.rulesJson;
+        data.pluginVersions = metadata_.pluginVersions;
+        data.registryVersion = compute_registry_version(*registry_);
 
         return emit_world_save_body(data, errorOut);
     }
@@ -1237,12 +1345,22 @@ public:
             ? builder.CreateVector(static_cast<const uint8_t*>(nullptr), 0)
             : builder.CreateVector(schedulerBytes);
 
+        // World identity + content provenance (FALTANTES §4 item 4): seed,
+        // world name, rules JSON, plugin versions and the block-registry
+        // fingerprint. Optional — older v5 buffers have no meta (null loads
+        // as default metadata).
+        const auto meta =
+            build_meta_offset(builder, data.seed, data.worldName,
+                              data.rulesJson, data.pluginVersions,
+                              data.registryVersion);
+
         engine::voxel::save::WorldSaveBuilder save(builder);
         save.add_palette(paletteVec);
         save.add_chunks(chunkVec);
         save.add_entities(entityVec);
         save.add_world_entities(worldEntityVec);
         save.add_scheduler_state(schedulerVec);
+        save.add_meta(meta);
         builder.Finish(save.Finish(), "WLD5");
 
         std::string body;
@@ -1367,6 +1485,14 @@ public:
         if (!parse_legacy_world_save(body, version, data, errorOut)) {
             return false;
         }
+        // Legacy saves carry no identity, so the migrated bytes inherit the
+        // MIGRATING world's metadata (FALTANTES §4 item 4): the caller who
+        // migrates decides what identity the upgraded save carries.
+        data.seed = metadata_.seed;
+        data.worldName = metadata_.worldName;
+        data.rulesJson = metadata_.rulesJson;
+        data.pluginVersions = metadata_.pluginVersions;
+        data.registryVersion = compute_registry_version(*registry_);
         migratedOut = emit_world_save_body(data, errorOut);
         return !migratedOut.empty();
     }
@@ -1574,6 +1700,11 @@ public:
         std::map<std::pair<int, int>, bool> preUnsaved_;
         World::BlockEntityMap blockEntities_;
         std::vector<engine::entity::EntitySnapshot> worldEntities_;
+        // World identity + registry stamp (FALTANTES §4 item 4): the load
+        // restores them from the save's meta; a rollback must bring back the
+        // pre-load values exactly like the chunk/entity state.
+        engine::voxel::IVoxelWorld::WorldMetadata metadata_;
+        uint64_t savedRegistryVersion_{ 0 };
         bool committed_{ false };
 
         explicit LoadRollback(VoxelWorldFacade& facade, World& world)
@@ -1610,6 +1741,8 @@ public:
             if (facade_.entityWorld_) {
                 worldEntities_ = facade_.entityWorld_->serialize_entities();
             }
+            metadata_ = facade_.metadata_;
+            savedRegistryVersion_ = facade_.savedRegistryVersion_;
         }
 
         ~LoadRollback() {
@@ -1668,6 +1801,11 @@ public:
                 facade_.entityWorld_->deserialize_entities(worldEntities_,
                                                            entityError);
             }
+            // 4. World identity + registry stamp (FALTANTES §4 item 4): o
+            // load pode ter sobrescrito a metadata do save; o rollback
+            // restaura os valores pré-load.
+            facade_.metadata_ = metadata_;
+            facade_.savedRegistryVersion_ = savedRegistryVersion_;
         }
     };
 
@@ -2122,6 +2260,36 @@ public:
                 errorOut = "world save: scheduler state refused: " + schedulerError;
                 return false;
             }
+        }
+
+        // World identity + content provenance (FALTANTES §4 item 4): restore
+        // the save's metadata (seed/name/rules/plugin versions) and the
+        // block-registry fingerprint. Optional: v5 buffers without the field
+        // (null, e.g. written before this addition) keep the caller's
+        // metadata and clear the saved registry stamp.
+        if (const auto* meta = save->meta(); meta != nullptr) {
+            metadata_.seed = meta->seed();
+            metadata_.worldName = meta->world_name() != nullptr
+                ? meta->world_name()->str() : std::string();
+            metadata_.rulesJson = meta->rules_json() != nullptr
+                ? meta->rules_json()->str() : std::string();
+            metadata_.pluginVersions.clear();
+            if (meta->plugins() != nullptr) {
+                metadata_.pluginVersions.reserve(meta->plugins()->size());
+                for (flatbuffers::uoffset_t i = 0; i < meta->plugins()->size();
+                     ++i) {
+                    const engine::voxel::save::PluginVersionEntry* plugin =
+                        meta->plugins()->Get(i);
+                    metadata_.pluginVersions.emplace_back(
+                        plugin->name() != nullptr ? plugin->name()->str()
+                                                  : std::string(),
+                        plugin->version() != nullptr ? plugin->version()->str()
+                                                     : std::string());
+                }
+            }
+            savedRegistryVersion_ = meta->registry_version();
+        } else {
+            savedRegistryVersion_ = 0;
         }
         errorOut.clear();
         return true;
@@ -2796,12 +2964,22 @@ private:
             ? builder.CreateVector(static_cast<const uint8_t*>(nullptr), 0)
             : builder.CreateVector(schedulerBytes);
 
+        // World identity + content provenance (FALTANTES §4 item 4): the
+        // paged manifest carries the same meta as the monolithic save so
+        // load_world_regions restores seed/name/rules/plugins and the
+        // registry fingerprint identically.
+        const auto meta = build_meta_offset(
+            builder, metadata_.seed, metadata_.worldName,
+            metadata_.rulesJson, metadata_.pluginVersions,
+            compute_registry_version(*registry_));
+
         engine::voxel::save::WorldSaveBuilder save(builder);
         save.add_palette(paletteVec);
         save.add_entities(entityVec);
         save.add_world_entities(worldEntityVec);
         save.add_regions(regionVec);
         save.add_scheduler_state(schedulerVec);
+        save.add_meta(meta);
         builder.Finish(save.Finish(), "WLD5");
 
         std::string body;
@@ -3199,6 +3377,14 @@ private:
     // last snapshot for change-gating the dispatch.
     std::shared_ptr<engine::voxel::IVoxelStreamingMonitor> monitor_;
     engine::voxel::StreamingSnapshot lastSnapshot_;
+
+    // World identity + content provenance (FALTANTES §4 item 4): the project's
+    // metadata (seed/name/rules/plugin versions) stored on the world, ridden
+    // with every v5 save and restored on load. savedRegistryVersion_ is the
+    // block-registry fingerprint carried by the last loaded save (0 when
+    // nothing was loaded or the save had no metadata).
+    engine::voxel::IVoxelWorld::WorldMetadata metadata_;
+    uint64_t savedRegistryVersion_{ 0 };
 
     // Registry-driven ids: the source of truth for settable block ids.
     std::shared_ptr<const engine::registry::BlockRegistry> registry_;

@@ -12,6 +12,11 @@ struct SparseVoxelSection {
     // registry blocks (identity by UUID; material from BlockDefinition).
     RuntimeBlockId blocks[CHUNK_SIZE_X][VERTICAL_SECTION_SIZE][CHUNK_SIZE_Z];
     uint8_t waterLevels[CHUNK_SIZE_X][VERTICAL_SECTION_SIZE][CHUNK_SIZE_Z];
+    // Per-voxel block state index (FALTANTES item 2 "variantes de modelo"):
+    // 0 = default state (states[0]); >0 = named state from BlockDefinition.
+    // Stored alongside blocks so transitions/state queries are O(1). uint8_t
+    // supports 256 states per block (far more than any practical asset).
+    uint8_t stateIndices[CHUNK_SIZE_X][VERTICAL_SECTION_SIZE][CHUNK_SIZE_Z]{};
 
     SparseVoxelSection();
 };
@@ -28,6 +33,10 @@ struct SparseVoxelSection {
 struct VoxelOverride {
     RuntimeBlockId type{ kRuntimeAirId };
     uint8_t waterLevel{ WATER_LEVEL_NONE };
+    // Per-voxel block state index (FALTANTES item 2): 0 = default; >0 = named
+    // state from BlockDefinition. The override tracks state alongside type so
+    // set_state can coexist with voxelOverrides without a separate map.
+    uint8_t stateIndex{ 0 };
 };
 
 // Authoritative CPU voxel state. It deliberately contains no Vulkan handles.
@@ -35,6 +44,9 @@ struct ChunkData {
     // Runtime block ids (builtin prefix + dynamic registry blocks).
     RuntimeBlockId blocks[CHUNK_SIZE_X][GENERATED_TERRAIN_HEIGHT][CHUNK_SIZE_Z];
     uint8_t waterLevels[CHUNK_SIZE_X][GENERATED_TERRAIN_HEIGHT][CHUNK_SIZE_Z];
+    // Per-voxel block state index (FALTANTES item 2 "variantes de modelo"):
+    // 0 = default state (states[0]); >0 = named state from BlockDefinition.
+    uint8_t stateIndices[CHUNK_SIZE_X][GENERATED_TERRAIN_HEIGHT][CHUNK_SIZE_Z]{};
     std::unordered_map<uint32_t, VoxelOverride> voxelOverrides;
     std::unordered_map<int, std::unique_ptr<SparseVoxelSection>> upperSections;
     int highestOccupiedY{0};

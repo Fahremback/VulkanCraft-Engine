@@ -39,7 +39,7 @@ Os schemas exportados (draft-07) são o artefato para editor/IDE (intellisense),
 
 ## Ferramentas
 
-### Controle do editor ao vivo (Control API, 48 ferramentas)
+### Controle do editor ao vivo (Control API, 69 ferramentas)
 
 Todas as funcionalidades interativas do editor rodando (o mesmo conjunto da Control API HTTP em `127.0.0.1:8321`) estão expostas como ferramentas MCP tipadas — o agente pode **dirigir o editor aberto** em vez de só escrever arquivos:
 

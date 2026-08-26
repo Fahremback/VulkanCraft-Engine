@@ -120,12 +120,38 @@ struct RegionReplicationSnapshot {
     std::vector<BlockEntityReplicationState> blockEntities;
     std::vector<FluidLightReplicationCell> cells;
     std::vector<entity::EntitySnapshot> entities;
+};// A client's streaming interest: world position + chunk radius around it.
+struct ReplicationInterest {
+    glm::ivec3 position{ 0, 0, 0 };
+    int chunkRadius{ 0 };
 };
 
-// A client's streaming interest: world position + chunk radius around it.
-struct ReplicationInterest {
-    glm::ivec3 position{0, 0, 0};
-    int chunkRadius{0};
+// One catalog-only block in the server-negotiated identity palette (FALTANTES
+// item 1 — identity stability / server-negotiated palette). Blocks are
+// replicated by RUNTIME id; a JSON-only block's id is dynamic (>= the builtin
+// prefix) and only meaningful to a client that registered the same definition
+// (the same UUID allocates the same id — deterministic, load-order
+// independent). The server is the authority: it ships every catalog-only
+// block's full definition JSON (the exact asset form load_from_json parses,
+// via serialize_block_definition), so a client reconstructs the block and its
+// material without recompiling.
+struct ReplicationPaletteEntry {
+    std::uint32_t runtimeId{ 0 };  // the server's runtime id for this block
+    std::string uuid;              // persistent identity (canonical UUID)
+    std::string namespacedName;    // "ns:name"
+    std::string definitionJson;    // single-object BlockDefinition asset
+
+    bool operator==(const ReplicationPaletteEntry&) const = default;
+};
+
+// The authoritative block palette for one connection: every catalog-only
+// (dynamic id) block the world knows. Builtins are the engine's contract —
+// their ids are the stable builtin prefix both sides share — and are NOT
+// shipped. Send the palette before the first snapshot/delta so the client can
+// resolve dynamic ids; deltas/snapshots/regions referencing a palette block
+// then apply verbatim.
+struct ReplicationPalette {
+    std::vector<ReplicationPaletteEntry> entries;
 };
 
 struct ReplicationEditResult {
@@ -203,6 +229,26 @@ public:
     virtual std::uint32_t client_applied_sequence() const = 0;
     virtual std::size_t client_pending_predictions() const = 0;
     virtual std::size_t client_stale_dropped() const = 0;
+
+    // ---- block identity palette (FALTANTES item 1) ----
+    // Server: packs the authoritative block palette for `connection` — every
+    // catalog-only (dynamic id) block, as its full definition JSON + runtime
+    // id (builtins excluded: the builtin prefix is the engine contract both
+    // sides share). Deterministic for a given world + registry. The transport
+    // ships this before the first snapshot/delta so the client can reconstruct
+    // dynamic ids. False with a diagnostic for an unknown/unregistered
+    // connection or a world without a registry.
+    virtual bool server_pack_palette(ReplicationConnectionId connection,
+                                     ReplicationPalette& out,
+                                     std::string& errorOut) = 0;
+    // Client: registers the transported definitions into the local world's
+    // block registry — the server's definition WINS by UUID, the client's own
+    // blocks are kept — and re-attaches it, so dynamic ids resolve exactly
+    // like the server's (UUID-sorted allocation). All-or-nothing: a malformed
+    // entry (empty uuid/definition, unknown uuid, unparseable JSON, a builtin
+    // mapping) leaves the client's registry untouched and returns a diagnostic.
+    virtual bool client_apply_palette(const ReplicationPalette& palette,
+                                      std::string& errorOut) = 0;
 };
 
 // ---- Codec (batching + compression, META 17) ----
@@ -231,6 +277,14 @@ std::vector<std::byte> encode_replication_region(
 
 bool decode_replication_region(
     const std::vector<std::byte>& data, RegionReplicationSnapshot& out,
+    std::shared_ptr<const compression::ICompressionProvider> compression = nullptr);
+
+std::vector<std::byte> encode_replication_palette(
+    const ReplicationPalette& palette,
+    std::shared_ptr<const compression::ICompressionProvider> compression = nullptr);
+
+bool decode_replication_palette(
+    const std::vector<std::byte>& data, ReplicationPalette& out,
     std::shared_ptr<const compression::ICompressionProvider> compression = nullptr);
 
 // Factory: builds the adapter bound to `world` (the implementation lives in

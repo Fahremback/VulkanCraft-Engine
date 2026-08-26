@@ -48,6 +48,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <cstdint>
 #include <mutex>
@@ -57,6 +58,18 @@
 #include <map>
 #include <memory>
 #include <process.h>
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+// windef.h defines far/near/small as empty macros — they collide with
+// identifiers used across this TU (e.g. `auto far = ...`); undefine them.
+#undef far
+#undef near
+#undef small
+#else
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1991,6 +2004,435 @@ void test_dynamic_block_persistence() {
                  "order, byte-identical reserialization\n";
 }
 
+// FALTANTES item 1 (parte rede) — identity stability / server-negotiated
+// palette: the replication layer ships every catalog-only block's definition
+// JSON + runtime id, the client registers them into its own world and the
+// dynamic ids resolve IDENTICALLY (UUID-sorted allocation) — so a JSON-only
+// block's deltas/snapshots apply without the client recompiling. Codec
+// round-trips bit-exactly; a malformed palette is refused all-or-nothing.
+void test_replication_palette() {
+    constexpr engine::voxel::ReplicationConnectionId conn = 1;
+    // Server: JSON-only registry [ruby, sapphire].
+    std::unique_ptr<engine::voxel::IVoxelWorld> server =
+        engine::voxel::create_default_voxel_world();
+    auto registry = std::make_shared<engine::registry::BlockRegistry>();
+    std::string error;
+    CHECK(registry->load_from_json(
+        R"([{"name":"ruby","namespace":"test","color":[0.9,0.1,0.1],"hardness":3.0},)"
+        R"({"name":"sapphire","namespace":"test","color":[0.1,0.1,0.9],"faceTop":[0.2,0.8,0.2]}])",
+        error));
+    server->set_block_registry(registry);
+    CHECK(boot_world(*server, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    uint32_t rubyId = 0, sapphireId = 0;
+    CHECK(server->resolve_block_id("test:ruby", rubyId, error));
+    CHECK(server->resolve_block_id("test:sapphire", sapphireId, error));
+    CHECK(rubyId >= static_cast<uint32_t>(BlockType::Count));
+    CHECK(sapphireId >= static_cast<uint32_t>(BlockType::Count));
+    CHECK(rubyId != sapphireId);
+
+    auto srv = engine::voxel::create_voxel_replication(*server);
+    srv->server_register_connection(conn);
+    engine::voxel::ReplicationPalette palette;
+    CHECK(srv->server_pack_palette(conn, palette, error));
+    CHECK(error.empty());
+    // Exactly the two catalog-only blocks; builtins (the engine contract) are
+    // NOT shipped; ids match the server's own resolution.
+    CHECK(palette.entries.size() == 2);
+    std::map<std::string, const engine::voxel::ReplicationPaletteEntry*> byName;
+    for (const engine::voxel::ReplicationPaletteEntry& entry : palette.entries) {
+        byName[entry.namespacedName] = &entry;
+        CHECK(entry.uuid.find('-') != std::string::npos);  // canonical UUID
+        CHECK(entry.definitionJson.find("\"name\":\"ruby\"") != std::string::npos ||
+              entry.definitionJson.find("\"name\":\"sapphire\"") != std::string::npos);
+    }
+    CHECK(byName["test:ruby"] != nullptr && byName["test:sapphire"] != nullptr);
+    CHECK(byName["test:ruby"]->runtimeId == rubyId);
+    CHECK(byName["test:sapphire"]->runtimeId == sapphireId);
+    CHECK(byName["test:ruby"]->uuid == registry->find_by_name("test:ruby")->uuid);
+
+    // Deterministic: a second pack is identical.
+    engine::voxel::ReplicationPalette palette2;
+    CHECK(srv->server_pack_palette(conn, palette2, error));
+    CHECK(palette2.entries == palette.entries);
+
+    // Codec: bit-exact round-trip (raw + zstd), malformed frame refused.
+    auto raw = engine::voxel::encode_replication_palette(palette);
+    engine::voxel::ReplicationPalette decoded;
+    CHECK(engine::voxel::decode_replication_palette(raw, decoded));
+    CHECK(decoded.entries == palette.entries);
+    auto zstd = engine::compression::create_zstd_compression_provider();
+    auto packed = engine::voxel::encode_replication_palette(palette, zstd);
+    engine::voxel::ReplicationPalette fromPacked;
+    CHECK(engine::voxel::decode_replication_palette(packed, fromPacked, zstd));
+    CHECK(fromPacked.entries == palette.entries);
+    std::vector<std::byte> junk = raw;
+    junk[0] = std::byte{'X'};
+    engine::voxel::ReplicationPalette bad;
+    CHECK(!engine::voxel::decode_replication_palette(junk, bad));
+    // Unknown connection is refused.
+    engine::voxel::ReplicationPalette unused;
+    CHECK(!srv->server_pack_palette(999, unused, error));
+    CHECK(error.find("unknown") != std::string::npos);
+
+    // Client: a FRESH world (no registry of its own) applies the palette and
+    // resolves the SAME dynamic ids — no recompile, no redefinition.
+    std::unique_ptr<engine::voxel::IVoxelWorld> client =
+        engine::voxel::create_default_voxel_world();
+    client->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*client, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    auto cli = engine::voxel::create_voxel_replication(*client);
+    CHECK(cli->client_apply_palette(palette, error));
+    CHECK(error.empty());
+    uint32_t clientRuby = 0, clientSapphire = 0;
+    CHECK(client->resolve_block_id("test:ruby", clientRuby, error));
+    CHECK(client->resolve_block_id("test:sapphire", clientSapphire, error));
+    CHECK(clientRuby == rubyId);   // same UUID -> same dynamic id
+    CHECK(clientSapphire == sapphireId);
+
+    // Client's own block survives the merge (palette adds, never wipes).
+    auto merged = client->block_registry();
+    CHECK(merged->find_by_name("test:ruby") != nullptr);
+    CHECK(merged->find_by_name("test:sapphire") != nullptr);
+
+    // All-or-nothing: a malformed palette leaves the client untouched.
+    engine::voxel::ReplicationPalette poisoned = palette;
+    poisoned.entries[0].uuid.clear();
+    std::string poisonedError;
+    CHECK(!cli->client_apply_palette(poisoned, poisonedError));
+    CHECK(!poisonedError.empty());
+    uint32_t stillRuby = 0;
+    CHECK(client->resolve_block_id("test:ruby", stillRuby, error));
+    CHECK(stillRuby == rubyId);  // registry unchanged (still the good palette)
+
+    std::cout << "[sdk] replication: server-negotiated block palette (identity "
+                 "stability, codec, all-or-nothing, id parity) OK\n";
+}
+
+// FALTANTES item 1 / Fase 2 — prova e2e do bloco JSON-only em UM teste externo
+// (só headers públicos + glm): um bloco criado somente por asset (JSON) é
+// COLOCADO, tem o material de RENDER data-driven, é COLIDIDO (raycast),
+// SALVO, CARREGADO e REPLICADO — sem recompilar a engine. A última etapa
+// (replicado) depende da paleta negociada pelo servidor (test_replication_
+// palette): o cliente novo não conhece o bloco, recebe a definição pela
+// paleta e os deltas/regiões com id dinâmico aplicam verbatim.
+void test_json_only_block_e2e() {
+    constexpr engine::voxel::ReplicationConnectionId conn = 1;
+    const char* rubyJson =
+        R"({"name":"ruby","namespace":"test","color":[0.9,0.1,0.1],"hardness":3.0})";
+    const char* ghostJson =
+        R"({"name":"ghost","namespace":"test","collisionShape":"none"})";
+
+    // --- Server: registry JSON-only, boot, PLACE + COLLIDE + RENDER data. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> server =
+        engine::voxel::create_default_voxel_world();
+    auto registry = std::make_shared<engine::registry::BlockRegistry>();
+    std::string error;
+    std::string both = std::string("[") + rubyJson + "," + ghostJson + "]";
+    CHECK(    registry->load_from_json(both, error));
+    server->set_block_registry(registry);
+    // DRY terrain above sea level (kFluidTestTerrain = 130 > SeaLevel 127):
+    // no water lake, so the surface is unambiguous and the placed blocks sit
+    // inside the replication snapshot window.
+    server->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    CHECK(boot_world(*server, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    uint32_t rubyId = 0, ghostId = 0;
+    CHECK(server->resolve_block_id("test:ruby", rubyId, error));
+    CHECK(server->resolve_block_id("test:ghost", ghostId, error));
+    CHECK(rubyId >= static_cast<uint32_t>(BlockType::Count));
+    const int surface = helper_surface_y(*server, 3, 3);
+    CHECK(surface == kFluidTestTerrain);
+
+    // 1) COLOCADO: transactional place on the authoritative world.
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = server->begin_transaction();
+        tx->set_block(3, surface + 1, 3, rubyId);
+        tx->set_block(5, surface + 1, 5, ghostId);
+        std::string txError;
+        CHECK(tx->commit(txError));
+        CHECK(txError.empty());
+    }
+    CHECK(server->get_block(3, surface + 1, 3) == rubyId);
+    CHECK(server->get_block(5, surface + 1, 5) == ghostId);
+
+    // 2) RENDER (dados): the mesher consumes the runtime table derived from
+    // the registry; the definition JSON round-trips bit-exactly (color and
+    // per-face material survive serialize -> load) — the data the mesher
+    // reads is fully data-driven (mesh output proven in
+    // scenario_dynamic_block_meshes / voxel_streaming_tests).
+    const auto* rubyDef = registry->find_by_name("test:ruby");
+    const std::string serialized =
+        engine::registry::serialize_block_definition(*rubyDef);
+    auto reparsed = std::make_shared<engine::registry::BlockRegistry>();
+    CHECK(reparsed->load_from_json(serialized, error));
+    const auto* reparsedRuby = reparsed->find_by_name("test:ruby");
+    CHECK(reparsedRuby != nullptr);
+    CHECK(reparsedRuby->uuid == rubyDef->uuid);
+    CHECK(reparsedRuby->color == rubyDef->color);      // %.9g bit-exact
+    CHECK(reparsedRuby->hardness == rubyDef->hardness);
+    CHECK(!reparsedRuby->hasBuiltinMapping);
+    // The effective runtime table exposes the dynamic block with its identity.
+    bool rubyInViews = false;
+    for (const engine::voxel::BlockRuntimeView& view : server->runtime_block_views()) {
+        if (view.id == rubyId) {
+            rubyInViews = true;
+            CHECK(view.uuid == rubyDef->uuid);
+            CHECK(view.solid);  // collidable by default
+        }
+    }
+    CHECK(rubyInViews);
+
+    // 3) COLIDIDO: the raycast hits the solid ruby but passes THROUGH the
+    // ghost (collisionShape none) down to the terrain below.
+    const glm::vec3 down{ 0.0f, -1.0f, 0.0f };
+    const engine::voxel::VoxelRaycastHit rubyHit =
+        server->raycast(glm::vec3(3.0f, 200.0f, 3.0f), down, 1000.0f);
+    CHECK(rubyHit.hit);
+    CHECK(rubyHit.block == glm::ivec3(3, surface + 1, 3));
+    const engine::voxel::VoxelRaycastHit ghostHit =
+        server->raycast(glm::vec3(5.0f, 200.0f, 5.0f), down, 1000.0f);
+    CHECK(ghostHit.hit);
+    CHECK(ghostHit.block == glm::ivec3(5, surface, 5));  // terrain below the ghost
+
+    // 4+5) SALVO + CARREGADO: the UUID palette pins the dynamic id; a fresh
+    // world with the registry in REVERSED order restores the same id.
+    std::string saveError;
+    const std::string bytes = server->serialize_world(saveError);
+    CHECK(saveError.empty());
+    std::unique_ptr<engine::voxel::IVoxelWorld> reload =
+        engine::voxel::create_default_voxel_world();
+    auto reversed = std::make_shared<engine::registry::BlockRegistry>();
+    std::string reversedJson = std::string("[") + ghostJson + "," + rubyJson + "]";
+    CHECK(reversed->load_from_json(reversedJson, error));
+    reload->set_block_registry(reversed);
+    reload->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    CHECK(boot_world(*reload, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    uint32_t reloadRuby = 0;
+    CHECK(reload->resolve_block_id("test:ruby", reloadRuby, error));
+    CHECK(reloadRuby == rubyId);
+    std::string loadError;
+    CHECK(reload->deserialize_world(bytes, loadError));
+    CHECK(loadError.empty());
+    CHECK(reload->get_block(3, surface + 1, 3) == rubyId);
+    CHECK(reload->get_block(5, surface + 1, 5) == ghostId);
+
+    // 6) REPLICADO: a FRESH client (no registry, no knowledge of the block)
+    // receives the server-negotiated palette, then the region snapshot with
+    // the ruby's DYNAMIC id and the delta stream — all apply verbatim.
+    std::unique_ptr<engine::voxel::IVoxelWorld> client =
+        engine::voxel::create_default_voxel_world();
+    client->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    CHECK(boot_world(*client, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    auto srv = engine::voxel::create_voxel_replication(*server);
+    auto cli = engine::voxel::create_voxel_replication(*client);
+    srv->server_register_connection(conn);
+    srv->server_set_interest(conn, {{16, surface, 16}, 2});
+
+    engine::voxel::ReplicationPalette palette;
+    CHECK(srv->server_pack_palette(conn, palette, error));
+    CHECK(palette.entries.size() == 2);
+    CHECK(cli->client_apply_palette(palette, error));
+    CHECK(error.empty());
+    uint32_t clientRuby = 0;
+    CHECK(client->resolve_block_id("test:ruby", clientRuby, error));
+    CHECK(clientRuby == rubyId);
+
+    // Region state-sync carries the dynamic id; the client converges. The
+    // snapshot window must cover the placed blocks (surface + 1).
+    srv->server_set_snapshot_window(0, surface + 8);
+    srv->server_update();
+    engine::voxel::RegionReplicationSnapshot region;
+    CHECK(srv->server_pack_region(conn, region, error));
+    CHECK(error.empty());
+    CHECK(cli->client_apply_region(region, error));
+    CHECK(error.empty());
+    CHECK(client->get_block(3, surface + 1, 3) == rubyId);   // ruby replicated
+    CHECK(client->get_block(5, surface + 1, 5) == ghostId);  // ghost replicated
+
+    // Live deltas with the dynamic id also apply after the palette.
+    srv->server_update();
+    srv->server_update();
+    CHECK(srv->server_submit_edit(conn, 4, surface + 1, 4, rubyId).accepted);
+    srv->server_update();
+    auto batch = srv->server_pack_batch(conn);
+    CHECK(batch.deltas.size() >= 1);
+    cli->client_apply_batch(batch);
+    CHECK(client->get_block(4, surface + 1, 4) == rubyId);  // delta applied
+
+    std::cout << "[sdk] e2e JSON-only block: place, render-data, collide, "
+                 "save, load, REPLICATE (palette) without recompiling OK\n";
+}
+
+// World identity + content provenance (FALTANTES §4 item 4): seed, world
+// name, rules JSON, plugin versions and the block-registry fingerprint ride
+// with the v5 save and are restored on load; a registry change since the
+// save is DETECTABLE through the fingerprint; a migrated legacy save inherits
+// the migrating world's identity; the world manager's save/load keeps the
+// seed authoritative.
+void test_world_metadata_persistence() {
+    // World A: custom registry (ruby v3 + sapphire) + metadata, serialize.
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    auto registryA = std::make_shared<engine::registry::BlockRegistry>();
+    std::string error;
+    CHECK(registryA->load_from_json(
+        R"([{"name":"ruby","namespace":"test","version":3,"color":[0.9,0.1,0.1]},)"
+        R"({"name":"sapphire","namespace":"test","color":[0.1,0.1,0.9]}])",
+        error));
+    a->set_block_registry(registryA);
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+
+    engine::voxel::IVoxelWorld::WorldMetadata metaA;
+    metaA.seed = 424242;
+    metaA.worldName = "alpha-world";
+    metaA.rulesJson = R"({"difficulty":"hard","dayLength":1200})";
+    metaA.pluginVersions.emplace_back("vulkancraft:mesher", "2.1.0");
+    metaA.pluginVersions.emplace_back("vulkancraft:lighting", "1.0.3");
+    a->set_world_metadata(metaA);
+    CHECK(a->world_metadata().seed == 424242);
+    const uint64_t stampA = a->registry_version();
+    CHECK(stampA != 0);
+
+    std::string saveError;
+    const std::string bytes = a->serialize_world(saveError);
+    CHECK(saveError.empty());
+
+    // World B: same registry in REVERSED load order -> same fingerprint;
+    // load restores the full metadata + the save's registry stamp.
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    auto registryB = std::make_shared<engine::registry::BlockRegistry>();
+    CHECK(registryB->load_from_json(
+        R"([{"name":"sapphire","namespace":"test","color":[0.1,0.1,0.9]},)"
+        R"({"name":"ruby","namespace":"test","version":3,"color":[0.9,0.1,0.1]}])",
+        error));
+    b->set_block_registry(registryB);
+    CHECK(boot_world(*b, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    CHECK(b->registry_version() == stampA);  // load-order independent
+
+    std::string loadError;
+    CHECK(b->deserialize_world(bytes, loadError));
+    CHECK(loadError.empty());
+    const engine::voxel::IVoxelWorld::WorldMetadata metaB = b->world_metadata();
+    CHECK(metaB.seed == 424242);
+    CHECK(metaB.worldName == "alpha-world");
+    CHECK(metaB.rulesJson.find("dayLength") != std::string::npos);
+    CHECK(metaB.pluginVersions.size() == 2);
+    CHECK(metaB.pluginVersions[0].first == "vulkancraft:mesher");
+    CHECK(metaB.pluginVersions[0].second == "2.1.0");
+    CHECK(metaB.pluginVersions[1].first == "vulkancraft:lighting");
+    CHECK(metaB.pluginVersions[1].second == "1.0.3");
+    CHECK(b->saved_registry_version() == stampA);
+
+    // Idempotency: re-serializing B yields the same bytes (meta included).
+    std::string reError;
+    CHECK(b->serialize_world(reError) == bytes);
+
+    // A registry change since the save is DETECTABLE: same block, different
+    // definition version -> different fingerprint; the save's stamp is kept
+    // so a caller can warn (never guess). Identity still restores.
+    std::unique_ptr<engine::voxel::IVoxelWorld> c =
+        engine::voxel::create_default_voxel_world();
+    auto registryC = std::make_shared<engine::registry::BlockRegistry>();
+    CHECK(registryC->load_from_json(
+        R"([{"name":"ruby","namespace":"test","version":4,"color":[0.9,0.1,0.1]},)"
+        R"({"name":"sapphire","namespace":"test","color":[0.1,0.1,0.9]}])",
+        error));
+    c->set_block_registry(registryC);
+    CHECK(boot_world(*c, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    CHECK(c->registry_version() != stampA);  // version bump -> new stamp
+    std::string cError;
+    CHECK(c->deserialize_world(bytes, cError));
+    CHECK(cError.empty());
+    CHECK(c->saved_registry_version() == stampA);  // the save's own stamp
+    CHECK(c->saved_registry_version() != c->registry_version());  // mismatch!
+    CHECK(c->world_metadata().seed == 424242);  // identity still restored
+
+    // A migrated legacy save inherits the MIGRATING world's identity: build a
+    // v1 save (no palette/entities, FNV-1a), migrate it with a world that has
+    // metadata, and the upgraded bytes carry that identity.
+    auto appendU32 = [](std::string& b, uint32_t v) {
+        b.push_back(static_cast<char>(v & 0xFFu));
+        b.push_back(static_cast<char>((v >> 8) & 0xFFu));
+        b.push_back(static_cast<char>((v >> 16) & 0xFFu));
+        b.push_back(static_cast<char>((v >> 24) & 0xFFu));
+    };
+    auto appendI32 = [&appendU32](std::string& b, int32_t v) {
+        appendU32(b, static_cast<uint32_t>(v));
+    };
+    std::string v1 = "VCWLD";
+    appendU32(v1, 1);
+    appendU32(v1, 1);  // one chunk
+    appendI32(v1, 0);  // cx
+    appendI32(v1, 0);  // cz
+    appendU32(v1, 1);  // extent 1 (all air, 1-byte ids)
+    for (int v = 0; v < 256; ++v) v1.push_back(static_cast<char>(kBlockAir));
+    for (int v = 0; v < 256; ++v) v1.push_back(static_cast<char>(0xFF));  // no fluid
+    {
+        uint64_t hash = 1469598103934665603ull;
+        for (const unsigned char ch : v1) {
+            hash ^= ch;
+            hash *= 1099511628211ull;
+        }
+        for (int i = 0; i < 8; ++i) {
+            v1.push_back(static_cast<char>((hash >> (8 * i)) & 0xFFu));
+        }
+    }
+
+    engine::voxel::IVoxelWorld::WorldMetadata metaMigrator;
+    metaMigrator.seed = 555;
+    metaMigrator.worldName = "migrated-world";
+    metaMigrator.rulesJson = R"({"legacy":true})";
+    metaMigrator.pluginVersions.emplace_back("vulkancraft:legacy", "0.9");
+    a->set_world_metadata(metaMigrator);
+    std::string migratedOut, migrateError;
+    CHECK(a->migrate_world_save(v1, migratedOut, migrateError));
+    CHECK(migrateError.empty());
+    CHECK(a->world_save_schema_version(migratedOut) == 5u);
+    std::unique_ptr<engine::voxel::IVoxelWorld> m =
+        engine::voxel::create_default_voxel_world();
+    std::string mError;
+    CHECK(m->deserialize_world(migratedOut, mError));
+    CHECK(m->world_metadata().seed == 555);
+    CHECK(m->world_metadata().worldName == "migrated-world");
+    CHECK(m->world_metadata().pluginVersions.size() == 1);
+
+    // The world manager's save/load keeps the seed authoritative: a world
+    // created with seed 777, saved and reloaded into a FRESH manager reports
+    // the save's seed (not whatever the reload spec claims).
+    {
+        const std::string path =
+            scratch_dir() + "/vc_test_meta_world";
+        auto manager = engine::world::create_world_manager();
+        engine::world::WorldSpec spec;
+        spec.name = "meta-overworld";
+        spec.seed = 777;
+        spec.rulesJson = R"({"difficulty":"normal"})";
+        spec.savePath = path;
+        std::string mgrError;
+        CHECK(manager->create_world(spec, mgrError));
+        CHECK(manager->world_info("meta-overworld").seed == 777);
+        CHECK(manager->save_world("meta-overworld", path, mgrError));
+        CHECK(mgrError.empty());
+
+        auto manager2 = engine::world::create_world_manager();
+        engine::world::WorldSpec reload;
+        reload.name = "meta-overworld";
+        reload.seed = 123;  // wrong on purpose: the save must win
+        reload.savePath = path;
+        std::string reloadError;
+        CHECK(manager2->load_world(reload, reloadError));
+        CHECK(reloadError.empty());
+        CHECK(manager2->world_info("meta-overworld").seed == 777);
+        CHECK(manager2->world_info("meta-overworld").rulesJson.find("normal") !=
+              std::string::npos);
+    }
+
+    std::cout << "[sdk] world metadata persistence: seed/name/rules/plugin "
+                 "versions + registry fingerprint ride the v5 save, restore on "
+                 "load, detect registry change, migrate with identity, manager "
+                 "save/load keeps the seed\n";
+}
+
 // Block entities (META section 8): lifecycle, deterministic ticking through
 // the world scheduler and atomic destroy with the block. All through the
 // public contract, in the external-project TU.
@@ -3131,6 +3573,143 @@ void test_wal_recovery() {
     std::cout << "[sdk] wal recovery: committed save leaves no journal, "
                  "interrupted save rolls back to the last committed state "
                  "(pages + tombstones), end-to-end through the facade OK\n";
+}
+
+// FALTANTES §25 — REAL process interruption mid-save. test_wal_recovery above
+// simulates the WAL journal window in-process; here the window is produced by
+// a REAL child process that dies (self-_exit: no commit_save, no destructors,
+// no flushing — the exact on-disk state a killed process leaves) between page
+// writes and commit, and a FRESH process verifies recovery on the next load.
+//
+// Child role: commit a baseline save through the facade, then begin a second
+// save that overwrites one page and adds another, and die before commit.
+void child_crash_mid_save(const std::string& dir) {
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(96));
+    if (!boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16)) ::_exit(66);
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx =
+            a->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);
+        std::string error;
+        if (!tx->commit(error)) ::_exit(67);
+    }
+    auto storeA = engine::storage::create_region_chunk_storage(8);
+    a->register_storage(storeA);
+    std::string saveErr;
+    if (!a->save_world(dir, saveErr) || !saveErr.empty()) ::_exit(68);
+    if (std::filesystem::exists(dir + "/wal")) ::_exit(69);  // committed: none
+
+    // Interrupted second save: swap an existing page and add a new one, then
+    // die BEFORE commit_save — the exact window the WAL journal covers.
+    auto b = engine::storage::create_region_chunk_storage(8);
+    std::string err;
+    if (!b->save_world(dir, err)) ::_exit(70);
+    if (!b->save_page("r.0.0", "torn-interrupted-page", err)) ::_exit(71);
+    if (!b->save_page("r.1.1", "never-committed-page", err)) ::_exit(72);
+    ::_exit(137);  // "killed" mid-save: no commit, no destructors, no flush
+}
+
+std::string self_exe_path(const char* argv0) {
+#ifdef _WIN32
+    char buf[MAX_PATH] = {0};
+    const DWORD n = ::GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) return std::string(buf, n);
+    return argv0 ? argv0 : "";
+#else
+    return argv0 ? argv0 : "";
+#endif
+}
+
+// Spawns THIS binary as the crash child (env VC_TEST_CRASH_CHILD=1 +
+// VC_TEST_CRASH_DIR=<dir>) and waits. Returns the child's exit code.
+int spawn_crash_child(const std::string& exePath, const std::string& dir) {
+#ifdef _WIN32
+    ::_putenv("VC_TEST_CRASH_CHILD=1");
+    ::_putenv(("VC_TEST_CRASH_DIR=" + dir).c_str());
+    const intptr_t code =
+        ::_spawnl(_P_WAIT, exePath.c_str(), exePath.c_str(),
+                  static_cast<const char*>(nullptr));
+    ::_putenv("VC_TEST_CRASH_CHILD=");  // unset: restore parent env
+    ::_putenv("VC_TEST_CRASH_DIR=");
+    return static_cast<int>(code);
+#else
+    ::setenv("VC_TEST_CRASH_CHILD", "1", 1);
+    ::setenv("VC_TEST_CRASH_DIR", dir.c_str(), 1);
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        ::execl(exePath.c_str(), exePath.c_str(), static_cast<char*>(nullptr));
+        ::_exit(90);  // exec failed
+    }
+    int status = 0;
+    ::waitpid(pid, &status, 0);
+    ::unsetenv("VC_TEST_CRASH_CHILD");
+    ::unsetenv("VC_TEST_CRASH_DIR");
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+#endif
+}
+
+void test_real_process_interruption(const char* exePath) {
+    if (exePath == nullptr || exePath[0] == '\0') {
+        std::cout << "[sdk] real process interruption: skipped (no exe path)\n";
+        return;
+    }
+    const auto readFile = [](const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    };
+    const std::string dir = scratch_dir() + "/crash_world";
+
+    // The child commits a save, then dies mid-save (exit 137) before commit.
+    const int code = spawn_crash_child(exePath, dir);
+    CHECK(code == 137);
+
+    // On-disk evidence a killed process leaves behind: journal present, the
+    // overwritten page torn on disk, backup/tombstone markers registered.
+    CHECK(std::filesystem::exists(dir + "/wal"));
+    CHECK(std::filesystem::exists(dir + "/wal/r_0_0.dat.bak"));
+    CHECK(std::filesystem::exists(dir + "/wal/r_1_1.dat.missing"));
+    CHECK(readFile(dir + "/pages/r_0_0.dat") == "torn-interrupted-page");
+
+    // A FRESH process loads: recovery must roll back to the committed save.
+    std::unique_ptr<engine::voxel::IVoxelWorld> w =
+        engine::voxel::create_default_voxel_world();
+    w->register_generator(std::make_shared<FlatGenerator>(96));
+    w->register_storage(engine::storage::create_region_chunk_storage(8));
+    CHECK(boot_world(*w, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    std::string loadErr;
+    CHECK(w->load_world(dir, loadErr));
+    CHECK(loadErr.empty());
+    CHECK(w->get_block(3, 130, 3) == kBlockStone);  // committed edit survived
+    CHECK(!std::filesystem::exists(dir + "/wal"));   // journal consumed
+
+    // The never-committed tile was rolled back (tombstoned = removed).
+    auto after = engine::storage::create_region_chunk_storage(8);
+    std::string err;
+    CHECK(after->load_world(dir, err));
+    std::string page;
+    CHECK(!after->load_page("r.1.1", page, err));
+
+    // No stray .tmp* left by the dead process or the recovery.
+    bool strayTmp = false;
+    std::error_code ec;
+    for (auto& entry :
+         std::filesystem::recursive_directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (entry.path().filename().string().rfind(".tmp", 0) == 0) {
+            strayTmp = true;
+            break;
+        }
+    }
+    CHECK(!strayTmp);
+
+    std::cout << "[sdk] real process interruption: child died mid-save (exit "
+              << code << "), WAL journal left on disk, fresh load rolled back "
+                 "to the committed save (stone survived, new tile gone, "
+                 "journal consumed, no stray temp files) OK\n";
 }
 
 // Block entities + world entities through the PAGED save path (FALTANTES §4):
@@ -9502,7 +10081,16 @@ void test_lod_terrain() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // FALTANTES §25 — real process interruption: when this binary is spawned
+    // as the "crash child" (env VC_TEST_CRASH_CHILD), it commits a save and
+    // then dies mid-save (see test_real_process_interruption below).
+    if (std::getenv("VC_TEST_CRASH_CHILD") != nullptr) {
+        if (const char* crashDir = std::getenv("VC_TEST_CRASH_DIR")) {
+            child_crash_mid_save(crashDir);  // never returns (_exit)
+        }
+        return 138;
+    }
     try {
         test_version();
         test_world_headless();
@@ -9523,6 +10111,9 @@ int main() {
         test_region_async_save_load();
         test_world_registry_source_of_truth();
         test_dynamic_block_persistence();
+        test_replication_palette();
+        test_json_only_block_e2e();
+        test_world_metadata_persistence();
         test_block_entity_lifecycle();
         test_block_entity_atomic_destroy();
         test_block_entity_persistence();
@@ -9540,6 +10131,8 @@ int main() {
         test_chunk_memory_budget();
         test_autosave_incremental();
         test_wal_recovery();
+        test_real_process_interruption(
+            self_exe_path(argc > 0 ? argv[0] : nullptr).c_str());
         test_region_entity_persistence();
         test_region_batch_restore();
         test_load_rollback();

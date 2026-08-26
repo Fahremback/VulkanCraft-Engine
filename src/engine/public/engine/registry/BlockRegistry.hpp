@@ -292,5 +292,16 @@ private:
     BlockDefinition fallback_;
 };
 
+// Serializes one definition to its JSON asset form — the single-object schema
+// load_from_json parses. Round-trips exactly for every registered definition:
+// loading serialize_block_definition(d) reproduces a definition with the same
+// identity (uuid/namespaced name), material (base/face colors, states),
+// behavior (fluid binding, tool, sounds) and version fields. Floats use %.9g
+// (9 significant digits round-trip float32 bit-exactly). Replication uses this
+// to ship a JSON-only block's definition to a client that must reconstruct the
+// same runtime id without recompiling (FALTANTES item 1 / Fase 2 — the
+// server-negotiated palette).
+std::string serialize_block_definition(const BlockDefinition& definition);
+
 }  // namespace registry
 }  // namespace engine

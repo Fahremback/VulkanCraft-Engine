@@ -77,6 +77,29 @@ table EntityEntry {
   stable_id: string;
 }
 
+// One registered plugin/service version (FALTANTES §4 item 4 "versão dos
+// plugins"): the (name, version) identity of a plugin that produced content
+// in this save. The engine stores the list verbatim (set_world_metadata) and
+// restores it on load; interpretation/diagnostics belong to the caller.
+table PluginVersionEntry {
+  name: string;
+  version: string;
+}
+
+// World identity + content provenance (FALTANTES §4 item 4): seed, world
+// name, rules JSON, a deterministic fingerprint of the block registry that
+// produced the blocks, and the registered plugin versions. Optional field on
+// WorldSave: v5 buffers written before this table (null meta) load with
+// default metadata (seed 0, no name/rules/plugins, no registry stamp), so
+// older v5 saves keep working unchanged.
+table WorldMeta {
+  seed: ulong;
+  world_name: string;
+  rules_json: string;
+  registry_version: ulong;
+  plugins: [PluginVersionEntry];
+}
+
 table WorldSave {
   palette: [PaletteEntry];
   chunks: [ChunkEntry];
@@ -89,6 +112,10 @@ table WorldSave {
   // null/empty means "no scheduler state" (e.g. v1-v4 migrated saves start a
   // fresh clock). The engine never interprets the bytes here.
   scheduler_state: [ubyte];
+  // World identity + content provenance (FALTANTES §4 item 4). Optional: null
+  // means "no metadata" (older v5 buffers); loaders restore it into
+  // world_metadata().
+  meta: WorldMeta;
 }
 
 root_type WorldSave;

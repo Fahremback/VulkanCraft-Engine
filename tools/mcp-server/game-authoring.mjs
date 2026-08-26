@@ -59,6 +59,90 @@ const VEHICLE_SHAPES = new Set(["box", "sphere", "capsule"]);
 const VEHICLE_KIND_ENUM = new Set(["wheeled", "motorcycle", "tracked"]);
 const PROPULSION_KINDS = new Set(["wing", "thruster", "buoyancy"]);
 
+// Ability/powers asset kind (FALTANTES §19 — abilities data-driven): the MCP
+// authors an ability (data-driven attributes/tags/cost/cooldown/conditions,
+// composable effects, targeting) as a versioned JSON document under
+// Content/Abilities/<name>.json. Each document mirrors EXACTLY the versioned
+// JSON the public C++ factory parses (engine/gameplay/IAbilitySystem.hpp,
+// implemented by src/engine/sdk/AbilitySystem.cpp — all-or-nothing, never
+// clamped), so an authored asset loads through `AbilityDefinition::
+// load_from_json` unchanged (proved by tests/AbilitySystemTests.cpp).
+export const ABILITY_KINDS = Object.freeze(["ability"]);
+const ABILITY_TARGET_MODES = new Set(["self", "direction", "point", "body"]);
+const ABILITY_CONDITION_KINDS = new Set(["ownerTag", "targetTag", "ownerAttribute", "targetAttribute", "distance"]);
+const ABILITY_EFFECT_TYPES = new Set(["damage", "heal", "impulse", "telekinesis", "flight", "blockEdit", "periodic"]);
+const ABILITY_MAX_BLOCK_EDIT_VOLUME = 4096;
+
+// Compact field contracts surfaced by game_capabilities so an agent can author
+// an ability without reading the engine source. Single source for the exported
+// JSON Schema (buildAbilityJsonSchema) and the author tool.
+export const ABILITY_FIELD_SCHEMAS = Object.freeze({
+  ability: [
+    { name: "name", type: "string", required: true, description: "ability name (becomes the file name)" },
+    { name: "id", type: "string", required: false, description: "persistent UUID; derived from 'abilities:<name>' when omitted" },
+    { name: "version", type: "integer", required: false, default: 1 },
+    { name: "cooldownSeconds", type: "number", required: false, default: 0, description: "cooldown after a cast, >= 0" },
+    { name: "cancelable", type: "boolean", required: false, default: true },
+    { name: "interruptible", type: "boolean", required: false, default: true },
+    { name: "attributes", type: "array[object]", required: false, default: [], description: "named numeric attributes: [{ name, value }]" },
+    { name: "tags", type: "array[string]", required: false, default: [], description: "named tags ('movement', 'fire', 'ultimate') the runtime never interprets" },
+    { name: "cost", type: "object", required: false, description: "resource cost spent from the caster at cast: { resource, amount >= 0 }" },
+    { name: "conditions", type: "array[object]", required: false, default: [], description: "AND-ed gates: [{ kind: ownerTag|targetTag|ownerAttribute|targetAttribute|distance, tag, attribute, minValue, maxDistance }]" },
+    { name: "targeting", type: "object", required: false, description: "{ mode: self|direction|point|body, range >= 0, radius >= 0 }" },
+    { name: "effects", type: "array[object]", required: true, description: "composable effects applied in order: [{ type: damage|heal|impulse|telekinesis|flight|blockEdit|periodic, ... }] — see ability_effect_fields" }
+  ]
+});
+
+// The authoring ARG names (snake_case) differ from the DOCUMENT keys
+// (camelCase — what the public C++ factory parses). Same mapping as
+// buildAbilityDocument, single source.
+const ABILITY_DOC_KEYS = Object.freeze({
+  ability: {
+    cooldown_seconds: "cooldownSeconds",
+    min_value: "minValue",
+    max_distance: "maxDistance",
+    hold_offset: "holdOffset",
+    grab_force: "grabForce",
+    duration_seconds: "durationSeconds",
+    interval_seconds: "intervalSeconds",
+    block_id: "blockId",
+    cast_animation: "castAnimation",
+    particle_effect: "particleEffect",
+    sound_effect: "soundEffect"
+  }
+});
+
+// Per-effect-type fields (same order the C++ parse_effect emits) so the
+// capability document can describe composable effects compactly.
+export const ABILITY_EFFECT_FIELDS = Object.freeze({
+  damage: [{ name: "amount", type: "number", required: false, default: 0, description: "health subtracted from the target, >= 0" }],
+  heal: [{ name: "amount", type: "number", required: false, default: 0, description: "health added to the target, >= 0" }],
+  impulse: [{ name: "force", type: "number", required: false, default: 0, description: "impulse along the cast direction, >= 0" }],
+  telekinesis: [
+    { name: "holdOffset", type: "array[3]", required: false, default: [0, 1.5, 0], description: "hold offset relative to the CASTER position" },
+    { name: "grabForce", type: "number", required: false, default: 240, description: "spring stiffness pulling the body to the hold point, >= 0" },
+    { name: "durationSeconds", type: "number", required: false, default: 0, description: "> 0 ends the hold automatically; 0 = until cancel" }
+  ],
+  flight: [
+    { name: "thrust", type: "number", required: false, default: 320, description: "upward thrust applied to the caster each update, >= 0" },
+    { name: "durationSeconds", type: "number", required: false, default: 0, description: "> 0 ends flight automatically; 0 = until cancel" }
+  ],
+  blockEdit: [
+    { name: "min", type: "array[3]", required: false, default: [-1, -1, -1], description: "box corner (relative or absolute) — integers" },
+    { name: "max", type: "array[3]", required: false, default: [1, 1, 1], description: "box corner (relative or absolute) — integers; max >= min per axis" },
+    { name: "blockId", type: "number", required: false, default: 1, description: "block to write (0 = air); box volume <= 4096 cells" },
+    { name: "relative", type: "boolean", required: false, default: true, description: "min/max relative to the target point (true) or absolute world coordinates (false)" }
+  ],
+  periodic: [
+    { name: "intervalSeconds", type: "number", required: false, default: 0.5, description: "repeat interval, > 0" },
+    { name: "ticks", type: "integer", required: false, default: 4, description: "repeat count, >= 1" },
+    { name: "subEffect", type: "object", required: false, description: "the repeated effect (any effect type, recursively)" }
+  ]
+});
+
+// Presentation hooks every effect accepts (particles/audio/animation).
+const ABILITY_EFFECT_HOOKS = ["castAnimation", "particleEffect", "soundEffect"];
+
 // Compact field contracts surfaced by game_capabilities so an agent can author
 // a vehicle assembly without reading the engine source. Single source for the
 // exported JSON Schema (buildVehicleJsonSchema) and the author tool.
@@ -375,6 +459,44 @@ export function buildVehicleJsonSchema(kind) {
   };
 }
 
+export function buildAbilityJsonSchema(kind) {
+  const fields = ABILITY_FIELD_SCHEMAS[kind];
+  if (!fields) throw new Error(`unsupported ability kind '${kind}'`);
+  const docKeys = ABILITY_DOC_KEYS[kind] ?? {};
+  const properties = {};
+  const required = [];
+  for (const field of fields) {
+    const docKey = docKeys[field.name] ?? field.name;
+    let schema = { description: field.description ?? `"${field.name}" ability field` };
+    if (field.default !== undefined) schema.default = field.default;
+    switch (field.type) {
+      case "string": schema.type = "string"; break;
+      case "boolean": schema.type = "boolean"; break;
+      case "number": schema.type = "number"; break;
+      case "integer": schema.type = "integer"; break;
+      case "enum": schema.enum = [...field.values]; break;
+      case "object": schema.type = "object"; break;
+      case "array": schema.type = "array"; break;
+      case "array[object]": schema.type = "array"; schema.items = { type: "object" }; break;
+      case "array[string]": schema.type = "array"; schema.items = { type: "string" }; break;
+      case "array[3]": schema.type = "array"; schema.minItems = 3; schema.maxItems = 3; schema.items = { type: "number" }; break;
+      case "array[4]": schema.type = "array"; schema.minItems = 4; schema.maxItems = 4; schema.items = { type: "number" }; break;
+      default: throw new Error(`unknown ability field type '${field.type}' in ${kind} schema`);
+    }
+    properties[docKey] = schema;
+    if (field.required) required.push(docKey);
+  }
+  return {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    $id: `https://vulkancraft.engine/schema/abilities/${kind}.json`,
+    title: `${kind} ability`,
+    type: "object",
+    additionalProperties: true,
+    properties,
+    ...(required.length > 0 ? { required } : {})
+  };
+}
+
 const PROJECT_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const PROFILE_NAMES = new Set(["Debug", "Development", "Shipping", "Server", "Editor"]);
 const PLATFORM_NAMES = new Set(["windows-x64", "linux-x64", "macos-universal", "dedicated-server"]);
@@ -437,7 +559,8 @@ function projectPaths(engineRoot, projectName) {
     audioEvents: path.join(root, "Content", "AudioEvents"),
     physicsMaterials: path.join(root, "Content", "PhysicsMaterials"),
     registry: path.join(root, "Content", "Registry"),
-    vehicles: path.join(root, "Content", "Vehicles")
+    vehicles: path.join(root, "Content", "Vehicles"),
+    abilities: path.join(root, "Content", "Abilities")
   };
 }
 
@@ -517,7 +640,9 @@ function capabilityDocument() {
       "author registry assets (blocks/items/fluids/recipes/biomes/structures)",
       "inspect registry assets", "dry-run registry asset updates",
       "author vehicle assemblies (rigid VehicleAsset / beam BeamGraphAsset)",
-      "inspect vehicle assemblies", "dry-run vehicle assembly updates"
+      "inspect vehicle assemblies", "dry-run vehicle assembly updates",
+      "author ability assets (data-driven abilities: attributes/tags/cost/cooldown/conditions, composable effects)",
+      "inspect ability assets", "dry-run ability asset updates"
     ],
     components: COMPONENT_SCHEMAS,
     light_types: { Directional: 0, Point: 1, Spot: 2, Area: 3 },
@@ -541,6 +666,23 @@ function capabilityDocument() {
     vehicle_validation: {
       note: "Each document mirrors exactly the versioned JSON the public C++ factories parse (VehicleAsset::load_from_json / BeamGraphAsset::load_from_json, implemented by src/engine/sdk/VehicleAsset.cpp and BeamGraphAsset.cpp); the MCP validates structure only — the runtime validates the same document again on load (all-or-nothing).",
       dry_run: "author_vehicle_asset accepts dry_run: true to validate and preview the document/diff without writing.",
+      rollback: "Updates return the previous document; re-authoring it with update: true restores the prior state."
+    },
+    // Ability assets (FALTANTES §19 — abilities data-driven): data-driven
+    // abilities with attributes/tags/cost/cooldown/conditions, composable
+    // effects and targeting under Content/Abilities/<name>.json.
+    ability_asset_kinds: ABILITY_KINDS.map((kind) => ({
+      kind,
+      file: `Content/Abilities/<name>.json`,
+      fields: ABILITY_FIELD_SCHEMAS[kind],
+      effect_fields: ABILITY_EFFECT_FIELDS
+    })),
+    ability_schemas: Object.fromEntries(
+      ABILITY_KINDS.map((kind) => [kind, buildAbilityJsonSchema(kind)])
+    ),
+    ability_validation: {
+      note: "Each document mirrors exactly the versioned JSON the public C++ factory parses (AbilityDefinition::load_from_json, implemented by src/engine/sdk/AbilitySystem.cpp); the MCP validates structure only — the runtime validates the same document again on load (all-or-nothing).",
+      dry_run: "author_ability_asset accepts dry_run: true to validate and preview the document/diff without writing.",
       rollback: "Updates return the previous document; re-authoring it with update: true restores the prior state."
     },
     // Full JSON Schema (draft-07) per registry kind (FALTANTES item 10): the
@@ -943,6 +1085,78 @@ export function semanticToolDefinitions() {
       }
     },
     {
+      name: "author_ability_asset",
+      description: "Author a data-driven ability (FALTANTES §19) as a versioned JSON document in Content/Abilities/, mirroring exactly the public C++ ability JSON schema (AbilityDefinition::load_from_json). Attributes/tags/cost/cooldown/conditions gate the cast; composable effects (damage/heal/impulse/telekinesis/flight/blockEdit/periodic) apply in order; targeting resolves self/direction/point/body. Validates structure against the public contract; dry_run previews the document/diff without writing; update replaces an existing asset and returns the previous document for rollback.",
+      inputSchema: {
+        type: "object",
+        required: ["project", "name", "effects"],
+        properties: {
+          project: { type: "string" },
+          name: { type: "string", minLength: 1, description: "ability name (becomes the file name)" },
+          dry_run: { type: "boolean", default: false },
+          update: { type: "boolean", default: false },
+          id: { type: "string" },
+          version: { type: "integer", default: 1 },
+          cooldown_seconds: { type: "number", default: 0, description: "cooldown after a cast, >= 0" },
+          cancelable: { type: "boolean", default: true },
+          interruptible: { type: "boolean", default: true },
+          attributes: {
+            type: "array", items: {
+              type: "object", properties: { name: { type: "string" }, value: { type: "number" } }, additionalProperties: false
+            }
+          },
+          tags: { type: "array", items: { type: "string" } },
+          cost: {
+            type: "object", properties: { resource: { type: "string" }, amount: { type: "number" } }, additionalProperties: false
+          },
+          conditions: {
+            type: "array", items: {
+              type: "object", properties: {
+                kind: { type: "string", enum: [...ABILITY_CONDITION_KINDS] },
+                tag: { type: "string" }, attribute: { type: "string" },
+                min_value: { type: "number" }, minValue: { type: "number" },
+                max_distance: { type: "number" }, maxDistance: { type: "number" }
+              }, additionalProperties: false
+            }
+          },
+          targeting: {
+            type: "object", properties: {
+              mode: { type: "string", enum: [...ABILITY_TARGET_MODES] },
+              range: { type: "number" }, radius: { type: "number" }
+            }, additionalProperties: false
+          },
+          effects: {
+            type: "array", items: {
+              type: "object", properties: {
+                type: { type: "string", enum: [...ABILITY_EFFECT_TYPES] },
+                amount: { type: "number" }, force: { type: "number" },
+                hold_offset: { type: "array", items: { type: "number" } }, holdOffset: { type: "array", items: { type: "number" } },
+                grab_force: { type: "number" }, grabForce: { type: "number" },
+                duration_seconds: { type: "number" }, durationSeconds: { type: "number" },
+                thrust: { type: "number" },
+                min: { type: "array", items: { type: "number" } }, max: { type: "array", items: { type: "number" } },
+                block_id: { type: "number" }, blockId: { type: "number" }, relative: { type: "boolean" },
+                interval_seconds: { type: "number" }, intervalSeconds: { type: "number" },
+                ticks: { type: "integer" },
+                subEffect: { type: "object", description: "periodic sub-effect (any effect type, recursively)" },
+                cast_animation: { type: "string" }, castAnimation: { type: "string" },
+                particle_effect: { type: "string" }, particleEffect: { type: "string" },
+                sound_effect: { type: "string" }, soundEffect: { type: "string" }
+              }, additionalProperties: false
+            }
+          }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_ability_assets",
+      description: "List and validate every ability asset under Content/Abilities for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
       name: "validate_game_project",
       description: "Validate the portable project, scenes, entity UUIDs, components, hierarchy, scripts, registry assets, and asset metadata without compiling the engine.",
       inputSchema: {
@@ -973,6 +1187,8 @@ export function callSemanticTool(engineRoot, name, args = {}) {
     case "inspect_registry_assets": return inspectRegistryAssets(engineRoot, args.project);
     case "author_vehicle_asset": return authorVehicleAsset(engineRoot, args);
     case "inspect_vehicle_assets": return inspectVehicleAssets(engineRoot, args.project);
+    case "author_ability_asset": return authorAbilityAsset(engineRoot, args);
+    case "inspect_ability_assets": return inspectAbilityAssets(engineRoot, args.project);
     case "validate_game_project": return validateProject(engineRoot, args.project);
     default: return undefined;
   }

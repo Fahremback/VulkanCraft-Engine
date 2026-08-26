@@ -64,9 +64,15 @@ public:
         WorldInfo info;
         const auto it = worlds_.find(name);
         if (it == worlds_.end()) return info;
+        // Identity comes from the world's metadata: for a freshly created
+        // world that is the spec (set in create_impl); for a loaded world the
+        // v5 save's meta is authoritative (seed/rules survive save/load and
+        // time travel). The manager's key keeps the runtime name.
+        const engine::voxel::IVoxelWorld::WorldMetadata meta =
+            it->second.voxel->world_metadata();
         info.name = it->second.spec.name;
-        info.seed = it->second.spec.seed;
-        info.rulesJson = it->second.spec.rulesJson;
+        info.seed = meta.seed;
+        info.rulesJson = meta.rulesJson;
         info.savePath = it->second.spec.savePath;
         info.loaded = true;
         info.elapsedSeconds = it->second.elapsed;
@@ -452,6 +458,15 @@ private:
             errorOut = "world: failed to construct '" + spec.name + "'";
             return false;
         }
+        // World identity (FALTANTES §4 item 4): the spec's seed/name/rules
+        // ride with every save. Set BEFORE load so a legacy save (no meta)
+        // keeps the caller's identity; a v5 save with metadata overrides it
+        // on load (the save is authoritative for identity).
+        engine::voxel::IVoxelWorld::WorldMetadata meta;
+        meta.seed = spec.seed;
+        meta.worldName = spec.name;
+        meta.rulesJson = spec.rulesJson;
+        voxel->set_world_metadata(meta);
         if (loadFromSave) {
             if (spec.savePath.empty()) {
                 errorOut = "world: '" + spec.name +

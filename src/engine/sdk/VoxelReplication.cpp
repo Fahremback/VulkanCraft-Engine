@@ -22,6 +22,7 @@
 #include "engine/voxel/IVoxelReplication.hpp"
 #include "engine/voxel/IVoxelWorld.hpp"
 #include "engine/voxel/IVoxelBlockEntity.hpp"
+#include "engine/registry/BlockRegistry.hpp"
 #include "engine/networking/NetworkRuntime.hpp"
 
 #include <glm/glm.hpp>
@@ -389,6 +390,34 @@ bool decode_region_body(std::string_view& s, RegionReplicationSnapshot& out) {
     return true;
 }
 
+// ---- palette body codec (identity negotiation, FALTANTES item 1) ----
+std::string encode_palette_body(const ReplicationPalette& p) {
+    std::string out;
+    put_u32(out, static_cast<std::uint32_t>(p.entries.size()));
+    for (const ReplicationPaletteEntry& entry : p.entries) {
+        put_u32(out, entry.runtimeId);
+        put_string(out, entry.uuid);
+        put_string(out, entry.namespacedName);
+        put_string(out, entry.definitionJson);
+    }
+    return out;
+}
+bool decode_palette_body(std::string_view& s, ReplicationPalette& out) {
+    std::uint32_t count = 0;
+    if (!get_u32(s, count)) return false;
+    out.entries.clear();
+    out.entries.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        ReplicationPaletteEntry entry;
+        if (!get_u32(s, entry.runtimeId) || !get_string(s, entry.uuid) ||
+            !get_string(s, entry.namespacedName) || !get_string(s, entry.definitionJson)) {
+            return false;
+        }
+        out.entries.push_back(std::move(entry));
+    }
+    return true;
+}
+
 // ---- codec frames (batching + optional zstd compression) ----
 constexpr std::array<std::byte, 4> kBatchMagic{
     std::byte{'V'}, std::byte{'X'}, std::byte{'R'}, std::byte{'B'}};
@@ -396,6 +425,8 @@ constexpr std::array<std::byte, 4> kChunkMagic{
     std::byte{'V'}, std::byte{'X'}, std::byte{'R'}, std::byte{'C'}};
 constexpr std::array<std::byte, 4> kRegionMagic{
     std::byte{'V'}, std::byte{'X'}, std::byte{'R'}, std::byte{'G'}};
+constexpr std::array<std::byte, 4> kPaletteMagic{
+    std::byte{'V'}, std::byte{'X'}, std::byte{'R'}, std::byte{'P'}};
 
 std::vector<std::byte> frame(const std::array<std::byte, 4>& magic, const std::string& payload,
                              std::shared_ptr<const compression::ICompressionProvider> compression) {
@@ -723,6 +754,108 @@ public:
         snapshotHeight_ = height;
     }
 
+    bool server_pack_palette(ReplicationConnectionId connection, ReplicationPalette& out,
+                             std::string& errorOut) override {
+        auto it = views_.find(connection);
+        if (it == views_.end() || !it->second.registered) {
+            errorOut = "server: unknown replication connection";
+            return false;
+        }
+        auto registry = world_.block_registry();
+        if (!registry) {
+            errorOut = "server: world has no block registry";
+            return false;
+        }
+        // Deterministic: registry.all_definitions() is UUID-sorted, so the
+        // palette order is stable for a given world + registry.
+        out.entries.clear();
+        for (const engine::registry::BlockDefinition& definition :
+             registry->all_definitions()) {
+            if (definition.hasBuiltinMapping) continue;  // builtin prefix = engine contract
+            std::uint32_t id = 0;
+            std::string resolveError;
+            if (!world_.resolve_block_id(definition.namespaced(), id, resolveError)) {
+                continue;  // not attached to this world yet — nothing to ship
+            }
+            ReplicationPaletteEntry entry;
+            entry.runtimeId = id;
+            entry.uuid = definition.uuid;
+            entry.namespacedName = definition.namespaced();
+            entry.definitionJson = engine::registry::serialize_block_definition(definition);
+            out.entries.push_back(std::move(entry));
+        }
+        errorOut.clear();
+        return true;
+    }
+
+    bool client_apply_palette(const ReplicationPalette& palette,
+                              std::string& errorOut) override {
+        // All-or-nothing: build the merged registry first, attach only on
+        // success (a malformed entry leaves the client's registry untouched).
+        std::unordered_set<std::string> paletteUuids;
+        for (const ReplicationPaletteEntry& entry : palette.entries) {
+            if (entry.uuid.empty()) {
+                errorOut = "client: palette entry with empty uuid";
+                return false;
+            }
+            if (entry.definitionJson.empty()) {
+                errorOut = "client: palette entry '" + entry.namespacedName +
+                           "' has no definition";
+                return false;
+            }
+            paletteUuids.insert(entry.uuid);
+        }
+        auto merged = std::make_shared<engine::registry::BlockRegistry>();
+        std::string error;
+        // Keep the client's own blocks EXCEPT those the palette replaces
+        // (server wins by UUID).
+        auto current = world_.block_registry();
+        if (current) {
+            for (const engine::registry::BlockDefinition& definition :
+                 current->all_definitions()) {
+                if (paletteUuids.count(definition.uuid) != 0) continue;
+                // The fresh merged registry already carries the engine
+                // builtins (BlockRegistry constructor); only catalog-only
+                // blocks of the client are re-registered. Identity guard:
+                // never register a definition that is already present.
+                if (merged->find_by_uuid(definition.uuid) != nullptr) continue;
+                if (!merged->register_block(definition, error)) {
+                    errorOut = "client: palette merge failed - " + error;
+                    return false;
+                }
+            }
+        }
+        for (const ReplicationPaletteEntry& entry : palette.entries) {
+            auto parsed = std::make_shared<engine::registry::BlockRegistry>();
+            if (!parsed->load_from_json(entry.definitionJson, error)) {
+                errorOut = "client: palette entry '" + entry.namespacedName +
+                           "' invalid - " + error;
+                return false;
+            }
+            const engine::registry::BlockDefinition* definition =
+                parsed->find_by_uuid(entry.uuid);
+            if (!definition) {
+                errorOut = "client: palette entry '" + entry.namespacedName +
+                           "' uuid mismatch";
+                return false;
+            }
+            if (definition->hasBuiltinMapping) {
+                errorOut = "client: palette entry '" + entry.namespacedName +
+                           "' is a builtin (the palette ships catalog-only "
+                           "blocks)";
+                return false;
+            }
+            if (!merged->register_block(*definition, error)) {
+                errorOut = "client: palette entry '" + entry.namespacedName +
+                           "' registration failed - " + error;
+                return false;
+            }
+        }
+        world_.set_block_registry(merged);
+        errorOut.clear();
+        return true;
+    }
+
     bool server_save(const std::string& filePath, std::string& errorOut) override {
         return world_.save_world(filePath, errorOut);
     }
@@ -1037,6 +1170,21 @@ bool decode_replication_region(const std::vector<std::byte>& data,
     if (!deframe(data, kRegionMagic, payload, compression)) return false;
     std::string_view s(payload);
     return decode_region_body(s, out);
+}
+
+std::vector<std::byte> encode_replication_palette(
+    const ReplicationPalette& palette,
+    std::shared_ptr<const compression::ICompressionProvider> compression) {
+    return frame(kPaletteMagic, encode_palette_body(palette), compression);
+}
+
+bool decode_replication_palette(const std::vector<std::byte>& data,
+                                ReplicationPalette& out,
+                                std::shared_ptr<const compression::ICompressionProvider> compression) {
+    std::string payload;
+    if (!deframe(data, kPaletteMagic, payload, compression)) return false;
+    std::string_view s(payload);
+    return decode_palette_body(s, out);
 }
 
 std::shared_ptr<IVoxelReplication> create_voxel_replication(IVoxelWorld& world) {

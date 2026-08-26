@@ -405,6 +405,7 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/BeamGraphAsset.cpp
     src/engine/sdk/VehicleReplication.cpp
     src/engine/sdk/VehicleProvider.cpp
+    src/engine/sdk/AbilitySystem.cpp
     src/engine/sdk/MotionDatabase.cpp
     src/engine/sdk/GaitPlanner.cpp
     src/engine/sdk/FootPlacement.cpp
@@ -1004,6 +1005,28 @@ target_include_directories(gameplay_runtime_tests PRIVATE
 )
 target_link_libraries(gameplay_runtime_tests PRIVATE vc_build_options glm vc_ozz vc_acl)
 add_test(NAME gameplay_runtime_tests COMMAND gameplay_runtime_tests)
+
+# FALTANTES item 19: generic abilities/powers as data-driven assets (attributes,
+# tags, costs, cooldowns, conditions; targeting + composable effects; voxel /
+# physics / particles / audio / animation integration through the public world
+# seam; cancel/interrupt/periodic; persistence + authority + prediction; event
+# hooks). The contract compiles with public SDK headers only; the gate drives a
+# deterministic mock IAbilityWorld (no engine internal is touched — the "without
+# core code" proof).
+add_executable(ability_system_tests
+    tests/AbilitySystemTests.cpp
+    # AbilitySystem.cpp uses the shared RegistryJson helpers; both live in
+    # vc_sdk_public. This light target compiles the TUs directly (the
+    # gameplay_runtime_tests pattern) so the gate needs no other SDK module.
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/AbilitySystem.cpp
+)
+target_include_directories(ability_system_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(ability_system_tests PRIVATE vc_build_options glm)
+add_test(NAME ability_system_tests COMMAND ability_system_tests)
 
 add_executable(visual_authoring_tests
     tests/VisualAuthoringTests.cpp
