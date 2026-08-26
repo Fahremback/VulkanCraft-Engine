@@ -9,6 +9,7 @@
 #include "frontend/ForgeWidgets.hpp"
 #include "engine/compression/ICompressionProvider.hpp"
 #include "../engine/assets/GltfGeometry.hpp"
+#include "../engine/physics/VoxelBoxMerger.hpp"
 #include "../engine/animation/AnimationAssets.hpp"
 #include "../engine/rendering/vulkan/MaterialPipeline.hpp"
 #include "../engine/audio/AudioRuntime.hpp"
@@ -18,6 +19,7 @@
 #include "../engine/gameplay/MissionSystem.hpp"
 #include "engine/navigation/INavigationProvider.hpp"
 #include <array>
+#include <map>
 #include <random>
 #include <cctype>
 #include <cstdlib>
@@ -65,8 +67,9 @@ glm::mat4 model_from_transform(const Engine::TransformComponent& t) {
 // Current fog state (set per-frame from WeatherComponent)
 static glm::vec4 g_fogParams{ 0.001f, 100.0f, 0.0f, 0.0f };
 static glm::vec4 g_fogColor{ 0.5f, 0.6f, 0.7f, 1.0f };
-void push_constants(VkCommandBuffer cmd, VkPipelineLayout layout, const glm::mat4& mvp, const glm::vec4& color) {
-    const Engine::ScenePushConstants pc{ mvp, color, g_fogParams, g_fogColor };
+void push_constants(VkCommandBuffer cmd, VkPipelineLayout layout, const glm::mat4& mvp,
+                    const glm::vec4& color, const glm::mat4& model = glm::mat4(1.0f)) {
+    const Engine::ScenePushConstants pc{ mvp, color, g_fogParams, g_fogColor, model };
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        static_cast<uint32_t>(sizeof(pc)), &pc);
 }
@@ -77,17 +80,18 @@ void set_viewport_scissor(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 }
 void draw_indexed_cube(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb, const VkBuffer& ib,
-                       uint32_t indexCount, const glm::mat4& mvp, const glm::vec4& color) {
+                       uint32_t indexCount, const glm::mat4& mvp, const glm::vec4& color,
+                       const glm::mat4& model = glm::mat4(1.0f)) {
     const VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
     vkCmdBindIndexBuffer(cmd, ib, 0, VK_INDEX_TYPE_UINT32);
-    push_constants(cmd, layout, mvp, color);
+    push_constants(cmd, layout, mvp, color, model);
     vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
 }
 void draw_indexed_editor_mesh(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb,
                               const VkBuffer& ib, uint32_t indexCount, const glm::mat4& mvp,
-                              const glm::vec4& color) {
-    draw_indexed_cube(cmd, layout, vb, ib, indexCount, mvp, color);
+                              const glm::vec4& color, const glm::mat4& model = glm::mat4(1.0f)) {
+    draw_indexed_cube(cmd, layout, vb, ib, indexCount, mvp, color, model);
 }
 
 } // namespace
@@ -162,6 +166,7 @@ void PlayNavAgent::update(float deltaTime) {
 #include <commdlg.h>
 #include <shlobj.h>
 #include <wincodec.h>
+#include <propsys.h> // IPropertyBag2 (WIC frame encode)
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
 #include <wrl/client.h>
@@ -233,6 +238,18 @@ float dist_point_segment(glm::vec2 p, glm::vec2 a, glm::vec2 b) {
     return glm::length(p - (a + ab * t));
 }
 
+// Strict float-token parsing for control-API commands: every token must be a
+// complete number. std::stof / operator>> happily parse a UUID pasted into a
+// numeric field as "2e7e5bd6…" = 2e7 = 20000000 and teleport the camera with
+// no error — reject any leftover garbage after the last number instead.
+bool parse_all_floats(const std::string& text, std::vector<float>& out) {
+    out.clear();
+    std::istringstream ss(text);
+    float v;
+    while (ss >> v) out.push_back(v);
+    return ss.eof();  // failbit with unread text = garbage token
+}
+
 constexpr glm::vec3 kAxisDirs[3] = { {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f} };
 constexpr glm::vec3 kAxisColors[3] = { {1.0f, 0.25f, 0.25f}, {0.30f, 1.0f, 0.45f}, {0.35f, 0.62f, 1.0f} };
 
@@ -269,6 +286,16 @@ int EditorApplication::run() {
         init_scene_pipeline();
         init_geometry_buffers();
         init_default_scene();
+        // Autosave recovery: a session that closed without an explicit save
+        // leaves assets/scenes/autosave.scene — load it so nothing is lost.
+        {
+            const std::filesystem::path recovery =
+                std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "assets" / "scenes" / "autosave.scene";
+            if (std::filesystem::is_regular_file(recovery)) {
+                load_scene_file(recovery.string());
+                std::cout << "[Editor] Autosave recuperado: " << recovery.string() << std::endl;
+            }
+        }
         // Persisted editor preferences (language, VSync, shadows, theme).
         load_settings();
 
@@ -554,6 +581,13 @@ void EditorApplication::init_imgui() {
 
 void EditorApplication::init_default_scene() {
     m_editorScene = std::make_unique<Scene>("Untitled Scene");
+    m_playMode.set_editor_scene(m_editorScene.get());
+    m_activeScenePath.clear();
+    m_autosavePath.clear();
+    m_sceneDirty = false;
+    // A fresh scene has no authored terrain (the previous scene's heightmap
+    // must not leak into the new one).
+    clear_terrain_mesh();
 
     Entity camera = m_editorScene->create_entity(tr("Câmera Principal", "Main Camera"));
     m_editorScene->transformComponents[camera.get_id()].position = glm::vec3(0.0f, 2.0f, 5.0f);
@@ -901,9 +935,12 @@ void EditorApplication::main_loop() {
         // create-project) can leave the hub; then publish live state for
         // /state.
         {
-            for (const std::string& cmd : m_controlApi.drain_commands()) {
-                std::cout << "[API-DEBUG] " << cmd << std::endl;
-                handle_control_command(cmd);
+            for (const auto& pc : m_controlApi.drain_commands()) {
+                std::cout << "[API-DEBUG] " << pc.cmd << std::endl;
+                m_controlResult.clear();
+                m_controlData.clear();
+                handle_control_command(pc.cmd);
+                m_controlApi.complete_command(pc.id, m_controlResult.empty(), m_controlResult, m_controlData);
             }
         }
 
@@ -917,6 +954,11 @@ void EditorApplication::main_loop() {
                     default: break;
                 }
                 Scene* s = m_playMode.get_active_scene();
+                // get_active_scene() can return null in Edit mode before the
+                // first Play (the cached editor-scene pointer is only set by
+                // start_play / set_editor_scene); fall back to the editor's
+                // own scene, matching every render/tick path.
+                if (!s) s = m_editorScene.get();
                 api.fps = m_fps;
                 api.entities = s ? s->get_entities().size() : 0u;
                 api.orbitDistance = m_editorCamera.orbitDistance;
@@ -988,8 +1030,18 @@ void EditorApplication::main_loop() {
         pump_asset_thumbnail_decodes();
         if (!m_audioDeviceStarted) m_playAudio.render(1024);
 
+        // Scene autosave: debounced persist of every change (see
+        // mark_scene_dirty / autosave_scene). Runs in every mode so API
+        // mutations made before the launcher hub is left still get saved.
+        autosave_scene();
+
         // 3D asset thumbnails (mesh + block cubes): a few renders per frame.
         pump_asset_thumbnails(4);
+
+        // Voxel block pipelines are built here, outside the render pass:
+        // creating pipelines/uploading atlases while record_viewport_scene
+        // content is recording the viewport pass hung the GPU (device lost).
+        ensure_voxel_pipelines();
 
         // Runtime-wired Wicked-port features (hair strands, soft-body cloth,
         // video flipbooks, gaussian splats, env-probe captures): preview in
@@ -1074,6 +1126,11 @@ void EditorApplication::main_loop() {
             std::exit(ok ? 0 : 1);
         }
     }
+
+    // Final autosave flush: the window is closing — persist any change that
+    // arrived inside the debounce window so nothing is lost on exit.
+    autosave_scene(true);
+
     vkDeviceWaitIdle(m_device);
 }
 
@@ -1672,9 +1729,11 @@ void EditorApplication::draw_menu_bar() {
         if (ImGui::BeginMenu(tr("Editar", "Edit"))) {
             if (ImGui::MenuItem(tr("Desfazer", "Undo"), "Ctrl+Z", false, m_undo.can_undo())) {
                 m_undo.undo();
+                mark_scene_dirty();
             }
             if (ImGui::MenuItem(tr("Refazer", "Redo"), "Ctrl+Y", false, m_undo.can_redo())) {
                 m_undo.redo();
+                mark_scene_dirty();
             }
             ImGui::Separator();
             if (ImGui::BeginMenu(tr("Configurações", "Settings"))) {
@@ -1699,6 +1758,7 @@ void EditorApplication::draw_menu_bar() {
                 if (m_editorScene) {
                     Entity ent = m_editorScene->create_entity(tr("Novo Objeto", "New Entity"));
                     m_selectedEntity = ent;
+                    mark_scene_dirty();
                 }
             }
             if (ImGui::MenuItem(tr("Objeto 3D > Cubo", "3D Object > Cube"))) {
@@ -1706,6 +1766,7 @@ void EditorApplication::draw_menu_bar() {
                     Entity cube = m_editorScene->create_entity(tr("Cubo 3D", "Cube"));
                     m_editorScene->meshRendererComponents[cube.get_id()] = MeshRendererComponent{};
                     m_selectedEntity = cube;
+                    mark_scene_dirty();
                 }
             }
             if (ImGui::MenuItem(tr("Iluminação > Luz do Sol", "Light > Directional Light"))) {
@@ -1713,6 +1774,7 @@ void EditorApplication::draw_menu_bar() {
                     Entity light = m_editorScene->create_entity(tr("Luz do Sol", "Directional Light"));
                     m_editorScene->lightComponents[light.get_id()] = LightComponent{};
                     m_selectedEntity = light;
+                    mark_scene_dirty();
                 }
             }
             if (ImGui::MenuItem(tr("Iluminação > Luz de Lâmpada", "Light > Point Light"))) {
@@ -1720,6 +1782,7 @@ void EditorApplication::draw_menu_bar() {
                     Entity light = m_editorScene->create_entity(tr("Luz de Lâmpada", "Point Light"));
                     m_editorScene->lightComponents[light.get_id()] = LightComponent{ glm::vec3(1.0f, 0.8f, 0.4f), 5000.0f, 15.0f, true };
                     m_selectedEntity = light;
+                    mark_scene_dirty();
                 }
             }
             if (ImGui::MenuItem(tr("Iluminação > Luz Spot", "Light > Spot Light"))) {
@@ -1727,6 +1790,7 @@ void EditorApplication::draw_menu_bar() {
                     Entity light = m_editorScene->create_entity(tr("Luz Spot", "Spot Light"));
                     m_editorScene->lightComponents[light.get_id()] = LightComponent{ glm::vec3(0.2f, 0.5f, 1.0f), 4000.0f, 18.0f, true, LightType::Spot };
                     m_selectedEntity = light;
+                    mark_scene_dirty();
                 }
             }
             if (ImGui::MenuItem(tr("Iluminação > Luz de Área", "Light > Area Light"))) {
@@ -1734,6 +1798,7 @@ void EditorApplication::draw_menu_bar() {
                     Entity light = m_editorScene->create_entity(tr("Luz de Área", "Area Light"));
                     m_editorScene->lightComponents[light.get_id()] = LightComponent{ glm::vec3(1.0f, 0.4f, 0.9f), 1500.0f, 20.0f, true, LightType::Area };
                     m_selectedEntity = light;
+                    mark_scene_dirty();
                 }
             }
 #if VC_ENABLE_VOXEL_PLUGIN
@@ -1742,6 +1807,7 @@ void EditorApplication::draw_menu_bar() {
                     Entity voxel = m_editorScene->create_entity(tr("Mundo de Blocos", "Voxel Volume"));
                     m_editorScene->voxelVolumeComponents[voxel.get_id()] = VoxelVolumeComponent{};
                     m_selectedEntity = voxel;
+                    mark_scene_dirty();
                 }
             }
 #endif
@@ -1956,6 +2022,7 @@ void EditorApplication::draw_app_bar() {
             ImGui::IsMouseHoveringRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax())) {
             teardown_play_runtime();
             m_playMode.stop_play();
+            m_playMode.set_editor_scene(m_editorScene.get());
             m_selectedEntity = Entity();
             m_editorGui.select_entity(m_selectedEntity);
         }
@@ -2066,14 +2133,15 @@ void EditorApplication::draw_app_bar() {
                 } else {
                     teardown_play_runtime();
                     m_playMode.stop_play();
+                    m_playMode.set_editor_scene(m_editorScene.get());
                     m_selectedEntity = Entity();
                     m_editorGui.select_entity(m_selectedEntity);
                 }
             } },
             { tr("Abrir Guia de Uso", "Open How-to-Use Guide"), [this]() { m_wickedTools.showGuideWindow = true; } },
             { tr("Abrir Painel de Desenvolvimento", "Open Developer Panel"), [this]() { m_wickedTools.showDevWindow = true; } },
-            { tr("Desfazer", "Undo"), [this]() { m_undo.undo(); } },
-            { tr("Refazer", "Redo"), [this]() { m_undo.redo(); } },
+            { tr("Desfazer", "Undo"), [this]() { m_undo.undo(); mark_scene_dirty(); } },
+            { tr("Refazer", "Redo"), [this]() { m_undo.redo(); mark_scene_dirty(); } },
             { tr("Alternar Viewport", "Toggle Viewport"), [this]() { m_showViewport = !m_showViewport; } },
             { tr("Alternar Cena", "Toggle Scene"), [this]() { m_showHierarchy = !m_showHierarchy; } },
             { tr("Alternar Inspector", "Toggle Inspector"), [this]() { m_showInspector = !m_showInspector; } },
@@ -2138,6 +2206,7 @@ void EditorApplication::draw_hierarchy_panel() {
         if (!m_editorScene) return Entity();
         Entity e = m_editorScene->create_entity(name);
         m_selectedEntity = e;
+        mark_scene_dirty();
         return e;
     };
     if (ImGui::BeginPopup("##AddEntityMenu")) {
@@ -2267,7 +2336,10 @@ void EditorApplication::draw_hierarchy_panel() {
             if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kEntityDrag)) {
                 UUID dragged;
                 std::memcpy(&dragged, payload->Data, sizeof(UUID));
-                if (dragged != id) scene->set_parent(dragged, id); // cycle-safe
+                if (dragged != id) {
+                    scene->set_parent(dragged, id); // cycle-safe
+                    mark_scene_dirty();
+                }
             }
             ImGui::EndDragDropTarget();
         }
@@ -2276,6 +2348,7 @@ void EditorApplication::draw_hierarchy_panel() {
             if (ImGui::MenuItem(tr("Deletar Objeto", "Delete Entity"))) {
                 scene->destroy_entity(id);
                 if (m_selectedEntity.is_valid() && m_selectedEntity.get_id() == id) m_selectedEntity = Entity();
+                mark_scene_dirty();
             }
             ImGui::EndPopup();
         }
@@ -2771,6 +2844,15 @@ void EditorApplication::draw_inspector_panel() {
         ImGui::EndPopup();
     }
 
+    // Inspector edits (drag floats, color pickers, combos, the name field,
+    // Add-Component popup): any mouse release inside the panel ends an edit —
+    // mark the scene dirty so autosave persists it. A spurious save of an
+    // unchanged scene is harmless (debounce caps the frequency).
+    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+        ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        mark_scene_dirty();
+    }
+
     ImGui::End();
 }
 
@@ -2989,6 +3071,8 @@ void EditorApplication::draw_viewport_panel() {
         } else {
             m_gizmoDragging = false;
             m_activeAxis = GizmoAxis::None;
+            // Gizmo drag released: the transform change is committed.
+            mark_scene_dirty();
         }
     } else if (m_viewportImageHovered && !ImGui::IsAnyMouseDown() && m_gizmoMode != GizmoMode::Select) {
         gizmo_axis_hit_test(mouse); // hover highlight
@@ -4600,8 +4684,9 @@ glm::mat4 model_from_transform(const TransformComponent& t) {
     return model;
 }
 
-void push_constants(VkCommandBuffer cmd, VkPipelineLayout layout, const glm::mat4& mvp, const glm::vec4& color) {
-    const ScenePushConstants pc{ mvp, color };
+void push_constants(VkCommandBuffer cmd, VkPipelineLayout layout, const glm::mat4& mvp,
+                    const glm::vec4& color, const glm::mat4& model = glm::mat4(1.0f)) {
+    const ScenePushConstants pc{ mvp, color, g_fogParams, g_fogColor, model };
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        static_cast<uint32_t>(sizeof(pc)), &pc);
 }
@@ -5782,11 +5867,12 @@ void set_viewport_scissor(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
 }
 
 void draw_indexed_cube(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb, const VkBuffer& ib,
-                       uint32_t indexCount, const glm::mat4& mvp, const glm::vec4& color) {
+                       uint32_t indexCount, const glm::mat4& mvp, const glm::vec4& color,
+                       const glm::mat4& model = glm::mat4(1.0f)) {
     const VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
     vkCmdBindIndexBuffer(cmd, ib, 0, VK_INDEX_TYPE_UINT32);
-    push_constants(cmd, layout, mvp, color);
+    push_constants(cmd, layout, mvp, color, model);
     vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
 }
 
@@ -5800,8 +5886,8 @@ void draw_line_list(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer
 
 void draw_indexed_editor_mesh(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb,
                               const VkBuffer& ib, uint32_t indexCount, const glm::mat4& mvp,
-                              const glm::vec4& color) {
-    draw_indexed_cube(cmd, layout, vb, ib, indexCount, mvp, color);
+                              const glm::vec4& color, const glm::mat4& model = glm::mat4(1.0f)) {
+    draw_indexed_cube(cmd, layout, vb, ib, indexCount, mvp, color, model);
 }
 
 } // namespace
@@ -5995,10 +6081,13 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
     draw_voxel_volumes(cmd, viewProj, renderScene);
 
     // Analytic infinite grid (fullscreen triangle, fwidth AA, distance fade).
-    // Gated by the viewport ⋯ menu (m_showGrid).
+    // Gated by the viewport ⋯ menu (m_showGrid). The CPU passes the inverse
+    // view-projection and the camera position so the shader unprojects rays
+    // without inverting matrices per vertex.
     if (m_showGrid && m_gridPipeline != VK_NULL_HANDLE) {
-        const GridPushConstants gridPC{ m_editorCamera.get_view_matrix(),
-                                        m_editorCamera.get_projection_matrix(aspect) };
+        const GridPushConstants gridPC{
+            glm::inverse(m_editorCamera.get_projection_matrix(aspect) * m_editorCamera.get_view_matrix()),
+            glm::vec4(m_editorCamera.position, 1.0f) };
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_gridPipeline);
         vkCmdPushConstants(cmd, m_gridPipelineLayout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -6082,7 +6171,11 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                             // Minecraft character/mob skin in the scene: the
                             // humanoid mesh with the skin sampled directly —
                             // no sidecar, the texture IS the character.
-                            gmp = ensure_texture_pipeline(meshComp->second.meshAssetID, m_skinGraphPipelines);
+                            gmp = ensure_texture_pipeline(meshComp->second.meshAssetID, m_skinGraphPipelines, true);
+                            if (!gmp) {
+                                std::cerr << "[Editor] skin pipeline failed for "
+                                          << meshComp->second.meshAssetID.to_string() << std::endl;
+                            }
                         } else if (meshComp->second.materialAssetID.is_valid() &&
                                    load_material_asset(meshComp->second.materialAssetID)) {
                             const UUID matId = meshComp->second.materialAssetID;
@@ -6147,7 +6240,8 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                                     if (mesh->ib.buffer != VK_NULL_HANDLE)
                                         vkCmdBindIndexBuffer(cmd, mesh->ib.buffer, 0, VK_INDEX_TYPE_UINT32);
                                     push_constants(cmd, m_scenePipelineLayout,
-                                                   viewProj * model_from_transform(t), glm::vec4(1.0f));
+                                                   viewProj * model_from_transform(t), glm::vec4(1.0f),
+                                                   model_from_transform(t));
                                     for (const auto& range : mesh->ranges) {
                                         if (range.indexed)
                                             vkCmdDrawIndexed(cmd, range.indexCount, 1, range.firstIndex, 0, 0);
@@ -6159,7 +6253,8 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                             }
                             if (!drewMesh) {
                                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
-                                draw_mesh_resource(cmd, viewProj * model_from_transform(t), color, *mesh);
+                                draw_mesh_resource(cmd, viewProj * model_from_transform(t), color, *mesh,
+                                                   model_from_transform(t));
                                 drewMesh = true;
                             }
                         }
@@ -6168,13 +6263,14 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                 if (!drewMesh) {
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
                     draw_indexed_cube(cmd, m_scenePipelineLayout, m_cubeVB.buffer, m_cubeIB.buffer,
-                                      m_cubeIndexCount, viewProj * model_from_transform(t), color);
+                                      m_cubeIndexCount, viewProj * model_from_transform(t), color,
+                                      model_from_transform(t));
                 }
                 if (selected) {
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_wireframePipeline);
                     draw_indexed_cube(cmd, m_scenePipelineLayout, m_cubeVB.buffer, m_cubeIB.buffer,
                                       m_cubeIndexCount, viewProj * model_from_transform(t),
-                                      glm::vec4(0.55f, 0.60f, 1.00f, 1.0f));
+                                      glm::vec4(0.55f, 0.60f, 1.00f, 1.0f), model_from_transform(t));
                 }
             } else {
                 // Transform-only entity: subtle wireframe box.
@@ -6182,7 +6278,8 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                 draw_indexed_cube(cmd, m_scenePipelineLayout, m_cubeVB.buffer, m_cubeIB.buffer,
                                   m_cubeIndexCount, viewProj * model_from_transform(t),
                                   selected ? glm::vec4(0.55f, 0.60f, 1.00f, 1.0f)
-                                           : glm::vec4(0.35f, 0.38f, 0.50f, 1.0f));
+                                           : glm::vec4(0.35f, 0.38f, 0.50f, 1.0f),
+                                  model_from_transform(t));
             }
 
             // Hair strands: verlet-simulated LINE_LIST, rebuilt each frame.
@@ -6210,7 +6307,8 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                     vkCmdBindVertexBuffers(cmd, 0, 1, &sim->second.vb.buffer, &off);
                     vkCmdBindIndexBuffer(cmd, sim->second.ib.buffer, 0, VK_INDEX_TYPE_UINT32);
                     push_constants(cmd, m_scenePipelineLayout,
-                                   viewProj * model_from_transform(t), glm::vec4(1.0f));
+                                   viewProj * model_from_transform(t), glm::vec4(1.0f),
+                                   model_from_transform(t));
                     vkCmdDrawIndexed(cmd, sim->second.indexCount, 1, 0, 0, 0);
                 }
             }
@@ -6222,7 +6320,7 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                 const DecalComponent& dec = decalIt->second;
                 const UUID texId = resolve_texture_asset_by_name(dec.texturePath);
                 if (texId.is_valid()) {
-                    if (GraphMaterialPipeline* dgmp = ensure_texture_pipeline(texId, m_blockGraphPipelines)) {
+                    if (GraphMaterialPipeline* dgmp = ensure_texture_pipeline(texId, m_blockGraphPipelines, true)) {
                         write_material_ubo(*dgmp, nullptr, nullptr);
                         write_light_ubo(*dgmp, renderScene, m_editorCamera.position);
                         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, dgmp->pipeline);
@@ -6387,7 +6485,7 @@ void EditorApplication::draw_gizmo_overlay(VkCommandBuffer cmd, const glm::mat4&
                 (m_gizmoMode == GizmoMode::Translate) ? m_gizmoArrowRanges[axis] : m_gizmoTipRanges[axis];
             bind_gizmo();
             push_constants(cmd, m_scenePipelineLayout, viewProj * gizmoModel,
-                           active ? highlight : normal);
+                           active ? highlight : normal, gizmoModel);
             vkCmdDrawIndexed(cmd, range.count, 1, range.offset, 0, 0);
         }
     }
@@ -6529,18 +6627,177 @@ void EditorApplication::perform_pick_readback() {
 // ===========================================================================
 // Play Mode, Control API & Gizmo (split from EditorApplication.cpp)
 // ===========================================================================
+namespace {
+
+// Voxel grid dims (shared with the sculpting section below).
+constexpr int kVoxelSizeX = 32;
+constexpr int kVoxelSizeY = 24;
+constexpr int kVoxelSizeZ = 32;
+
+// Deterministic terrain height used by BOTH the visual sheet generation
+// (generate_terrain_mesh) and play-mode world collision so colliders match
+// exactly what is drawn. Hash-based value noise + fBm octaves, seeded.
+float terrain_surface_height(uint32_t seed, float scale, int octaves,
+                             float amount, float falloffParam,
+                             float halfExtent, float x, float z) {
+    const auto hash2 = [seed](int hx, int hz) -> float {
+        uint32_t n = static_cast<uint32_t>(hx) * 374761393u
+                   + static_cast<uint32_t>(hz) * 668265263u;
+        n ^= seed * 0x9E3779B9u;
+        n = (n ^ (n >> 13)) * 1274126177u;
+        n ^= (n >> 16);
+        return static_cast<float>(n & 0xFFFFu) / 65535.0f;
+    };
+    const auto smoothT = [](float t) { return t * t * (3.0f - 2.0f * t); };
+    const auto valueNoise = [&](float vx, float vz) {
+        const int xi = static_cast<int>(std::floor(vx));
+        const int zi = static_cast<int>(std::floor(vz));
+        const float xf = smoothT(vx - std::floor(vx));
+        const float zf = smoothT(vz - std::floor(vz));
+        const float a = hash2(xi, zi), b = hash2(xi + 1, zi);
+        const float c = hash2(xi, zi + 1), d = hash2(xi + 1, zi + 1);
+        return a + (b - a) * xf + (c - a) * zf + (a - b - c + d) * xf * zf;
+    };
+    const auto fbm = [&](float fx, float fz, int oct) {
+        float amp = 1.0f, freq = 1.0f, sum = 0.0f, norm = 0.0f;
+        for (int o = 0; o < oct; ++o) {
+            sum += amp * valueNoise(fx * freq, fz * freq);
+            norm += amp;
+            amp *= 0.5f;
+            freq *= 2.0f;
+        }
+        return sum / std::max(norm, 1e-6f);
+    };
+    const float dist = std::sqrt(x * x + z * z);
+    const float falloff = glm::clamp(1.0f - (dist / halfExtent) * falloffParam,
+                                     0.0f, 1.0f);
+    return (fbm(x / scale, z / scale, octaves) - 0.5f)
+           * 2.0f * amount * 20.0f * falloff;
+}
+
+} // namespace
+
+// Builds the play world's REAL collision from scene content (FALTANTES item:
+// colisão real de terrain/voxel): every voxel volume becomes exact merged-cell
+// boxes (Engine::Physics::merge_solid_voxels) positioned by the volume's
+// transform, and the procedural terrain becomes sampled column boxes sharing
+// the exact height function of the visual sheet. Bodies land on what they see.
+void EditorApplication::build_play_world_collision() {
+    m_playStaticBodies.clear();
+    float minBottom = 0.0f;
+    bool any = false;
+    size_t voxelBoxes = 0;
+
+    // ---- Voxel volumes: exact merged-cell boxes ----------------------------
+    if (m_editorScene) {
+        for (const auto& [entityId, gridPtr] : m_voxelStructures) {
+            if (!gridPtr) continue;
+            glm::vec3 origin(0.0f);
+            const auto trIt = m_editorScene->transformComponents.find(entityId);
+            if (trIt != m_editorScene->transformComponents.end())
+                origin = trIt->second.position;
+            const Engine::Voxel::VoxelStructure& grid = *gridPtr;
+            const auto solid = [&grid](int x, int y, int z) -> bool {
+                return !grid.get(Engine::Voxel::Int3{ x, y, z }).empty();
+            };
+            const auto boxes = Engine::Physics::merge_solid_voxels(
+                kVoxelSizeX, kVoxelSizeY, kVoxelSizeZ, solid);
+            for (const auto& b : boxes) {
+                const glm::vec3 half(static_cast<float>(b.sx) * 0.5f,
+                                     static_cast<float>(b.sy) * 0.5f,
+                                     static_cast<float>(b.sz) * 0.5f);
+                Physics::BodyDesc desc;
+                desc.motion = Physics::MotionType::Static;
+                // Same cell -> world mapping as rebuild_voxel_mesh(): grid
+                // centered on the volume origin in X/Z, base at origin.y.
+                desc.position = origin + glm::vec3(
+                    static_cast<float>(b.x - kVoxelSizeX / 2) + half.x,
+                    static_cast<float>(b.y) + half.y,
+                    static_cast<float>(b.z - kVoxelSizeZ / 2) + half.z);
+                desc.collider.shape = Physics::BoxShape{ half };
+                desc.collider.friction = 0.7f;
+                desc.collider.restitution = 0.05f;
+                const Physics::BodyHandle handle = m_playPhysics.create_body(desc);
+                if (handle == Physics::InvalidBody) continue;
+                m_playStaticBodies.push_back(handle);
+                ++voxelBoxes;
+                const float bottom = desc.position.y - half.y;
+                minBottom = any ? std::min(minBottom, bottom) : bottom;
+                any = true;
+            }
+        }
+    }
+
+    // ---- Procedural terrain: sampled column boxes ---------------------------
+    // 64x64 columns over the sheet. Each column runs from a common base below
+    // the lowest sample up to its own height, so adjacent columns always share
+    // faces — no gaps to fall through between samples.
+    size_t terrainColumns = 0;
+    if (m_terrainValid && m_terrainParams.segments > 0 && m_terrainParams.halfExtent > 0.0f) {
+        constexpr int kCols = 64;
+        constexpr size_t kMaxTerrainBodies = 4096; // hard cap for play startup
+        const float half = m_terrainParams.halfExtent;
+        const float cell = (2.0f * half) / static_cast<float>(kCols);
+        float heights[kCols * kCols];
+        float minH = 0.0f;
+        for (int j = 0; j < kCols; ++j) {
+            for (int i = 0; i < kCols; ++i) {
+                const float x = -half + (static_cast<float>(i) + 0.5f) * cell;
+                const float z = -half + (static_cast<float>(j) + 0.5f) * cell;
+                const float h = terrain_surface_height(
+                    m_terrainParams.seed, m_terrainParams.scale,
+                    m_terrainParams.octaves, m_terrainParams.amount,
+                    m_terrainParams.falloff, half, x, z);
+                heights[j * kCols + i] = h;
+                minH = (i == 0 && j == 0) ? h : std::min(minH, h);
+            }
+        }
+        const float base = std::floor(minH) - 2.0f;
+        for (int j = 0; j < kCols && m_playStaticBodies.size() < kMaxTerrainBodies + voxelBoxes; ++j) {
+            for (int i = 0; i < kCols && m_playStaticBodies.size() < kMaxTerrainBodies + voxelBoxes; ++i) {
+                const float top = heights[j * kCols + i];
+                const float centerY = (top + base) * 0.5f;
+                const float halfY = std::max((top - base) * 0.5f, 0.25f);
+                Physics::BodyDesc desc;
+                desc.motion = Physics::MotionType::Static;
+                desc.position = glm::vec3(
+                    -half + (static_cast<float>(i) + 0.5f) * cell, centerY,
+                    -half + (static_cast<float>(j) + 0.5f) * cell);
+                desc.collider.shape = Physics::BoxShape{
+                    glm::vec3(cell * 0.5f, halfY, cell * 0.5f) };
+                desc.collider.friction = 0.7f;
+                desc.collider.restitution = 0.05f;
+                const Physics::BodyHandle handle = m_playPhysics.create_body(desc);
+                if (handle == Physics::InvalidBody) continue;
+                m_playStaticBodies.push_back(handle);
+                ++terrainColumns;
+                minBottom = any ? std::min(minBottom, base) : base;
+                any = true;
+            }
+        }
+    }
+
+    std::cout << "[PlayRuntime] world collision: " << voxelBoxes << " voxel boxes, "
+              << terrainColumns << " terrain columns" << std::endl;
+
+    // Void-failsafe plane goes BELOW everything real (or stays at y=0 when the
+    // scene has no collidable content at all).
+    m_playCollisionFloorY = any ? (minBottom - 8.0f) : -0.5f;
+}
+
 void EditorApplication::setup_play_runtime() {
     teardown_play_runtime();
     Scene* playScene = m_playMode.get_active_scene();
     if (!playScene) return;
 
-    // Static ground plane at y=0: terrain and voxel volumes are visual-only
-    // (no collision), so without this every dynamic body falls forever. A wide
-    // thin box keeps the solver cheap and gives vehicles/destructibles a floor.
+    // Real world collision first (see build_play_world_collision). The wide
+    // thin plane below is now only a void-failsafe placed under the lowest
+    // real collider (or at y=0 when the scene has no collidable content).
+    build_play_world_collision();
     {
         Physics::BodyDesc ground;
         ground.motion = Physics::MotionType::Static;
-        ground.position = glm::vec3(0.0f, -0.5f, 0.0f);
+        ground.position = glm::vec3(0.0f, m_playCollisionFloorY, 0.0f);
         ground.collider.shape = Physics::BoxShape{ glm::vec3(2000.0f, 0.5f, 2000.0f) };
         ground.collider.friction = 0.7f;
         ground.collider.restitution = 0.05f;
@@ -7849,6 +8106,7 @@ bool EditorApplication::paint_mesh_stroke(const glm::vec3& origin, const glm::ve
     }
     const auto pit = m_paintBuffers.find(target);
     if (pit != m_paintBuffers.end()) pit->second.dirty = true;
+    mark_scene_dirty();
     return true;
 }
 
@@ -8258,6 +8516,10 @@ void EditorApplication::teardown_play_runtime() {
         m_playPhysics.destroy_body(m_playGroundBody);
         m_playGroundBody = Physics::InvalidBody;
     }
+    for (const Physics::BodyHandle handle : m_playStaticBodies) {
+        m_playPhysics.destroy_body(handle);
+    }
+    m_playStaticBodies.clear();
     for (const auto& [id, handle] : m_playBodies) {
         (void)id;
         m_playPhysics.destroy_body(handle);
@@ -8299,6 +8561,126 @@ void EditorApplication::teardown_play_runtime() {
     m_playNav.reset();
 }
 
+// Captures the offscreen viewport (the previous rendered frame) to a PNG file.
+// Runs on the main/render thread at the top of the frame, so it first waits
+// for the device to idle, copies the color image into a host-visible staging
+// buffer, then encodes via Windows Imaging Component (same tech as the PNG
+// decoder). Returns empty on success, or a human-readable error.
+std::string EditorApplication::capture_viewport_screenshot(const std::string& path) {
+    if (m_offscreen.colorImage == VK_NULL_HANDLE || m_offscreen.width == 0 || m_offscreen.height == 0)
+        return "screenshot: viewport not initialized";
+    const uint32_t w = m_offscreen.width, h = m_offscreen.height;
+    const VkDeviceSize size = static_cast<VkDeviceSize>(w) * h * 4;
+    // Make sure no frame is in flight before we read the image back.
+    vkDeviceWaitIdle(m_device);
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    create_buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  staging, stagingMemory);
+    if (staging == VK_NULL_HANDLE) return "screenshot: staging buffer allocation failed";
+    {
+        VkCommandBuffer cmd = begin_single_time_commands();
+        transition_image_layout(cmd, m_offscreen.colorImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.imageExtent = { w, h, 1 };
+        vkCmdCopyImageToBuffer(cmd, m_offscreen.colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               staging, 1, &region);
+        transition_image_layout(cmd, m_offscreen.colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        end_single_time_commands(cmd);
+    }
+    void* mapped = nullptr;
+    vkMapMemory(m_device, stagingMemory, 0, size, 0, &mapped);
+    if (!mapped) {
+        vkDestroyBuffer(m_device, staging, nullptr);
+        vkFreeMemory(m_device, stagingMemory, nullptr);
+        return "screenshot: staging buffer map failed";
+    }
+    std::vector<uint8_t> rgba(static_cast<size_t>(size));
+    std::memcpy(rgba.data(), mapped, static_cast<size_t>(size));
+    vkUnmapMemory(m_device, stagingMemory);
+    vkDestroyBuffer(m_device, staging, nullptr);
+    vkFreeMemory(m_device, stagingMemory, nullptr);
+
+    // ImGui displays the offscreen texture with UV v inverted (uv0=(0,1) →
+    // uv1=(1,0)), so the readback's row 0 is the BOTTOM of what the user
+    // sees. Flip rows so the saved PNG matches the displayed viewport.
+    std::vector<uint8_t> flipped(static_cast<size_t>(size));
+    for (uint32_t y = 0; y < h; ++y) {
+        const uint32_t srcY = h - 1 - y;
+        std::memcpy(flipped.data() + static_cast<size_t>(y) * w * 4,
+                    rgba.data() + static_cast<size_t>(srcY) * w * 4, w * 4);
+    }
+
+    // Encode RGBA -> PNG via WIC (same tech as the PNG decoder).
+    static ComPtr<IWICImagingFactory> factory;
+    if (!factory) {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(factory.ReleaseAndGetAddressOf()))))
+            return "screenshot: WIC factory init failed";
+    }
+    ComPtr<IWICStream> stream;
+    if (FAILED(factory->CreateStream(&stream))) return "screenshot: WIC stream creation failed";
+    {
+        const std::wstring wide(path.begin(), path.end());
+        if (FAILED(stream->InitializeFromFilename(wide.c_str(), GENERIC_WRITE)))
+            return "screenshot: cannot open file for writing: " + path;
+    }
+    ComPtr<IWICBitmapEncoder> encoder;
+    if (FAILED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)))
+        return "screenshot: PNG encoder creation failed";
+    if (FAILED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)))
+        return "screenshot: PNG encoder init failed";
+    ComPtr<IWICBitmapFrameEncode> frame;
+    ComPtr<IPropertyBag2> props;
+    if (FAILED(encoder->CreateNewFrame(&frame, &props))) return "screenshot: PNG frame creation failed";
+    if (FAILED(frame->Initialize(props.Get()))) return "screenshot: PNG frame init failed";
+    if (FAILED(frame->SetSize(w, h))) return "screenshot: PNG frame size failed";
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppRGBA;
+    if (FAILED(frame->SetPixelFormat(&fmt))) return "screenshot: PNG pixel format failed";
+    if (FAILED(frame->WritePixels(h, w * 4, static_cast<UINT>(flipped.size()), flipped.data())))
+        return "screenshot: PNG write failed";
+    if (FAILED(frame->Commit())) return "screenshot: PNG frame commit failed";
+    if (FAILED(encoder->Commit())) return "screenshot: PNG encoder commit failed";
+    return std::string();
+}
+
+void EditorApplication::mark_scene_dirty() {
+    m_sceneDirty = true;
+    m_sceneLastChange = glfwGetTime();
+}
+
+void EditorApplication::autosave_scene(bool force) {
+    if (!m_sceneDirty || !m_editorScene) return;
+    // Mutations always target m_editorScene (the play world is a clone), so
+    // saving it is safe in any play state — the dirty flag itself is the gate.
+    // Debounce: wait ~1.5s after the last change so gizmo drags / paint
+    // strokes don't write the file every frame.
+    if (!force && glfwGetTime() - m_sceneLastChange < 1.5) return;
+    std::string path = m_activeScenePath;
+    if (path.empty()) {
+        // Untitled scene: a stable autosave file in the scenes folder
+        // (overwritten each time, unlike the API's timestamped fallback).
+        if (m_autosavePath.empty()) {
+            const auto scenesDir = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "assets" / "scenes";
+            std::error_code ec;
+            std::filesystem::create_directories(scenesDir, ec);
+            m_autosavePath = (scenesDir / "autosave.scene").string();
+        }
+        path = m_autosavePath;
+    }
+    if (m_editorScene->save_to_file(path)) {
+        m_sceneDirty = false;
+        persist_terrain_sidecar(path);
+        std::cout << "[Autosave] scene saved: " << path << std::endl;
+    } else {
+        std::cerr << "[Autosave] save failed: " << path << std::endl;
+    }
+}
 
 void EditorApplication::handle_control_command(const std::string& cmd) {
     if (cmd == "play" && m_playMode.get_state() == PlayState::Edit) {
@@ -8317,58 +8699,98 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
     } else if (cmd == "stop" && m_playMode.get_state() != PlayState::Edit) {
         teardown_play_runtime();
         m_playMode.stop_play();
+        m_playMode.set_editor_scene(m_editorScene.get());
         m_selectedEntity = Entity();
         m_editorGui.select_entity(m_selectedEntity);
         std::cout << "[ControlApi] stopped" << std::endl;
     } else if (cmd.rfind("zoom ", 0) == 0) {
-        const float amount = std::stof(cmd.substr(5));
-        m_editorCamera.orbitDistance =
-            glm::clamp(m_editorCamera.orbitDistance * (1.0f - amount), 0.5f, 5000.0f);
-        recompute_editor_camera_position();
-        std::cout << "[ControlApi] zoom " << amount << " -> " << m_editorCamera.orbitDistance << std::endl;
+        std::vector<float> f;
+        if (!parse_all_floats(cmd.substr(5), f) || f.empty()) {
+            m_controlResult = "zoom: expected a number";
+        } else {
+            const float amount = f[0];
+            m_editorCamera.orbitDistance =
+                glm::clamp(m_editorCamera.orbitDistance * (1.0f - amount), 0.5f, 5000.0f);
+            recompute_editor_camera_position();
+            std::cout << "[ControlApi] zoom " << amount << " -> " << m_editorCamera.orbitDistance << std::endl;
+        }
     } else if (cmd.rfind("move ", 0) == 0) {
-        float fx = 0.0f, ry = 0.0f, uz = 0.0f;
-        std::istringstream ss(cmd.substr(5));
-        ss >> fx >> ry >> uz;
-        m_editorCamera.orbitTarget +=
-            m_editorCamera.get_front() * fx +
-            m_editorCamera.get_right() * ry +
-            m_editorCamera.get_up() * uz;
-        recompute_editor_camera_position();
-        std::cout << "[ControlApi] move " << fx << " " << ry << " " << uz << std::endl;
+        std::vector<float> f;
+        if (!parse_all_floats(cmd.substr(5), f) || f.size() < 3) {
+            m_controlResult = "move: expected 3 numbers";
+        } else {
+            m_editorCamera.orbitTarget +=
+                m_editorCamera.get_front() * f[0] +
+                m_editorCamera.get_right() * f[1] +
+                m_editorCamera.get_up() * f[2];
+            recompute_editor_camera_position();
+            std::cout << "[ControlApi] move " << f[0] << " " << f[1] << " " << f[2] << std::endl;
+        }
     } else if (cmd.rfind("turn ", 0) == 0) {
-        float yawDeg = 0.0f, pitchDeg = 0.0f;
-        std::istringstream ss(cmd.substr(5));
-        ss >> yawDeg >> pitchDeg;
-        m_editorCamera.yaw += yawDeg;
-        m_editorCamera.pitch = glm::clamp(m_editorCamera.pitch + pitchDeg, -89.0f, 89.0f);
-        recompute_editor_camera_position();
-        std::cout << "[ControlApi] turn " << yawDeg << " " << pitchDeg << std::endl;
+        std::vector<float> f;
+        if (!parse_all_floats(cmd.substr(5), f) || f.size() < 2) {
+            m_controlResult = "turn: expected 2 numbers";
+        } else {
+            m_editorCamera.yaw += f[0];
+            m_editorCamera.pitch = glm::clamp(m_editorCamera.pitch + f[1], -89.0f, 89.0f);
+            recompute_editor_camera_position();
+            std::cout << "[ControlApi] turn " << f[0] << " " << f[1] << std::endl;
+        }
+    } else if (cmd.rfind("focus ", 0) == 0) {
+        std::vector<float> f;
+        if (!parse_all_floats(cmd.substr(6), f) || f.size() < 3) {
+            m_controlResult = "focus: expected 3 numbers (x y z)";
+        } else {
+            m_editorCamera.orbitTarget = glm::vec3(f[0], f[1], f[2]);
+            recompute_editor_camera_position();
+            std::cout << "[ControlApi] focus " << f[0] << " " << f[1] << " " << f[2] << std::endl;
+        }
     } else if (cmd.rfind("terrain ", 0) == 0) {
-        float scale = 1.0f, amount = 0.5f, falloff = 0.4f;
-        int octaves = 4;
-        std::istringstream ss(cmd.substr(8));
-        ss >> scale >> octaves >> amount >> falloff;
-        generate_terrain_mesh(TerrainParams{ scale, octaves, amount, falloff });
-        std::cout << "[ControlApi] terrain scale=" << scale << " octaves=" << octaves
-                  << " amount=" << amount << " falloff=" << falloff << std::endl;
+        // Defaults match the TerrainParams / panel defaults: scale 120 gives
+        // rolling hills — 1.0 turns the sheet into high-frequency spikes.
+        std::vector<float> f;
+        if (!parse_all_floats(cmd.substr(8), f)) {
+            m_controlResult = "terrain: expected numbers (scale octaves amount falloff extent segments seed)";
+        } else {
+            const float scale = f.size() > 0 ? f[0] : 120.0f;
+            const int octaves = f.size() > 1 ? static_cast<int>(f[1]) : 5;
+            const float amount = f.size() > 2 ? f[2] : 0.5f;
+            const float falloff = f.size() > 3 ? f[3] : 0.4f;
+            const float halfExtent = f.size() > 4 ? f[4] : 500.0f;
+            const int segments = f.size() > 5 ? static_cast<int>(f[5]) : 256;
+            const uint32_t seed = f.size() > 6 ? static_cast<uint32_t>(f[6]) : 1u;
+            generate_terrain_mesh(TerrainParams{ scale, octaves, amount, falloff,
+                                                 halfExtent, segments, seed });
+            mark_scene_dirty();
+            std::cout << "[ControlApi] terrain scale=" << scale << " octaves=" << octaves
+                      << " amount=" << amount << " falloff=" << falloff
+                      << " extent=" << halfExtent << " segments=" << segments
+                      << " seed=" << seed << std::endl;
+        }
     } else if (cmd.rfind("graphics ", 0) == 0) {
-        int vsyncInt = 1, quality = 2;
-        std::istringstream ss(cmd.substr(9));
-        ss >> vsyncInt >> quality;
-        apply_graphics_settings(vsyncInt != 0, quality);
-        std::cout << "[ControlApi] graphics vsync=" << vsyncInt << " quality=" << quality << std::endl;
+        std::vector<float> f;
+        if (!parse_all_floats(cmd.substr(9), f) || f.size() < 2) {
+            m_controlResult = "graphics: expected 2 numbers";
+        } else {
+            const int vsyncInt = static_cast<int>(f[0]);
+            const int quality = static_cast<int>(f[1]);
+            apply_graphics_settings(vsyncInt != 0, quality);
+            std::cout << "[ControlApi] graphics vsync=" << vsyncInt << " quality=" << quality << std::endl;
+        }
     } else if (cmd == "save-settings") {
         save_settings();
         std::cout << "[ControlApi] save-settings" << std::endl;
     } else if (cmd.rfind("project ", 0) == 0) {
         const std::string result = create_project(cmd.substr(8), "");
+        if (result.rfind("OK", 0) != 0) m_controlResult = result;
         std::cout << "[ControlApi] project -> " << result << std::endl;
     } else if (cmd.rfind("mesh ", 0) == 0) {
         int mode = 0;
         std::istringstream ss(cmd.substr(5));
         ss >> mode;
         const std::string result = apply_mesh_normals(mode);
+        if (result.rfind("Normais recalculadas", 0) != 0 && result.rfind("OK", 0) != 0)
+            m_controlResult = result;
         std::cout << "[ControlApi] mesh " << mode << " -> " << result << std::endl;
     } else if (cmd == "simulate" && m_playMode.get_state() == PlayState::Edit) {
         m_playMode.start_simulate(m_editorScene.get());
@@ -8376,6 +8798,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         std::cout << "[ControlApi] simulate started" << std::endl;
     } else if (cmd == "new-scene") {
         init_default_scene();
+        m_sceneDirty = false;
         std::cout << "[ControlApi] new scene" << std::endl;
     } else if (cmd.rfind("open-scene ", 0) == 0) {
         // Resolve relative paths against the source root: the editor process
@@ -8385,6 +8808,11 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         if (rel.is_relative()) {
             const auto abs = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / rel;
             if (std::filesystem::exists(abs)) scenePath = abs.string();
+        }
+        if (!std::filesystem::exists(scenePath)) {
+            m_controlResult = "open-scene: file not found: " + scenePath;
+            std::cout << "[ControlApi] open-scene: file not found: " << scenePath << std::endl;
+            return;
         }
         load_scene_file(scenePath);
         // API-driven scene open must leave the launcher hub: the control-API
@@ -8396,11 +8824,15 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         // path (that would wedge the main loop). If there is no active scene
         // path yet, fall back to a timestamped file in the scenes folder.
         if (!m_editorScene) {
+            m_controlResult = "save-scene: no scene";
             std::cout << "[ControlApi] save-scene: no scene" << std::endl;
         } else if (!m_activeScenePath.empty()) {
             if (m_editorScene->save_to_file(m_activeScenePath)) {
+                m_sceneDirty = false;
+                persist_terrain_sidecar(m_activeScenePath);
                 std::cout << "[ControlApi] scene saved: " << m_activeScenePath << std::endl;
             } else {
+                m_controlResult = "save-scene failed: " + m_activeScenePath;
                 std::cerr << "[ControlApi] save-scene failed: " << m_activeScenePath << std::endl;
             }
         } else {
@@ -8411,18 +8843,14 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
             const std::filesystem::path fallback = scenesDir / ("api_" + stamp + ".scene");
             if (m_editorScene->save_to_file(fallback.string())) {
                 m_activeScenePath = fallback.string();
+                m_sceneDirty = false;
+                persist_terrain_sidecar(m_activeScenePath);
                 std::cout << "[ControlApi] scene saved (new): " << m_activeScenePath << std::endl;
             } else {
+                m_controlResult = "save-scene failed: " + fallback.string();
                 std::cerr << "[ControlApi] save-scene failed: " << fallback << std::endl;
             }
         }
-    } else if (cmd.rfind("focus ", 0) == 0) {
-        float x = 0.0f, y = 0.0f, z = 0.0f;
-        std::istringstream ss(cmd.substr(6));
-        ss >> x >> y >> z;
-        m_editorCamera.orbitTarget = glm::vec3(x, y, z);
-        recompute_editor_camera_position();
-        std::cout << "[ControlApi] focus " << x << " " << y << " " << z << std::endl;
     } else if (cmd.rfind("add-entity ", 0) == 0) {
         if (!m_editorScene) { std::cout << "[ControlApi] no scene" << std::endl; return; }
         const std::string type = cmd.substr(11);
@@ -8430,6 +8858,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
             Entity e = m_editorScene->create_entity(name);
             m_selectedEntity = e;
             m_editorGui.select_entity(e);
+            mark_scene_dirty();
             return e;
         };
         Entity e;
@@ -8459,6 +8888,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         ss >> uuidStr >> type;
         const UUID id = UUID::from_string(uuidStr);
         if (!m_editorScene || !m_editorScene->get_entities().contains(id)) {
+            m_controlResult = "add-component: entity not found";
             std::cout << "[ControlApi] add-component: entity not found" << std::endl;
             return;
         }
@@ -8484,15 +8914,18 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
 #if VC_ENABLE_VOXEL_PLUGIN
         else if (type == "voxel") scene->voxelVolumeComponents[id] = VoxelVolumeComponent{};
 #endif
-        else { std::cout << "[ControlApi] add-component: unknown type '" << type << "'" << std::endl; return; }
+        else { m_controlResult = "add-component: unknown type '" + type + "'"; std::cout << "[ControlApi] add-component: unknown type '" << type << "'" << std::endl; return; }
+        mark_scene_dirty();
         std::cout << "[ControlApi] add-component " << type << " on " << uuidStr << std::endl;
     } else if (cmd.rfind("delete-entity ", 0) == 0) {
         const UUID id = UUID::from_string(cmd.substr(14));
         if (m_editorScene && m_editorScene->get_entities().contains(id)) {
             m_editorScene->destroy_entity(id);
             if (m_selectedEntity.is_valid() && m_selectedEntity.get_id() == id) m_selectedEntity = Entity();
+            mark_scene_dirty();
             std::cout << "[ControlApi] deleted entity" << std::endl;
         } else {
+            m_controlResult = "delete-entity: not found";
             std::cout << "[ControlApi] delete-entity: not found" << std::endl;
         }
     } else if (cmd.rfind("rename-entity ", 0) == 0) {
@@ -8504,8 +8937,10 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         const UUID id = UUID::from_string(uuidStr);
         if (m_editorScene && m_editorScene->get_entities().contains(id) && !name.empty()) {
             m_editorScene->rename_entity(id, name);
+            mark_scene_dirty();
             std::cout << "[ControlApi] renamed to '" << name << "'" << std::endl;
         } else {
+            m_controlResult = "rename-entity: not found or empty name";
             std::cout << "[ControlApi] rename-entity: not found or empty name" << std::endl;
         }
     } else if (cmd.rfind("select ", 0) == 0) {
@@ -8516,6 +8951,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
             m_editorGui.select_entity(m_selectedEntity);
             std::cout << "[ControlApi] selected " << id.to_string() << std::endl;
         } else {
+            m_controlResult = "select: entity not found";
             std::cout << "[ControlApi] select: entity not found" << std::endl;
         }
     } else if (cmd.rfind("select-name ", 0) == 0) {
@@ -8530,23 +8966,36 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
                 return;
             }
         }
+        m_controlResult = "select-name: no match";
         std::cout << "[ControlApi] select-name: no match" << std::endl;
     } else if (cmd.rfind("set-transform ", 0) == 0) {
+        // Field-masked PATCH, not positional: <uuid> <mask> p0 p1 p2 r0 r1 r2 s0 s1 s2
+        // mask = 3 chars ('1'/'0') for position/rotation/scale, so the agent can
+        // change ONLY scale (mask "001") without teleporting the object to the
+        // origin or having scale floats reinterpreted as rotation.
         std::istringstream ss(cmd.substr(14));
-        std::string uuidStr;
-        ss >> uuidStr;
+        std::string uuidStr, maskStr;
+        ss >> uuidStr >> maskStr;
         const UUID id = UUID::from_string(uuidStr);
         std::vector<float> values;
         float v;
         while (ss >> v) values.push_back(v);
         auto it = m_editorScene ? m_editorScene->transformComponents.find(id) : m_editorScene->transformComponents.end();
         if (it == m_editorScene->transformComponents.end()) {
+            m_controlResult = "set-transform: entity not found";
             std::cout << "[ControlApi] set-transform: entity not found" << std::endl;
+        } else if (values.size() < 9) {
+            m_controlResult = "set-transform: expected <uuid> <mask> + 9 floats";
+            std::cout << "[ControlApi] set-transform: expected 9 floats" << std::endl;
         } else {
-            if (values.size() >= 3) it->second.position = glm::vec3(values[0], values[1], values[2]);
-            if (values.size() >= 6) it->second.rotation = glm::vec3(values[3], values[4], values[5]);
-            if (values.size() >= 9) it->second.scale = glm::vec3(values[6], values[7], values[8]);
-            std::cout << "[ControlApi] transform set (" << values.size() << " floats)" << std::endl;
+            if (maskStr.size() > 0 && maskStr[0] == '1')
+                it->second.position = glm::vec3(values[0], values[1], values[2]);
+            if (maskStr.size() > 1 && maskStr[1] == '1')
+                it->second.rotation = glm::vec3(values[3], values[4], values[5]);
+            if (maskStr.size() > 2 && maskStr[2] == '1')
+                it->second.scale = glm::vec3(values[6], values[7], values[8]);
+            mark_scene_dirty();
+            std::cout << "[ControlApi] transform set (mask " << maskStr << ")" << std::endl;
         }
     } else if (cmd.rfind("gizmo ", 0) == 0) {
         const std::string mode = cmd.substr(6);
@@ -8562,14 +9011,18 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         m_snapTranslate = std::max(0.0f, std::stof(cmd.substr(5)));
         std::cout << "[ControlApi] snap " << m_snapTranslate << std::endl;
     } else if (cmd.rfind("import ", 0) == 0) {
-        if (m_assetPipeline) {
+        if (!m_assetPipeline) {
+            m_controlResult = "import: asset pipeline not ready";
+        } else {
             const std::filesystem::path cookedRoot =
                 std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "DerivedDataCache";
             const ImportResult result = m_assetPipeline->import({ cmd.substr(7), cookedRoot, 1 });
+            if (!result) m_controlResult = "import: " + result.error;
             std::cout << "[ControlApi] import -> " << (result ? "ok" : result.error) << std::endl;
         }
     } else if (cmd.rfind("import-pack ", 0) == 0) {
         const size_t count = import_texture_pack(std::filesystem::path(cmd.substr(12)));
+        if (count == 0) m_controlResult = "import-pack: no assets imported from the given path";
         std::cout << "[ControlApi] import-pack -> " << count << " assets imported" << std::endl;
     } else if (cmd.rfind("block-model ", 0) == 0) {
         const UUID texId = UUID::from_string(cmd.substr(12));
@@ -8578,12 +9031,51 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
             create_block_asset(*meta);
             std::cout << "[ControlApi] block model created" << std::endl;
         } else {
+            m_controlResult = "block-model: texture not found";
             std::cout << "[ControlApi] block-model: texture not found" << std::endl;
+        }
+    } else if (cmd.rfind("block-faces ", 0) == 0) {
+        // block-faces {blockId} {top} {side} {bottom} — "0" keeps the current
+        // face. Rewrites the .vblock sidecar and invalidates the atlas so the
+        // block renders with per-face textures (grass top / grass side / dirt).
+        std::istringstream ss(cmd.substr(12));
+        std::string blockStr, topStr, sideStr, bottomStr;
+        ss >> blockStr >> topStr >> sideStr >> bottomStr;
+        const auto face = [](const std::string& s) {
+            return (s.empty() || s == "0") ? UUID{ 0, 0 } : UUID::from_string(s);
+        };
+        const UUID blockId = UUID::from_string(blockStr);
+        if (set_block_faces(blockId, face(topStr), face(sideStr), face(bottomStr))) {
+            std::cout << "[ControlApi] block-faces updated " << blockId.to_string() << std::endl;
+        } else {
+            m_controlResult = "block-faces: block not found or face UUID is not a registered texture";
+        }
+    } else if (cmd.rfind("block-model-faces ", 0) == 0) {
+        // block-model-faces {base} {top} {side} {bottom} {name} — "0" = no face.
+        // Creates a NEW block asset with per-face textures from texture UUIDs.
+        std::istringstream ss(cmd.substr(18));
+        std::string baseStr, topStr, sideStr, bottomStr, name;
+        ss >> baseStr >> topStr >> sideStr >> bottomStr >> name;
+        const auto face = [](const std::string& s) {
+            return (s.empty() || s == "0") ? UUID{ 0, 0 } : UUID::from_string(s);
+        };
+        const UUID newId = create_block_from_faces(face(baseStr), face(topStr),
+                                                   face(sideStr), face(bottomStr), name);
+        if (!newId.is_valid()) {
+            m_controlResult = "block-model-faces: at least one face must be a registered texture";
+        } else {
+            std::cout << "[ControlApi] block-model-faces created " << newId.to_string() << std::endl;
         }
     } else if (cmd.rfind("spawn-block ", 0) == 0) {
         const UUID blockId = UUID::from_string(cmd.substr(12));
-        spawn_block_entity(blockId, m_editorCamera.position + m_editorCamera.get_front() * 2.0f);
-        std::cout << "[ControlApi] spawn-block " << blockId.to_string() << std::endl;
+        const auto blockMeta = m_assetRegistry.find(blockId);
+        if (!blockMeta || blockMeta->type != AssetType::Block) {
+            m_controlResult = "spawn-block: block asset not found";
+            std::cout << "[ControlApi] spawn-block: block asset not found" << std::endl;
+        } else {
+            spawn_block_entity(blockId, m_editorCamera.position + m_editorCamera.get_front() * 2.0f);
+            std::cout << "[ControlApi] spawn-block " << blockId.to_string() << std::endl;
+        }
     } else if (cmd.rfind("spawn-character ", 0) == 0) {
         const UUID texId = UUID::from_string(cmd.substr(16));
         const auto meta = m_assetRegistry.find(texId);
@@ -8591,6 +9083,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
             spawn_character_entity(texId, m_editorCamera.position + m_editorCamera.get_front() * 2.0f);
             std::cout << "[ControlApi] spawn-character " << texId.to_string() << std::endl;
         } else {
+            m_controlResult = "spawn-character: skin texture not found";
             std::cout << "[ControlApi] spawn-character: skin texture not found" << std::endl;
         }
     } else if (cmd.rfind("layer ", 0) == 0) {
@@ -8604,6 +9097,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         if (scene && !uuidStr.empty() && !name.empty()) {
             const UUID id = UUID::from_string(uuidStr);
             scene->layerComponents[id].name = name;
+            mark_scene_dirty();
             std::cout << "[ControlApi] layer " << uuidStr << " -> '" << name << "'" << std::endl;
         }
     } else if (cmd.rfind("layer-vis ", 0) == 0) {
@@ -8620,6 +9114,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
             for (auto& [id, lc] : scene->layerComponents) {
                 if (lc.name == name) lc.visible = visible != 0;
             }
+            mark_scene_dirty();
             std::cout << "[ControlApi] layer-vis '" << name << "' visible=" << visible << std::endl;
         }
     } else if (cmd.rfind("decal-add ", 0) == 0) {
@@ -8633,6 +9128,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
             DecalComponent dec;
             dec.texturePath = texture;
             scene->decalComponents[UUID::from_string(uuidStr)] = dec;
+            mark_scene_dirty();
             std::cout << "[ControlApi] decal-add " << uuidStr << " texture='" << texture << "'" << std::endl;
         }
     } else if (cmd.rfind("hair-add ", 0) == 0) {
@@ -8640,6 +9136,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         const UUID id = UUID::from_string(cmd.substr(9));
         if (scene && id.is_valid()) {
             scene->hairParticleComponents[id] = HairParticleComponent{};
+            mark_scene_dirty();
             std::cout << "[ControlApi] hair-add " << id.to_string() << std::endl;
         }
     } else if (cmd.rfind("softbody-add ", 0) == 0) {
@@ -8647,6 +9144,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         const UUID id = UUID::from_string(cmd.substr(13));
         if (scene && id.is_valid()) {
             scene->softBodyComponents[id] = SoftBodyComponent{};
+            mark_scene_dirty();
             std::cout << "[ControlApi] softbody-add " << id.to_string() << std::endl;
         }
     } else if (cmd.rfind("env-add ", 0) == 0) {
@@ -8654,6 +9152,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         const UUID id = UUID::from_string(cmd.substr(8));
         if (scene && id.is_valid()) {
             scene->envProbeComponents[id] = EnvProbeComponent{};
+            mark_scene_dirty();
             std::cout << "[ControlApi] env-add " << id.to_string() << std::endl;
         }
     } else if (cmd.rfind("env-capture ", 0) == 0) {
@@ -8661,6 +9160,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         const UUID id = UUID::from_string(cmd.substr(12));
         if (scene && scene->envProbeComponents.contains(id)) {
             scene->envProbeComponents[id].captureRequested = true;
+            mark_scene_dirty();
             std::cout << "[ControlApi] env-capture " << id.to_string() << std::endl;
         }
     } else if (cmd.rfind("paint-add ", 0) == 0) {
@@ -8668,6 +9168,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         const UUID id = UUID::from_string(cmd.substr(10));
         if (scene && id.is_valid()) {
             scene->paintComponents[id] = PaintComponent{};
+            mark_scene_dirty();
             std::cout << "[ControlApi] paint-add " << id.to_string() << std::endl;
         }
     } else if (cmd.rfind("paint-mode ", 0) == 0) {
@@ -8751,11 +9252,14 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
     } else if (cmd.rfind("asset-duplicate ", 0) == 0) {
         const UUID id = UUID::from_string(cmd.substr(16));
         const auto meta = m_assetRegistry.find(id);
-        if (meta) {
+        if (!meta) {
+            m_controlResult = "asset-duplicate: asset not found";
+        } else {
             const std::filesystem::path dup = meta->sourcePath.parent_path() /
                 (meta->sourcePath.stem().string() + "_copy" + meta->sourcePath.extension().string());
             AssetBrowserModel browser{ m_assetRegistry };
             const auto result = browser.duplicate_asset(id, dup);
+            if (!result) m_controlResult = "asset-duplicate: " + result.error;
             m_assetRegistry.save(std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db");
             std::cout << "[ControlApi] asset-duplicate -> " << (result ? "ok" : result.error) << std::endl;
         }
@@ -8763,6 +9267,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         const UUID id = UUID::from_string(cmd.substr(13));
         AssetBrowserModel browser{ m_assetRegistry };
         const auto result = browser.delete_asset(id);
+        if (!result) m_controlResult = "asset-delete: " + result.error;
         m_assetRegistry.save(std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db");
         std::cout << "[ControlApi] asset-delete -> " << (result ? "ok" : result.error) << std::endl;
     } else if (cmd.rfind("reimport ", 0) == 0) {
@@ -8776,6 +9281,33 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
                 .importerVersion = meta->importerVersion, .settings = meta->importSettings });
             m_assetRegistry.save(std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db");
             std::cout << "[ControlApi] reimport -> " << (result ? "ok" : result.error) << std::endl;
+        } else {
+            m_controlResult = "reimport: asset not found";
+        }
+    } else if (cmd.rfind("screenshot", 0) == 0) {
+        // Save the current viewport to a PNG so an agent can SEE the result.
+        // The path is absolute or relative to the engine root. Returns the
+        // saved path on success (through the Control-API result).
+        std::string path = (cmd.size() > 10) ? cmd.substr(10) : std::string();
+        while (!path.empty() && path.front() == ' ') path.erase(path.begin());
+        if (path.empty()) {
+            const auto shots = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "screenshots";
+            std::error_code ec;
+            std::filesystem::create_directories(shots, ec);
+            const std::string stamp = std::to_string(static_cast<long long>(std::time(nullptr)));
+            path = (shots / ("viewport_" + stamp + ".png")).string();
+        } else {
+            std::filesystem::path p(path);
+            if (p.is_relative()) p = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / p;
+            path = p.string();
+        }
+        const std::string err = capture_viewport_screenshot(path);
+        if (!err.empty()) {
+            m_controlResult = err;
+            std::cout << "[ControlApi] screenshot FAILED: " << err << std::endl;
+        } else {
+            m_controlData = path;
+            std::cout << "[ControlApi] screenshot saved: " << path << std::endl;
         }
     } else if (cmd.rfind("voxel-generate ", 0) == 0) {
         std::istringstream ss(cmd.substr(15));
@@ -8785,6 +9317,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         m_voxelStructures.erase(id);
         ensure_voxel_volume(id, seed, seaLevel);
         m_voxelMeshesDirty.insert(id);
+        mark_scene_dirty();
         std::cout << "[ControlApi] voxel-generate " << uuidStr << " seed=" << seed << std::endl;
     } else if (cmd.rfind("voxel-clear ", 0) == 0) {
         const UUID id = UUID::from_string(cmd.substr(12));
@@ -8796,6 +9329,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
                     for (int z = 0; z < size.z; ++z)
                         gridIt->second->set(Engine::Voxel::Int3{ x, y, z }, Engine::Voxel::VoxelValue::air());
             m_voxelMeshesDirty.insert(id);
+            mark_scene_dirty();
             std::cout << "[ControlApi] voxel-clear " << id.to_string() << std::endl;
         }
     } else if (cmd.rfind("voxel-paint ", 0) == 0) {
@@ -8810,7 +9344,33 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
             if (mode == 1) gridIt->second->set(Engine::Voxel::Int3{ x, y, z }, Engine::Voxel::VoxelValue::air());
             else gridIt->second->set(Engine::Voxel::Int3{ x, y, z }, Engine::Voxel::VoxelValue{ static_cast<uint16_t>(type), 0, 255 });
             m_voxelMeshesDirty.insert(id);
+            mark_scene_dirty();
             std::cout << "[ControlApi] voxel-paint " << uuidStr << " (" << x << "," << y << "," << z << ") type=" << type << " mode=" << mode << std::endl;
+        }
+    } else if (cmd.rfind("voxel-block ", 0) == 0) {
+        // Assign a Block asset to a voxel type (1=dirt, 2=grass, 3=stone,
+        // 4=water, or any painted type): `voxel-block 2 <block-uuid>`. The
+        // volume then samples that block's per-face atlas [top|side|bottom]
+        // instead of a flat color. Auto-resolution by texture name is the
+        // fallback when no override was set for the type.
+        std::istringstream ss(cmd.substr(12));
+        int type = 0;
+        std::string uuidStr;
+        ss >> type >> uuidStr;
+        const UUID blockId = UUID::from_string(uuidStr);
+        const auto meta = m_assetRegistry.find(blockId);
+        if (type < 1 || uuidStr.empty() || !blockId.is_valid() || !meta || meta->type != AssetType::Block) {
+            m_controlResult = "voxel-block: expected <type> <block-asset-uuid>";
+            std::cout << "[ControlApi] voxel-block: invalid type/block " << uuidStr << std::endl;
+        } else {
+            m_voxelTypeBlocks[static_cast<uint16_t>(type)] = blockId;
+            for (auto& [id, mesh] : m_voxelMeshes) {
+                (void)mesh;
+                m_voxelMeshesDirty.insert(id);
+            }
+            mark_scene_dirty();
+            std::cout << "[ControlApi] voxel-block type=" << type
+                      << " block=" << blockId.to_string() << std::endl;
         }
     } else if (cmd.rfind("script-event ", 0) == 0) {
         const std::string ev = cmd.substr(13);
@@ -8942,6 +9502,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         const auto reloaded = m_assetHotReload ? m_assetHotReload->poll() : std::vector<AssetMetadata>{};
         std::cout << "[ControlApi] hot-reload -> " << reloaded.size() << " asset(s) reimported" << std::endl;
     } else {
+        m_controlResult = "unrecognized command: " + cmd;
         std::cout << "[ControlApi] ignored '" << cmd << "' (state="
                   << static_cast<int>(m_playMode.get_state()) << ")" << std::endl;
     }
@@ -9400,6 +9961,20 @@ void EditorApplication::ensure_block_cube_resource(const UUID& blockId) {
     std::vector<EditorVertex> verts;
     std::vector<uint32_t> indices;
     generate_cube_geometry(verts, indices);
+    // Per-face atlas UVs: the block texture is a 3-wide [top|side|bottom]
+    // atlas. build_cube face order: 0=-Z,1=+Z,2=-X,3=+X (side), 4=-Y
+    // (bottom), 5=+Y (top) — remap each face's u into its atlas region.
+    if (verts.size() >= 24) {
+        for (uint32_t f = 0; f < 6; ++f) {
+            float u0 = 1.0f / 3.0f, u1 = 2.0f / 3.0f; // sides
+            if (f == 5) { u0 = 0.0f; u1 = 1.0f / 3.0f; }        // +Y top
+            else if (f == 4) { u0 = 2.0f / 3.0f; u1 = 1.0f; }   // -Y bottom
+            for (int c = 0; c < 4; ++c) {
+                EditorVertex& v = verts[f * 4 + static_cast<uint32_t>(c)];
+                v.uv.x = u0 + v.uv.x * (u1 - u0);
+            }
+        }
+    }
     EditorMeshResource cube;
     cube.vertexCount = static_cast<uint32_t>(verts.size());
     cube.ranges.push_back({ 0, static_cast<uint32_t>(indices.size()), 0, true });
@@ -9411,8 +9986,16 @@ void EditorApplication::ensure_block_cube_resource(const UUID& blockId) {
     create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   cube.ib.buffer, cube.ib.memory);
-    safe_map_and_copy(m_device, cube.vb.memory, 0, vbSize, verts.data());
-    safe_map_and_copy(m_device, cube.ib.memory, 0, ibSize, indices.data());
+    // #19: a failed upload must NOT leave a "valid" mesh with uninitialized
+    // buffers (rendering garbage). Abort and keep the resource invalid.
+    if (!safe_map_and_copy(m_device, cube.vb.memory, 0, vbSize, verts.data()) ||
+        !safe_map_and_copy(m_device, cube.ib.memory, 0, ibSize, indices.data())) {
+        if (cube.vb.buffer != VK_NULL_HANDLE) vkDestroyBuffer(m_device, cube.vb.buffer, nullptr);
+        if (cube.vb.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, cube.vb.memory, nullptr);
+        if (cube.ib.buffer != VK_NULL_HANDLE) vkDestroyBuffer(m_device, cube.ib.buffer, nullptr);
+        if (cube.ib.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, cube.ib.memory, nullptr);
+        return;
+    }
     cube.valid = true;
     m_meshResources[blockId] = std::move(cube);
 }
@@ -9459,22 +10042,29 @@ void EditorApplication::ensure_character_mesh_resource(const UUID& texId) {
 // humanoid mesh + skin pipeline on demand), so there is no sidecar file and no
 // duplicate asset in the browser.
 void EditorApplication::spawn_character_entity(const UUID& texId, const glm::vec3& position) {
-    if (!m_editorScene) return;
+    if (!m_editorScene) {
+        std::cerr << "[Editor] spawn_character_entity: m_editorScene is null" << std::endl;
+        return;
+    }
     const auto meta = m_assetRegistry.find(texId);
-    if (!meta || meta->type != AssetType::Texture) return;
+    if (!meta || meta->type != AssetType::Texture) {
+        std::cerr << "[Editor] spawn_character_entity: texture not found " << texId.to_string() << std::endl;
+        return;
+    }
     Entity e = m_editorScene->create_entity(meta->sourcePath.stem().string());
     m_editorScene->transformComponents[e.get_id()].position = position;
     m_editorScene->meshRendererComponents[e.get_id()] =
         MeshRendererComponent{ texId, UUID{ 0, 0 }, true, true };
     m_selectedEntity = e;
     m_editorGui.select_entity(e);
+    mark_scene_dirty();
 }
 
 // Shared material-graph pipeline that samples one texture (block faces and
 // character skins both land here). Cached per texture UUID so two blocks that
 // share a texture reuse the same pipeline; rebuilt when the graph hash changes.
 EditorApplication::GraphMaterialPipeline* EditorApplication::ensure_texture_pipeline(
-    const UUID& texId, std::unordered_map<UUID, GraphMaterialPipeline>& cache) {
+    const UUID& texId, std::unordered_map<UUID, GraphMaterialPipeline>& cache, bool withAlpha) {
     if (!texId.is_valid()) return nullptr;
     auto it = cache.find(texId);
     Rendering::MaterialGraph graph;
@@ -9482,6 +10072,13 @@ EditorApplication::GraphMaterialPipeline* EditorApplication::ensure_texture_pipe
     if (auto* node = graph.find_node(texNode)) node->value = texId.to_string();
     const auto baseOut = graph.add_output("BaseColor", Rendering::MaterialValueType::Vec3);
     (void)graph.connect(texNode, baseOut, 0);
+    if (withAlpha) {
+        // Alpha cutout: skins/decals sample the texture's alpha into Opacity
+        // so fully transparent texels are discarded by the generated shader
+        // (no more white/black sides from ignored alpha).
+        const auto opacityOut = graph.add_output("Opacity", Rendering::MaterialValueType::Float);
+        (void)graph.connect(texNode, opacityOut, 0);
+    }
     const uint64_t graphHash = hash_material_graph(graph);
     // Rebuild when the sampled texture's content changed (hot reload) — the
     // graph hash alone cannot see that, so pipelines kept stale GPU copies.
@@ -9514,15 +10111,17 @@ void EditorApplication::spawn_block_entity(const UUID& blockId, const glm::vec3&
         MeshRendererComponent{ blockId, UUID{ 0, 0 }, true, true };
     m_selectedEntity = e;
     m_editorGui.select_entity(e);
+    mark_scene_dirty();
 }void EditorApplication::draw_mesh_resource(VkCommandBuffer cmd, const glm::mat4& mvp, const glm::vec4& color,
-                                           const EditorMeshResource& resource) {
+                                           const EditorMeshResource& resource,
+                                           const glm::mat4& model) {
     if (!resource.valid || resource.vb.buffer == VK_NULL_HANDLE) return;
     const VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &resource.vb.buffer, &offset);
     if (resource.ib.buffer != VK_NULL_HANDLE) {
         vkCmdBindIndexBuffer(cmd, resource.ib.buffer, 0, VK_INDEX_TYPE_UINT32);
     }
-    push_constants(cmd, m_scenePipelineLayout, mvp, color);
+    push_constants(cmd, m_scenePipelineLayout, mvp, color, model);
     for (const EditorMeshResource::DrawRange& range : resource.ranges) {
         if (range.indexed) {
             vkCmdDrawIndexed(cmd, range.indexCount, 1, range.firstIndex, 0, 0);
@@ -10326,6 +10925,17 @@ void EditorApplication::init_block_cube() {
         0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 8, 9, 10, 8, 10, 11,
         12, 13, 14, 12, 14, 15, 16, 17, 18, 16, 18, 19, 20, 21, 22, 20, 22, 23,
     };
+    // Per-face atlas UVs: remap the shared thumbnail cube into the 3-wide
+    // [top|side|bottom] atlas regions. Face groups: 0-3=+Z, 4-7=-Z, 8-11=+X,
+    // 12-15=-X (sides), 16-19=+Y (top), 20-23=-Y (bottom).
+    BlockVert cube[24];
+    std::memcpy(cube, verts, sizeof(cube));
+    for (int i = 0; i < 24; ++i) {
+        float u0 = 1.0f / 3.0f, u1 = 2.0f / 3.0f; // sides
+        if (i >= 16 && i < 20) { u0 = 0.0f; u1 = 1.0f / 3.0f; }     // +Y top
+        else if (i >= 20) { u0 = 2.0f / 3.0f; u1 = 1.0f; }          // -Y bottom
+        cube[i].uv.x = u0 + cube[i].uv.x * (u1 - u0);
+    }
     const VkDeviceSize vbSize = sizeof(BlockVert) * 24;
     const VkDeviceSize ibSize = sizeof(uint32_t) * 36;
     create_buffer(vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -10334,18 +10944,37 @@ void EditorApplication::init_block_cube() {
     create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   m_blockCubeIB.buffer, m_blockCubeIB.memory);
-    safe_map_and_copy(m_device, m_blockCubeVB.memory, 0, vbSize, verts);
-    safe_map_and_copy(m_device, m_blockCubeIB.memory, 0, ibSize, indices);
+    if (!safe_map_and_copy(m_device, m_blockCubeVB.memory, 0, vbSize, cube) ||
+        !safe_map_and_copy(m_device, m_blockCubeIB.memory, 0, ibSize, indices)) {
+        std::cerr << "[Editor] block cube upload failed" << std::endl;
+    }
     m_blockCubeIndexCount = 36;
 
+    // Pixel-art sampler: Minecraft blocks/skins are nearest-filtered, no
+    // mipmap bleeding. (PBR/HD textures keep the trilinear sampler elsewhere.)
     VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-    samplerInfo.magFilter = VK_FILTER_LINEAR;
-    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.magFilter = VK_FILTER_NEAREST;
+    samplerInfo.minFilter = VK_FILTER_NEAREST;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+    samplerInfo.maxLod = 0.0f; // the atlas is a single mip
     vkCreateSampler(m_device, &samplerInfo, nullptr, &m_blockSampler);
+
+    // Same pixel-art filtering for the block atlases sampled by the
+    // material-graph pipelines (voxel volumes + scene block cubes): NEAREST,
+    // no mipmap bleeding — the crisp Minecraft look instead of LINEAR blur.
+    VkSamplerCreateInfo blockDrawInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    blockDrawInfo.magFilter = VK_FILTER_NEAREST;
+    blockDrawInfo.minFilter = VK_FILTER_NEAREST;
+    blockDrawInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    blockDrawInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    blockDrawInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    blockDrawInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    blockDrawInfo.minLod = 0.0f;
+    blockDrawInfo.maxLod = 0.0f; // the block atlas is a single mip
+    vkCreateSampler(m_device, &blockDrawInfo, nullptr, &m_blockDrawSampler);
 
     VkDescriptorSetLayoutBinding binding{};
     binding.binding = 0;
@@ -10356,6 +10985,20 @@ void EditorApplication::init_block_cube() {
     descLayoutInfo.bindingCount = 1;
     descLayoutInfo.pBindings = &binding;
     vkCreateDescriptorSetLayout(m_device, &descLayoutInfo, nullptr, &m_blockDescSetLayout);
+
+    // Block descriptors come from their OWN pool, not the ImGui pool:
+    // ImGui resets its descriptor pools every frame, which invalidated these
+    // sets right after allocation — draws with the reset sets corrupted the
+    // whole frame (viewport went blank; occasionally the device faulted).
+    // A dedicated pool keeps the sets alive for the block pipeline's lifetime.
+    VkDescriptorPoolSize blockPoolSize{};
+    blockPoolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    blockPoolSize.descriptorCount = 2048;
+    VkDescriptorPoolCreateInfo blockPoolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    blockPoolInfo.maxSets = 1024;
+    blockPoolInfo.poolSizeCount = 1;
+    blockPoolInfo.pPoolSizes = &blockPoolSize;
+    vkCreateDescriptorPool(m_device, &blockPoolInfo, nullptr, &m_blockDescPool);
 
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -10452,7 +11095,16 @@ void EditorApplication::destroy_block_cube() {
     if (m_blockPipeline != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_blockPipeline, nullptr); m_blockPipeline = VK_NULL_HANDLE; }
     if (m_blockPipelineLayout != VK_NULL_HANDLE) { vkDestroyPipelineLayout(m_device, m_blockPipelineLayout, nullptr); m_blockPipelineLayout = VK_NULL_HANDLE; }
     if (m_blockDescSetLayout != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(m_device, m_blockDescSetLayout, nullptr); m_blockDescSetLayout = VK_NULL_HANDLE; }
+    if (m_blockDescPool != VK_NULL_HANDLE) { vkDestroyDescriptorPool(m_device, m_blockDescPool, nullptr); m_blockDescPool = VK_NULL_HANDLE; }
     if (m_blockSampler != VK_NULL_HANDLE) { vkDestroySampler(m_device, m_blockSampler, nullptr); m_blockSampler = VK_NULL_HANDLE; }
+    if (m_blockDrawSampler != VK_NULL_HANDLE) { vkDestroySampler(m_device, m_blockDrawSampler, nullptr); m_blockDrawSampler = VK_NULL_HANDLE; }
+    // Per-face atlas textures (same lifecycle as the block cube).
+    for (auto& [uuid, gt] : m_blockAtlasTextures) {
+        (void)uuid;
+        destroy_graph_texture(gt);
+    }
+    m_blockAtlasTextures.clear();
+    m_blockAtlasHashes.clear();
     if (m_blockVertShader != VK_NULL_HANDLE) { vkDestroyShaderModule(m_device, m_blockVertShader, nullptr); m_blockVertShader = VK_NULL_HANDLE; }
     if (m_blockFragShader != VK_NULL_HANDLE) { vkDestroyShaderModule(m_device, m_blockFragShader, nullptr); m_blockFragShader = VK_NULL_HANDLE; }
     if (m_blockCubeVB.buffer != VK_NULL_HANDLE) { vkDestroyBuffer(m_device, m_blockCubeVB.buffer, nullptr); vkFreeMemory(m_device, m_blockCubeVB.memory, nullptr); m_blockCubeVB = GPUBuffer{}; }
@@ -10462,6 +11114,12 @@ void EditorApplication::destroy_block_cube() {
 // Lazy descriptor set for a block texture (my layout, allocated from the ImGui
 // descriptor pool which carries COMBINED_IMAGE_SAMPLER).
 VkDescriptorSet EditorApplication::get_block_descriptor(const UUID& textureAsset) {
+    // Block assets resolve to the per-face atlas, which is OWNED by
+    // m_blockAtlasTextures (not m_blockTextures) — avoid double-owning/destroying.
+    const bool isAtlas = [&] {
+        const auto meta = m_assetRegistry.find(textureAsset);
+        return meta && meta->type == AssetType::Block;
+    }();
     // Content-hash invalidation: a reimported texture (hot reload) must not
     // keep its stale GPU copy (thumbnails and scene block faces share it).
     uint64_t contentHash = 0;
@@ -10470,12 +11128,14 @@ VkDescriptorSet EditorApplication::get_block_descriptor(const UUID& textureAsset
     if (hashIt != m_blockTextureHashes.end() && hashIt->second != contentHash) {
         const auto descIt = m_blockDescriptors.find(textureAsset);
         if (descIt != m_blockDescriptors.end()) {
-            if (descIt->second != VK_NULL_HANDLE && m_imguiDescriptorPool != VK_NULL_HANDLE)
-                vkFreeDescriptorSets(m_device, m_imguiDescriptorPool, 1, &descIt->second);
+            if (descIt->second != VK_NULL_HANDLE && m_blockDescPool != VK_NULL_HANDLE)
+                vkFreeDescriptorSets(m_device, m_blockDescPool, 1, &descIt->second);
             m_blockDescriptors.erase(descIt);
         }
-        const auto texIt = m_blockTextures.find(textureAsset);
-        if (texIt != m_blockTextures.end()) { destroy_graph_texture(texIt->second); m_blockTextures.erase(texIt); }
+        if (!isAtlas) {
+            const auto texIt = m_blockTextures.find(textureAsset);
+            if (texIt != m_blockTextures.end()) { destroy_graph_texture(texIt->second); m_blockTextures.erase(texIt); }
+        }
         m_blockTextureHashes.erase(hashIt);
     }
     const auto cached = m_blockDescriptors.find(textureAsset);
@@ -10485,12 +11145,12 @@ VkDescriptorSet EditorApplication::get_block_descriptor(const UUID& textureAsset
     std::string error;
     if (!load_viewport_texture(textureAsset, gt, error, 192)) return VK_NULL_HANDLE;
     VkDescriptorSetAllocateInfo ai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    ai.descriptorPool = m_imguiDescriptorPool;
+    ai.descriptorPool = m_blockDescPool;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &m_blockDescSetLayout;
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (vkAllocateDescriptorSets(m_device, &ai, &set) != VK_SUCCESS) {
-        destroy_graph_texture(gt);
+        if (!isAtlas) destroy_graph_texture(gt); // atlas is owned by its cache
         return VK_NULL_HANDLE;
     }
     VkDescriptorImageInfo imageInfo{ m_blockSampler, gt.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
@@ -10501,7 +11161,7 @@ VkDescriptorSet EditorApplication::get_block_descriptor(const UUID& textureAsset
     write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     write.pImageInfo = &imageInfo;
     vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
-    m_blockTextures[textureAsset] = gt; // keeps image/view alive
+    if (!isAtlas) m_blockTextures[textureAsset] = gt; // atlas kept alive by its cache
     m_blockDescriptors[textureAsset] = set;
     m_blockTextureHashes[textureAsset] = contentHash;
     return set;
@@ -10670,7 +11330,7 @@ void EditorApplication::render_block_thumbnail(const UUID& assetId, VkDescriptor
 // for character entities) — the card shows the 3D character instead of the
 // flat skin atlas PNG.
 void EditorApplication::render_character_thumbnail(const UUID& assetId, const EditorMeshResource& mesh) {
-    GraphMaterialPipeline* gmp = ensure_texture_pipeline(assetId, m_skinGraphPipelines);
+    GraphMaterialPipeline* gmp = ensure_texture_pipeline(assetId, m_skinGraphPipelines, true);
     if (!gmp) { m_assetThumbnailFailed.insert(assetId); return; }
     write_material_ubo(*gmp, nullptr, nullptr);
     write_light_ubo(*gmp, m_editorScene.get(), m_editorCamera.position);
@@ -10820,6 +11480,43 @@ bool EditorApplication::looks_like_block_texture(const AssetMetadata& meta) cons
         return true;
     }
     if (is_character_texture(meta)) return false;
+    // Non-block decorative/UI textures: even when square POT, particle
+    // atlases, icons, GUI sprites, noise maps and similar are not block
+    // faces. Only the fallback path (no /block/ folder) is filtered — a
+    // texture explicitly inside a block folder always wins above.
+    std::string stem = meta.sourcePath.stem().string();
+    std::transform(stem.begin(), stem.end(), stem.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    static const char* kNonBlockStems[] = {
+        "particle", "particles", "icon", "icons", "noise", "noises",
+        "gui", "font", "fontsheet", "cursor", "logo", "splash",
+        "toolbar", "badge", "badges", "emoji", "emojis", "widget",
+        "widgets", "button", "buttons", "panel", "panels", "frame",
+        "frames", "loading", "menu", "menus", "title", "options",
+        "settings", "achievement", "achievements", "recipe", "recipes",
+        "inventory", "hotbar", "crosshair", "hud", "map", "maps",
+        "book", "books", "painting", "paintings", "slot", "slots",
+        "container", "containers", "banner", "banners", "arrow",
+        "arrows", "experience", "xp", "effect", "effects",
+    };
+    for (const char* marker : kNonBlockStems) {
+        if (stem == marker) return false;
+    }
+    static const char* kNonBlockSuffixes[] = {
+        "_icon", "_icons", "_particle", "_particles", "_noise", "_sprite",
+        "_sprites", "_gui", "_ui", "_hud",
+    };
+    for (const char* suffix : kNonBlockSuffixes) {
+        const size_t n = std::strlen(suffix);
+        if (stem.size() > n && stem.compare(stem.size() - n, n, suffix) == 0) return false;
+    }
+    static const char* kNonBlockPrefixes[] = {
+        "gui_", "icon_", "particle_", "noise_", "ui_", "hud_", "menu_", "title_",
+    };
+    for (const char* prefix : kNonBlockPrefixes) {
+        const size_t n = std::strlen(prefix);
+        if (stem.size() > n && stem.compare(0, n, prefix) == 0) return false;
+    }
     return true;
 }
 
@@ -11009,6 +11706,81 @@ UUID EditorApplication::create_block_asset(const AssetMetadata& textureMeta) {
         std::error_code ec;
         std::filesystem::remove(textureMeta.sourcePath.string() + ".noblock", ec);
     }
+    const auto lowerStem = [](const std::filesystem::path& p) {
+        std::string s = p.stem().string();
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s;
+    };
+    const std::string baseLower = lowerStem(textureMeta.sourcePath);
+    // Minecraft-style face textures (<base>_top/_side/_bottom) have no
+    // <base>.png of their own (grass_block = grass_block_top + grass_block_side
+    // + dirt). Every face import (re)assembles the parent <base>.vblock so the
+    // block renders with the correct per-face atlas — converges as the pack
+    // import visits the sibling faces in any order.
+    static const char* kFaceSuffixes[] = { "_top", "_up", "_side", "_bottom", "_down" };
+    std::string parentLower = baseLower;
+    for (const char* suffix : kFaceSuffixes) {
+        const size_t n = std::strlen(suffix);
+        if (parentLower.size() > n && parentLower.compare(parentLower.size() - n, n, suffix) == 0) {
+            parentLower.resize(parentLower.size() - n);
+            break;
+        }
+    }
+    if (!parentLower.empty() && parentLower != baseLower) {
+        UUID pBase, pTop, pSide, pBottom, dirtTex;
+        for (const AssetMetadata& candidate : m_assetRegistry.snapshot()) {
+            if (candidate.type != AssetType::Texture || candidate.sourcePath.empty()) continue;
+            const std::string cStem = lowerStem(candidate.sourcePath);
+            if (cStem == parentLower) pBase = candidate.id;
+            else if (cStem == parentLower + "_top" || cStem == parentLower + "_up") pTop = candidate.id;
+            else if (cStem == parentLower + "_side") pSide = candidate.id;
+            else if (cStem == parentLower + "_bottom" || cStem == parentLower + "_down") pBottom = candidate.id;
+            else if (cStem == "dirt") dirtTex = candidate.id;
+        }
+        const UUID mainTex = pBase.is_valid() ? pBase
+                           : (pTop.is_valid() ? pTop : (pSide.is_valid() ? pSide : pBottom));
+        if (mainTex.is_valid() && (pTop.is_valid() || pSide.is_valid() || pBottom.is_valid())) {
+            const UUID faceTop = pTop.is_valid() ? pTop : mainTex;
+            const UUID faceSide = pSide.is_valid() ? pSide : mainTex;
+            // Minecraft convention: no dedicated bottom → dirt (grass_block);
+            // otherwise the block's own texture (stone) or the top (logs).
+            const UUID faceBottom = pBottom.is_valid() ? pBottom
+                                  : (pBase.is_valid() ? pBase
+                                  : (dirtTex.is_valid() ? dirtTex : faceTop));
+            const std::filesystem::path parentPath = textureMeta.sourcePath.parent_path() /
+                (parentLower + ".vblock");
+            UUID parentId{ 0, 0 };
+            if (const auto existing = m_assetRegistry.find_id(parentPath)) parentId = *existing;
+            else parentId = UUID();
+            {
+                std::ofstream out(parentPath);
+                out << "{\"texture\":\"" << mainTex.to_string() << "\"";
+                out << ",\"top\":\"" << faceTop.to_string() << "\"";
+                out << ",\"side\":\"" << faceSide.to_string() << "\"";
+                if (faceBottom.is_valid()) out << ",\"bottom\":\"" << faceBottom.to_string() << "\"";
+                out << "}";
+            }
+            AssetMetadata pmeta;
+            pmeta.id = parentId;
+            pmeta.type = AssetType::Block;
+            pmeta.sourcePath = parentPath;
+            pmeta.cookedPath = parentPath;
+            pmeta.isCooked = true;
+            pmeta.contentHash = textureMeta.contentHash;
+            if (m_assetRegistry.register_asset(pmeta)) {
+                m_blockAssetCache[parentId] = BlockAssetData{ mainTex, faceTop, faceBottom, faceSide,
+                                                              UUID{ 0, 0 }, UUID{ 0, 0 } };
+                m_blockAssetFailed.erase(parentId);
+                const auto stale = m_blockAtlasTextures.find(parentId);
+                if (stale != m_blockAtlasTextures.end()) {
+                    destroy_graph_texture(stale->second);
+                    m_blockAtlasTextures.erase(stale);
+                }
+                m_blockAtlasHashes.erase(parentId);
+            }
+        }
+    }
     // Reuse an existing sidecar that already references this texture (repeat
     // drops/clicks/API calls must not pile up grass_2.vblock, grass_3.vblock…).
     for (const AssetMetadata& candidate : m_assetRegistry.snapshot()) {
@@ -11030,27 +11802,34 @@ UUID EditorApplication::create_block_asset(const AssetMetadata& textureMeta) {
     // Group the block's material set: sibling <base>_n / <base>_s textures
     // (normal/specular maps, already registered as plain textures) are recorded
     // in the sidecar so the block asset owns its maps, not just the albedo
-    // face — andesite_n.png is no longer a separate "Block".
-    UUID normalId, specularId;
-    std::string baseLower = textureMeta.sourcePath.stem().string();
-    std::transform(baseLower.begin(), baseLower.end(), baseLower.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    // face — andesite_n.png is no longer a separate "Block". Per-face sibling
+    // textures (<base>_top/_side/_bottom) are recorded too, so the renderer's
+    // per-face atlas shows grass_block_top on +Y, grass_block_side on the
+    // sides and dirt on -Y instead of one texture everywhere.
+    UUID normalId, specularId, topId, sideId, bottomId;
     for (const AssetMetadata& candidate : m_assetRegistry.snapshot()) {
         if (candidate.type != AssetType::Texture || candidate.sourcePath.empty()) continue;
-        std::string cStem = candidate.sourcePath.stem().string();
-        std::transform(cStem.begin(), cStem.end(), cStem.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const std::string cStem = lowerStem(candidate.sourcePath);
         if (cStem == baseLower + "_n" || cStem == baseLower + "_normal" ||
             cStem == baseLower + "_normalmap") {
             normalId = candidate.id;
         } else if (cStem == baseLower + "_s" || cStem == baseLower + "_spec" ||
                    cStem == baseLower + "_specular") {
             specularId = candidate.id;
+        } else if (cStem == baseLower + "_top" || cStem == baseLower + "_up") {
+            topId = candidate.id;
+        } else if (cStem == baseLower + "_side") {
+            sideId = candidate.id;
+        } else if (cStem == baseLower + "_bottom" || cStem == baseLower + "_down") {
+            bottomId = candidate.id;
         }
     }
     {
         std::ofstream out(blockPath);
         out << "{\"texture\":\"" << textureMeta.id.to_string() << "\"";
+        if (topId.is_valid()) out << ",\"top\":\"" << topId.to_string() << "\"";
+        if (sideId.is_valid()) out << ",\"side\":\"" << sideId.to_string() << "\"";
+        if (bottomId.is_valid()) out << ",\"bottom\":\"" << bottomId.to_string() << "\"";
         if (normalId.is_valid()) out << ",\"normal\":\"" << normalId.to_string() << "\"";
         if (specularId.is_valid()) out << ",\"specular\":\"" << specularId.to_string() << "\"";
         out << "}";
@@ -11067,12 +11846,126 @@ UUID EditorApplication::create_block_asset(const AssetMetadata& textureMeta) {
         return UUID{ 0, 0 };
     }
     m_blockAssetCache[meta.id] =
-        BlockAssetData{ textureMeta.id, textureMeta.id, textureMeta.id, textureMeta.id, normalId, specularId };
+        BlockAssetData{ textureMeta.id,
+                        topId.is_valid() ? topId : textureMeta.id,
+                        bottomId.is_valid() ? bottomId : textureMeta.id,
+                        sideId.is_valid() ? sideId : textureMeta.id,
+                        normalId, specularId };
     m_blockAssetFailed.erase(meta.id);
     const auto registryPath = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db";
     if (!m_assetRegistry.save(registryPath)) {
         std::cerr << "[AssetRegistry] Could not persist block asset" << std::endl;
     }
+    return meta.id;
+}
+
+bool EditorApplication::set_block_faces(const UUID& blockId, const UUID& top,
+                                        const UUID& side, const UUID& bottom) {
+    const auto meta = m_assetRegistry.find(blockId);
+    if (!meta || meta->type != AssetType::Block || meta->sourcePath.empty()) {
+        std::cerr << "[BlockFaces] block asset not found" << std::endl;
+        return false;
+    }
+    BlockAssetData data;
+    if (!load_block_asset(blockId, data)) return false;
+    const auto isTex = [&](const UUID& id) {
+        if (!id.is_valid()) return true;
+        const auto tm = m_assetRegistry.find(id);
+        return tm && tm->type == AssetType::Texture;
+    };
+    if (!isTex(top) || !isTex(side) || !isTex(bottom)) {
+        std::cerr << "[BlockFaces] a face UUID is not a registered texture" << std::endl;
+        return false;
+    }
+    const UUID newTop = top.is_valid() ? top : (data.top.is_valid() ? data.top : data.texture);
+    const UUID newSide = side.is_valid() ? side : (data.side.is_valid() ? data.side : data.texture);
+    const UUID newBottom = bottom.is_valid() ? bottom : (data.bottom.is_valid() ? data.bottom : data.texture);
+    data.top = newTop;
+    data.side = newSide;
+    data.bottom = newBottom;
+    {
+        std::ofstream out(meta->sourcePath);
+        out << "{\"texture\":\"" << data.texture.to_string() << "\"";
+        if (newTop.is_valid()) out << ",\"top\":\"" << newTop.to_string() << "\"";
+        if (newSide.is_valid()) out << ",\"side\":\"" << newSide.to_string() << "\"";
+        if (newBottom.is_valid()) out << ",\"bottom\":\"" << newBottom.to_string() << "\"";
+        if (data.normal.is_valid()) out << ",\"normal\":\"" << data.normal.to_string() << "\"";
+        if (data.specular.is_valid()) out << ",\"specular\":\"" << data.specular.to_string() << "\"";
+        out << "}";
+    }
+    m_blockAssetCache[blockId] = data;
+    m_blockAssetFailed.erase(blockId);
+    // Invalidate the per-face atlas so the next render composites the new faces.
+    const auto staleIt = m_blockAtlasTextures.find(blockId);
+    if (staleIt != m_blockAtlasTextures.end()) {
+        destroy_graph_texture(staleIt->second);
+        m_blockAtlasTextures.erase(staleIt);
+    }
+    m_blockAtlasHashes.erase(blockId);
+    std::cout << "[BlockFaces] updated " << blockId.to_string() << std::endl;
+    return true;
+}
+
+UUID EditorApplication::create_block_from_faces(const UUID& base, const UUID& top,
+                                                const UUID& side, const UUID& bottom,
+                                                const std::string& name) {
+    const auto isTex = [&](const UUID& id) {
+        if (!id.is_valid()) return false;
+        const auto tm = m_assetRegistry.find(id);
+        return tm && tm->type == AssetType::Texture;
+    };
+    if (!isTex(base) && !isTex(top) && !isTex(side) && !isTex(bottom)) {
+        std::cerr << "[BlockModelFaces] at least one face must be a registered texture" << std::endl;
+        return UUID{ 0, 0 };
+    }
+    const UUID fallback = base.is_valid() ? base : (side.is_valid() ? side : top);
+    std::filesystem::path blockPath;
+    if (const auto bm = m_assetRegistry.find(fallback); bm && !bm->sourcePath.empty()) {
+        blockPath = bm->sourcePath.parent_path();
+    } else {
+        blockPath = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "assets" / "textures";
+    }
+    std::string stem = name;
+    if (stem.empty()) stem = "block";
+    std::string sanitized;
+    for (char c : stem) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-') sanitized += c;
+    }
+    if (sanitized.empty()) sanitized = "block";
+    blockPath /= sanitized + ".vblock";
+    unsigned suffix = 2;
+    while (std::filesystem::exists(blockPath)) {
+        blockPath = blockPath.parent_path() /
+            (sanitized + "_" + std::to_string(suffix++) + ".vblock");
+    }
+    {
+        std::ofstream out(blockPath);
+        out << "{\"texture\":\"" << fallback.to_string() << "\"";
+        if (top.is_valid()) out << ",\"top\":\"" << top.to_string() << "\"";
+        if (side.is_valid()) out << ",\"side\":\"" << side.to_string() << "\"";
+        if (bottom.is_valid()) out << ",\"bottom\":\"" << bottom.to_string() << "\"";
+        out << "}";
+    }
+    AssetMetadata meta;
+    meta.id = UUID();
+    meta.type = AssetType::Block;
+    meta.sourcePath = blockPath;
+    meta.cookedPath = blockPath;
+    meta.isCooked = true;
+    meta.contentHash = 0;
+    if (const auto bm = m_assetRegistry.find(fallback); bm) meta.contentHash = bm->contentHash;
+    if (!m_assetRegistry.register_asset(meta)) {
+        std::cerr << "[BlockModelFaces] failed to register block asset " << blockPath.string() << std::endl;
+        return UUID{ 0, 0 };
+    }
+    m_blockAssetCache[meta.id] = BlockAssetData{ fallback, top, bottom, side, UUID{ 0, 0 }, UUID{ 0, 0 } };
+    m_blockAssetFailed.erase(meta.id);
+    const auto registryPath = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "AssetRegistry.db";
+    if (!m_assetRegistry.save(registryPath)) {
+        std::cerr << "[AssetRegistry] Could not persist block asset" << std::endl;
+    }
+    std::cout << "[BlockModelFaces] created " << meta.id.to_string() << " ("
+              << blockPath.filename().string() << ")" << std::endl;
     return meta.id;
 }
 
@@ -11118,6 +12011,13 @@ bool EditorApplication::load_block_asset(const UUID& blockAssetId, BlockAssetDat
 }
 
 UUID EditorApplication::resolve_block_texture(const UUID& blockAssetId) {
+    // Block assets now resolve to themselves: load_viewport_texture hooks them
+    // to the per-face atlas [top|side|bottom], so the renderer samples the
+    // right face per side instead of one texture on the whole cube.
+    if (const auto meta = m_assetRegistry.find(blockAssetId);
+        meta && meta->type == AssetType::Block) {
+        return blockAssetId;
+    }
     BlockAssetData data;
     if (!load_block_asset(blockAssetId, data)) return UUID{ 0, 0 };
     if (data.texture.is_valid()) return data.texture;
@@ -11133,10 +12033,8 @@ UUID EditorApplication::resolve_block_texture(const UUID& blockAssetId) {
 // cubes; the brush panel paints into it via Engine::Voxel::VoxelTools.
 // ---------------------------------------------------------------------------
 namespace {
-constexpr int kVoxelSizeX = 32;
-constexpr int kVoxelSizeY = 24;
-constexpr int kVoxelSizeZ = 32;
-
+// kVoxelSizeX/Y/Z live in the anonymous namespace above setup_play_runtime()
+// (shared with play-mode real world collision).
 uint32_t voxel_hash2(int x, int z, uint32_t seed) {
     uint32_t h = seed ^ (static_cast<uint32_t>(x) * 374761393u) ^ (static_cast<uint32_t>(z) * 668265263u);
     h = (h ^ (h >> 13)) * 1274126177u;
@@ -11181,6 +12079,57 @@ void EditorApplication::ensure_voxel_volume(const UUID& entityId, uint32_t seed,
     m_voxelMeshesDirty.insert(entityId);
 }
 
+UUID EditorApplication::resolve_voxel_type_block(uint16_t type) {
+    // Explicit agent override (API `voxel-block <type> <uuid>`) wins.
+    const auto overrideIt = m_voxelTypeBlocks.find(type);
+    if (overrideIt != m_voxelTypeBlocks.end()) return overrideIt->second;
+    // Name-based defaults from the BlockRegistry: 1=dirt, 2=grass, 3=stone,
+    // 4=water. A texture pack import creates .vblock assets for these, so the
+    // voxel volume picks them up automatically.
+    static const char* keywords[5] = { nullptr, "dirt", "grass", "stone", "water" };
+    if (type >= 5 || keywords[type] == nullptr) return UUID{ 0, 0 };
+    const std::string keyword = keywords[type];
+    const auto assets = m_assetRegistry.snapshot();
+    // Prefer blocks with a real per-face map (top/side/bottom differ): the
+    // assembled grass_block (top + side + dirt) must win over the single-face
+    // grass_block_top/grass_block_side sidecars a pack import also produces.
+    const auto faceScore = [&](const AssetMetadata& meta) {
+        BlockAssetData data;
+        if (!load_block_asset(meta.id, data)) return 0;
+        int score = 0;
+        if (data.top.is_valid() && data.top != data.side) ++score;
+        if (data.bottom.is_valid() && data.bottom != data.side) ++score;
+        return score;
+    };
+    const AssetMetadata* best = nullptr;
+    int bestFaces = -1;
+    bool bestHasBlock = false;
+    for (const AssetMetadata& meta : assets) {
+        if (meta.type != AssetType::Block) continue;
+        std::string stem = meta.sourcePath.stem().string();
+        std::transform(stem.begin(), stem.end(), stem.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (stem.find(keyword) == std::string::npos) continue;
+        const int faces = faceScore(meta);
+        const bool hasBlock = stem.find("block") != std::string::npos;
+        // Face-composited block > explicitly-named block > first match.
+        if (!best || faces > bestFaces ||
+            (faces == bestFaces && hasBlock && !bestHasBlock)) {
+            best = &meta;
+            bestFaces = faces;
+            bestHasBlock = hasBlock;
+        }
+    }
+    if (best) {
+        std::cerr << "[Editor] voxel type " << static_cast<int>(type) << " -> block "
+                  << best->id.to_string() << " (" << best->sourcePath.filename().string() << ")" << std::endl;
+    } else {
+        std::cerr << "[Editor] voxel type " << static_cast<int>(type)
+                  << " -> no block match (registry " << m_assetRegistry.size() << ")" << std::endl;
+    }
+    return best ? best->id : UUID{ 0, 0 };
+}
+
 void EditorApplication::rebuild_voxel_mesh(const UUID& entityId) {
     const auto gridIt = m_voxelStructures.find(entityId);
     if (gridIt == m_voxelStructures.end()) return;
@@ -11190,12 +12139,12 @@ void EditorApplication::rebuild_voxel_mesh(const UUID& entityId) {
                                  ? trIt->second.position
                                  : glm::vec3(0.0f);
 
-    std::vector<EditorVertex> verts;
-    std::vector<uint32_t> indices;
-    verts.reserve(32768);
-    indices.reserve(49152);
     auto& mesh = m_voxelMeshes[entityId];
     if (mesh.valid) {
+        // Same in-flight hazard as terrain regeneration: wait for the GPU
+        // before freeing buffers the previous frame may still read.
+        if (mesh.vb.buffer != VK_NULL_HANDLE || mesh.ib.buffer != VK_NULL_HANDLE)
+            vkDeviceWaitIdle(m_device);
         if (mesh.vb.buffer != VK_NULL_HANDLE) destroy_buffer(mesh.vb);
         if (mesh.ib.buffer != VK_NULL_HANDLE) destroy_buffer(mesh.ib);
         mesh = EditorVoxelMesh{};
@@ -11223,35 +12172,76 @@ void EditorApplication::rebuild_voxel_mesh(const UUID& entityId) {
     const int noff[6][3] = {
         { 0, 0,-1 }, { 0, 0, 1 }, {-1, 0, 0 }, { 1, 0, 0 }, { 0,-1, 0 }, { 0, 1, 0 },
     };
+    // Per voxel type: its own vertex/index group so each type can be drawn
+    // with a different block atlas pipeline. The block atlas layout is the
+    // same for every block ([top|side|bottom], 3 wide), so the UV mapping is
+    // identical across types — only the sampled texture differs.
+    std::map<uint16_t, std::vector<EditorVertex>> typeVerts;
+    std::map<uint16_t, std::vector<uint32_t>> typeIndices;
+    std::unordered_map<uint16_t, UUID> typeBlock;
+    std::unordered_set<uint16_t> typeResolved;
+    const glm::vec2 cornerUv[4] = { {0,0},{1,0},{1,1},{0,1} };
     for (int x = 0; x < kVoxelSizeX; ++x) {
         for (int y = 0; y < kVoxelSizeY; ++y) {
             for (int z = 0; z < kVoxelSizeZ; ++z) {
                 const Engine::Voxel::VoxelValue v = grid.get(Engine::Voxel::Int3{ x, y, z });
                 if (v.empty()) continue;
                 const glm::vec3 base = origin + glm::vec3(x - kVoxelSizeX / 2, y, z - kVoxelSizeZ / 2);
-                const glm::vec3 color = voxel_type_color(v.type);
+                auto& tv = typeVerts[v.type];
+                auto& ti = typeIndices[v.type];
+                // Resolve the block once per type. NOTE: UUID's default ctor is
+                // RANDOM, so we must track resolution explicitly — comparing
+                // typeBlock[type] against UUID{0,0} would never match.
+                if (!typeResolved.contains(v.type)) {
+                    typeResolved.insert(v.type);
+                    typeBlock[v.type] = resolve_voxel_type_block(v.type);
+                }
+                const UUID block = typeBlock[v.type];
+                // Vertex color is only used by the untextured fallback path;
+                // textured types sample white so the albedo comes from the atlas.
+                const glm::vec3 color = block.is_valid() ? glm::vec3(1.0f) : voxel_type_color(v.type);
                 for (int f = 0; f < 6; ++f) {
                     if (solid(x + noff[f][0], y + noff[f][1], z + noff[f][2])) continue;
-                    const uint32_t first = static_cast<uint32_t>(verts.size());
+                    // Atlas regions: +Y top [0,1/3], sides [1/3,2/3], -Y bottom [2/3,1].
+                    float u0 = 1.0f / 3.0f, u1 = 2.0f / 3.0f;
+                    if (f == 5) { u0 = 0.0f; u1 = 1.0f / 3.0f; }
+                    else if (f == 4) { u0 = 2.0f / 3.0f; u1 = 1.0f; }
+                    const uint32_t first = static_cast<uint32_t>(tv.size());
                     for (int c = 0; c < 4; ++c) {
                         EditorVertex ev;
                         ev.pos = base + faces[f].c[c];
                         ev.normal = faces[f].n;
                         ev.color = color;
-                        ev.uv = glm::vec2(0.0f);
-                        verts.push_back(ev);
+                        ev.uv = glm::vec2(u0 + cornerUv[c].x * (u1 - u0), cornerUv[c].y);
+                        tv.push_back(ev);
                     }
-                    indices.push_back(first);
-                    indices.push_back(first + 1);
-                    indices.push_back(first + 2);
-                    indices.push_back(first);
-                    indices.push_back(first + 2);
-                    indices.push_back(first + 3);
+                    ti.push_back(first);
+                    ti.push_back(first + 1);
+                    ti.push_back(first + 2);
+                    ti.push_back(first);
+                    ti.push_back(first + 2);
+                    ti.push_back(first + 3);
                 }
             }
         }
     }
-    if (verts.empty()) return;
+    if (typeVerts.empty()) return;
+    // Concatenate the per-type groups into one VB/IB, recording a range per
+    // type (indices are rebased onto the shared vertex buffer).
+    std::vector<EditorVertex> verts;
+    std::vector<uint32_t> indices;
+    verts.reserve(32768);
+    indices.reserve(49152);
+    size_t vertBase = 0;
+    for (auto& [type, tv] : typeVerts) {
+        auto& ti = typeIndices[type];
+        const uint32_t firstIndex = static_cast<uint32_t>(indices.size());
+        for (const uint32_t idx : ti) indices.push_back(idx + static_cast<uint32_t>(vertBase));
+        verts.insert(verts.end(), tv.begin(), tv.end());
+        vertBase += tv.size();
+        mesh.ranges.push_back(EditorVoxelRange{
+            firstIndex, static_cast<uint32_t>(ti.size()), type, typeBlock[type] });
+    }
     const VkDeviceSize vbSize = sizeof(EditorVertex) * verts.size();
     const VkDeviceSize ibSize = sizeof(uint32_t) * indices.size();
     create_buffer(vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -11266,24 +12256,70 @@ void EditorApplication::rebuild_voxel_mesh(const UUID& entityId) {
     mesh.valid = true;
 }
 
+void EditorApplication::ensure_voxel_pipelines() {
+    // Rebuild dirty meshes and pre-build the block atlas pipelines OUTSIDE the
+    // render pass (see the draw-site comment: building GPU resources mid-pass
+    // hung the device). Runs every frame; the pipeline cache makes it a no-op
+    // after the first successful build, and a failed build is retried.
+    Scene* renderScene = m_playMode.get_active_scene();
+    if (!renderScene) renderScene = m_editorScene.get();
+    if (!renderScene) return;
+    for (const auto& [id, vol] : renderScene->voxelVolumeComponents) {
+        (void)vol;
+        if (!renderScene->transformComponents.contains(id)) continue;
+        if (m_voxelMeshesDirty.erase(id) != 0 || !m_voxelMeshes[id].valid) {
+            ensure_voxel_volume(id, renderScene->voxelVolumeComponents[id].seed,
+                                renderScene->voxelVolumeComponents[id].seaLevel);
+            rebuild_voxel_mesh(id);
+        }
+        const auto& mesh = m_voxelMeshes[id];
+        if (!mesh.valid) continue;
+        for (const EditorVoxelRange& range : mesh.ranges) {
+            if (range.blockId.is_valid()) {
+                ensure_texture_pipeline(range.blockId, m_blockGraphPipelines);
+            }
+        }
+    }
+}
+
 void EditorApplication::draw_voxel_volumes(VkCommandBuffer cmd, const glm::mat4& viewProj, Scene* scene) {
     if (!scene || m_device == VK_NULL_HANDLE) return;
     for (const auto& [id, vol] : scene->voxelVolumeComponents) {
         (void)vol;
         if (!scene->transformComponents.contains(id)) continue;
-        if (m_voxelMeshesDirty.erase(id) != 0 || !m_voxelMeshes[id].valid) {
-            ensure_voxel_volume(id, scene->voxelVolumeComponents[id].seed,
-                                scene->voxelVolumeComponents[id].seaLevel);
-            rebuild_voxel_mesh(id);
-        }
+        // Meshes are rebuilt and pipelines pre-built by ensure_voxel_pipelines()
+        // in the main loop — never create GPU resources while a render pass is
+        // being recorded (that hung the device). A volume that is not ready
+        // yet simply skips this frame.
         const auto& mesh = m_voxelMeshes[id];
         if (!mesh.valid || mesh.vb.buffer == VK_NULL_HANDLE) continue;
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
         const VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vb.buffer, &offset);
         vkCmdBindIndexBuffer(cmd, mesh.ib.buffer, 0, VK_INDEX_TYPE_UINT32);
-        push_constants(cmd, m_scenePipelineLayout, viewProj, glm::vec4(1.0f));
-        vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+        for (const EditorVoxelRange& range : mesh.ranges) {
+            // BlockRegistry-backed types render textured (per-face atlas
+            // [top|side|bottom], sampled by a material-graph pipeline); types
+            // without a matching block fall back to the vertex-color pipeline.
+            GraphMaterialPipeline* gmp = nullptr;
+            if (range.blockId.is_valid()) {
+                gmp = ensure_texture_pipeline(range.blockId, m_blockGraphPipelines);
+                if (gmp) {
+                    write_material_ubo(*gmp, nullptr, nullptr);
+                    write_light_ubo(*gmp, scene, m_editorCamera.position);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gmp->pipeline);
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gmp->layout,
+                                            0, 1, &gmp->descriptorSet, 0, nullptr);
+                    const Rendering::MaterialPushConstants pc{ viewProj, glm::mat4(1.0f) };
+                    vkCmdPushConstants(cmd, gmp->layout, VK_SHADER_STAGE_VERTEX_BIT,
+                                       0, sizeof(pc), &pc);
+                }
+            }
+            if (!gmp) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
+                push_constants(cmd, m_scenePipelineLayout, viewProj, glm::vec4(1.0f));
+            }
+            vkCmdDrawIndexed(cmd, range.indexCount, 1, range.firstIndex, 0, 0);
+        }
     }
 }
 
@@ -11356,14 +12392,85 @@ void EditorApplication::destroy_voxel_editor_meshes() {
     m_voxelMeshesDirty.clear();
 }
 
+// Builds (or returns cached) the per-face atlas for a Block asset: a 3-wide
+// image [top | side | bottom] composited from the .vblock face maps, with the
+// main texture as fallback for missing faces. Blocks without face maps still
+// get the 3-region atlas (all regions = the main texture), so the cube UVs
+// stay uniform across every block.
+bool EditorApplication::ensure_block_atlas(const UUID& blockId, GraphTexture& out) {
+    const auto meta = m_assetRegistry.find(blockId);
+    if (!meta || meta->type != AssetType::Block) return false;
+    const auto hashIt = m_blockAtlasHashes.find(blockId);
+    if (hashIt != m_blockAtlasHashes.end()) {
+        if (hashIt->second == meta->contentHash) {
+            const auto texIt = m_blockAtlasTextures.find(blockId);
+            if (texIt != m_blockAtlasTextures.end() && texIt->second.image != VK_NULL_HANDLE) {
+                out = texIt->second;
+                return true;
+            }
+        }
+        // Stale content (hot reload): rebuild from the new source pixels.
+        const auto staleIt = m_blockAtlasTextures.find(blockId);
+        if (staleIt != m_blockAtlasTextures.end()) {
+            destroy_graph_texture(staleIt->second);
+            m_blockAtlasTextures.erase(staleIt);
+        }
+        m_blockAtlasHashes.erase(hashIt);
+    }
+    BlockAssetData data;
+    if (!load_block_asset(blockId, data)) return false;
+    const UUID mainTex = data.texture.is_valid() ? data.texture
+                       : (data.side.is_valid() ? data.side : data.top);
+    if (!mainTex.is_valid()) return false;
+    const auto texMeta = m_assetRegistry.find(mainTex);
+    if (!texMeta || texMeta->type != AssetType::Texture || texMeta->cookedPath.empty()) return false;
+    std::string err;
+    DecodedTexturePixels base;
+    if (!decode_cooked_texture_pixels(texMeta->cookedPath, 256, base, err)) return false;
+    const uint32_t w = base.width, h = base.height;
+    if (w == 0 || h == 0) return false;
+    const uint32_t atlasW = w * 3;
+    std::vector<uint8_t> atlas(static_cast<size_t>(atlasW) * h * 4);
+    const auto blitFace = [&](const UUID& faceId, uint32_t region) {
+        uint8_t* dst = atlas.data() + static_cast<size_t>(region) * w * 4;
+        const auto fm = m_assetRegistry.find(faceId);
+        if (faceId.is_valid() && fm && fm->type == AssetType::Texture && !fm->cookedPath.empty()) {
+            DecodedTexturePixels px;
+            if (decode_cooked_texture_pixels(fm->cookedPath, 256, px, err) &&
+                px.width == w && px.height == h) {
+                std::memcpy(dst, px.rgba.data(), static_cast<size_t>(w) * h * 4);
+                return;
+            }
+        }
+        std::memcpy(dst, base.rgba.data(), static_cast<size_t>(w) * h * 4);
+    };
+    blitFace(data.top, 0);     // +Y
+    blitFace(data.side, 1);    // ±X/±Z
+    blitFace(data.bottom, 2);  // -Y
+    GraphTexture atlasTex;
+    if (!upload_texture_pixels(atlasW, h, atlas, 1, base.srgb, atlasTex, err)) return false;
+    m_blockAtlasTextures[blockId] = atlasTex;
+    m_blockAtlasHashes[blockId] = meta->contentHash;
+    out = atlasTex;
+    return true;
+}
+
 bool EditorApplication::load_viewport_texture(const UUID& assetId, GraphTexture& out, std::string& error,
                                               uint32_t maxDim) {
     const auto metaOpt = m_assetRegistry.find(assetId);
     if (!metaOpt) {
         error = "texture asset not found in registry";
+        std::cerr << "[Editor] load_viewport_texture: missing asset " << assetId.to_string()
+                  << " (registry size " << m_assetRegistry.size() << ")" << std::endl;
         return false;
     }
     const AssetMetadata& meta = *metaOpt;
+    // Block assets sample their per-face atlas [top|side|bottom] instead of a
+    // single texture on all six faces. This hook serves BOTH the scene
+    // material-graph path and the block thumbnail pipeline.
+    if (meta.type == AssetType::Block) {
+        return ensure_block_atlas(assetId, out);
+    }
     if (meta.type != AssetType::Texture || meta.cookedPath.empty()) {
         error = "asset is not a cooked texture";
         return false;
@@ -11511,9 +12618,20 @@ bool EditorApplication::build_graph_pipeline(const Rendering::MaterialGraph& gra
         if (!id.is_valid() || !load_viewport_texture(id, tex, texError)) {
             out.lastError = texError.empty()
                 ? "a TextureSample node has no texture asset assigned" : texError;
-            for (auto& t : textures) destroy_graph_texture(t);
+            // Only destroy textures the pipeline owns (atlas textures are
+            // borrowed from m_blockAtlasTextures).
+            for (size_t i = 0; i < textures.size(); ++i) {
+                if (i < out.textureIsAtlas.size() && out.textureIsAtlas[i]) continue;
+                destroy_graph_texture(textures[i]);
+            }
+            out.textureIsAtlas.clear();
             return false;
         }
+        // Block assets sample their per-face atlas, which is OWNED by
+        // m_blockAtlasTextures — the pipeline only references it, so record
+        // that so destroy_graph_pipeline doesn't free it twice.
+        const auto meta = m_assetRegistry.find(id);
+        out.textureIsAtlas.push_back(meta && meta->type == AssetType::Block);
         textures.push_back(std::move(tex));
     }
     out.textures = std::move(textures);
@@ -11521,6 +12639,13 @@ bool EditorApplication::build_graph_pipeline(const Rendering::MaterialGraph& gra
     if (!gen) {
         out.lastError = gen.errors.empty() ? "material graph compile failed" : gen.errors[0].message;
         return false;
+    }
+    // VC_EDITOR_DUMP_MATERIAL_GLSL=1: log the generated fragment source (useful
+    // to debug alpha cutout, BRDF and sampler wiring without instrumenting
+    // the generator).
+    if (std::getenv("VC_EDITOR_DUMP_MATERIAL_GLSL") != nullptr) {
+        std::cout << "[MaterialGLSL] --- generated fragment source ---\n"
+                  << gen.source << "\n[MaterialGLSL] --- end ---" << std::endl;
     }
 
     const std::vector<uint32_t> vertSpv = read_spv("editor_material.vert.spv");
@@ -11680,7 +12805,10 @@ bool EditorApplication::build_graph_pipeline(const Rendering::MaterialGraph& gra
     writes.push_back(lightWrite);
     for (size_t i = 0; i < out.textures.size(); ++i) {
         VkDescriptorImageInfo imageInfo{};
-        imageInfo.sampler = m_offscreen.sampler;
+        // Block/pixel-art textures use NEAREST filtering (Minecraft look);
+        // skins, decals and PBR textures keep trilinear + anisotropic.
+        const bool isBlockAtlas = i < out.textureIsAtlas.size() && out.textureIsAtlas[i];
+        imageInfo.sampler = isBlockAtlas ? m_blockDrawSampler : m_offscreen.sampler;
         imageInfo.imageView = out.textures[i].view;
         imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         imageInfos.push_back(imageInfo);
@@ -11736,8 +12864,13 @@ void EditorApplication::destroy_graph_pipeline(GraphMaterialPipeline& p) {
     if (p.lightBuffer != VK_NULL_HANDLE) vkDestroyBuffer(m_device, p.lightBuffer, nullptr);
     if (p.lightMemory != VK_NULL_HANDLE) vkFreeMemory(m_device, p.lightMemory, nullptr);
     destroy_graph_texture(p.shadowDummy);
-    for (auto& t : p.textures) destroy_graph_texture(t);
+    for (size_t i = 0; i < p.textures.size(); ++i) {
+        // Block atlases are owned by m_blockAtlasTextures — reference only.
+        if (i < p.textureIsAtlas.size() && p.textureIsAtlas[i]) continue;
+        destroy_graph_texture(p.textures[i]);
+    }
     p.textures.clear();
+    p.textureIsAtlas.clear();
     p = GraphMaterialPipeline{};
 }
 
@@ -11791,7 +12924,13 @@ void EditorApplication::write_light_ubo(GraphMaterialPipeline& p, const Scene* s
                     std::cos(pitch) * std::sin(yaw), std::sin(pitch),
                     std::cos(pitch) * std::cos(yaw)));
             }
-            const glm::vec3 colorIntensity = light.color * light.intensity;
+            // Editor lights use lux-like intensity (default sun = 10000) but the
+            // MaterialPipeline Lambert term adds lightColor.rgb straight into
+            // lightAccum (lit = baseColor*(0.22+0.78*lightAccum)), which expects
+            // ~1.0 for a full-strength light. Normalize to the default-sun
+            // reference so material-graph lit objects (blocks, voxels, skins,
+            // decals) get balanced light instead of white-out or ambient-only.
+            const glm::vec3 colorIntensity = light.color * (light.intensity / 10000.0f);
             if (is_directional_sun(light)) {
                 data.sunDirection = glm::vec4(dir, 1.0f);
                 data.sunColor = glm::vec4(colorIntensity, 1.0f);
@@ -12069,7 +13208,10 @@ void EditorApplication::load_scene_file(const std::string& path) {
     }
     if (m_playMode.get_state() != PlayState::Edit) m_playMode.stop_play();
     m_editorScene = std::move(scene);
+    m_playMode.set_editor_scene(m_editorScene.get());
     m_activeScenePath = path;
+    m_autosavePath.clear();
+    m_sceneDirty = false;
     m_editorGui.init(m_editorScene.get(), &m_undo);
     m_editorGui.set_asset_registry(&m_assetRegistry);
     m_selectedEntity = Entity();
@@ -12084,6 +13226,10 @@ void EditorApplication::load_scene_file(const std::string& path) {
         m_editorScene->transformComponents[cam.get_id()].position = glm::vec3(0.0f, 2.0f, 5.0f);
         m_editorScene->cameraComponents[cam.get_id()] = CameraComponent{ 70.0f, 0.1f, 2000.0f, true };
     }
+    // Terrain is editor-owned (the scene serializer stores entity data only),
+    // so the heightmap parameters live in the ".terrain" sidecar next to the
+    // scene file and are regenerated on load.
+    restore_terrain_sidecar(path);
     std::cout << "[Editor] Cena carregada: " << path << " ("
               << m_editorScene->get_entities().size() << " entidades)" << std::endl;
 }
@@ -12131,6 +13277,8 @@ void EditorApplication::save_current_scene() {
         if (!m_editorScene->save_to_file(m_activeScenePath)) {
             std::cerr << "[Editor] Falha ao salvar: " << m_activeScenePath << std::endl;
         } else {
+            m_sceneDirty = false;
+            persist_terrain_sidecar(m_activeScenePath);
             std::cout << "[Editor] Cena salva: " << m_activeScenePath << std::endl;
         }
         return;
@@ -12151,6 +13299,9 @@ void EditorApplication::save_scene_as() {
         return;
     }
     m_activeScenePath = path;
+    m_autosavePath.clear();
+    m_sceneDirty = false;
+    persist_terrain_sidecar(path);
     std::cout << "[Editor] Cena salva: " << path << std::endl;
 }
 
@@ -12164,7 +13315,9 @@ void EditorApplication::create_new_scene() {
     m_editorGui.select_entity(m_selectedEntity);
     const std::string name = (m_newSceneName[0] != '\0') ? m_newSceneName : "Untitled Scene";
     m_editorScene = std::make_unique<Scene>(name);
+    m_playMode.set_editor_scene(m_editorScene.get());
     m_activeScenePath.clear();  // new scene has no file until Salvar
+    clear_terrain_mesh();
     init_default_scene();
     std::cout << "[Editor] Nova cena: " << name << std::endl;
 }
@@ -12200,41 +13353,92 @@ bool EditorApplication::pick_save_file_dialog(std::string& outPath, const wchar_
 // ===========================================================================
 // Terreno (Terrain panel): procedural heightmap mesh + static play body.
 // ===========================================================================
+std::filesystem::path EditorApplication::terrain_sidecar_path(const std::string& scenePath) {
+    return std::filesystem::path(scenePath).string() + ".terrain";
+}
+
+void EditorApplication::persist_terrain_sidecar(const std::string& scenePath) {
+    if (!m_terrainValid || scenePath.empty()) return;
+    std::error_code ec;
+    const std::filesystem::path path = terrain_sidecar_path(scenePath);
+    std::ofstream out(path);
+    if (!out) {
+        std::cerr << "[Editor] Terrain sidecar write failed: " << path << std::endl;
+        return;
+    }
+    const TerrainParams& p = m_terrainParams;
+    out << "scale=" << p.scale << "\n"
+        << "octaves=" << p.octaves << "\n"
+        << "amount=" << p.amount << "\n"
+        << "falloff=" << p.falloff << "\n"
+        << "halfExtent=" << p.halfExtent << "\n"
+        << "segments=" << p.segments << "\n"
+        << "seed=" << p.seed << "\n";
+    out.close();
+    if (!out) std::cerr << "[Editor] Terrain sidecar write failed (close): " << path << std::endl;
+}
+
+void EditorApplication::restore_terrain_sidecar(const std::string& scenePath) {
+    if (scenePath.empty()) return;
+    const std::filesystem::path path = terrain_sidecar_path(scenePath);
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec)) {
+        // No sidecar: the scene has no terrain authored yet.
+        clear_terrain_mesh();
+        return;
+    }
+    std::ifstream in(path);
+    if (!in) return;
+    TerrainParams p = m_terrainParams;
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = line.substr(0, eq);
+        const std::string val = line.substr(eq + 1);
+        try {
+            if (key == "scale") p.scale = std::stof(val);
+            else if (key == "octaves") p.octaves = std::stoi(val);
+            else if (key == "amount") p.amount = std::stof(val);
+            else if (key == "falloff") p.falloff = std::stof(val);
+            else if (key == "halfExtent") p.halfExtent = std::stof(val);
+            else if (key == "segments") p.segments = std::stoi(val);
+            else if (key == "seed") p.seed = static_cast<uint32_t>(std::stoul(val));
+        } catch (const std::exception&) {
+            // Tolerate a malformed line; keep the previous value.
+        }
+    }
+    generate_terrain_mesh(p);
+    std::cout << "[Editor] Terrain restaurado: " << path
+              << " (scale=" << p.scale << " seed=" << p.seed << ")" << std::endl;
+}
+
+void EditorApplication::clear_terrain_mesh() {
+    if (m_terrainVB.buffer != VK_NULL_HANDLE) { destroy_buffer(m_terrainVB); m_terrainVB = GPUBuffer{}; }
+    if (m_terrainIB.buffer != VK_NULL_HANDLE) { destroy_buffer(m_terrainIB); m_terrainIB = GPUBuffer{}; }
+    m_terrainValid = false;
+    m_terrainIndexCount = 0;
+    m_terrainParams = TerrainParams{};
+}
+
 void EditorApplication::generate_terrain_mesh(const TerrainParams& params) {
-    // Drop the previous GPU buffers before regenerating.
+    // Drop the previous GPU buffers before regenerating. The old buffers may
+    // still be referenced by an in-flight command buffer — freeing them
+    // without waiting crashes the device (fence wait failed: -4, then the
+    // viewport renders black forever). The editor can afford an idle here:
+    // terrain regeneration is a user/API action, never per-frame.
+    if (m_terrainVB.buffer != VK_NULL_HANDLE || m_terrainIB.buffer != VK_NULL_HANDLE)
+        vkDeviceWaitIdle(m_device);
     if (m_terrainVB.buffer != VK_NULL_HANDLE) { destroy_buffer(m_terrainVB); m_terrainVB = GPUBuffer{}; }
     if (m_terrainIB.buffer != VK_NULL_HANDLE) { destroy_buffer(m_terrainIB); m_terrainIB = GPUBuffer{}; }
     m_terrainValid = false;
     m_terrainParams = params;
     m_terrainIndexCount = 0;
 
-    // Hash-based value noise + fBm octaves (deterministic, no RNG state).
-    const auto hash2 = [](int x, int z) -> float {
-        uint32_t n = static_cast<uint32_t>(x) * 374761393u + static_cast<uint32_t>(z) * 668265263u;
-        n = (n ^ (n >> 13)) * 1274126177u;
-        n ^= (n >> 16);
-        return static_cast<float>(n & 0xFFFFu) / 65535.0f;
-    };
-    const auto smoothT = [](float t) { return t * t * (3.0f - 2.0f * t); };
-    const auto valueNoise = [&](float x, float z) {
-        const int xi = static_cast<int>(std::floor(x));
-        const int zi = static_cast<int>(std::floor(z));
-        const float xf = smoothT(x - std::floor(x));
-        const float zf = smoothT(z - std::floor(z));
-        const float a = hash2(xi, zi), b = hash2(xi + 1, zi);
-        const float c = hash2(xi, zi + 1), d = hash2(xi + 1, zi + 1);
-        return a + (b - a) * xf + (c - a) * zf + (a - b - c + d) * xf * zf;
-    };
-    const auto fbm = [&](float x, float z, int octaves) {
-        float amp = 1.0f, freq = 1.0f, sum = 0.0f, norm = 0.0f;
-        for (int o = 0; o < octaves; ++o) {
-            sum += amp * valueNoise(x * freq, z * freq);
-            norm += amp;
-            amp *= 0.5f;
-            freq *= 2.0f;
-        }
-        return sum / std::max(norm, 1e-6f);
-    };
+    // Height pass: y = terrain_surface_height(...) with a radial falloff that
+    // pulls the border back to 0 so the sheet blends with the infinite grid.
+    // The math lives in ONE place (anonymous namespace near
+    // setup_play_runtime) because play-mode collision shares it.
 
     const int segments = params.segments;
     const float half = params.halfExtent;
@@ -12244,17 +13448,14 @@ void EditorApplication::generate_terrain_mesh(const TerrainParams& params) {
     std::vector<uint32_t> indices;
     verts.reserve(static_cast<size_t>(segments + 1) * (segments + 1));
 
-    // Height pass: y = fbm(x, z) with a radial falloff that pulls the border
-    // back to 0 so the sheet blends with the infinite grid.
     const size_t cols = static_cast<size_t>(segments + 1);
     for (int zi = 0; zi <= segments; ++zi) {
         for (int xi = 0; xi <= segments; ++xi) {
             const float x = -half + static_cast<float>(xi) * step;
             const float z = -half + static_cast<float>(zi) * step;
-            const float dist = std::sqrt(x * x + z * z);
-            const float falloff = glm::clamp(1.0f - (dist / half) * params.falloff, 0.0f, 1.0f);
-            const float h = (fbm(x / params.scale, z / params.scale, params.octaves) - 0.5f)
-                            * 2.0f * params.amount * 20.0f * falloff;
+            const float h = terrain_surface_height(params.seed, params.scale,
+                                                   params.octaves, params.amount,
+                                                   params.falloff, half, x, z);
             EditorVertex v;
             v.pos = glm::vec3(x, h, z);
             v.normal = glm::vec3(0.0f, 1.0f, 0.0f);

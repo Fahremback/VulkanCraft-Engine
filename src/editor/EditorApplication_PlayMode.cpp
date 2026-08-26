@@ -2067,9 +2067,10 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         }
         std::cout << "[ControlApi] select-name: no match" << std::endl;
     } else if (cmd.rfind("set-transform ", 0) == 0) {
+        // Field-masked PATCH (see EditorApplication.cpp): <uuid> <mask> + 9 floats.
         std::istringstream ss(cmd.substr(14));
-        std::string uuidStr;
-        ss >> uuidStr;
+        std::string uuidStr, maskStr;
+        ss >> uuidStr >> maskStr;
         const UUID id = UUID::from_string(uuidStr);
         std::vector<float> values;
         float v;
@@ -2077,11 +2078,16 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         auto it = m_editorScene ? m_editorScene->transformComponents.find(id) : m_editorScene->transformComponents.end();
         if (it == m_editorScene->transformComponents.end()) {
             std::cout << "[ControlApi] set-transform: entity not found" << std::endl;
+        } else if (values.size() < 9) {
+            std::cout << "[ControlApi] set-transform: expected 9 floats" << std::endl;
         } else {
-            if (values.size() >= 3) it->second.position = glm::vec3(values[0], values[1], values[2]);
-            if (values.size() >= 6) it->second.rotation = glm::vec3(values[3], values[4], values[5]);
-            if (values.size() >= 9) it->second.scale = glm::vec3(values[6], values[7], values[8]);
-            std::cout << "[ControlApi] transform set (" << values.size() << " floats)" << std::endl;
+            if (maskStr.size() > 0 && maskStr[0] == '1')
+                it->second.position = glm::vec3(values[0], values[1], values[2]);
+            if (maskStr.size() > 1 && maskStr[1] == '1')
+                it->second.rotation = glm::vec3(values[3], values[4], values[5]);
+            if (maskStr.size() > 2 && maskStr[2] == '1')
+                it->second.scale = glm::vec3(values[6], values[7], values[8]);
+            std::cout << "[ControlApi] transform set (mask " << maskStr << ")" << std::endl;
         }
     } else if (cmd.rfind("gizmo ", 0) == 0) {
         const std::string mode = cmd.substr(6);

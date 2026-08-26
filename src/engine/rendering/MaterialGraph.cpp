@@ -139,10 +139,12 @@ bool MaterialGraph::connect(MaterialNodeId source, MaterialNodeId destination, s
     if (source == destination) return fail("A node cannot connect to itself");
     if (inputIndex >= destinationNode->inputs.size()) return fail("Input index is out of range");
     if (sourceNode->kind == MaterialNodeKind::Output) return fail("Output nodes cannot be used as values");
-    // Implicit RGBA→RGB swizzle at output sinks only (generator emits .rgb).
+    // Implicit swizzle at output sinks only (generator emits .rgb for Vec3
+    // sinks and .a for Float sinks, e.g. texture alpha → Opacity cutout).
     const bool swizzleOk = destinationNode->kind == MaterialNodeKind::Output &&
-                           destinationNode->inputs[inputIndex].type == MaterialValueType::Vec3 &&
-                           sourceNode->outputType == MaterialValueType::Vec4;
+                           sourceNode->outputType == MaterialValueType::Vec4 &&
+                           (destinationNode->inputs[inputIndex].type == MaterialValueType::Vec3 ||
+                            destinationNode->inputs[inputIndex].type == MaterialValueType::Float);
     if (!swizzleOk && sourceNode->outputType != destinationNode->inputs[inputIndex].type) {
         return fail("Type mismatch: expected " + std::string(material_type_name(destinationNode->inputs[inputIndex].type)) +
                     ", got " + std::string(material_type_name(sourceNode->outputType)));
@@ -240,11 +242,13 @@ MaterialCompileResult MaterialGraph::compile() const {
                 valid = false;
                 continue;
             }
-            // Implicit RGBA→RGB swizzle is allowed only at output sinks, where
-            // the GLSL generator appends .rgb to the source register.
+            // Implicit swizzle is allowed only at output sinks, where the GLSL
+            // generator appends .rgb (Vec3 sinks) or .a (Float sinks, e.g.
+            // texture alpha → Opacity cutout) to the source register.
             const bool swizzleOk = node.kind == MaterialNodeKind::Output &&
-                                   input.type == MaterialValueType::Vec3 &&
-                                   sourceIt->second->outputType == MaterialValueType::Vec4;
+                                   sourceIt->second->outputType == MaterialValueType::Vec4 &&
+                                   (input.type == MaterialValueType::Vec3 ||
+                                    input.type == MaterialValueType::Float);
             if (!swizzleOk && sourceIt->second->outputType != input.type) {
                 result.errors.push_back({node.id, "Input '" + input.name + "' expects " + std::string(material_type_name(input.type))});
                 valid = false;

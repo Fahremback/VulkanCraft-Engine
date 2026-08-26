@@ -194,14 +194,20 @@ struct ScenePushConstants {
     // Fog parameters (from WeatherComponent)
     glm::vec4 fogParams; // x=density, y=start, z=heightFog(0/1), w=unused
     glm::vec4 fogColor;  // xyz=fog color, w=unused
+    // Model matrix: the vertex shader computes the WORLD position
+    // (fragWorldPos = model * inPosition) so fog distance and rim lighting
+    // use real world coordinates, not the mesh's local space.
+    glm::mat4 model;
 };
 
 // -----------------------------------------------------------------------
-// Push constant for the analytic infinite grid (128 bytes, no VBO)
+// Push constant for the analytic infinite grid (80 bytes, no VBO). The CPU
+// hands the inverse view-projection (ray unprojection) and the camera
+// position, so the shader never inverts matrices per vertex.
 // -----------------------------------------------------------------------
 struct GridPushConstants {
-    glm::mat4 view;
-    glm::mat4 proj;
+    glm::mat4 invViewProj;
+    glm::vec4 cameraPos;
 };
 
 class EditorApplication {
@@ -212,6 +218,13 @@ public:
     // Loopback HTTP control API (curl http://127.0.0.1:8321/play etc.) so the
     // editor can be driven from a terminal or an agent without mouse clicks.
     EditorControlApi m_controlApi;
+
+    // Result of the last Control-API command executed on the main thread:
+    // empty = success, non-empty = human-readable error. The HTTP thread waits
+    // for this before answering, so the agent gets the REAL outcome.
+    std::string m_controlResult;
+    // Optional success payload (e.g. a screenshot path) sent in the response.
+    std::string m_controlData;
 
     int run();
 
@@ -259,6 +272,10 @@ private:
     void update_editor_camera(float deltaTime);
     // Shared executor for Control API commands (loopback HTTP + UI buttons).
     void handle_control_command(const std::string& cmd);
+    // Captures the current offscreen viewport (previous frame) to a PNG file
+    // via WIC. Returns empty string on success, or an error message. Used by
+    // the Control-API `screenshot` command so an agent can SEE the result.
+    std::string capture_viewport_screenshot(const std::string& path);
     // Runs one headless self-test (spawns this exe with the test env var,
     // waits for it, returns "PASS"/"FAIL"/error). 0=RenderGraph 1=HDR
     // 2=Material 3=Play 4=Build.
@@ -500,7 +517,8 @@ private:
     bool load_mesh_resource(const UUID& assetId);
     const EditorMeshResource* get_mesh_resource(const UUID& assetId);
     void draw_mesh_resource(VkCommandBuffer cmd, const glm::mat4& mvp, const glm::vec4& color,
-                            const EditorMeshResource& resource);
+                            const EditorMeshResource& resource,
+                            const glm::mat4& model = glm::mat4(1.0f));
     void destroy_mesh_resources();
 
     // Material-graph rendering: pipelines built from a MaterialGraph via
@@ -533,6 +551,10 @@ private:
         std::vector<Rendering::MaterialValue> uniformDefaults;
         // Combined image samplers, binding i+1 for textures[i] (node-id order).
         std::vector<GraphTexture> textures;
+        // Parallel to `textures`: true when the texture is a block per-face
+        // atlas owned by m_blockAtlasTextures (the pipeline only references it
+        // and must NOT destroy it).
+        std::vector<bool> textureIsAtlas;
         uint64_t graphHash{ 0 };
         // Content hash of the sampled texture when the pipeline was built, so a
         // reimported texture rebuilds the pipeline instead of sampling a stale
@@ -626,7 +648,14 @@ private:
     VkPipeline m_blockPipeline{ VK_NULL_HANDLE };
     VkPipelineLayout m_blockPipelineLayout{ VK_NULL_HANDLE };
     VkDescriptorSetLayout m_blockDescSetLayout{ VK_NULL_HANDLE };
+    // Dedicated pool for block descriptors (never the ImGui pool, which is
+    // reset every frame and invalidated these sets).
+    VkDescriptorPool m_blockDescPool{ VK_NULL_HANDLE };
     VkSampler m_blockSampler{ VK_NULL_HANDLE };
+    // NEAREST-filtered sampler for block atlases on the voxel/block draw path
+    // (the material-graph pipelines sample blocks pixel-art; skins/decals/PBR
+    // keep the trilinear anisotropic m_offscreen.sampler).
+    VkSampler m_blockDrawSampler{ VK_NULL_HANDLE };
     GPUBuffer m_blockCubeVB;
     GPUBuffer m_blockCubeIB;
     uint32_t m_blockCubeIndexCount{ 0 };
@@ -636,6 +665,13 @@ private:
     void init_block_cube();
     void destroy_block_cube();
     VkDescriptorSet get_block_descriptor(const UUID& textureAsset);
+    // Per-face block atlas: builds/caches a 3-wide image [top | side | bottom]
+    // from the .vblock face maps so the cube samples per-face textures (grass
+    // top / grass side / dirt bottom). Missing faces fall back to the main
+    // texture. Keyed by block asset UUID + content hash (hot-reload aware).
+    std::unordered_map<UUID, GraphTexture> m_blockAtlasTextures;
+    std::unordered_map<UUID, uint64_t> m_blockAtlasHashes;
+    bool ensure_block_atlas(const UUID& blockId, GraphTexture& out);
 
     // Minecraft-style block model recognition: a small square power-of-two
     // texture is treated as a block face. "Criar Modelo de Bloco" writes a
@@ -677,6 +713,19 @@ private:
     // (Minecraft-style), so repeated drops/clicks reuse the same asset instead
     // of piling up duplicates. Returns the block asset UUID (invalid on failure).
     UUID create_block_asset(const AssetMetadata& textureMeta);
+    // Per-face authoring: rewrites the .vblock sidecar with explicit top/side/
+    // bottom face textures. Invalid UUIDs (0) keep the current face. The atlas
+    // cache is invalidated so the next render rebuilds it. Returns false if the
+    // block asset doesn't exist or a given face UUID is not a registered texture.
+    bool set_block_faces(const UUID& blockId, const UUID& top, const UUID& side,
+                         const UUID& bottom);
+    // Creates a NEW block asset whose .vblock sidecar carries per-face textures
+    // (top/side/bottom). `base` is the fallback texture used on every face where
+    // a specific texture isn't given. `name` seeds the .vblock filename. Returns
+    // the new block asset UUID (invalid on failure).
+    [[nodiscard]] UUID create_block_from_faces(const UUID& base, const UUID& top,
+                                               const UUID& side, const UUID& bottom,
+                                               const std::string& name);
     struct BlockAssetData {
         UUID texture{ 0, 0 }; // all faces default to this
         UUID top{ 0, 0 }, bottom{ 0, 0 }, side{ 0, 0 };
@@ -710,23 +759,44 @@ private:
     // block cubes and character humanoids). Cached per texture UUID in the
     // given map and rebuilt when the graph hash changes.
     GraphMaterialPipeline* ensure_texture_pipeline(
-        const UUID& texId, std::unordered_map<UUID, GraphMaterialPipeline>& cache);
+        const UUID& texId, std::unordered_map<UUID, GraphMaterialPipeline>& cache,
+        bool withAlpha = false);
 
     // Voxel sculpting (Escultura de Blocos): each VoxelVolumeComponent entity
     // gets an editable grid (Engine::Voxel::VoxelStructure) rendered as colored
     // cubes in the viewport. The brush panel paints into it in real time — the
     // panel used to be decorative (the brush was never consumed).
+    struct EditorVoxelRange {
+        uint32_t firstIndex{ 0 };
+        uint32_t indexCount{ 0 };
+        uint16_t type{ 0 };
+        // Block asset sampled by this range (invalid = vertex-color fallback).
+        UUID blockId{ 0, 0 };
+    };
     struct EditorVoxelMesh {
         GPUBuffer vb;
         GPUBuffer ib;
         uint32_t indexCount{ 0 };
+        std::vector<EditorVoxelRange> ranges;
         bool valid{ false };
     };
     std::unordered_map<UUID, std::unique_ptr<Engine::Voxel::VoxelStructure>> m_voxelStructures;
     std::unordered_map<UUID, EditorVoxelMesh> m_voxelMeshes;
     std::unordered_set<UUID> m_voxelMeshesDirty;
     bool m_voxelPaintMode{ false }; // "Pintar" toggle in the sculpt panel
+    // Voxel type → Block asset override (API `voxel-block <type> <uuid>`).
+    // Empty = auto-resolve by texture name from the BlockRegistry.
+    std::unordered_map<uint16_t, UUID> m_voxelTypeBlocks;
     void ensure_voxel_volume(const UUID& entityId, uint32_t seed, float seaLevel);
+    // Finds the Block asset to sample for a voxel type: explicit override
+    // first, then a name match in the registry (1=dirt, 2=grass, 3=stone,
+    // 4=water). Invalid UUID = render the type with vertex colors.
+    UUID resolve_voxel_type_block(uint16_t type);
+    // Pre-builds the textured block pipelines for every voxel volume in the
+    // main loop, OUTSIDE the viewport render pass. Creating pipelines and
+    // uploading atlases while a render pass is being recorded hangs the GPU
+    // (device lost), so the draw path only ever hits the pipeline cache.
+    void ensure_voxel_pipelines();
     void rebuild_voxel_mesh(const UUID& entityId);
     void draw_voxel_volumes(VkCommandBuffer cmd, const glm::mat4& viewProj, Scene* scene);
     void paint_voxel_ray(const glm::vec3& origin, const glm::vec3& dir, bool remove);
@@ -876,6 +946,16 @@ private:
     Entity m_selectedEntity;
     std::string m_activeScenePath;
 
+    // Scene autosave: every mutation calls mark_scene_dirty(); a debounced
+    // autosave_scene() in the main loop persists the scene ~1.5s after the
+    // last change, and a final flush runs on window close — closing the
+    // engine without Ctrl+S never loses work.
+    bool m_sceneDirty{ false };
+    double m_sceneLastChange{ 0.0 };   // glfwGetTime() of the last mutation
+    std::string m_autosavePath;        // stable fallback target for untitled scenes
+    void mark_scene_dirty();
+    void autosave_scene(bool force = false);
+
     // Project asset database and import/cook pipeline used by Content Browser.
     AssetRegistry m_assetRegistry;
     std::unique_ptr<AssetPipeline> m_assetPipeline;
@@ -885,8 +965,15 @@ private:
     // the viewport during Play/Simulate, so the authored scene runs visibly.
     Physics::PhysicsRuntime m_playPhysics;
     std::unordered_map<UUID, Physics::BodyHandle> m_playBodies;
+    // Real world collision (play mode): static boxes derived from the actual
+    // scene content — voxel volumes become exact merged-cell boxes, the
+    // procedural terrain becomes sampled column boxes. The wide plane is only
+    // a void-failsafe placed below the lowest real collider.
+    std::vector<Physics::BodyHandle> m_playStaticBodies;
+    float m_playCollisionFloorY{ -0.5f };
+    void build_play_world_collision();
     // Static ground plane added to every play world so dynamic bodies land
-    // instead of falling forever (terrain/voxel have no collision yet).
+    // instead of falling forever when a scene has no collidable content.
     Physics::BodyHandle m_playGroundBody{ Physics::InvalidBody };
     // Play-world weapons: one WeaponRuntime per WeaponComponent entity, fired
     // with the viewport camera ray (SPACE) against the play physics (Fase 8).
@@ -1063,6 +1150,9 @@ private:
         float falloff{ 0.4f };
         float halfExtent{ 500.0f };
         int segments{ 256 };
+        // Deterministic noise seed (hash mixing), so an agent can reproduce
+        // an exact terrain with the same seed + parameters.
+        uint32_t seed{ 1 };
     };
     GPUBuffer m_terrainVB;
     GPUBuffer m_terrainIB;
@@ -1070,6 +1160,13 @@ private:
     bool m_terrainValid{ false };
     TerrainParams m_terrainParams;
     void generate_terrain_mesh(const TerrainParams& params);
+    // Terrain survives reloads via a small sidecar ("<scene>.terrain"): the
+    // scene serializer owns entity data only, so the heightmap parameters are
+    // written next to the scene on every save and restored on load.
+    static std::filesystem::path terrain_sidecar_path(const std::string& scenePath);
+    void persist_terrain_sidecar(const std::string& scenePath);
+    void restore_terrain_sidecar(const std::string& scenePath);
+    void clear_terrain_mesh();
 
     // Editor settings persisted to settings.json (Opções Gerais / Tema).
     std::string m_settingsPath;

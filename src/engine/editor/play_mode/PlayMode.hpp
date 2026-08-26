@@ -25,6 +25,13 @@ public:
     // and flips back).
     void set_state(PlayState state) { m_state = state; }
 
+    // Editor-only: keeps the cached editor-scene pointer fresh so
+    // get_active_scene() returns the real scene in Edit mode even before the
+    // first start_play() (which would otherwise leave it null and make every
+    // caller see an empty scene). The editor calls this whenever it replaces
+    // its scene (init, New Scene, Open Scene, after stop_play).
+    void set_editor_scene(Scene* editorScene) { m_editorScene = editorScene; }
+
     void start_play(Scene* editorScene) {
         if (m_state != PlayState::Edit) return;
         m_editorScene = editorScene;

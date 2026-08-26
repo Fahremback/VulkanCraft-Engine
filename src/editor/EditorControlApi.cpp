@@ -58,11 +58,35 @@ void EditorControlApi::stop() {
 #endif
 }
 
-std::deque<std::string> EditorControlApi::drain_commands() {
+std::deque<EditorControlApi::PendingCommand> EditorControlApi::drain_commands() {
     std::lock_guard<std::mutex> lock(m_cmdMutex);
-    std::deque<std::string> out;
+    std::deque<PendingCommand> out;
     out.swap(m_commands);
     return out;
+}
+
+void EditorControlApi::complete_command(uint64_t id, bool ok, const std::string& message,
+                                        const std::string& data) {
+    std::lock_guard<std::mutex> lock(m_resultMutex);
+    const auto esc = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size() + 8);
+        for (const char ch : s) {
+            if (ch == '\\' || ch == '"') out.push_back('\\');
+            out.push_back(ch);
+        }
+        return out;
+    };
+    std::string body;
+    if (ok) {
+        body = "{\"ok\":true";
+        if (!data.empty()) body += ",\"data\":\"" + esc(data) + "\"";
+        body += "}";
+    } else {
+        body = "{\"ok\":false,\"error\":\"" + esc(message) + "\"}";
+    }
+    m_results[id] = body;
+    m_resultCV.notify_all();
 }
 
 void EditorControlApi::publish_state(const EditorApiState& s) {
@@ -122,12 +146,24 @@ void EditorControlApi::server_loop(uint16_t port) {
 
 namespace {
 
-// Simple "HTTP/1.1 200 OK" response writer (single request per connection).
-void send_response(SOCKET_TYPE conn, const std::string& body, const char* contentType = "application/json") {
+// Simple HTTP response writer (single request per connection). Status lets the
+// agent distinguish a real success (200) from a rejected/unknown command (404)
+// or an execution failure (422) instead of trusting a 200 with an error body.
+void send_response(SOCKET_TYPE conn, const std::string& body, const char* contentType = "application/json",
+                   int status = 200) {
+    const char* reason = "OK";
+    switch (status) {
+        case 400: reason = "Bad Request"; break;
+        case 404: reason = "Not Found"; break;
+        case 422: reason = "Unprocessable Entity"; break;
+        case 500: reason = "Internal Server Error"; break;
+        case 504: reason = "Gateway Timeout"; break;
+        default: break;
+    }
     char header[512];
     std::snprintf(header, sizeof(header),
-                  "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
-                  contentType, body.size());
+                  "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                  status, reason, contentType, body.size());
     ::send(conn, header, static_cast<int>(std::strlen(header)), 0);
     ::send(conn, body.data(), static_cast<int>(body.size()), 0);
 }
@@ -276,6 +312,32 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
         // ---- Assets -----------------------------------------------------------
         else if (path.rfind("/import?path=", 0) == 0) cmd = "import " + query_value_after(path, "path");
         else if (path.rfind("/block-model/", 0) == 0) cmd = "block-model " + path.substr(13);
+        else if (path.rfind("/block-faces/", 0) == 0) {
+            // /block-faces/{blockId}?top=..&side=..&bottom=.. — each param is
+            // optional; absent/empty falls back to "0" (keep current face).
+            const size_t q = path.find('?', 13);
+            const std::string blockId = (q == std::string::npos) ? path.substr(13) : path.substr(13, q - 13);
+            const auto qv = [&](const char* key) -> std::string {
+                std::string raw = query_value_after(path, key);
+                const size_t amp = raw.find('&');
+                if (amp != std::string::npos) raw.resize(amp);
+                return raw.empty() ? "0" : raw;
+            };
+            cmd = "block-faces " + blockId + " " + qv("top") + " " + qv("side") + " " + qv("bottom");
+        }
+        else if (path.rfind("/block-model-faces/", 0) == 0) {
+            // /block-model-faces/{base}/{top}/{side}/{bottom}?name=..
+            const size_t q = path.find('?');
+            const std::string pathPart = (q == std::string::npos) ? path.substr(19) : path.substr(19, q - 19);
+            std::string name = query_value_after(path, "name");
+            const size_t amp = name.find('&');
+            if (amp != std::string::npos) name.resize(amp);
+            // pathPart is "base/top/side/bottom" but the command parser splits
+            // on whitespace, so normalize the separators before dispatching.
+            std::string faces = pathPart;
+            for (char& c : faces) { if (c == '/') c = ' '; }
+            cmd = "block-model-faces " + faces + " " + name;
+        }
         else if (path.rfind("/spawn-block/", 0) == 0) cmd = "spawn-block " + path.substr(13);
         else if (path.rfind("/spawn-character/", 0) == 0) cmd = "spawn-character " + path.substr(17);
         // ---- Runtime-wired Wicked-port features (Layers/Decal/Hair/SoftBody/
@@ -325,6 +387,7 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
         else if (path.rfind("/voxel-generate/", 0) == 0) cmd = "voxel-generate " + slash_args(path, 16);
         else if (path.rfind("/voxel-clear/", 0) == 0) cmd = "voxel-clear " + path.substr(13);
         else if (path.rfind("/voxel-paint/", 0) == 0) cmd = "voxel-paint " + slash_args(path, 13);
+        else if (path.rfind("/voxel-block/", 0) == 0) cmd = "voxel-block " + slash_args(path, 13);
         // ---- Scripts ----------------------------------------------------------
         else if (path.rfind("/script-event?name=", 0) == 0) cmd = "script-event " + query_value_after(path, "name");
         else if (path == "/script-pause") cmd = "script-pause";
@@ -345,16 +408,44 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
         else if (path.rfind("/selftest/", 0) == 0) cmd = "selftest " + path.substr(10);
         else if (path == "/package") cmd = "package";
         else if (path == "/hot-reload") cmd = "hot-reload";
+        else if (path.rfind("/screenshot", 0) == 0) {
+            // /screenshot?path=... — captures the viewport to a PNG and returns
+            // the saved path in `data` so an agent can see the result.
+            const std::string p = query_value_after(path, "path");
+            cmd = p.empty() ? "screenshot" : "screenshot " + p;
+        }
         if (!cmd.empty()) {
+            // Queue the command, then WAIT for the editor main thread to
+            // actually execute it and report the real outcome. This replaces
+            // the old fire-and-forget `{"ok":true}` that lied to the agent
+            // when a command failed after the fact.
+            const uint64_t id = m_nextCmdId.fetch_add(1);
             {
                 std::lock_guard<std::mutex> lock(m_cmdMutex);
-                m_commands.push_back(cmd);
+                m_commands.push_back({ id, cmd });
             }
-            send_response(conn, "{\"ok\":true}", "text/plain");
+            std::string body;
+            int status = 200;
+            {
+                std::unique_lock<std::mutex> lk(m_resultMutex);
+                const bool done = m_resultCV.wait_for(
+                    lk, std::chrono::seconds(15),
+                    [&] { return m_results.count(id) != 0; });
+                if (done) {
+                    body = m_results[id];
+                    status = (body.find("\"ok\":true") != std::string::npos) ? 200 : 422;
+                    m_results.erase(id);
+                } else {
+                    body = "{\"ok\":false,\"error\":\"timeout: the editor did not execute the command\"}";
+                    status = 504;
+                }
+            }
+            send_response(conn, body, "application/json", status);
             return;
         }
     }
-    send_response(conn, "{\"error\":\"unknown endpoint\"}", "text/plain");
+    // Unknown endpoint: a real 404, not a 200 with an error body.
+    send_response(conn, "{\"error\":\"unknown endpoint\"}", "application/json", 404);
 }
 
 } // namespace Engine

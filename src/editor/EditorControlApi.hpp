@@ -1,12 +1,15 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 
 namespace Engine {
 
@@ -66,8 +69,23 @@ public:
     bool start(uint16_t port = 8321);
     void stop();
 
+    // A queued command carries an id so the HTTP thread can wait for the
+    // editor main thread to actually execute it and report the real result
+    // (no more fire-and-forget `{"ok":true}` before anything ran).
+    struct PendingCommand {
+        uint64_t id;
+        std::string cmd;
+    };
+
     // Editor main thread: pull queued commands (executed in main_loop).
-    std::deque<std::string> drain_commands();
+    std::deque<PendingCommand> drain_commands();
+
+    // Editor main thread: report the real outcome of command `id` so the
+    // waiting HTTP request can answer with success/failure + message. `data`
+    // is optional free-form JSON payload (e.g. a screenshot path) embedded as
+    // `"data":"..."` on success.
+    void complete_command(uint64_t id, bool ok, const std::string& message,
+                          const std::string& data = std::string());
 
     // Editor main thread: publish live state for GET /state.
     void publish_state(const EditorApiState& s);
@@ -81,7 +99,12 @@ private:
     std::atomic<uint64_t> m_listenSocket{ 0 };
 
     std::mutex m_cmdMutex;
-    std::deque<std::string> m_commands;
+    std::deque<PendingCommand> m_commands;
+
+    std::mutex m_resultMutex;
+    std::condition_variable m_resultCV;
+    std::unordered_map<uint64_t, std::string> m_results;
+    std::atomic<uint64_t> m_nextCmdId{ 1 };
 
     std::mutex m_stateMutex;
     EditorApiState m_live;

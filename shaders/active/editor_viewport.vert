@@ -9,6 +9,7 @@ layout(push_constant) uniform Push {
     vec4 color;      // rgb = tint; a = unused
     vec4 fogParams;  // x=density, y=start, z=heightFog, w=unused
     vec4 fogColor;   // xyz=fog color, w=unused
+    mat4 model;      // world transform: fragWorldPos = model * inPosition
 } push;
 
 layout (location = 0) out vec3 fragColor;
@@ -19,5 +20,8 @@ void main() {
     gl_Position = push.mvp * vec4(inPosition, 1.0);
     fragColor = inColor * push.color.rgb;
     fragNormal = inNormal;
-    fragWorldPos = inPosition;
+    // World position (not local): fog distance and rim lighting in the
+    // fragment stage use real world coordinates, correct for transformed
+    // entities (blocks, characters, meshes placed in the scene).
+    fragWorldPos = (push.model * vec4(inPosition, 1.0)).xyz;
 }

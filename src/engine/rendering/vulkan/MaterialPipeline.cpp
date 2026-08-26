@@ -175,10 +175,14 @@ GlslGenerationResult material_graph_to_glsl(const MaterialGraph& graph) {
     // produces no register, so the two numbering schemes diverge. Map registers
     // to their assigned variable names.
     std::unordered_map<uint32_t, std::string> regNames;
+    std::unordered_map<uint32_t, MaterialValueType> regTypes;
     for (size_t i = 0; i < compiled.ir.instructions.size(); ++i) {
         const MaterialIRInstruction& ins = compiled.ir.instructions[i];
         std::string var = "t" + std::to_string(ins.result);
-        if (ins.result != 0) regNames[ins.result] = var;
+        if (ins.result != 0) {
+            regNames[ins.result] = var;
+            regTypes[ins.result] = ins.type;
+        }
         auto reg = [&](size_t index) -> const std::string& {
             const auto it = regNames.find(ins.operands[index]);
             return it != regNames.end() ? it->second : var;
@@ -218,12 +222,24 @@ GlslGenerationResult material_graph_to_glsl(const MaterialGraph& graph) {
                 else if (ins.symbol == "Roughness") out << "    roughness = " << src << ";\n";
                 else if (ins.symbol == "Metallic") out << "    metallic = " << src << ";\n";
                 else if (ins.symbol == "Emissive") out << "    emissive = " << src << ".rgb;\n";
-                else if (ins.symbol == "Opacity") out << "    opacity = " << src << ";\n";
+                else if (ins.symbol == "Opacity") {
+                    // Opacity fed directly from a texture sample is a vec4:
+                    // take its alpha channel (skin/leaf cutout).
+                    const auto tit = regTypes.find(ins.operands[0]);
+                    const bool fromTex = tit != regTypes.end() &&
+                                         tit->second == MaterialValueType::Vec4;
+                    out << "    opacity = " << src << (fromTex ? ".a" : "") << ";\n";
+                }
                 else if (ins.symbol == "Normal") out << "    normal = normalize(" << src << ");\n";
                 break;
             }
         }
     }
+
+    // Alpha cutout: fully transparent texels (skins, leaves, glass) are
+    // discarded instead of rendering as opaque white/black. Default opacity
+    // is 1.0, so materials that never drive Opacity are unaffected.
+    out << "    if (opacity < 0.05) discard;\n";
 
     // Real lighting: directional sun + point lights from LightComponents,
     // written into the LightParams UBO by the caller every frame.

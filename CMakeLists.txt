@@ -465,6 +465,7 @@ vc_object_module(vc_gameplay_sdk
     src/engine/physics/SkeletonPoseMapper.cpp
     src/engine/physics/PhysicsStreamingBridge.cpp
     src/engine/physics/VoxelConnectivity.cpp
+    src/engine/physics/VoxelBoxMerger.cpp
     src/engine/gameplay/WeaponSystem.cpp
     src/engine/gameplay/VehicleRuntime.cpp
     src/engine/gameplay/BeamChassisRuntime.cpp
@@ -487,6 +488,7 @@ vc_object_module(vc_advanced_runtime
     src/engine/physics/SkeletonPoseMapper.cpp
     src/engine/physics/PhysicsStreamingBridge.cpp
     src/engine/physics/VoxelConnectivity.cpp
+    src/engine/physics/VoxelBoxMerger.cpp
     src/engine/physics/PhysicsBackend.cpp
     src/engine/physics/JoltPhysicsBackend.cpp
     src/engine/physics/BulletPhysicsBackend.cpp
@@ -561,7 +563,7 @@ set(VC_SHADERS
     shadow_far_surface.vert shadow.frag shadow_foliage.vert shadow_grass.vert
     editor_viewport.vert editor_viewport.frag editor_pick.frag editor_material.vert
     editor_grid.vert editor_grid.frag editor_splat.vert editor_splat.frag
-    editor_envsphere.vert editor_envsphere.frag
+    editor_envsphere.vert editor_envsphere.frag block.vert block.frag
 )
 set(VC_SHADER_OUTPUTS)
 foreach(shader IN LISTS VC_SHADERS)
@@ -756,6 +758,13 @@ add_test(NAME gltf_geometry_tests COMMAND gltf_geometry_tests)
 add_executable(radiance_cache_math_tests tests/RadianceCacheMathTests.cpp)
 target_link_libraries(radiance_cache_math_tests PRIVATE vc_build_options glm)
 add_test(NAME radiance_cache_math_tests COMMAND radiance_cache_math_tests)
+
+add_executable(voxel_box_merger_tests
+    tests/VoxelBoxMergerTests.cpp
+    src/engine/physics/VoxelBoxMerger.cpp
+)
+target_link_libraries(voxel_box_merger_tests PRIVATE vc_build_options glm)
+add_test(NAME voxel_box_merger_tests COMMAND voxel_box_merger_tests)
 
 add_executable(architecture_boundary_tests tests/ArchitectureBoundaryTests.cpp)
 target_link_libraries(architecture_boundary_tests PRIVATE vc_build_options)

@@ -3,23 +3,22 @@
 // Analytic infinite grid (anti-aliased).
 // Draws a single fullscreen triangle (no vertex buffer); each fragment
 // intersects its view ray with the ground plane (Y = 0) in the fragment
-// shader. The near/far endpoints are unprojected here so the fragment
-// can interpolate the ray in world space; the fragment treats it as an
-// infinite ray (no far-plane cutoff) so the grid runs to the horizon.
+// shader. The inverse view-projection arrives from the CPU (constant for the
+// whole draw), so the near/far endpoints are unprojected here cheaply; the
+// fragment treats the ray as an infinite ray (no far-plane cutoff) so the
+// grid runs to the horizon.
 
 layout (location = 0) out vec3 nearPoint;
 layout (location = 1) out vec3 farPoint;
 
 layout (push_constant) uniform PushConstants {
-    mat4 view;
-    mat4 proj;
+    mat4 invViewProj;
+    vec4 cameraPos;
 } pc;
 
 vec3 unproject(vec2 ndc, float clipZ) {
     // GL clip convention: near = -1, far = +1 (matches glm::perspective).
-    mat4 invView = inverse(pc.view);
-    mat4 invProj = inverse(pc.proj);
-    vec4 p = invView * invProj * vec4(ndc, clipZ, 1.0);
+    vec4 p = pc.invViewProj * vec4(ndc, clipZ, 1.0);
     return p.xyz / p.w;
 }
 

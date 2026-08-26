@@ -31,12 +31,22 @@ int main() {
     const auto editorSource = read(root / "src/editor/EditorApplication.cpp");
 
 #ifdef _WIN32
-    if (editorSource.find("1.5/build/Release/vulkan_craft.exe") == std::string::npos ||
-        editorSource.find("SetParent") == std::string::npos ||
-        editorSource.find("MoveWindow") == std::string::npos ||
-        editorSource.find("WS_CHILD") == std::string::npos ||
-        editorSource.find("ScreenToClient") != std::string::npos) {
-        std::cerr << "Windows editor play mode must embed the 1.5 game inside the scene viewport\n";
+    // Play mode is in-process via PlayModeManager (engine/editor/play_mode),
+    // NOT a subprocess that embeds the legacy 1.5 game window. Guard both
+    // directions so nobody reintroduces the external-process embed.
+    const bool legacyEmbed =
+        editorSource.find("1.5/build/Release/vulkan_craft.exe") != std::string::npos ||
+        editorSource.find("SetParent") != std::string::npos ||
+        editorSource.find("MoveWindow") != std::string::npos ||
+        editorSource.find("WS_CHILD") != std::string::npos ||
+        editorSource.find("ScreenToClient") != std::string::npos;
+    if (legacyEmbed) {
+        std::cerr << "Windows editor play mode must not embed the legacy 1.5 game (use in-process PlayModeManager)\n";
+        return 1;
+    }
+    if (editorSource.find("m_playMode.start_play(") == std::string::npos ||
+        editorSource.find("m_playMode.stop_play(") == std::string::npos) {
+        std::cerr << "Windows editor play mode must run through PlayModeManager (in-process start/stop)\n";
         return 1;
     }
 #endif

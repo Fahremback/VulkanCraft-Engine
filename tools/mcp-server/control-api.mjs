@@ -330,21 +330,21 @@ export function controlApiToolDefinitions() {
     },
     {
       name: "editor_set_transform",
-      description: "Set position (and optionally rotation/scale) of an entity by UUID. Values in degrees for rotation.",
+      description: "Patch an entity's position/rotation/scale by UUID (PATCH semantics: only the groups you provide are changed; unspecified groups keep their current values). Rotation in degrees. Send only the fields you want to change — the editor never teleports the entity or reinterprets scale as rotation.",
       inputSchema: {
         type: "object",
         required: ["uuid"],
         properties: {
           uuid: { type: "string" },
-          x: { type: "number", default: 0 },
-          y: { type: "number", default: 0 },
-          z: { type: "number", default: 0 },
-          rot_x: { type: "number", description: "Rotation X in degrees" },
-          rot_y: { type: "number", description: "Rotation Y in degrees" },
-          rot_z: { type: "number", description: "Rotation Z in degrees" },
-          scale_x: { type: "number", default: 1 },
-          scale_y: { type: "number", default: 1 },
-          scale_z: { type: "number", default: 1 }
+          x: { type: "number", description: "Position X (only applied if provided)" },
+          y: { type: "number", description: "Position Y (only applied if provided)" },
+          z: { type: "number", description: "Position Z (only applied if provided)" },
+          rot_x: { type: "number", description: "Rotation X in degrees (only applied if provided)" },
+          rot_y: { type: "number", description: "Rotation Y in degrees (only applied if provided)" },
+          rot_z: { type: "number", description: "Rotation Z in degrees (only applied if provided)" },
+          scale_x: { type: "number", description: "Scale X (only applied if provided)" },
+          scale_y: { type: "number", description: "Scale Y (only applied if provided)" },
+          scale_z: { type: "number", description: "Scale Z (only applied if provided)" }
         },
         additionalProperties: false
       }
@@ -419,6 +419,22 @@ export function controlApiToolDefinitions() {
         type: "object",
         required: ["texture_uuid"],
         properties: { texture_uuid: { type: "string", description: "UUID of the source texture asset" } },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_author_block_model",
+      description: "Create or update a Minecraft-style block model (.vblock) with per-face textures. Pass block_uuid to update an existing block's faces; omit it to create a new block. Each face takes a texture UUID ('0' = keep current face / no face). The editor composites [top | side | bottom] into a 3-region atlas so grass gets a green top, dirt sides and a dirt bottom.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          block_uuid: { type: "string", description: "UUID of an existing block asset (.vblock) to update (omit to create a new block)" },
+          name: { type: "string", description: "Block name used for the .vblock filename when creating a new block" },
+          base_texture_uuid: { type: "string", description: "Fallback texture UUID used on every face where a specific face is not given (required when creating)" },
+          top_texture_uuid: { type: "string", description: "Texture UUID for the top face (+Y)" },
+          side_texture_uuid: { type: "string", description: "Texture UUID for the side faces (+-X/+-Z)" },
+          bottom_texture_uuid: { type: "string", description: "Texture UUID for the bottom face (-Y)" }
+        },
         additionalProperties: false
       }
     },
@@ -660,14 +676,14 @@ export function controlApiToolDefinitions() {
     },
     {
       name: "editor_voxel_generate",
-      description: "Regenerate the voxel volume of an entity with a seed and sea level.",
+      description: "Regenerate the voxel volume of an entity with a seed and sea level. NOTE: the editor preview is a 32x24x32 sculpt grid (1m per cell), NOT a chunked world — sea_level is clamped to 0..22 (the grid is 24 tall), so Minecraft-style sea levels like 62 are meaningless here.",
       inputSchema: {
         type: "object",
         required: ["uuid"],
         properties: {
           uuid: { type: "string", description: "Voxel volume entity UUID" },
-          seed: { type: "integer", default: 1337 },
-          sea_level: { type: "number", default: 24 }
+          seed: { type: "integer", default: 1337, description: "Deterministic generation seed" },
+          sea_level: { type: "number", default: 24, min: 0, max: 22, description: "Water height; clamped to 0..22 by the preview grid" }
         },
         additionalProperties: false
       }
@@ -694,6 +710,19 @@ export function controlApiToolDefinitions() {
         type: "object",
         required: ["uuid"],
         properties: { uuid: { type: "string" } },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_voxel_block",
+      description: "Assign a Block asset to a voxel type so the volume renders with the block's per-face textures (top/side/bottom) instead of a flat color. Types resolve by texture name by default (1=dirt, 2=grass, 3=stone, 4=water); this overrides that mapping. Use editor_list_assets (type=block) to get the block UUID.",
+      inputSchema: {
+        type: "object",
+        required: ["type", "block_uuid"],
+        properties: {
+          type: { type: "integer", min: 1, description: "Voxel type id (1 = dirt, 2 = grass, 3 = stone, 4 = water, or any painted type)" },
+          block_uuid: { type: "string", description: "UUID of a Block asset in the registry" }
+        },
         additionalProperties: false
       }
     },
@@ -771,14 +800,28 @@ export function controlApiToolDefinitions() {
     },
     {
       name: "editor_generate_terrain",
-      description: "Generate a terrain mesh in the scene.",
+      description: "Generate a terrain mesh in the scene. scale is the world size of the base noise feature: ~120 gives gentle rolling hills, small values (1-10) produce high-frequency spikes, so start near 120 and lower it only for detail. Same seed + params always reproduce the exact same sheet.",
       inputSchema: {
         type: "object",
         properties: {
-          scale: { type: "number", default: 1, description: "Terrain scale" },
-          octaves: { type: "integer", default: 4 },
-          amount: { type: "number", default: 0.5 },
-          falloff: { type: "number", default: 0.4 }
+          scale: { type: "number", default: 120, description: "Base noise feature size in world units (120 = rolling hills, small = spikes)" },
+          octaves: { type: "integer", default: 5, min: 1, max: 8 },
+          amount: { type: "number", default: 0.5, description: "Height amplitude (0..1)" },
+          falloff: { type: "number", default: 0.4, description: "Radial falloff pulling the border to 0" },
+          half_extent: { type: "number", default: 500, description: "Half size of the square sheet in world units" },
+          segments: { type: "integer", default: 256, min: 16, max: 1024, description: "Grid resolution (densify to reduce faceting)" },
+          seed: { type: "integer", default: 1, description: "Deterministic noise seed" }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_capture_viewport",
+      description: "Capture the current editor viewport to a PNG file and return its absolute path. USE THIS after every create/spawn/terrain/voxel/transform change and whenever the result is visual: look at the PNG, spot problems (wrong textures, missing geometry, camera framing), then fix and re-capture. This is the visual loop that build+logs cannot replace.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Optional output path (absolute, or relative to the engine root). Defaults to engine/screenshots/viewport_<timestamp>.png" }
         },
         additionalProperties: false
       }
@@ -928,12 +971,20 @@ export async function callControlApiTool(name, args = {}) {
     case "editor_set_transform": {
       const uuid = requireUuid(args.uuid);
       const p = (v, d) => pickNumber(v, d);
+      // PATCH semantics: a mask ('1'/'0' per position/rotation/scale group)
+      // tells the editor which groups to apply. Only groups the agent actually
+      // provided are changed; the rest keep their current values. This kills
+      // the old bugs where omitted x/y/z teleported the object to the origin
+      // and scale-only requests had scale floats misread as rotation.
+      const hasPos = args.x !== undefined || args.y !== undefined || args.z !== undefined;
       const hasRot = args.rot_x !== undefined || args.rot_y !== undefined || args.rot_z !== undefined;
       const hasScale = args.scale_x !== undefined || args.scale_y !== undefined || args.scale_z !== undefined;
-      let endpoint = `/set-transform/${uuid}/${p(args.x, 0)}/${p(args.y, 0)}/${p(args.z, 0)}`;
-      if (hasRot) endpoint += `/${p(args.rot_x, 0)}/${p(args.rot_y, 0)}/${p(args.rot_z, 0)}`;
-      if (hasScale) endpoint += `/${p(args.scale_x, 1)}/${p(args.scale_y, 1)}/${p(args.scale_z, 1)}`;
-      return callEditor(name, endpoint);
+      const mask = `${hasPos ? "1" : "0"}${hasRot ? "1" : "0"}${hasScale ? "1" : "0"}`;
+      const px = p(args.x, 0), py = p(args.y, 0), pz = p(args.z, 0);
+      const rx = p(args.rot_x, 0), ry = p(args.rot_y, 0), rz = p(args.rot_z, 0);
+      const sx = p(args.scale_x, 1), sy = p(args.scale_y, 1), sz = p(args.scale_z, 1);
+      return callEditor(name,
+        `/set-transform/${uuid}/${mask}/${px}/${py}/${pz}/${rx}/${ry}/${rz}/${sx}/${sy}/${sz}`);
     }
     case "editor_add_component": {
       const uuid = requireUuid(args.uuid);
@@ -967,6 +1018,28 @@ export async function callControlApiTool(name, args = {}) {
     case "editor_create_block_model": {
       const uuid = requireUuid(args.texture_uuid, "texture_uuid");
       return callEditor(name, `/block-model/${uuid}`);
+    }
+    case "editor_author_block_model": {
+      // block_uuid present -> update an existing block's faces; otherwise create.
+      const block = args.block_uuid ? requireUuid(args.block_uuid, "block_uuid") : "";
+      // NOTE: deliberately NOT named "name" — that would shadow callEditor's
+      // tool-name argument below.
+      const blockName = args.name ? queryEscape(String(args.name)) : "";
+      const faceOf = (key) => {
+        if (args[key] === undefined || args[key] === null || args[key] === "") return "0";
+        return requireUuid(args[key], key);
+      };
+      const top = faceOf("top_texture_uuid");
+      const side = faceOf("side_texture_uuid");
+      const bottom = faceOf("bottom_texture_uuid");
+      if (block) {
+        return callEditor(name, `/block-faces/${block}?top=${top}&side=${side}&bottom=${bottom}`);
+      }
+      const base = faceOf("base_texture_uuid");
+      if (base === "0" && top === "0" && side === "0" && bottom === "0") {
+        throw new Error("editor_author_block_model: provide at least one face texture (base_texture_uuid/top/side/bottom) when creating a block");
+      }
+      return callEditor(name, `/block-model-faces/${base}/${top}/${side}/${bottom}?name=${blockName}`);
     }
     case "editor_spawn_block": {
       const uuid = requireUuid(args.block_uuid, "block_uuid");
@@ -1084,6 +1157,11 @@ export async function callControlApiTool(name, args = {}) {
       const uuid = requireUuid(args.uuid);
       return callEditor(name, `/voxel-clear/${uuid}`);
     }
+    case "editor_voxel_block": {
+      const type = Math.trunc(pickNumber(args.type, 1, { min: 1, max: 65535 }));
+      const blockUuid = requireUuid(args.block_uuid);
+      return callEditor(name, `/voxel-block/${type}/${blockUuid}`);
+    }
 
     // ---- Scripts -----------------------------------------------------------
     case "editor_script_event": {
@@ -1122,11 +1200,25 @@ export async function callControlApiTool(name, args = {}) {
 
     // ---- Terrain / graphics / settings / project / mesh / dev --------------
     case "editor_generate_terrain": {
-      const scale = pickNumber(args.scale, 1, { min: 0.01, max: 1000 });
-      const octaves = Math.trunc(pickNumber(args.octaves, 4, { min: 1, max: 8 }));
+      const scale = pickNumber(args.scale, 120, { min: 0.01, max: 1000 });
+      const octaves = Math.trunc(pickNumber(args.octaves, 5, { min: 1, max: 8 }));
       const amount = pickNumber(args.amount, 0.5);
       const falloff = pickNumber(args.falloff, 0.4);
-      return callEditor(name, `/terrain/${scale}/${octaves}/${amount}/${falloff}`);
+      const halfExtent = pickNumber(args.half_extent, 500, { min: 10, max: 5000 });
+      const segments = Math.trunc(pickNumber(args.segments, 256, { min: 16, max: 1024 }));
+      const seed = Math.trunc(pickNumber(args.seed, 1, { min: 0, max: 4294967295 }));
+      return callEditor(name, `/terrain/${scale}/${octaves}/${amount}/${falloff}/${halfExtent}/${segments}/${seed}`);
+    }
+    case "editor_capture_viewport": {
+      const p = typeof args.path === "string" && args.path.trim() ? args.path.trim() : "";
+      const res = await callEditor(name, p ? `/screenshot?path=${queryEscape(p)}` : "/screenshot");
+      let result = res.result;
+      try {
+        const parsed = JSON.parse(res.result);
+        if (parsed.data) result = `Screenshot saved: ${parsed.data}`;
+        else if (parsed.error) result = `Screenshot failed: ${parsed.error}`;
+      } catch { /* keep raw body */ }
+      return { ...res, result };
     }
     case "editor_set_graphics": {
       const vsync = args.vsync === false ? 0 : 1;
