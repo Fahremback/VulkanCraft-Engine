@@ -68,6 +68,39 @@ struct EditorApiState {
     // + viewport + confirmations as ONE versioned JSON doc — the data surface
     // for reflection/scripting/MCP tooling.
     std::string ui_doc;
+    // The shell layout snapshot (EditorLayout): panel visibility, active
+    // panel, gizmo mode, viewport-first — persisted across sessions.
+    std::string layout;
+    // The message catalog JSON (engine/editor IMessageCatalog) — stable ids,
+    // severity, parameterized text, actionable hint.
+    std::string messages;
+    // The shortcut documentation markdown (engine/editor IShortcutDoc) — the
+    // shell's current shortcuts rendered from the IActionMap contract.
+    std::string shortcuts;
+    // The play-mode snapshot JSON (engine/editor IPlayMode) — the
+    // unambiguous Edit/Play/Pause/Simulate state machine, observable.
+    std::string play_mode;
+    // The command index JSON (engine/editor ICommandSearch) — the palette's
+    // data-driven command catalog (id/label/category/keywords/action).
+    std::string command_index;
+    // The frame-profiler JSON (engine/profiling IFrameProfiler) — deterministic
+    // frame-time/memory stats (samples, min/max/avg, p95/p99, spikes, fps).
+    std::string profiler;
+    // The undo-history JSON (engine/editor IUndoHistory) — the editor's
+    // UndoSystem stack depths/cap (deterministic), observable via GET /undo.
+    std::string undo;
+    // The content-browser JSON (engine/editor IContentBrowser) — the asset
+    // navigation model (index/folders/selection) from the AssetRegistry.
+    std::string content_browser;
+    // The window-mode JSON (engine/editor IWindowMode) — the windowed /
+    // borderless / fullscreen state machine (deterministic), via GET /window-mode.
+    std::string window_mode;
+    // The editor-camera JSON (engine/editor IEditorCamera) — the orbit/pan/
+    // zoom/fly model driving the real camera, via GET /camera.
+    std::string camera;
+    // The gizmo JSON (engine/editor IGizmoController) — live gizmo mode, local
+    // flag and snap values, via GET /gizmo.
+    std::string gizmo;
 };
 
 class EditorControlApi {

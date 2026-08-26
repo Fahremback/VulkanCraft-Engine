@@ -232,6 +232,10 @@ public:
     // engine::voxel::StreamingSnapshot contract.
     [[nodiscard]] engine::voxel::StreamingSnapshot streaming_snapshot() const;
 
+    // Render handoff (task C.3): whether the chunk at (cx, cz) is awaiting a
+    // relight (present in lightDirtyChunks_). False for an unknown chunk.
+    bool is_light_dirty(int cx, int cz) const;
+
     void update(const glm::vec3& playerPos, WorldRenderBridge& renderBridge, float deltaTime);
     void cleanup();
 

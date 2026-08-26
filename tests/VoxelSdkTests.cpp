@@ -184,6 +184,53 @@ public:
     }
 };
 
+// A chest block entity that EXERCISES the optional B.1 capabilities: an
+// authoritative inventory, a project script and one project component. It
+// persists all three through its own state blob (the project's responsibility:
+// the blob is opaque to the engine). The engine only routes and frames it.
+class ChestEntity final : public engine::voxel::IVoxelBlockEntity {
+public:
+    ChestEntity() : inventory_(27) {}  // chest: 27 slots
+
+    std::string type_id() const override { return "project:chest"; }
+    void on_tick(uint64_t) override {}
+    uint32_t data_version() const override { return 1; }
+
+    // B.1 capabilities.
+    engine::registry::Inventory* inventory() override { return &inventory_; }
+    const engine::registry::Inventory* inventory() const override {
+        return &inventory_;
+    }
+    std::string script_id() const override { return "project:chest_loot"; }
+    std::vector<engine::voxel::BlockEntityComponent> components() const override {
+        engine::voxel::BlockEntityComponent fuel;
+        fuel.type = "project:fuel";
+        fuel.version = 1;
+        fuel.blob = { 0xBB };
+        engine::voxel::BlockEntityComponent lockable;
+        lockable.type = "project:lockable";
+        lockable.version = 1;
+        lockable.blob = { 0xAA, 0x01 };  // opaque project payload
+        // Deterministic order (sorted by type): fuel < lockable.
+        return { fuel, lockable };
+    }
+
+    // Persists the component blob marker (the engine frames it; the project
+    // owns the content). The inventory/script/components are runtime
+    // capabilities reachable through the accessors; the blob is the
+    // persistence channel the entity itself defines.
+    std::vector<uint8_t> serialize_state() const override { return lockedBlob_; }
+    bool deserialize_state(const std::vector<uint8_t>& data,
+                           uint32_t version) override {
+        if (version != 1) return false;
+        lockedBlob_ = data;
+        return true;
+    }
+
+    engine::registry::Inventory inventory_;
+    std::vector<uint8_t> lockedBlob_;
+};
+
 // Boots a world headless: drive update() with real-time pacing until the
 // center chunk is loaded or the wall-clock budget runs out.
 bool boot_world(engine::voxel::IVoxelWorld& world, const glm::vec3& player,
@@ -2965,6 +3012,189 @@ void test_block_entities_json_defined() {
                  "JSON-defined outside the engine, full roundtrip OK\n";
 }
 
+// Task B.1: OPTIONAL capabilities on block entities — inventory, script and
+// components — WITHOUT turning every block into a full ECS entity. The
+// accessors default to none, so a plain entity (counter machine) stays lean;
+// an entity that opts in (chest) exposes a real authoritative Inventory, a
+// script id and sorted project components through the PUBLIC contract, and the
+// capabilities survive the save/load roundtrip through the entity's own blob
+// (the engine frames it, the project owns the content).
+void test_block_entity_optional_capabilities() {
+    using engine::registry::ItemDefinition;
+    using engine::registry::ItemStack;
+    using engine::registry::SlotFilter;
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> world =
+        engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(96));
+    world->register_block_entity_type("project:chest",
+        [] { return std::make_shared<ChestEntity>(); });
+    world->register_block_entity_type("project:counter_machine",
+        [] { return std::make_shared<CounterMachine>(); });
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    CHECK(boot_world(*world, player, 16));
+
+    // Attach a chest (opts in) and a counter machine (plain, stays lean).
+    auto chest = std::make_shared<ChestEntity>();
+    std::string error;
+    CHECK(world->attach_block_entity(8, 96, 8, chest, error));
+    auto machine = std::make_shared<CounterMachine>();
+    CHECK(world->attach_block_entity(9, 96, 9, machine, error));
+
+    // (1) The chest's capabilities are reachable through the PUBLIC contract
+    //     (block_entity_at -> dynamic_cast -> accessors).
+    auto viaWorld = std::dynamic_pointer_cast<ChestEntity>(
+        world->block_entity_at(8, 96, 8));
+    CHECK(viaWorld != nullptr);
+    CHECK(viaWorld->inventory() != nullptr);
+    CHECK(viaWorld->inventory()->slot_count() == 27);
+    CHECK(viaWorld->inventory() == &chest->inventory_);
+    CHECK(viaWorld->script_id() == "project:chest_loot");
+    {
+        const std::vector<engine::voxel::BlockEntityComponent> comps =
+            viaWorld->components();
+        CHECK(comps.size() == 2);
+        CHECK(comps[0].type == "project:fuel");      // sorted by type
+        CHECK(comps[1].type == "project:lockable");
+        CHECK(comps[1].blob.size() == 2);
+    }
+
+    // (2) The inventory is authoritative and mutable: an item can be placed
+    //     through the world-facing accessor (chest slot 0 accepts anything).
+    engine::registry::ItemRegistry items;
+    {
+        ItemDefinition def;
+        def.ns = "vulkancraft";
+        def.name = "cobblestone";
+        def.maxStack = 64;
+        CHECK(items.register_item(def, error));
+    }
+    SlotFilter any;
+    any.allowAny = true;
+    viaWorld->inventory()->set_filter(0, any);
+    ItemStack stone;
+    stone.item = "vulkancraft:cobblestone";
+    stone.count = 12;
+    CHECK(viaWorld->inventory()->set(0, stone, items, error));
+    CHECK(viaWorld->inventory()->get(0).count == 12);
+
+    // (3) A plain entity keeps the DEFAULT capabilities: no inventory, no
+    //     script, no components — it was NOT turned into a full entity.
+    auto plain = std::dynamic_pointer_cast<CounterMachine>(
+        world->block_entity_at(9, 96, 9));
+    CHECK(plain != nullptr);
+    CHECK(plain->inventory() == nullptr);
+    CHECK(plain->script_id().empty());
+    CHECK(plain->components().empty());
+
+    // (4) The capabilities survive save/load through the entity's own blob:
+    //     the chest's persisted marker round-trips and the restored entity
+    //     still exposes inventory/script/components.
+    chest->lockedBlob_ = { 0xDE, 0xAD, 0xBE, 0xEF };
+    const std::string bytes = world->serialize_world(error);
+    CHECK(error.empty());
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> fresh =
+        engine::voxel::create_default_voxel_world();
+    fresh->register_generator(std::make_shared<FlatGenerator>(96));
+    fresh->register_block_entity_type("project:chest",
+        [] { return std::make_shared<ChestEntity>(); });
+    fresh->register_block_entity_type("project:counter_machine",
+        [] { return std::make_shared<CounterMachine>(); });
+    CHECK(boot_world(*fresh, player, 16));
+    CHECK(fresh->deserialize_world(bytes, error));
+    CHECK(error.empty());
+    auto restored = std::dynamic_pointer_cast<ChestEntity>(
+        fresh->block_entity_at(8, 96, 8));
+    CHECK(restored != nullptr);
+    CHECK(restored->lockedBlob_ == std::vector<uint8_t>({ 0xDE, 0xAD, 0xBE, 0xEF }));
+    CHECK(restored->inventory() != nullptr);
+    CHECK(restored->inventory()->slot_count() == 27);
+    CHECK(restored->script_id() == "project:chest_loot");
+    CHECK(restored->components().size() == 2);
+
+    std::cout << "[sdk] block entities: optional inventory/script/components "
+                 "reachable through the public contract, plain entities stay "
+                 "lean, roundtrip OK\n";
+}
+
+// Task C.3 (handoff 3->1): the renderer-facing dirty-region contract. The
+// world exposes the chunk-level dirty signals (mesh + light) with monotonic
+// per-chunk revisions — exactly what a renderer needs to drive ILumenScene's
+// incremental replace_chunk (the stale gate compares revisions). The snapshot
+// is read-only and NON-consuming: the world keeps owning the signals, so
+// repeated polls return the same deterministic (sorted) state until the world
+// processes them.
+void test_render_handoff_dirty_updates() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> world =
+        engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(96));
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    CHECK(boot_world(*world, player, 16));
+
+    // A freshly booted world converges: no chunk is dirty once meshing/light
+    // settle (the boot waits for (0,0); drain the rest before asserting).
+    CHECK(settle(*world, player, [&] {
+        for (const auto& u : world->render_dirty_updates()) {
+            (void)u;
+        }
+        return world->streaming_snapshot().chunksDirty == 0;
+    }));
+
+    // (1) A committed edit marks the edited chunk (and its halo neighbors)
+    //     dirty with a bumped monotonic revision.
+    uint64_t before = 0;
+    for (const auto& u : world->render_dirty_updates()) {
+        if (u.chunkX == 0 && u.chunkZ == 0) before = u.revision;
+    }
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx =
+            world->begin_transaction();
+        tx->set_block(8, 120, 8, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    bool foundEdited = false;
+    for (const auto& u : world->render_dirty_updates()) {
+        if (u.chunkX == 0 && u.chunkZ == 0) {
+            foundEdited = true;
+            CHECK(u.meshDirty);
+            CHECK(u.lightDirty);
+            CHECK(u.revision > before);  // monotonic per chunk
+        }
+    }
+    CHECK(foundEdited);
+
+    // (2) Deterministic, sorted output: two consecutive polls are identical
+    //     (non-consuming) and the list is sorted by (chunkX, chunkZ).
+    const std::vector<engine::voxel::ChunkDirtyUpdate> first =
+        world->render_dirty_updates();
+    const std::vector<engine::voxel::ChunkDirtyUpdate> second =
+        world->render_dirty_updates();
+    CHECK(first == second);
+    bool sorted = true;
+    for (std::size_t i = 1; i < first.size(); ++i) {
+        if (first[i].chunkX < first[i - 1].chunkX) sorted = false;
+        else if (first[i].chunkX == first[i - 1].chunkX &&
+                 first[i].chunkZ < first[i - 1].chunkZ) sorted = false;
+    }
+    CHECK(sorted);
+
+    // (3) The world processes the signals (mesher + light pass consume them):
+    //     after the sim settles, the edited chunk is no longer reported dirty.
+    CHECK(settle(*world, player, [&] {
+        return world->streaming_snapshot().chunksDirty == 0 &&
+               world->streaming_snapshot().lightDirtyChunks == 0;
+    }));
+    for (const auto& u : world->render_dirty_updates()) {
+        CHECK(!(u.chunkX == 0 && u.chunkZ == 0));
+    }
+
+    std::cout << "[sdk] render handoff: dirty chunk lists with monotonic "
+                 "revisions, deterministic non-consuming snapshot OK\n";
+}
+
 // Discrete world lighting (META section 12), through the public contract:
 // skylight from column occlusion, block light from data-driven emitters,
 // attenuation through air, opaque blocking, chunk borders and determinism.
@@ -5639,6 +5869,144 @@ void test_project_defined_fluids() {
     std::cout << "[sdk] fluids: project-defined water (thick/range 7/falling:false), "
                  "lava (falling column) and a third acid (thin/range 4) all "
                  "simulate per JSON OK\n";
+}
+
+// Task D.5 (handoff 3->1, optical side): a renderer consumes fluid levels and
+// OPTICAL PROPERTIES through the public contract only — no visual logic lives
+// in the simulation. Levels via get_fluid_level; the color of the fluid AT A
+// CELL resolves through the public chain (block id -> runtime_block_views
+// uuid -> FluidRegistry::find_by_uuid -> FluidDefinition.color).
+void test_fluid_render_handoff_optics() {
+    auto world = engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+    std::string error;
+    CHECK(blocks->load_from_json(
+        R"([{"name":"acid","namespace":"test","class":"fluid","color":[0.3,1.0,0.2]}])",
+        error));
+    world->set_block_registry(blocks);
+    auto fluids = std::make_shared<engine::registry::FluidRegistry>();
+    CHECK(fluids->load_from_json(
+        R"([{"block":"test:acid","viscosity":0.0,"range":4,"falling":false,"evaporation":false,"damagePerTick":2.0,"color":[0.3,1.0,0.2,1.0]}])",
+        error));
+    CHECK(world->set_fluid_registry(fluids, error));
+    CHECK(error.empty());
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    CHECK(boot_world(*world, player, 64));
+    CHECK(settle(*world, player, [&] { return world->is_chunk_loaded(2, 2); }));
+
+    uint32_t acidId = 0;
+    CHECK(world->resolve_block_id("test:acid", acidId, error) && error.empty());
+
+    // A renderer needs levels AND optics. Place an acid source on the dry
+    // terrain (kFluidTestTerrain = 130, above sea level -> no generated
+    // water), then read both through the public contract. The source reads
+    // level 0; the spread (mirroring test_project_defined_fluids: acid
+    // reaches distance 2 at level 4) is waited for, not raced.
+    const int sourceX = 8;
+    world->set_block(sourceX, kFluidTestGroundedY, sourceX, acidId);
+    CHECK(settle(*world, player, [&] {
+        return world->get_fluid_level(sourceX + 2, kFluidTestGroundedY,
+                                      sourceX) != 0xFFu;
+    }));
+    CHECK(world->get_fluid_level(sourceX, kFluidTestGroundedY, sourceX) == 0);
+    CHECK(world->get_fluid_level(sourceX + 2, kFluidTestGroundedY, sourceX) !=
+          0xFFu);
+
+    // Optical properties of the fluid AT THE SOURCE CELL, through the public
+    // chain a renderer can follow with no simulation internals: block id ->
+    // runtime view uuid -> FluidRegistry::find_by_uuid -> color.
+    const uint32_t cellId = world->get_block(sourceX, kFluidTestGroundedY, sourceX);
+    CHECK(cellId == acidId);
+    std::string cellUuid;
+    for (const auto& view : world->runtime_block_views()) {
+        if (view.id == cellId) cellUuid = view.uuid;
+    }
+    CHECK(!cellUuid.empty());
+    const engine::registry::FluidDefinition* def =
+        fluids->find_by_uuid(cellUuid);
+    CHECK(def != nullptr);
+    CHECK(def != nullptr && std::fabs(def->color.r - 0.3f) < 1e-4f &&
+          std::fabs(def->color.g - 1.0f) < 1e-4f &&
+          std::fabs(def->color.b - 0.2f) < 1e-4f);
+    // The named alternative a project can use when it knows the block id.
+    // NOTE: the registry stores a COPY per map (byBlock_ and byUuid_), so the
+    // lookups return different objects — compare by uuid (the stable
+    // identity), never by pointer.
+    const engine::registry::FluidDefinition* byName =
+        fluids->find_by_block("test:acid");
+    CHECK(byName != nullptr && byName->uuid == def->uuid);
+
+    std::cout << "[sdk] fluids: renderer handoff — levels + optical properties "
+                 "(color) via the public contract, no visual logic in the "
+                 "simulation OK\n";
+}
+
+// Semantic block queries (A.2 enabler): consumers ask what a runtime block id
+// MEANS without as_builtin_block. is_air matches the empty-cell id; is_fluid
+// matches the fluid table (builtin water + project-declared JSON fluids, incl.
+// inline FluidBinding blocks) — so gameplay/audio/selection can migrate from
+// the builtin enum to the public contract unchanged for JSON-only blocks.
+void test_block_semantic_queries() {
+    auto world = engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+    auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+    std::string error;
+    CHECK(blocks->load_from_json(
+        R"([{"name":"acid","namespace":"test","class":"fluid","color":[0.3,1.0,0.2]}])",
+        error));
+    world->set_block_registry(blocks);
+    auto fluids = std::make_shared<engine::registry::FluidRegistry>();
+    CHECK(fluids->load_from_json(
+        R"([{"block":"test:acid","viscosity":0.0,"range":4,"falling":false,"evaporation":false,"damagePerTick":2.0,"color":[0.3,1.0,0.2,1.0]}])",
+        error));
+    CHECK(world->set_fluid_registry(fluids, error));
+    CHECK(error.empty());
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    CHECK(boot_world(*world, player, 64));
+    CHECK(settle(*world, player, [&] { return world->is_chunk_loaded(0, 0); }));
+
+    // Air = the empty-cell id (0); stone is not air.
+    CHECK(world->is_air(kBlockAir));
+    CHECK(!world->is_air(kBlockStone));
+    CHECK(!world->is_air(kBlockDirt));
+
+    // Builtin water (BlockType::Water) is in the engine's default fluid
+    // table; stone/dirt are not fluids.
+    constexpr int kBlockWaterId = 12;  // BlockType::Water
+    CHECK(world->is_fluid(kBlockWaterId));
+    CHECK(!world->is_fluid(kBlockStone));
+    CHECK(!world->is_fluid(kBlockDirt));
+    CHECK(!world->is_fluid(kBlockAir));
+
+    // Solid drives collision/raycast (the semantic the gameplay consumers
+    // need): stone/dirt solid, air/water/acid not.
+    CHECK(world->is_solid(kBlockStone));
+    CHECK(world->is_solid(kBlockDirt));
+    CHECK(!world->is_solid(kBlockAir));
+    CHECK(!world->is_solid(kBlockWaterId));
+
+    // A project-declared JSON fluid resolves to a runtime id that is_fluid
+    // recognizes — the SAME answer a JSON-only block gets, no builtin enum.
+    uint32_t acidId = 0;
+    CHECK(world->resolve_block_id("test:acid", acidId, error) && error.empty());
+    CHECK(acidId != kBlockAir);
+    CHECK(world->is_fluid(acidId));
+
+    // End-to-end through a placed cell: the id read back from the world is
+    // classified identically.
+    const int sx = 8, sy = kFluidTestGroundedY, sz = 8;
+    world->set_block(sx, sy, sz, acidId);
+    const uint32_t cellId = world->get_block(sx, sy, sz);
+    CHECK(cellId == acidId);
+    CHECK(world->is_fluid(cellId));
+    CHECK(!world->is_air(cellId));
+    CHECK(!world->is_solid(cellId));
+    CHECK(world->is_air(world->get_block(sx, sy + 2, sz)));
+
+    std::cout << "[sdk] blocks: semantic queries is_air/is_fluid/is_solid "
+                 "via the public contract (builtin + JSON-only) — A.2 "
+                 "enabler OK\n";
 }
 
 // Density displacement (task D.2 / META §13): a fluid's declared density now
@@ -12865,6 +13233,8 @@ int main(int argc, char** argv) {
         test_block_entity_atomic_destroy();
         test_block_entity_persistence();
         test_block_entities_json_defined();
+        test_block_entity_optional_capabilities();
+        test_render_handoff_dirty_updates();
         test_light_skylight();
         test_light_block_emitter();
         test_light_chunk_boundary();
@@ -12900,6 +13270,8 @@ int main(int argc, char** argv) {
         test_fluid_budgets();
         test_material_simulation_separation();
         test_project_defined_fluids();
+        test_fluid_render_handoff_optics();
+        test_block_semantic_queries();
         test_fluid_density_displacement();
         test_fluid_solidification_combustion();
         test_block_registry();

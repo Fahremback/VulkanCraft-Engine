@@ -294,6 +294,172 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
         send_response(conn, out.str());
         return;
     }
+    if (method == "GET" && path == "/layout") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        if (snapshot.layout.empty()) {
+            send_response(conn, "{\"layout\":\"\"}");
+            return;
+        }
+        // The snapshot is already JSON; wrap it in a stable envelope.
+        std::ostringstream out;
+        out << "{\"layout\":" << snapshot.layout << "}";
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/messages") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.messages.empty()) {
+            out << "{\"valid\":false,\"doc\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"doc\":" << snapshot.messages << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/shortcuts") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        const auto esc = [](const std::string& in) {
+            std::string out;
+            out.reserve(in.size() + 8);
+            for (const char ch : in) {
+                if (ch == '\\' || ch == '"') out.push_back('\\');
+                out.push_back(ch);
+            }
+            return out;
+        };
+        std::ostringstream out;
+        out << "{\"markdown\":\"" << esc(snapshot.shortcuts) << "\"}";
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/play-mode") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        // The snapshot is already the IPlayMode contract's JSON.
+        std::ostringstream out;
+        out << "{\"play_mode\":" << snapshot.play_mode << "}";
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/commands/search") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.command_index.empty()) {
+            out << "{\"valid\":false,\"index\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"index\":" << snapshot.command_index << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/profiler") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        // The snapshot is already the IFrameProfiler contract's JSON.
+        std::ostringstream out;
+        if (snapshot.profiler.empty()) {
+            out << "{\"valid\":false,\"stats\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"stats\":" << snapshot.profiler << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/undo") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        // The snapshot is already the IUndoHistory contract's JSON.
+        std::ostringstream out;
+        out << "{\"undo\":" << snapshot.undo << "}";
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/content-browser") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.content_browser.empty()) {
+            out << "{\"valid\":false,\"browser\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"browser\":" << snapshot.content_browser << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/window-mode") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.window_mode.empty()) {
+            out << "{\"valid\":false,\"window_mode\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"window_mode\":" << snapshot.window_mode << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/camera") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.camera.empty()) {
+            out << "{\"valid\":false,\"camera\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"camera\":" << snapshot.camera << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/gizmo") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.gizmo.empty()) {
+            out << "{\"valid\":false,\"gizmo\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"gizmo\":" << snapshot.gizmo << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
     if (method == "GET" && path == "/health") {
         send_response(conn, "ok", "text/plain");
         return;

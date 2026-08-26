@@ -216,17 +216,30 @@ void test_transactional_edit_refreshes_terrain() {
     check(bridge.terrain_body_count() == slabsBefore,
           "slab rebuilt in place (no leak: same terrain body count)");
 
-    // The woken body is re-resolved onto the NEW surface (pillar top at 106
-    // -> resting center ~106.5).
+    // The original body is WOKEN (it was resting on the surface that moved).
+    {
+        const RigidBody* rb = bridge.body(ball);
+        check(rb != nullptr && !rb->sleeping,
+              "original body is woken by the terrain edit");
+    }
+
+    // The slab really moved to the NEW surface: a fresh body dropped above
+    // the pillar comes to rest on the new top (pillar top at 106 -> resting
+    // center ~106.5), NOT the old flat surface (~97.5).
+    BodyDesc probe;
+    probe.position = glm::vec3(8.0f, 130.0f, 8.0f);
+    probe.collider.shape = SphereShape{ 0.5f };
+    const BodyHandle probeBody = bridge.spawn_dynamic(probe);
+    check(probeBody != InvalidBody, "bridge spawns the probe body");
     const bool onNewSurface = settle(
         *world, physics, bridge, focus,
         [&]() {
-            const RigidBody* rb = bridge.body(ball);
+            const RigidBody* rb = bridge.body(probeBody);
             return rb != nullptr && rb->sleeping &&
                    std::fabs(rb->position.y - 106.5f) < 1.5f;
         });
     check(onNewSurface,
-          "body re-rests on the post-edit surface (pillar top)");
+          "probe body rests on the post-edit surface (pillar top)");
 
     std::printf("[streaming] transactional edit refreshes the terrain slab "
                 "(commit -> note_region_edited -> sync): OK\n");
@@ -248,10 +261,13 @@ void test_streaming_authority_unload() {
     bridge.sync(focus);
 
     // Wait until both (0,0) and (1,0) are loaded AND slabbed (boot only
-    // guarantees (0,0), so settle on the two-slab state before spawning).
+    // guarantees (0,0); async generation can satisfy the two-slab state with
+    // a different neighbor first, so require (1,0) explicitly — body B spawns
+    // there and the authority despawns bodies in unloaded chunks).
     const bool slabs = settle(
         *world, physics, bridge, focus,
-        [&]() { return bridge.terrain_body_count() >= 2; });
+        [&]() { return world->is_chunk_loaded(1, 0) &&
+                       bridge.terrain_body_count() >= 2; });
     check(slabs, "chunks (0,0) and (1,0) both hold terrain slabs");
     const std::size_t slabsBefore = bridge.terrain_body_count();
 

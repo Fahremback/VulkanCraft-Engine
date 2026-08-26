@@ -14,6 +14,10 @@
 //    caminho completo "engine/<domain>/<Header>.hpp" (include dir = public),
 //    nunca por nome curto — nomes curtos só resolvem por diretório relativo e
 //    são frágeis quando o consumer usa o include path oficial.
+// 4. EXIGE include guard (task_plan Agente 5 §1 item 5 — lifecycle/safety
+//    uniforme): todo header público precisa de `#pragma once` ou `#ifndef`
+//    guard. Um header SEM guard incluído duas vezes no mesmo TU quebra a
+//    compilação do consumer (redefinition) ou, pior, duplica símbolos.
 //
 // Usage: node sdk-check.mjs [--emit-manifest] [--expect-count <n>]
 // Exit 0 = green, 1 = issues (or count mismatch).
@@ -48,6 +52,7 @@ function walk(dir, out = []) {
 const publicHeaders = walk(PUBLIC_ROOT).sort();
 const issues = [];
 const shortIncludes = [];
+const unguardedHeaders = [];
 
 for (const file of publicHeaders) {
   const text = fs.readFileSync(file, "utf8");
@@ -69,6 +74,12 @@ for (const file of publicHeaders) {
     if (STD_HEADERS.has(match[1])) continue;
     if (VENDOR_PREFIXES.some((prefix) => match[1].startsWith(prefix))) continue;
     shortIncludes.push(`${path.relative(ENGINE_ROOT, file).replaceAll(path.sep, "/")} short include "${match[1]}" (use engine/<domain>/<Header>.hpp)`);
+  }
+  // Include guard: every public header must carry `#pragma once` or an
+  // #ifndef guard — a guardless header breaks consumers that include it twice
+  // in one TU (redefinition). The old gate let 6 animation headers through.
+  if (!/^\s*#\s*pragma\s+once/m.test(text) && !/#\s*ifndef/m.test(text)) {
+    unguardedHeaders.push(path.relative(ENGINE_ROOT, file).replaceAll(path.sep, "/"));
   }
 }
 
@@ -114,13 +125,14 @@ if (writeManifest) {
   for (const entry of manifest) console.log(entry);
 } else {
   console.log(`sdk-check: ${publicHeaders.length} public headers under src/engine/public`);
-  console.log(`sdk-check: ${issues.length} non-public include(s), ${shortIncludes.length} short include(s)`);
+  console.log(`sdk-check: ${issues.length} non-public include(s), ${shortIncludes.length} short include(s), ${unguardedHeaders.length} unguarded header(s)`);
   for (const issue of issues) console.log(`  FAIL ${issue}`);
   for (const issue of shortIncludes) console.log(`  FAIL ${issue}`);
+  for (const issue of unguardedHeaders) console.log(`  FAIL ${issue} has no include guard (add #pragma once)`);
   if (expectCount !== null && publicHeaders.length !== expectCount) {
     console.log(`  FAIL expected ${expectCount} public headers, found ${publicHeaders.length}`);
     process.exit(1);
   }
-  if (issues.length > 0 || shortIncludes.length > 0) process.exit(1);
-  console.log("sdk-check: OK — every public header is self-contained (engine//std/vendor only)");
+  if (issues.length > 0 || shortIncludes.length > 0 || unguardedHeaders.length > 0) process.exit(1);
+  console.log("sdk-check: OK — every public header is self-contained (engine//std/vendor only) and guarded");
 }

@@ -46,7 +46,17 @@
 #include "EditorControlApi.hpp"
 #include "EditorPlugin.hpp"
 #include "ProjectTemplate.hpp"
+#include "EditorLayout.hpp"
 #include "engine/ui/IUiDoc.hpp"
+#include "engine/editor/IMessageCatalog.hpp"
+#include "engine/editor/IShortcutDoc.hpp"
+#include "engine/editor/IPlayMode.hpp"
+#include "engine/editor/ICommandSearch.hpp"
+#include "engine/editor/IContentBrowser.hpp"
+#include "engine/editor/IWindowMode.hpp"
+#include "engine/editor/IEditorCamera.hpp"
+#include "engine/editor/IGizmoController.hpp"
+#include "engine/profiling/IFrameProfiler.hpp"
 #include "WindowClamp.hpp"
 #include "tools/WickedToolsPanel.hpp"
 
@@ -910,6 +920,72 @@ private:
     // reflection/scripting/MCP tooling.
     std::string m_uiDocJson;
     std::string build_ui_doc_json();
+
+    // Shell layout persistence model (plano agente 2 §B): panel visibility
+    // derived from the panel registry, safe reset, tolerant snapshot apply.
+    // Exposed via GET /layout; the shell applies it to its real windows.
+    Engine::Editor::EditorLayoutModel m_layoutModel;
+    void apply_layout_defaults();
+
+    // Message catalog (plano agente 2 §C): curated user-facing messages
+    // (stable ids, severity, parameterized text, actionable hint). Built once
+    // and exposed via GET /messages.
+    std::string m_messageCatalogJson;
+    void build_message_catalog();
+
+    // Shortcut documentation (plano agente 2 §C): the shell's CURRENT
+    // shortcuts rendered as markdown from the IActionMap contract. Exposed
+    // via GET /shortcuts.
+    std::string m_shortcutDocMarkdown;
+    void build_shortcut_doc();
+
+    // Play-mode snapshot (plano agente 2 §B): the unambiguous
+    // Edit/Play/Pause/Simulate state machine, serialized each frame and
+    // exposed via GET /play-mode.
+    std::string m_playModeJson;
+    void refresh_play_mode();
+
+    // Command index (plano agente 2 §B): the palette's data-driven command
+    // catalog (id/label/category/keywords/action). Built once and exposed
+    // via GET /commands/search.
+    std::string m_commandIndexJson;
+    void build_command_index();
+
+    // Frame profiler (plano agente 2 §B): deterministic frame-time/memory
+    // stats (sliding window + percentiles + spikes). Fed every frame and
+    // exposed via GET /profiler.
+    std::unique_ptr<engine::profiling::IFrameProfiler> m_frameProfiler;
+    std::string m_profilerJson;
+    void refresh_profiler();
+
+    // Undo history (plano agente 2 §B): the UndoSystem's generic undo/redo
+    // stack, exposed via GET /undo.
+    std::string m_undoJson;
+    void refresh_undo();
+
+    // Content browser (plano agente 2 §B): the asset navigation model built
+    // from the real AssetRegistry snapshot, exposed via GET /content-browser.
+    std::string m_contentBrowserJson;
+    void build_content_browser();
+
+    // Window mode (plano agente 2 §B): the unambiguous Windowed/Borderless/
+    // Fullscreen state machine — exposed via GET /window-mode.
+    std::unique_ptr<engine::editor::IWindowMode> m_windowMode;
+    std::string m_windowModeJson;
+    void refresh_window_mode();
+
+    // Editor camera (plano agente 2 §B): the orbit/pan/zoom/fly MODEL drives
+    // the real m_editorCamera (single source of clamps/math) — exposed via
+    // GET /camera.
+    std::unique_ptr<engine::editor::IEditorCamera> m_cameraContract;
+    std::string m_cameraJson;
+    void refresh_camera();
+
+    // Gizmo math (plano agente 2 §B): translate/rotate/scale drag deltas and
+    // hit-test distances delegate to the contract — exposed via GET /gizmo.
+    std::unique_ptr<engine::editor::IGizmoController> m_gizmoContract;
+    std::string m_gizmoJson;
+    void refresh_gizmo();
 
     // Play-mode frame stepping (PASSO button): advance the play world one
     // frame while paused.

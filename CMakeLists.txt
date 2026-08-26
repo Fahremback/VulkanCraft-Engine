@@ -208,10 +208,10 @@ target_include_directories(vc_fastwfc PUBLIC ${VC_SOLUTIONS_DIR}/fast-wfc/src/in
 # spirv_reflect.cpp shim compiles spirv_reflect.c as C++. The upstream CMake
 # is not used. The public contract engine/rendering/ISpirvReflection.hpp never
 # includes it; only src/engine/sdk/SpirvReflection.cpp does (adapter rule).
-add_library(vc_spirv_reflect STATIC
-    ${VC_SOLUTIONS_DIR}/spirv-reflect/spirv_reflect.cpp)
-target_include_directories(vc_spirv_reflect PUBLIC
-    ${VC_SOLUTIONS_DIR}/spirv-reflect)
+# BUG-010 fix: the shim is compiled INTO vc_sdk_public (see its sources) so the
+# spvReflect* symbols travel with the adapter's objects — a standalone static
+# lib here left every $<TARGET_OBJECTS:vc_sdk_public> consumer with unresolved
+# externals (they link the objects, not the lib).
 
 # delaunator (Volodymyr Bilonenko, MIT) + earcut.hpp (Mapbox, ISC) — parceling/
 # road graph via Delaunay triangulation and polygon triangulation. Header-only,
@@ -255,7 +255,13 @@ if(CMAKE_CONFIGURATION_TYPES)
 endif()
 
 if(MSVC)
-    add_compile_options(/O2 /fp:fast /arch:AVX2)
+    # task_plan Agente 5 §1 item 6 (compatibilidade debug/release): /O2 is
+    # Release-only — MSVC Debug adds /RTC1, which conflicts with /O2 (D8016)
+    # and made the Debug config unbuildable across the whole tree (documented
+    # in findings #130). /fp:fast and /arch:AVX2 are conflict-free in every
+    # config, so they stay global; Debug keeps its default /Od /RTC1.
+    add_compile_options(/fp:fast /arch:AVX2)
+    add_compile_options($<$<NOT:$<CONFIG:Debug>>:/O2>)
 endif()
 
 include(FetchContent)
@@ -454,6 +460,17 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/UiConfirmation.cpp
     src/engine/sdk/UiDoc.cpp
     src/engine/sdk/UiCrafting.cpp
+    src/engine/sdk/FileChangeDebounce.cpp
+    src/engine/sdk/MessageCatalog.cpp
+    src/engine/sdk/ShortcutDoc.cpp
+    src/engine/sdk/PlayMode.cpp
+    src/engine/sdk/CommandSearch.cpp
+    src/engine/sdk/FrameProfiler.cpp
+    src/engine/sdk/UndoHistory.cpp
+    src/engine/sdk/ContentBrowser.cpp
+    src/engine/sdk/WindowMode.cpp
+    src/engine/sdk/EditorCamera.cpp
+    src/engine/sdk/GizmoController.cpp
     src/engine/sdk/Steering.cpp
     src/engine/sdk/Perception.cpp
     src/engine/sdk/Fsm.cpp
@@ -462,6 +479,26 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/AiLod.cpp
     src/engine/sdk/AiEventBus.cpp
     src/engine/sdk/FixedTickSim.cpp
+    src/engine/sdk/Faction.cpp
+    src/engine/sdk/AudioMixer.cpp
+    src/engine/sdk/SpatialAudio.cpp
+    src/engine/sdk/AdaptiveMusic.cpp
+    src/engine/sdk/LootTable.cpp
+    src/engine/sdk/Equipment.cpp
+    src/engine/sdk/AnimCore.cpp
+    src/engine/sdk/AnimStateMachine.cpp
+    src/engine/sdk/RootMotion.cpp
+    src/engine/sdk/AnimEvents.cpp
+    src/engine/sdk/AnimAdditive.cpp
+    src/engine/sdk/AnimMask.cpp
+    src/engine/sdk/IkSolver.cpp
+    src/engine/sdk/Retargeting.cpp
+    src/engine/sdk/Constraints.cpp
+    src/engine/sdk/TerrainAdaptation.cpp
+    src/engine/sdk/Inertializer.cpp
+    src/engine/sdk/Skinning.cpp
+    src/engine/sdk/AnimBudget.cpp
+    src/engine/sdk/Explosion.cpp
     # Agente 1 — rendering adapters (public contracts; self-contained std+glm).
     src/engine/sdk/GlobalIllumination.cpp
     src/engine/sdk/LumenScene.cpp
@@ -472,7 +509,13 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/ScreenSpaceTracer.cpp
     src/engine/sdk/RenderingDebugView.cpp
     src/engine/sdk/RenderGraphCore.cpp
+    src/engine/sdk/RenderPassMetrics.cpp
     src/engine/sdk/SpirvReflection.cpp
+    ${VC_SOLUTIONS_DIR}/spirv-reflect/spirv_reflect.cpp
+    src/engine/sdk/AtmosphereScattering.cpp
+    ${VC_SOLUTIONS_DIR}/atmospheric-scattering/atmosphere/reference/functions.cc
+    src/engine/sdk/Ktx2Transcoder.cpp
+    ${VC_SOLUTIONS_DIR}/ktx-software/external/basis_universal/transcoder/basisu_transcoder.cpp
     src/engine/sdk/RegistryJson.cpp
 
     src/engine/core/compression/ZstdCompression.cpp
@@ -492,6 +535,9 @@ target_include_directories(vc_sdk_public PRIVATE
     ${VC_SOLUTIONS_DIR}/meshoptimizer/src
     ${VC_SOLUTIONS_DIR}/xatlas/source/xatlas
     ${VC_SOLUTIONS_DIR}/spirv-reflect
+    ${VC_SOLUTIONS_DIR}/atmospheric-scattering
+    ${VC_SOLUTIONS_DIR}/atmospheric-scattering/external/dimensional_types
+    ${VC_SOLUTIONS_DIR}/ktx-software/external/basis_universal/transcoder
     ${VC_SOLUTIONS_DIR}/ozz-animation/include
     ${VC_SOLUTIONS_DIR}/acl/includes
     ${VC_SOLUTIONS_DIR}/acl/external/rtm/includes
@@ -722,6 +768,9 @@ add_executable(VulkanEngineEditor
     src/editor/EditorPlugin.cpp
     # Project templates (ezEngine "project templates" pillar; headless scaffold).
     src/editor/ProjectTemplate.cpp
+    # Shell layout persistence (plano agente 2 §B): registry-derived defaults,
+    # safe reset, tolerant snapshot apply — model-only.
+    src/editor/EditorLayout.cpp
     src/engine/editor/ui/EditorGUI.cpp
     src/editor/tools/SpecializedEditorsPanel.cpp
     # Wicked-port tool panels (frontend; PORTS.md): windows wired to the
@@ -751,6 +800,30 @@ add_executable(VulkanEngineEditor
     src/engine/sdk/UiViewport.cpp
     src/engine/sdk/UiConfirmation.cpp
     src/engine/sdk/UiDoc.cpp
+    # Message catalog + shortcut doc (plano agente 2 §C): the shell exposes
+    # GET /messages and GET /shortcuts from these sdk TUs — direct-TU pattern.
+    src/engine/sdk/MessageCatalog.cpp
+    src/engine/sdk/ActionMap.cpp
+    src/engine/sdk/ShortcutDoc.cpp
+    # Play mode (plano agente 2 §B): unambiguous play-state machine.
+    src/engine/sdk/PlayMode.cpp
+    # Command search (plano agente 2 §B): ranked global search backbone.
+    src/engine/sdk/CommandSearch.cpp
+    # Frame profiler (plano agente 2 §B): deterministic frame/memory stats.
+    src/engine/sdk/FrameProfiler.cpp
+    # Undo history (plano agente 2 §B): the editor's UndoSystem delegates its
+    # stacks to this generic contract (GET /undo) — direct-TU pattern.
+    src/engine/sdk/UndoHistory.cpp
+    # Content browser (plano agente 2 §B): asset-tree navigation model.
+    src/engine/sdk/ContentBrowser.cpp
+    # Window mode (plano agente 2 §B): fullscreen/borderless state machine.
+    src/engine/sdk/WindowMode.cpp
+    # Undo history (plano agente 2 §B): generic undo/redo stack with cap.
+    src/engine/sdk/UndoHistory.cpp
+    # Editor camera (plano agente 2 §B): orbit/pan/zoom/fly model (deterministic).
+    src/engine/sdk/EditorCamera.cpp
+    # Gizmo math (plano agente 2 §B): translate/rotate/scale drag + hit-test.
+    src/engine/sdk/GizmoController.cpp
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:src/engine/audio/SoundEngine.cpp>
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:src/plugins/voxel/VoxelPlugin.cpp>
     # Frontend port (Wicked Editor, MIT): the UI base font (Liberation Sans) is
@@ -963,14 +1036,63 @@ add_test(NAME render_graph_core_tests COMMAND render_graph_core_tests)
 add_executable(spirv_reflection_tests
     tests/SpirvReflectionTests.cpp
     src/engine/sdk/SpirvReflection.cpp
+    ${VC_SOLUTIONS_DIR}/spirv-reflect/spirv_reflect.cpp
 )
 target_include_directories(spirv_reflection_tests PRIVATE
     src/engine/public
     src
     ${VC_SOLUTIONS_DIR}/spirv-reflect
 )
-target_link_libraries(spirv_reflection_tests PRIVATE vc_build_options glm vc_spirv_reflect)
+target_link_libraries(spirv_reflection_tests PRIVATE vc_build_options glm)
 add_test(NAME spirv_reflection_tests COMMAND spirv_reflection_tests)
+
+# IAtmosphereScattering gate — analytic core of Bruneton's atmosphere model
+# (density profiles, optical length, spectral transmittance), physical
+# invariants + upstream golden values + determinism, all headless.
+add_executable(atmosphere_scattering_tests
+    tests/AtmosphereScatteringTests.cpp
+    src/engine/sdk/AtmosphereScattering.cpp
+    ${VC_SOLUTIONS_DIR}/atmospheric-scattering/atmosphere/reference/functions.cc
+)
+target_include_directories(atmosphere_scattering_tests PRIVATE
+    src/engine/public
+    src
+    ${VC_SOLUTIONS_DIR}/atmospheric-scattering
+    ${VC_SOLUTIONS_DIR}/atmospheric-scattering/external/dimensional_types
+)
+target_link_libraries(atmosphere_scattering_tests PRIVATE vc_build_options)
+add_test(NAME atmosphere_scattering_tests COMMAND atmosphere_scattering_tests)
+
+# IRenderPassMetrics gate — renderer telemetry producer (passes/GPU/memory/
+# streaming), deterministic windows + p95/p99 + JSON, refusals, determinism.
+add_executable(render_pass_metrics_tests
+    tests/RenderPassMetricsTests.cpp
+    src/engine/sdk/RenderPassMetrics.cpp
+)
+target_include_directories(render_pass_metrics_tests PRIVATE src/engine/public src)
+target_link_libraries(render_pass_metrics_tests PRIVATE vc_build_options)
+add_test(NAME render_pass_metrics_tests COMMAND render_pass_metrics_tests)
+
+# IKtx2Transcoder gate — CPU KTX2/Basis decode (promoted ktx-software).
+# The vendored basisu_transcoder.cpp is compiled WITHOUT Zstd support
+# (BASISD_SUPPORT_KTX2_ZSTD=0) so the gate stays self-contained; the supported
+# surface is the ETC1S/UASTC arithmetic payloads (the common GPU path).
+set_source_files_properties(
+    ${VC_SOLUTIONS_DIR}/ktx-software/external/basis_universal/transcoder/basisu_transcoder.cpp
+    PROPERTIES COMPILE_DEFINITIONS "BASISD_SUPPORT_KTX2_ZSTD=0"
+)
+add_executable(ktx2_transcoder_tests
+    tests/Ktx2TranscoderTests.cpp
+    src/engine/sdk/Ktx2Transcoder.cpp
+    ${VC_SOLUTIONS_DIR}/ktx-software/external/basis_universal/transcoder/basisu_transcoder.cpp
+)
+target_include_directories(ktx2_transcoder_tests PRIVATE
+    src/engine/public
+    src
+    ${VC_SOLUTIONS_DIR}/ktx-software/external/basis_universal/transcoder
+)
+target_link_libraries(ktx2_transcoder_tests PRIVATE vc_build_options)
+add_test(NAME ktx2_transcoder_tests COMMAND ktx2_transcoder_tests)
 
 add_executable(voxel_box_merger_tests
     tests/VoxelBoxMergerTests.cpp
@@ -1413,6 +1535,176 @@ target_include_directories(ui_crafting_tests PRIVATE
 target_link_libraries(ui_crafting_tests PRIVATE vc_build_options)
 add_test(NAME ui_crafting_tests COMMAND ui_crafting_tests)
 
+# Editor shell layout persistence (plano agente 2 §B): registry-derived
+# defaults + safe reset + tolerant snapshot apply. Model-only headless gate.
+add_executable(editor_layout_tests
+    tests/EditorLayoutTests.cpp
+    src/editor/EditorLayout.cpp
+    src/engine/sdk/RegistryJson.cpp
+)
+target_include_directories(editor_layout_tests PRIVATE
+    src/editor
+    src/engine/sdk
+    src
+)
+target_link_libraries(editor_layout_tests PRIVATE vc_build_options)
+add_test(NAME editor_layout_tests COMMAND editor_layout_tests)
+
+# Hot-reload debounce (plano agente 2 §D "efsw watcher + debounce"): the pure
+# coalescing core (injected clock -> deterministic). Native watcher wiring is a
+# deferred pending task (FetchContent + OS-specific + global CMake).
+add_executable(file_change_debounce_tests
+    tests/FileChangeDebounceTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/FileChangeDebounce.cpp
+)
+target_include_directories(file_change_debounce_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(file_change_debounce_tests PRIVATE vc_build_options)
+add_test(NAME file_change_debounce_tests COMMAND file_change_debounce_tests)
+
+# Message catalog (plano agente 2 §C "mensagens consistentes"): stable ids +
+# severity + parameterized text ({0}..{n}) + actionable hint. Headless gate.
+add_executable(message_catalog_tests
+    tests/MessageCatalogTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/MessageCatalog.cpp
+)
+target_include_directories(message_catalog_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(message_catalog_tests PRIVATE vc_build_options)
+add_test(NAME message_catalog_tests COMMAND message_catalog_tests)
+
+# Shortcut documentation (plano agente 2 §C "atalhos documentados"): renders
+# the CURRENT ActionMapSpec bindings as deterministic markdown (humanize +
+# document). Headless gate.
+add_executable(shortcut_doc_tests
+    tests/ShortcutDocTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/ShortcutDoc.cpp
+    src/engine/sdk/ActionMap.cpp
+)
+target_include_directories(shortcut_doc_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(shortcut_doc_tests PRIVATE vc_build_options)
+add_test(NAME shortcut_doc_tests COMMAND shortcut_doc_tests)
+
+# Play mode (plano agente 2 §B "Play/Simulate/Pause/Step/Stop inequívocos"):
+# unambiguous play-state machine (Edit/Play/Pause/Simulate) that refuses
+# invalid transitions. Headless gate.
+add_executable(play_mode_tests
+    tests/PlayModeTests.cpp
+    src/engine/sdk/PlayMode.cpp
+)
+target_include_directories(play_mode_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(play_mode_tests PRIVATE vc_build_options)
+add_test(NAME play_mode_tests COMMAND play_mode_tests)
+
+# Command search (plano agente 2 §B "busca global/command palette"):
+# data-driven ranked search over a command index — deterministic scores,
+# bit-exact ordering. Headless gate.
+add_executable(command_search_tests
+    tests/CommandSearchTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/CommandSearch.cpp
+)
+target_include_directories(command_search_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(command_search_tests PRIVATE vc_build_options)
+add_test(NAME command_search_tests COMMAND command_search_tests)
+
+# Frame profiler (plano agente 2 §B "profiler de CPU/memória"): sliding-window
+# frame-time/heap stats with deterministic percentiles and spike counting.
+# Headless gate.
+add_executable(frame_profiler_tests
+    tests/FrameProfilerTests.cpp
+    src/engine/sdk/FrameProfiler.cpp
+)
+target_include_directories(frame_profiler_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(frame_profiler_tests PRIVATE vc_build_options)
+add_test(NAME frame_profiler_tests COMMAND frame_profiler_tests)
+
+# Undo history (plano agente 2 §B "undo/redo"): generic undo/redo stack with
+# depth cap (evicts oldest), adjacent merge, deterministic JSON. Headless gate.
+add_executable(undo_history_tests
+    tests/UndoHistoryTests.cpp
+    src/engine/sdk/UndoHistory.cpp
+)
+target_include_directories(undo_history_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(undo_history_tests PRIVATE vc_build_options)
+add_test(NAME undo_history_tests COMMAND undo_history_tests)
+
+# Content browser (plano agente 2 §B "Content Browser"): deterministic asset
+# index + folder tree + search/filter + selection. Headless gate.
+add_executable(content_browser_tests
+    tests/ContentBrowserTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/ContentBrowser.cpp
+)
+target_include_directories(content_browser_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(content_browser_tests PRIVATE vc_build_options)
+add_test(NAME content_browser_tests COMMAND content_browser_tests)
+
+# Window mode (plano agente 2 §B "DPI/monitores/resize/fullscreen"):
+# unambiguous Windowed/Borderless/Fullscreen state machine with geometry
+# preservation and monitor tracking. Headless gate.
+add_executable(window_mode_tests
+    tests/WindowModeTests.cpp
+    src/engine/sdk/WindowMode.cpp
+)
+target_include_directories(window_mode_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(window_mode_tests PRIVATE vc_build_options)
+add_test(NAME window_mode_tests COMMAND window_mode_tests)
+
+# Editor camera (plano agente 2 §B): deterministic orbit/pan/zoom/fly model
+# with the SAME clamps the editor used to duplicate. Headless gate.
+add_executable(editor_camera_tests
+    tests/EditorCameraTests.cpp
+    src/engine/sdk/EditorCamera.cpp
+)
+target_include_directories(editor_camera_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(editor_camera_tests PRIVATE vc_build_options)
+add_test(NAME editor_camera_tests COMMAND editor_camera_tests)
+
+# Gizmo math (plano agente 2 §B): translate/rotate/scale drag deltas with snap
+# and the point-to-segment distance used by the axis hit-test. Headless gate.
+add_executable(gizmo_controller_tests
+    tests/GizmoControllerTests.cpp
+    src/engine/sdk/GizmoController.cpp
+)
+target_include_directories(gizmo_controller_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(gizmo_controller_tests PRIVATE vc_build_options)
+add_test(NAME gizmo_controller_tests COMMAND gizmo_controller_tests)
+
 # Steering behaviors (agente 4 §3 item 3): forças de Reynolds puras e
 # determinísticas (seek/flee/arrive/pursue/separation/alignment/cohesion/
 # obstacle_avoidance/blend) — contrato self-contained std, gate headless
@@ -1533,6 +1825,313 @@ target_include_directories(fixed_tick_sim_tests PRIVATE
 )
 target_link_libraries(fixed_tick_sim_tests PRIVATE vc_build_options glm)
 add_test(NAME fixed_tick_sim_tests COMMAND fixed_tick_sim_tests)
+
+# Factions/teams (agente 4 §1 item 16 "equipe"): relações simétricas
+# friendly/hostile/neutral data-driven — contrato self-contained std, JSON
+# versionado all-or-nothing bit-exact, gate headless.
+add_executable(faction_tests
+    tests/FactionTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/Faction.cpp
+)
+target_include_directories(faction_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(faction_tests PRIVATE vc_build_options glm)
+add_test(NAME faction_tests COMMAND faction_tests)
+
+# Audio mixer (agente 4 §7 item 73): mixer/buses/roteamento data-driven — ganho
+# em dB, sidechain ducking (envelope de ataque/release), snapshots, nível de
+# master — contrato self-contained std, JSON versionado all-or-nothing
+# bit-exact, gate headless.
+add_executable(audio_mixer_tests
+    tests/AudioMixerTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/AudioMixer.cpp
+)
+target_include_directories(audio_mixer_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(audio_mixer_tests PRIVATE vc_build_options glm)
+add_test(NAME audio_mixer_tests COMMAND audio_mixer_tests)
+
+# Spatial audio (agente 4 §7 item 74): atenuação por distância, panning
+# equal-power, oclusão (input do mundo), reverb zones AABB, prioridade/
+# virtualização — contrato self-contained std, JSON versionado all-or-nothing
+# bit-exact, gate headless.
+add_executable(spatial_audio_tests
+    tests/SpatialAudioTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/SpatialAudio.cpp
+)
+target_include_directories(spatial_audio_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(spatial_audio_tests PRIVATE vc_build_options glm)
+add_test(NAME spatial_audio_tests COMMAND spatial_audio_tests)
+
+# Adaptive music (agente 4 §7 item 75): camadas/estados com crossfade,
+# intensidade global, stingers — contrato self-contained std, JSON versionado
+# all-or-nothing bit-exact, gate headless.
+add_executable(adaptive_music_tests
+    tests/AdaptiveMusicTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/AdaptiveMusic.cpp
+)
+target_include_directories(adaptive_music_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(adaptive_music_tests PRIVATE vc_build_options glm)
+add_test(NAME adaptive_music_tests COMMAND adaptive_music_tests)
+
+# Loot tables (agente 4 §1 item 17): rolagem de drops data-driven por seed
+# (splitmix64) — seleção ponderada, chance, count range, merge/ordem —
+# contrato self-contained std, JSON versionado all-or-nothing bit-exact.
+add_executable(loot_table_tests
+    tests/LootTableTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/LootTable.cpp
+)
+target_include_directories(loot_table_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(loot_table_tests PRIVATE vc_build_options glm)
+add_test(NAME loot_table_tests COMMAND loot_table_tests)
+
+# Equipment slots (agente 4 §1 item 17 "equipamentos"): categorias com tags
+# permitidas, equip/unequip all-or-nothing, estado bit-exact — contrato
+# self-contained std, JSON versionado all-or-nothing, gate headless.
+add_executable(equipment_tests
+    tests/EquipmentTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/Equipment.cpp
+)
+target_include_directories(equipment_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(equipment_tests PRIVATE vc_build_options glm)
+add_test(NAME equipment_tests COMMAND equipment_tests)
+
+# Núcleo de animação (agente 4 §4 item 1): skeleton/clip/blend tree 1D —
+# hierarquia de ossos, keyframes com lerp/slerp determinístico, local→world —
+# contrato self-contained std, JSON versionado all-or-nothing bit-exact.
+add_executable(anim_core_tests
+    tests/AnimCoreTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/AnimCore.cpp
+)
+target_include_directories(anim_core_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(anim_core_tests PRIVATE vc_build_options glm)
+add_test(NAME anim_core_tests COMMAND anim_core_tests)
+
+# Animation state machine (agente 4 §4 item 1): estados com clip/speed/loop,
+# transições por evento/condição/timer na ordem de declaração — contrato
+# self-contained std, JSON versionado all-or-nothing bit-exact.
+add_executable(anim_state_machine_tests
+    tests/AnimStateMachineTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/AnimStateMachine.cpp
+)
+target_include_directories(anim_state_machine_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(anim_state_machine_tests PRIVATE vc_build_options glm)
+add_test(NAME anim_state_machine_tests COMMAND anim_state_machine_tests)
+
+# Root motion (agente 4 §4 item 1): delta do osso raiz de um clip entre dois
+# tempos (posição/rotação/distância), sobre o IAnimCore — contrato self-
+# contained std (consome o header público IAnimCore), determinístico.
+add_executable(root_motion_tests
+    tests/RootMotionTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/AnimCore.cpp
+    src/engine/sdk/RootMotion.cpp
+)
+target_include_directories(root_motion_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(root_motion_tests PRIVATE vc_build_options glm)
+add_test(NAME root_motion_tests COMMAND root_motion_tests)
+
+# Animation events (agente 4 §4 item 1): eventos nomeados em timestamps de
+# clips com polling meio-aberto determinístico (t0, t1], round-trip JSON
+# bit-exact — contrato self-contained std sobre o IAnimCore (só validação).
+add_executable(anim_events_tests
+    tests/AnimEventsTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/AnimCore.cpp
+    src/engine/sdk/AnimEvents.cpp
+)
+target_include_directories(anim_events_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(anim_events_tests PRIVATE vc_build_options glm)
+add_test(NAME anim_events_tests COMMAND anim_events_tests)
+
+# Animation additive (agente 4 §4 item 1): delta de pose relativo a uma
+# referência + camada sobre pose base — contrato self-contained std sobre o
+# IAnimCore (só amostragem), sem estado mutável.
+add_executable(anim_additive_tests
+    tests/AnimAdditiveTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/AnimCore.cpp
+    src/engine/sdk/AnimAdditive.cpp
+)
+target_include_directories(anim_additive_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(anim_additive_tests PRIVATE vc_build_options glm)
+add_test(NAME anim_additive_tests COMMAND anim_additive_tests)
+
+# Animation masks (agente 4 §4 item 1 — ÚLTIMA unidade): máscaras de ossos
+# com peso 0..1 (ausente = 0), aplicadas sobre deltas aditivos (#212) —
+# contrato self-contained std, JSON bit-exact all-or-nothing.
+add_executable(anim_mask_tests
+    tests/AnimMaskTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/AnimMask.cpp
+)
+target_include_directories(anim_mask_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(anim_mask_tests PRIVATE vc_build_options glm)
+add_test(NAME anim_mask_tests COMMAND anim_mask_tests)
+
+# IK solver (agente 4 §4 item 2 — unidade "IK de mãos/pés/olhar"): 2-bone
+# analítico + look-at determinístico — matemática pura self-contained std,
+# sem estado mutável (estado {}).
+add_executable(ik_solver_tests
+    tests/IkSolverTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/IkSolver.cpp
+)
+target_include_directories(ik_solver_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(ik_solver_tests PRIVATE vc_build_options glm)
+add_test(NAME ik_solver_tests COMMAND ik_solver_tests)
+
+# Retargeting (agente 4 §4 item 2): mapeamento fonte→alvo entre skeletons com
+# escala de posição, ossos sem mapeamento = bind da alvo — sobre o IAnimCore
+# (usa bind_pose, acesso aditivo), JSON bit-exact all-or-nothing.
+add_executable(retargeting_tests
+    tests/RetargetingTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/AnimCore.cpp
+    src/engine/sdk/Retargeting.cpp
+)
+target_include_directories(retargeting_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(retargeting_tests PRIVATE vc_build_options glm)
+add_test(NAME retargeting_tests COMMAND retargeting_tests)
+
+# Constraints (agente 4 §4 item 2): limites de articulação por osso (Euler
+# XYZ clamp + reconstrução Qx·Qy·Qz) — contrato self-contained std, JSON
+# bit-exact all-or-nothing.
+add_executable(constraints_tests
+    tests/ConstraintsTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/Constraints.cpp
+)
+target_include_directories(constraints_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(constraints_tests PRIVATE vc_build_options glm)
+add_test(NAME constraints_tests COMMAND constraints_tests)
+
+# Terrain adaptation (agente 4 §4 item 2 — ÚLTIMA unidade): heightmap em
+# grade + alinhamento de pés/root ao terreno (regra do menor ajuste) —
+# contrato self-contained std, JSON bit-exact all-or-nothing.
+add_executable(terrain_adaptation_tests
+    tests/TerrainAdaptationTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/TerrainAdaptation.cpp
+)
+target_include_directories(terrain_adaptation_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(terrain_adaptation_tests PRIVATE vc_build_options glm)
+add_test(NAME terrain_adaptation_tests COMMAND terrain_adaptation_tests)
+
+# Inertializer (agente 4 §4 item 46, componente "inertialization"): resíduo
+# current ⊖ target com envelope (1 + t/T)·e^(−t/T) — contrato self-contained
+# std, JSON bit-exact all-or-nothing.
+add_executable(inertializer_tests
+    tests/InertializerTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/Inertializer.cpp
+)
+target_include_directories(inertializer_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(inertializer_tests PRIVATE vc_build_options glm)
+add_test(NAME inertializer_tests COMMAND inertializer_tests)
+
+# Skinning CPU (agente 4 §4 item 49): skin = world · invBind por osso + 4
+# influências com pesos normalizados — contrato self-contained std sobre o
+# IAnimCore (bind_pose + local_to_world), estado {}.
+add_executable(skinning_tests
+    tests/SkinningTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/AnimCore.cpp
+    src/engine/sdk/Skinning.cpp
+)
+target_include_directories(skinning_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(skinning_tests PRIVATE vc_build_options glm)
+add_test(NAME skinning_tests COMMAND skinning_tests)
+
+# Animation budget (agente 4 §4 item 49): seleção determinística dentro do
+# orçamento por frame com fairness anti-starvation — contrato self-contained
+# std, JSON bit-exact all-or-nothing.
+add_executable(anim_budget_tests
+    tests/AnimBudgetTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/AnimBudget.cpp
+)
+target_include_directories(anim_budget_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(anim_budget_tests PRIVATE vc_build_options glm)
+add_test(NAME anim_budget_tests COMMAND anim_budget_tests)
+
+# Explosion (agente 4 §5 item 58, CORE): blast determinístico com falloff
+# (1 − d/r)^power + fragmentos por seed (xorshift32) — 1º contrato do domínio
+# engine/physics, contrato self-contained std, JSON bit-exact all-or-nothing.
+add_executable(explosion_tests
+    tests/ExplosionTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/Explosion.cpp
+)
+target_include_directories(explosion_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(explosion_tests PRIVATE vc_build_options glm)
+add_test(NAME explosion_tests COMMAND explosion_tests)
 
 # Mission/dialogue assets (FALTANTES item 23 "missões e diálogos"): a mission
 # is a data-driven JSON asset (objectives, dialogue graph, unlock conditions,
@@ -3119,20 +3718,32 @@ set_target_properties(vulkan_jolt PROPERTIES OUTPUT_NAME Jolt)
 # those optional deps are OFF (e.g. the clean-machine gate's reduced configure).
 # Install it OPTIONAL so partial builds stage everything else and skip this lib
 # silently; the workspace build always produces it.
-install(FILES "$<TARGET_FILE:vc_sdk>" DESTINATION lib OPTIONAL)
-foreach(vc_lib vc_zstd vc_blake3 vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas)
+#
+# task_plan Agente 5 §1 item 6 (compatibilidade debug/release): every SDK
+# archive is staged TWICE — non-Debug configs (Release default) into lib/ and
+# Debug into lib/Debug/. The package config (vulkan_craft_sdk-config.cmake)
+# selects per consumer config, so a Debug consumer links the /MDd archives and
+# a Release consumer the /MD archives (MSVC runtime compatibility — the old
+# single lib/ location silently mixed /MDd into /MD consumers and vice-versa).
+macro(vc_install_sdk_lib vc_lib)
     if(TARGET ${vc_lib})
         # $<TARGET_FILE:...> resolves the real archive path (subdirectory
         # builds like rocksdb/flatbuffers land outside the top-level Release
         # dir); OPTIONAL skips silently when a partial build defined the
         # target but did not build its archive (clean-machine gate, deps OFF).
-        install(FILES "$<TARGET_FILE:${vc_lib}>" DESTINATION lib OPTIONAL)
+        install(FILES "$<TARGET_FILE:${vc_lib}>" DESTINATION lib OPTIONAL
+            CONFIGURATIONS Release MinSizeRel RelWithDebInfo Shipping)
+        install(FILES "$<TARGET_FILE:${vc_lib}>" DESTINATION lib/Debug OPTIONAL
+            CONFIGURATIONS Debug)
     endif()
+endmacro()
+
+vc_install_sdk_lib(vc_sdk)
+foreach(vc_lib vc_zstd vc_blake3 vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas)
+    vc_install_sdk_lib(${vc_lib})
 endforeach()
 foreach(vc_lib flatbuffers rocksdb vulkan_jolt bullet)
-    if(TARGET ${vc_lib})
-        install(FILES "$<TARGET_FILE:${vc_lib}>" DESTINATION lib OPTIONAL)
-    endif()
+    vc_install_sdk_lib(${vc_lib})
 endforeach()
 # glm headers: the public contracts include <glm/...>, so the consumer needs
 # the same header-only library voxel_sdk_tests compiles against.
@@ -3164,3 +3775,48 @@ target_link_libraries(far_terrain_sampling_benchmark PRIVATE vc_build_options)
 add_test(NAME far_terrain_sampling_benchmark COMMAND far_terrain_sampling_benchmark)
 # Test labels for suite-based gating (Agent 6)
 include(cmake/TestLabels.cmake)
+
+# GoogleTest smoke test — proves external solution integration
+add_library(gtest_main STATIC
+    ${VC_SOLUTIONS_DIR}/googletest/googletest/src/gtest-all.cc
+    ${VC_SOLUTIONS_DIR}/googletest/googletest/src/gtest_main.cc)
+target_include_directories(gtest_main PUBLIC
+    ${VC_SOLUTIONS_DIR}/googletest/googletest/include
+    ${VC_SOLUTIONS_DIR}/googletest/googletest)
+target_compile_features(gtest_main PUBLIC cxx_std_14)
+
+add_executable(gtest_smoke_test
+    tests/GtestSmokeTest.cpp)
+target_link_libraries(gtest_smoke_test PRIVATE
+    vc_build_options
+    gtest_main
+    glm)
+target_include_directories(gtest_smoke_test PRIVATE
+    src/engine/public
+    src)
+add_test(NAME gtest_smoke_test COMMAND gtest_smoke_test)
+
+# Google Benchmark smoke test — proves external solution integration
+file(GLOB GENCHMARK_SOURCES ${VC_SOLUTIONS_DIR}/google-benchmark/src/*.cc)
+list(REMOVE_ITEM GENCHMARK_SOURCES
+    ${VC_SOLUTIONS_DIR}/google-benchmark/src/benchmark_main.cc)
+add_library(gbenchmark_main STATIC ${GENCHMARK_SOURCES})
+target_include_directories(gbenchmark_main PUBLIC
+    ${VC_SOLUTIONS_DIR}/google-benchmark/include
+    ${VC_SOLUTIONS_DIR}/google-benchmark/src)
+target_compile_definitions(gbenchmark_main PRIVATE
+    Benchmark_ENABLE_TESTING=0
+    Benchmark_ENABLE_GTEST_TESTS=0
+    BENCHMARK_STATIC_DEFINE)
+target_compile_features(gbenchmark_main PUBLIC cxx_std_14)
+
+add_executable(benchmark_smoke_test
+    tests/BenchmarkSmokeTest.cpp)
+target_link_libraries(benchmark_smoke_test PRIVATE
+    vc_build_options
+    gbenchmark_main
+    shlwapi)
+target_compile_definitions(benchmark_smoke_test PRIVATE BENCHMARK_STATIC_DEFINE)
+target_include_directories(benchmark_smoke_test PRIVATE
+    src)
+add_test(NAME benchmark_smoke_test COMMAND benchmark_smoke_test --benchmark_min_time=0.01s)

@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(gameplay_consumer CXX)
+set(CMAKE_CXX_STANDARD 20)
+find_package(vulkan_craft_sdk REQUIRED)
+add_executable(gameplay_consumer main.cpp)
+target_link_libraries(gameplay_consumer PRIVATE vulkan_craft_sdk)

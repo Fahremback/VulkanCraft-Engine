@@ -25,7 +25,7 @@ AGENT_LABELS = {
     "agente6_integracao": "Integração e Red Team",
 }
 DONE_RE = re.compile(r"^\s*-\s*\[[xX]\]", re.MULTILINE)
-OPEN_RE = re.compile(r"^\s*-\s*\[\s\]", re.MULTILINE)
+OPEN_RE = re.compile(r"^\s*-\s*\[(?:\s|~)\]", re.MULTILINE)
 SUCCESSOR_MARKER = "<!-- AUTO-SUCCESSOR:AGENT6-GAMEPLAY-AI -->"
 SUCCESSOR_TEMPLATE = AGENTS_ROOT / "agente6_integracao" / "successor_gameplay_ai.md"
 

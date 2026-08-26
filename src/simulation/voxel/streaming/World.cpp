@@ -732,6 +732,11 @@ bool World::is_chunk_loaded_at(const glm::vec3& worldPos) const {
     return false;
 }
 
+bool World::is_light_dirty(int cx, int cz) const {
+    std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+    return lightDirtyChunks_.find({ cx, cz }) != lightDirtyChunks_.end();
+}
+
 void World::set_restoring(bool active) {
     restoring_ = active;
 }

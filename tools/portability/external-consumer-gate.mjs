@@ -223,7 +223,21 @@ function main() {
           "differentials-consumer-ok reconciler", "differentials-consumer-ok director",
           "differentials-consumer-ok semantic", "differentials-consumer-ok episode-farm",
           "differentials-consumer-ok all"],
-        label: "differentials (S32 content pipeline)" }
+        label: "differentials (S32 content pipeline)" },
+      { template: "external-project-gameplay",
+        exe: "gameplay_consumer.exe",
+        markers: ["gameplay-consumer-ok steering", "gameplay-consumer-ok fsm",
+          "gameplay-consumer-ok utility", "gameplay-consumer-ok perception",
+          "gameplay-consumer-ok planner", "gameplay-consumer-ok lod",
+          "gameplay-consumer-ok eventbus", "gameplay-consumer-ok animation",
+          "gameplay-consumer-ok all"],
+        label: "gameplay (AI + Animation)" },
+      { template: "external-project-multiplayer",
+        exe: "multiplayer_consumer.exe",
+        markers: ["multiplayer-consumer-ok server-boot", "multiplayer-consumer-ok two-clients",
+          "multiplayer-consumer-ok edit-submitted", "multiplayer-consumer-ok replicated-batch",
+          "multiplayer-consumer-ok save", "multiplayer-consumer-ok all"],
+        label: "multiplayer (server + 2 clients)" }
     ];
     const allConsumerBuilds = [];
     for (const spec of consumers) {

@@ -486,6 +486,22 @@ public:
                       static_cast<float>(z))));
     }
 
+    // Semantic queries (A.2 enabler): registry/runtime-driven, so consumers
+    // never need as_builtin_block. is_air = the empty-cell id (0); is_fluid =
+    // membership in the fluid table (builtin water/lava + project-declared
+    // fluids, incl. inline FluidBinding blocks).
+    bool is_air(uint32_t blockId) const override {
+        return blockId == kRuntimeAirId;
+    }
+
+    bool is_fluid(uint32_t blockId) const override {
+        return world_.is_fluid_runtime_id(static_cast<RuntimeBlockId>(blockId));
+    }
+
+    bool is_solid(uint32_t blockId) const override {
+        return world_.is_solid_block_id(static_cast<RuntimeBlockId>(blockId));
+    }
+
     void set_block(int x, int y, int z, uint32_t blockId) override {
         // Convenience API: an implicit single-edit transaction, so even direct
         // edits are undoable and nothing bypasses the transactional path.
@@ -752,6 +768,39 @@ public:
     void set_streaming_monitor(
         std::shared_ptr<engine::voxel::IVoxelStreamingMonitor> monitor) override {
         monitor_ = std::move(monitor);
+    }
+
+    // Render handoff (task C.3): read-only snapshot of the chunk-level dirty
+    // signals in DETERMINISTIC order (sorted by chunkX then chunkZ), so a
+    // renderer drives ILumenScene incrementally and dedupes by (chunk,
+    // revision). The world keeps owning the signals (the mesher/light pass
+    // consume them); the snapshot never clears them.
+    std::vector<engine::voxel::ChunkDirtyUpdate>
+    render_dirty_updates() const override {
+        std::vector<engine::voxel::ChunkDirtyUpdate> out;
+        std::lock_guard<std::recursive_mutex> lock(world_.chunksMutex);
+        for (const auto& [key, chunk] : world_.chunks) {
+            if (!chunk) continue;
+            const bool mesh =
+                chunk->isDirty.load(std::memory_order_acquire);
+            const bool light =
+                world_.is_light_dirty(key.first, key.second);
+            if (!mesh && !light) continue;
+            engine::voxel::ChunkDirtyUpdate update;
+            update.chunkX = key.first;
+            update.chunkZ = key.second;
+            update.revision = chunk->revision();
+            update.meshDirty = mesh;
+            update.lightDirty = light;
+            out.push_back(update);
+        }
+        std::sort(out.begin(), out.end(),
+                  [](const engine::voxel::ChunkDirtyUpdate& a,
+                     const engine::voxel::ChunkDirtyUpdate& b) {
+                      if (a.chunkX != b.chunkX) return a.chunkX < b.chunkX;
+                      return a.chunkZ < b.chunkZ;
+                  });
+        return out;
     }
 
     // Effective runtime block table (FALTANTES §3 item 2): after the registry

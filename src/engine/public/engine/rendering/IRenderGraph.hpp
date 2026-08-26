@@ -118,9 +118,12 @@ public:
     virtual void clear() = 0;
 };
 
-// Helpers shared by SDK/MCP/editor tooling.
-[[nodiscard]] bool render_access_writes(RenderAccess access) noexcept;
-[[nodiscard]] std::string_view render_state_name(RenderResourceState state) noexcept;
+// Helpers shared by SDK/MCP/editor tooling. `inline` is required: the
+// internal RenderGraph.hpp declares the SAME helpers, and consumers that link
+// both object modules (e.g. VulkanEngineServer) would otherwise hit duplicate
+// symbol definitions (B2 integration fix).
+[[nodiscard]] inline bool render_access_writes(RenderAccess access) noexcept;
+[[nodiscard]] inline std::string_view render_state_name(RenderResourceState state) noexcept;
 
 // Public factory (always succeeds).
 std::unique_ptr<IRenderGraph> create_render_graph(std::string& errorOut);

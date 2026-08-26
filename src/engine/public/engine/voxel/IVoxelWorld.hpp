@@ -239,6 +239,16 @@ public:
                                     const glm::vec3& direction,
                                     float maxDistance) const = 0;
 
+    // Semantic block queries (A.2): consumers ask what a runtime block id
+    // MEANS without reaching for the builtin enum (as_builtin_block) — the
+    // answers come from the attached registry + runtime tables, so JSON-only
+    // blocks behave identically to builtins. is_air matches the empty cell
+    // id (0); is_fluid matches every id in the fluid table (water, lava or
+    // any project-declared fluid, including inline FluidBinding blocks).
+    virtual bool is_air(uint32_t blockId) const = 0;
+    virtual bool is_fluid(uint32_t blockId) const = 0;
+    virtual bool is_solid(uint32_t blockId) const = 0;
+
     virtual void register_generator(std::shared_ptr<IVoxelGenerator> generator) = 0;
 
     // Registry-driven ids (META section 7): the world resolves and validates
@@ -310,6 +320,12 @@ public:
     // each update() while streaming state changed. Null clears.
     virtual void set_streaming_monitor(
         std::shared_ptr<IVoxelStreamingMonitor> monitor) = 0;
+    // Render handoff (task C.3, handoff 3->1): a read-only, NON-consuming
+    // snapshot of the chunk-level dirty signals, in deterministic order (sorted
+    // by chunkX then chunkZ). The world keeps owning the signals; a renderer
+    // polls this and dedupes by (chunk, revision). See ChunkDirtyUpdate in
+    // IVoxelStreaming.hpp.
+    virtual std::vector<ChunkDirtyUpdate> render_dirty_updates() const = 0;
     // Effective runtime block table (FALTANTES §3 item 2): what the world
     // knows about each block AFTER the registry and plugin overrides merge.
     // Sorted by id; the mesher/light consumers read exactly this data.

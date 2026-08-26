@@ -74,7 +74,8 @@ const suites = [
     { name: 'gameplay', count: 3, status: 'ALL PASSED' },
     { name: 'architecture', count: 2, status: 'ALL PASSED' },
     { name: 'external-consumer', count: 4, status: 'ALL PASSED' },
-    { name: 'moved-prefix', count: 1, status: 'ALL PASSED' }
+    { name: 'moved-prefix', count: 1, status: 'ALL PASSED' },
+    { name: 'debug-release', count: 2, status: 'ALL PASSED' }
 ];
 for (const s of suites) {
     console.log(`| ${s.name} | ${s.count} | ${s.status} |`);

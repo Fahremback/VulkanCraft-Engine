@@ -50,6 +50,25 @@ struct StreamingSnapshot {
     bool operator==(const StreamingSnapshot&) const = default;
 };
 
+// Render handoff (task C.3, handoff 3->1): one chunk's pending render work.
+// The world owns the dirty signals (its mesher and light pass consume them);
+// a renderer polls render_dirty_updates(), dedupes by (chunkX, chunkZ) and
+// rebuilds only what changed. `revision` is the chunk's monotonic data
+// version at the moment of the poll — the exact gate ILumenScene's
+// replace_chunk uses to refuse stale updates, so the adapter can forward it
+// unchanged. meshDirty = the chunk's surface/geometry changed (remesh +
+// re-derive surfaces); lightDirty = its light/sky changed (relight; surfaces
+// only need their light terms re-derived).
+struct ChunkDirtyUpdate {
+    int chunkX{ 0 };
+    int chunkZ{ 0 };
+    uint64_t revision{ 0 };  // monotonic per chunk (stale gate)
+    bool meshDirty{ false }; // awaiting remesh (surface may have changed)
+    bool lightDirty{ false };  // awaiting relight (light/sky changed)
+
+    bool operator==(const ChunkDirtyUpdate&) const = default;
+};
+
 // Public view of one runtime block table entry (FALTANTES §3 item 2): what
 // the world knows about a block — identity, solidity and the mesh/light hints
 // the mesher and the light pass consume. Ids are the world's runtime uint32

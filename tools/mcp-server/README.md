@@ -110,12 +110,13 @@ Observações honestas do contrato atual:
 - `run_game`: executa um exe já compilado (VulkanEngineGame/Editor/Server/Cooker/vulkan_craft) por N segundos (padrão 10, máx 120), captura stdout/stderr em `Projects/.runs/<exe>-<ts>.log` e **mata o processo no fim** — nenhuma janela fica aberta. Devolve exit code e tail.
 - `list_game_logs`: lista os logs capturados (novos primeiro).
 - `read_game_log`: tail de um log capturado (`lines` para o tamanho).
+- `package_game`: empacota um projeto (staging `Bin/<exe>` + `Content/` + `PackageManifest.txt` via `VulkanPackageBuilder` C++, all-or-nothing — o exe precisa já estar buildado).
 
-Este ciclo substitui a validação visual: build → run curto → ler log, tudo pelo MCP.
+Este ciclo substitui a validação visual: build → run curto → ler log, tudo pelo MCP. `start_build`/`build_status`/`cancel_build`/`list_build_jobs` formam o ciclo assíncrono com job ID e timeout.
 
 ## CLI sem cliente MCP
 
-O `semantic-cli.mjs` expõe a **fachada semântica completa** (36 tools: projetos, cenas, entidades, componentes, scripts visuais, materiais, áudio, física, prefabs, partículas, registry/vehicle/ability/mission/world_profile/gait/simulation_lod) **sem servidor MCP** — mesmas factories do servidor (`callSemanticTool`), então nunca diverge da superfície MCP:
+O `semantic-cli.mjs` expõe a **fachada semântica completa** (37 tools: projetos, cenas, entidades, componentes, scripts visuais, materiais, áudio, física, prefabs, partículas, registry/vehicle/ability/mission/world_profile/gait/simulation_lod, **run_batch transacional**) **sem servidor MCP** — mesmas factories do servidor (`callSemanticTool`), então nunca diverge da superfície MCP:
 
 ```powershell
 node semantic-cli.mjs tools
@@ -141,3 +142,9 @@ Arquivos existentes devem ser lidos antes da edição. O hash retornado por `rea
 Diretórios de build, cache e metadados Git não aceitam escrita pelo MCP.
 
 Projetos são armazenados em `engine/Projects/<nome>` com referência relativa `../..` para a engine. Isso permite copiar a pasta completa da engine para outro computador sem gravar caminhos absolutos da máquina original.
+
+## Framing e recursos
+
+- **Framing**: o servidor aceita `Content-Length` (MCP canônico) **e** newline (linha JSON por `\n`). Frames parciais são segurados até completar o byte count declarado — sem resposta prematura nem crash (verificado por smoke dedicado). No transporte remoto, `POST /mcp` recebe JSON-RPC e responde na mesma conexão.
+- **Resources**: `resources/list` expõe documentos (README, architecture, migration, pending-work, SDK manifest, dependências, determinismo, política de dependência) e o **resource dinâmico `engine://metrics`** — métricas vivas do servidor (uptime, transport, contagem de tools, ring de auditoria, rate limit, subscriptions, SSE clients) geradas na leitura.
+- **Transacional**: `run_batch` executa N operações de autoria all-or-nothing (valida tudo → aplica → reverte em falha), com `dry_run` e `update` no nível do batch.

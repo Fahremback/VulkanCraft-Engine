@@ -140,6 +140,16 @@ try {
     assert.ok(got.result.messages[0].content.text.length > 0, `${p.name} has non-empty text`);
   }
 
+  // §5 item 8: the plugin prompt is grounded in the REAL project-authoring
+  // surface — create_game_project's plugins arg (the only honest plugin
+  // registration today; UI/system prompts stay deferred until those tools
+  // exist).
+  const pluginPrompt = await request("prompts/get", { name: "create_plugin", arguments: { name: "MyMod" } });
+  const pluginText = pluginPrompt.result.messages[0].content.text;
+  assert.match(pluginText, /create_game_project/);
+  assert.match(pluginText, /plugins: \["MyMod"\]/);
+  assert.ok(promptsListed.result.prompts.some((p) => p.name === "create_plugin"), "create_plugin listed");
+
   // Unknown prompt is refused with a protocol error.
   const unknownPrompt = await request("prompts/get", { name: "does_not_exist" });
   assert.equal(unknownPrompt.error.code, -32602);
@@ -153,6 +163,20 @@ try {
   assert.ok(resourceUris.includes("engine://pending-work"), "resources expose pending work");
   const manifestRead = await request("resources/read", { uri: "engine://sdk-manifest" });
   assert.match(manifestRead.result.contents[0].text, /SDK/);
+
+  // §5 item 3: the dynamic metrics resource (engine://metrics) — generated on
+  // read, no backing file. Shape is deterministic per instance; uptime and
+  // subscription counts move with the process.
+  assert.ok(resourceUris.includes("engine://metrics"), "resources expose live metrics");
+  const metricsRead = await request("resources/read", { uri: "engine://metrics" });
+  const metrics = JSON.parse(metricsRead.result.contents[0].text);
+  assert.equal(metrics.server, "vulkancraft-engine");
+  assert.equal(metrics.protocol_version, "2025-03-26");
+  assert.ok(metrics.tools.total >= metrics.tools.semantic && metrics.tools.semantic > 0, "tool counts coherent");
+  assert.ok(metrics.audit_ring.max >= metrics.audit_ring.entries, "audit ring bounded");
+  assert.ok(metrics.uptime_seconds >= 0, "uptime present");
+  const unknownResource = await request("resources/read", { uri: "engine://nope" });
+  assert.equal(unknownResource.error.code, -32002);
 
   const listed = await request("tools/list");
   assert.ok(listed.result.tools.some((tool) => tool.name === "apply_text_edits"));
@@ -178,6 +202,41 @@ try {
   const cancelUnknown = await request("tools/call", { name: "cancel_build", arguments: { job_id: 1 } });
   assert.equal(cancelUnknown.result.isError, true);
   assert.match(cancelUnknown.result.content[0].text, /unknown build job/);
+
+  // §5 item 5 ("artefatos"): a full job lifecycle with a fast-FAILING config.
+  // An invalid --config makes cmake error in <1s (MSB8013) WITHOUT compiling
+  // anything — no race with concurrent agents, but the job transitions
+  // running → failed and build_status/list expose the artifacts shape.
+  const badConfigStart = await request("tools/call", { name: "start_build", arguments: { exe: "VulkanEngineGame", config: "NopeConfig" } });
+  assert.equal(badConfigStart.result.isError, undefined, JSON.stringify(badConfigStart));
+  const jobStart = JSON.parse(badConfigStart.result.content[0].text);
+  assert.equal(jobStart.status, "running");
+  assert.match(jobStart.log, /\.log$/);
+  // Budget 30s: in a concurrent tree `cmake --build` first runs ZERO_CHECK,
+  // which reconfigures when CMakeLists.txt changed (agents edit it constantly)
+  // — that can add seconds before the fast MSB8013 failure. No compilation
+  // ever happens for an invalid --config, so a generous budget stays safe.
+  let jobFinal = null;
+  let polled = null;
+  for (let attempt = 0; attempt < 60; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const poll = await request("tools/call", { name: "build_status", arguments: { job_id: jobStart.job_id } });
+    polled = JSON.parse(poll.result.content[0].text);
+    if (polled.status !== "running") { jobFinal = polled; break; }
+  }
+  assert.ok(jobFinal, `job reached a terminal state (last: ${JSON.stringify(polled ?? null)})`);
+  assert.equal(jobFinal.status, "failed", JSON.stringify(jobFinal));
+  assert.equal(jobFinal.exit_code, 1);
+  assert.deepEqual(jobFinal.artifacts, { log: jobFinal.log, binaries: [] }, "failed job exposes log artifact, no binaries");
+  assert.match(jobFinal.tail, /MSB8013|error/i, "log tail carries the failure");
+  const jobsAfter = await request("tools/call", { name: "list_build_jobs", arguments: {} });
+  const jobsList = JSON.parse(jobsAfter.result.content[0].text);
+  assert.ok(jobsList.jobs.some((job) => job.job_id === jobStart.job_id && job.status === "failed"
+    && job.artifacts && Array.isArray(job.artifacts.binaries)), "list_build_jobs exposes artifacts");
+  // cancel of the now-terminal job is reported, not re-cancelled.
+  const cancelDone = await request("tools/call", { name: "cancel_build", arguments: { job_id: jobStart.job_id } });
+  const cancelPayload = JSON.parse(cancelDone.result.content[0].text);
+  assert.equal(cancelPayload.cancelled, false);
 
   const overview = await request("tools/call", { name: "engine_overview", arguments: {} });
   assert.equal(overview.result.isError, undefined);
@@ -228,6 +287,16 @@ try {
   });
   assert.equal(gameProject.result.isError, undefined);
   assert.ok(fs.existsSync(path.join(smokeProjectPath, "Content", "Scenes", "Initial.scene")));
+
+  // §4 item 3 "empacotar projetos": package_game deterministic surface
+  // (unknown exe / missing project — the tool was proven e2e against a real
+  // build, findings #186).
+  const packageUnknownExe = await request("tools/call", { name: "package_game", arguments: { project: smokeProject, exe: "not_an_exe" } });
+  assert.equal(packageUnknownExe.result.isError, true);
+  assert.match(packageUnknownExe.result.content[0].text, /unknown exe/);
+  const packageMissingProject = await request("tools/call", { name: "package_game", arguments: { project: "NopeNever" } });
+  assert.equal(packageMissingProject.result.isError, true);
+  assert.match(packageMissingProject.result.content[0].text, /does not exist/);
 
   const entityResponse = await request("tools/call", {
     name: "create_entity",
@@ -610,9 +679,13 @@ try {
   // under src/engine/public must be self-contained (engine//std/vendor only,
   // canonical engine/<domain>/<Header>.hpp includes — never short names). A
   // header with an internal include or a short include breaks this gate.
-  const sdkCheck = spawnSync(process.execPath, [path.join(directory, "..", "sdk", "sdk-check.mjs"), "--expect-count", "91"], { encoding: "utf8" });
+  // (No exact header count is pinned here: in a concurrent tree the count is
+  // pure churn — the freshness assertions below (inventory + matrix byte-equal
+  // to a fresh generation) subsume it: an added/removed header or a broken
+  // walk changes the regeneration and breaks the byte-equality until the
+  // committed docs are regenerated.)
+  const sdkCheck = spawnSync(process.execPath, [path.join(directory, "..", "sdk", "sdk-check.mjs")], { encoding: "utf8" });
   assert.equal(sdkCheck.status, 0, sdkCheck.stdout + sdkCheck.stderr);
-  assert.match(sdkCheck.stdout, /91 public headers/, sdkCheck.stdout);
 
   // §1 item 1 + §8 item 3: the COMMITTED API inventory (docs/SDK_API_INVENTORY.md)
   // must equal a fresh generation — it is a GENERATED artifact (single source:
@@ -626,6 +699,29 @@ try {
   const freshInventory = fs.readFileSync(inventoryTemp, "utf8");
   assert.equal(freshInventory, committedInventory, "docs/SDK_API_INVENTORY.md is fresh (regenerate: sdk-check.mjs --write-manifest docs/SDK_API_INVENTORY.md)");
   fs.rmSync(inventoryTemp, { force: true });
+
+  // §8 item 1: the COMMITTED capability matrix (docs/SDK_CAPABILITY_MATRIX.md)
+  // must equal a fresh generation — it is GENERATED from semanticToolDefinitions()
+  // + the filesystem walk (single sources, never a manual list). Regenerate with:
+  //   node tools/sdk/capability-matrix.mjs docs/SDK_CAPABILITY_MATRIX.md
+  const matrixPath = path.resolve(directory, "..", "..", "docs", "SDK_CAPABILITY_MATRIX.md");
+  const matrixTemp = path.join(directory, "mcp-smoke-matrix.md");
+  const matrixGen = spawnSync(process.execPath, [path.join(directory, "..", "sdk", "capability-matrix.mjs"), matrixTemp], { encoding: "utf8" });
+  assert.equal(matrixGen.status, 0, matrixGen.stderr);
+  const committedMatrix = fs.readFileSync(matrixPath, "utf8");
+  const freshMatrix = fs.readFileSync(matrixTemp, "utf8");
+  assert.equal(freshMatrix, committedMatrix, "docs/SDK_CAPABILITY_MATRIX.md is fresh (regenerate: capability-matrix.mjs docs/SDK_CAPABILITY_MATRIX.md)");
+  fs.rmSync(matrixTemp, { force: true });
+
+  // §1 item 6: the SDK package config template must carry per-config selection
+  // (Debug archives staged in lib/Debug/, every other config in lib/) with a
+  // backward-compatible fallback for single-config prefixes. This is the
+  // MSVC runtime-compatibility contract for Debug/Release consumers.
+  const configTemplate = fs.readFileSync(path.resolve(directory, "..", "..", "cmake", "vulkan_craft_sdk-config.cmake.in"), "utf8");
+  assert.match(configTemplate, /lib\/Debug\/vc_sdk\.lib/, "config template must stage/select Debug archives under lib/Debug/");
+  assert.match(configTemplate, /IMPORTED_CONFIGURATIONS \"DEBUG;RELEASE\"/, "config template must advertise DEBUG+RELEASE imported configs");
+  assert.match(configTemplate, /IMPORTED_LOCATION_DEBUG/, "config template must map the Debug consumer config to the Debug archive");
+  assert.match(configTemplate, /\$<\$<CONFIG:Debug>/s, "config template must select the Debug link set per consumer config");
 
   // The CLI exposes the same artifacts without a running server.
   const cliPath = path.join(directory, "registry-cli.mjs");
@@ -1617,6 +1713,70 @@ try {
     process.stdout.write("Lifecycle smoke (shutdown+exit) passed\n");
   }
 
+  // ---- §5 item 1 ("retry em framing parcial"): Content-Length framing must
+  // HOLD a partial frame (wait for the declared byte count — no premature
+  // response, no crash) and dispatch only when the frame is complete. ----
+  {
+    const framed = spawn(process.execPath, [path.join(directory, "server.mjs")], {
+      cwd: directory,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true
+    });
+    let fbuf = "";
+    let fPending = null;
+    let fResponses = [];
+    framed.stdout.setEncoding("utf8");
+    framed.stdout.on("data", (chunk) => {
+      fbuf += chunk;
+      let nl;
+      while ((nl = fbuf.indexOf("\n")) >= 0) {
+        const line = fbuf.slice(0, nl).trim();
+        fbuf = fbuf.slice(nl + 1);
+        if (!line) continue;
+        const msg = JSON.parse(line);
+        fResponses.push(msg);
+        if (fPending) { fPending(msg); fPending = null; }
+      }
+    });
+    const fNext = () => new Promise((resolve) => { fPending = resolve; });
+    const fExited = new Promise((resolve) => framed.on("exit", resolve));
+
+    // 1. Partial Content-Length frame: header + HALF the JSON body. The server
+    //    must not respond and must not crash — it waits for the remaining bytes.
+    const partialBody = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {} } });
+    const head = `Content-Length: ${Buffer.byteLength(partialBody, "utf8")}\r\n\r\n`;
+    const cut = Math.floor(partialBody.length / 2);
+    framed.stdin.write(head + partialBody.slice(0, cut));
+    const premature = await Promise.race([fNext(), new Promise((resolve) => setTimeout(() => resolve("no-response"), 400))]);
+    assert.equal(premature, "no-response", "partial Content-Length frame must be held (no premature response)");
+    assert.equal(fResponses.length, 0, "no response before the frame completes");
+
+    // 2. Complete the frame — the held request dispatches now.
+    const completed = fNext();
+    framed.stdin.write(partialBody.slice(cut));
+    const initMsg = await Promise.race([completed, new Promise((resolve) => setTimeout(() => resolve("timeout"), 5000))]);
+    assert.notEqual(initMsg, "timeout", "completed Content-Length frame dispatches");
+    assert.equal(initMsg.result.serverInfo.name, "vulkancraft-engine", JSON.stringify(initMsg));
+
+    // 3. A second full frame in the same connection works (the Content-Length
+    //    path, not the newline fallback) — ping round-trips.
+    const pingFrame = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+    const pingPromise = fNext();
+    framed.stdin.write(`Content-Length: ${Buffer.byteLength(pingFrame, "utf8")}\r\n\r\n${pingFrame}`);
+    const toolsMsg = await Promise.race([pingPromise, new Promise((resolve) => setTimeout(() => resolve("timeout"), 5000))]);
+    assert.notEqual(toolsMsg, "timeout", "second full Content-Length frame dispatches");
+    assert.ok(Array.isArray(toolsMsg.result.tools) && toolsMsg.result.tools.length > 0, "tools/list via Content-Length framing");
+
+    // 4. Truncated frame at EOF: the server must not hang forever — it exits
+    //    (stdin end), which is the documented behavior.
+    framed.stdin.write(`Content-Length: 999999\r\n\r\n{"jsonrpc":"2.0",`);
+    framed.stdin.end();
+    const exitCode = await Promise.race([fExited, new Promise((resolve) => setTimeout(() => resolve("timeout"), 5000))]);
+    assert.notEqual(exitCode, "timeout", "server exits (not hang) when stdin ends mid-frame");
+    framed.kill();
+    process.stdout.write("Framing smoke (Content-Length partial hold + dispatch + EOF) passed\n");
+  }
+
   // ---- optional remote transport (FALTANTES item 5): HTTP + SSE + concurrent clients ----
   {
     const httpPort = 8323 + (Date.now() % 1000);
@@ -1723,7 +1883,7 @@ try {
 
     const unknown = spawnSync(process.execPath, [path.join(directory, "semantic-cli.mjs"), "call", "nope", "{}"], { encoding: "utf8" });
     assert.equal(unknown.status, 3, "unknown tool call exits 3");
-    process.stdout.write("Semantic CLI smoke (36 tools, dependency-free) passed\n");
+    process.stdout.write("Semantic CLI smoke (37 tools, dependency-free) passed\n");
   }
 
   process.stdout.write("MCP protocol smoke test passed\n");

@@ -6,6 +6,7 @@
 #include <functional>
 #include <glm/glm.hpp>
 #include "../../scene/Scene.hpp"
+#include "../../public/engine/editor/IUndoHistory.hpp"
 
 namespace Engine {
 
@@ -277,51 +278,49 @@ public:
 
     void execute_command(std::unique_ptr<EditorCommand> command) {
         command->execute();
-        m_undoStack.push_back(std::move(command));
-        m_redoStack.clear();
+        push_into_history(std::move(command));
     }
 
     void execute_or_merge_property(std::string name, std::function<void()> execute,
                                    std::function<void()> undo, bool allowMerge = true) {
-        if (allowMerge && !m_undoStack.empty() && m_redoStack.empty()) {
-            auto* previous = dynamic_cast<PropertyChangeCommand*>(m_undoStack.back().get());
-            if (previous && previous->get_name() == name) {
-                previous->update_execute(std::move(execute));
-                previous->execute();
-                return;
-            }
+        if (allowMerge && m_history->merge_top(name, execute)) {
+            // Merged onto the top entry (keeps the ORIGINAL undo, swaps the
+            // redo to the newest value) — apply the merged value now.
+            execute();
+            return;
         }
-        execute_command(std::make_unique<PropertyChangeCommand>(
-            std::move(name), std::move(execute), std::move(undo)));
-    }
-
-    bool can_undo() const { return !m_undoStack.empty(); }
-    bool can_redo() const { return !m_redoStack.empty(); }
-
-    void undo() {
-        if (!can_undo()) return;
-        auto command = std::move(m_undoStack.back());
-        m_undoStack.pop_back();
-        command->undo();
-        m_redoStack.push_back(std::move(command));
-    }
-
-    void redo() {
-        if (!can_redo()) return;
-        auto command = std::move(m_redoStack.back());
-        m_redoStack.pop_back();
+        auto command = std::make_unique<PropertyChangeCommand>(
+            std::move(name), std::move(execute), std::move(undo));
         command->execute();
-        m_undoStack.push_back(std::move(command));
+        push_into_history(std::move(command));
     }
 
-    void clear() {
-        m_undoStack.clear();
-        m_redoStack.clear();
-    }
+    bool can_undo() const { return m_history->can_undo(); }
+    bool can_redo() const { return m_history->can_redo(); }
+
+    void undo() { m_history->undo(); }
+    void redo() { m_history->redo(); }
+
+    void clear() { m_history->clear(); }
+
+    // The generic undo/redo contract backing this system (depth cap evicts
+    // the oldest entry; the editor exposes it via GET /undo).
+    engine::editor::IUndoHistory* history() { return m_history.get(); }
+    const engine::editor::IUndoHistory* history() const { return m_history.get(); }
 
 private:
-    std::vector<std::unique_ptr<EditorCommand>> m_undoStack;
-    std::vector<std::unique_ptr<EditorCommand>> m_redoStack;
+    void push_into_history(std::unique_ptr<EditorCommand> command) {
+        std::shared_ptr<EditorCommand> holder = std::move(command);
+        engine::editor::UndoCommand entry;
+        entry.name = holder->get_name();
+        entry.undo = [holder]() { holder->undo(); };
+        entry.redo = [holder]() { holder->execute(); };
+        std::string err;
+        m_history->push(std::move(entry), err);
+    }
+
+    std::unique_ptr<engine::editor::IUndoHistory> m_history{
+        engine::editor::create_undo_history(256) };
 };
 
 } // namespace Engine

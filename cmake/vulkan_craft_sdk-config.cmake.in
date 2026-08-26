@@ -11,6 +11,15 @@
 # The imported target exposes include/ (engine/ + glm/) and the full static
 # link set (vc_sdk archive + promoted dependency libs), mirroring exactly what
 # voxel_sdk_tests links in-tree.
+#
+# task_plan Agente 5 §1 item 6 (compatibilidade debug/release): the engine
+# install rules stage the SDK archives per config — non-Debug (Release
+# default) into <prefix>/lib/ and Debug into <prefix>/lib/Debug/. This file
+# selects per consumer config: a Debug consumer links the /MDd Debug archives
+# and every other config links the /MD Release archives (MSVC runtime
+# compatibility). A prefix installed with only one config (e.g. the original
+# single-config layout) still resolves: every consumer config falls back to
+# lib/.
 
 # This file lives at <prefix>/lib/cmake/vulkan_craft_sdk/ — three levels up
 # is the prefix itself.
@@ -22,18 +31,45 @@ set(VULKAN_CRAFT_SDK_INCLUDE_DIRS "${VULKAN_CRAFT_SDK_PREFIX}/include")
 # The archive first, then every static dependency lib (names substituted at
 # engine configure time; paths resolved against the prefix at find time so the
 # prefix is relocatable).
-set(VULKAN_CRAFT_SDK_LIBRARIES
+set(_vc_sdk_common_libs
   "${VULKAN_CRAFT_SDK_PREFIX}/lib/vc_sdk.lib")
 foreach(_vc_dep @VULKAN_CRAFT_SDK_LINK_LIBS_CMAKE@)
-    list(APPEND VULKAN_CRAFT_SDK_LIBRARIES "${VULKAN_CRAFT_SDK_PREFIX}/lib/${_vc_dep}")
+    list(APPEND _vc_sdk_common_libs "${VULKAN_CRAFT_SDK_PREFIX}/lib/${_vc_dep}")
 endforeach()
+
+if(EXISTS "${VULKAN_CRAFT_SDK_PREFIX}/lib/Debug/vc_sdk.lib")
+    # Multi-config prefix: Debug archives staged in lib/Debug/. Build the Debug
+    # link set by mirroring each lib path into lib/Debug/, and select per
+    # consumer config with a generator expression (Debug -> Debug set, every
+    # other config -> the Release set in lib/).
+    set(_vc_sdk_debug_libs)
+    foreach(_vc_lib ${_vc_sdk_common_libs})
+        string(REPLACE "/lib/" "/lib/Debug/" _vc_debug_lib "${_vc_lib}")
+        list(APPEND _vc_sdk_debug_libs "${_vc_debug_lib}")
+    endforeach()
+    set(VULKAN_CRAFT_SDK_LIBRARIES
+        "$<$<CONFIG:Debug>:${_vc_sdk_debug_libs}>;$<$<NOT:$<CONFIG:Debug>>:${_vc_sdk_common_libs}>")
+else()
+    # Single-config prefix (only lib/ staged): lib/ for every consumer config —
+    # backward compatible with prefixes installed before the Debug split.
+    set(VULKAN_CRAFT_SDK_LIBRARIES "${_vc_sdk_common_libs}")
+endif()
 
 if(NOT TARGET vulkan_craft_sdk)
     add_library(vulkan_craft_sdk STATIC IMPORTED)
-    set_target_properties(vulkan_craft_sdk PROPERTIES
-        IMPORTED_LOCATION "${VULKAN_CRAFT_SDK_PREFIX}/lib/vc_sdk.lib"
-        INTERFACE_INCLUDE_DIRECTORIES "${VULKAN_CRAFT_SDK_INCLUDE_DIRS}"
-        INTERFACE_LINK_LIBRARIES "${VULKAN_CRAFT_SDK_LIBRARIES}")
+    if(EXISTS "${VULKAN_CRAFT_SDK_PREFIX}/lib/Debug/vc_sdk.lib")
+        set_target_properties(vulkan_craft_sdk PROPERTIES
+            IMPORTED_CONFIGURATIONS "DEBUG;RELEASE"
+            IMPORTED_LOCATION_DEBUG "${VULKAN_CRAFT_SDK_PREFIX}/lib/Debug/vc_sdk.lib"
+            IMPORTED_LOCATION_RELEASE "${VULKAN_CRAFT_SDK_PREFIX}/lib/vc_sdk.lib"
+            INTERFACE_INCLUDE_DIRECTORIES "${VULKAN_CRAFT_SDK_INCLUDE_DIRS}"
+            INTERFACE_LINK_LIBRARIES "${VULKAN_CRAFT_SDK_LIBRARIES}")
+    else()
+        set_target_properties(vulkan_craft_sdk PROPERTIES
+            IMPORTED_LOCATION "${VULKAN_CRAFT_SDK_PREFIX}/lib/vc_sdk.lib"
+            INTERFACE_INCLUDE_DIRECTORIES "${VULKAN_CRAFT_SDK_INCLUDE_DIRS}"
+            INTERFACE_LINK_LIBRARIES "${VULKAN_CRAFT_SDK_LIBRARIES}")
+    endif()
 endif()
 
 set(VULKAN_CRAFT_SDK_FOUND TRUE)

@@ -23,11 +23,11 @@ bool access_conflicts(RenderAccess a, RenderAccess b) noexcept {
 
 } // namespace
 
-bool render_access_writes(RenderAccess access) noexcept {
+inline bool render_access_writes(RenderAccess access) noexcept {
     return access == RenderAccess::Write || access == RenderAccess::ReadWrite;
 }
 
-std::string_view render_state_name(RenderResourceState state) noexcept {
+inline std::string_view render_state_name(RenderResourceState state) noexcept {
     switch (state) {
     case RenderResourceState::Undefined: return "Undefined";
     case RenderResourceState::ShaderRead: return "ShaderRead";

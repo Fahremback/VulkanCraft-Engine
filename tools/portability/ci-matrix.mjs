@@ -19,14 +19,19 @@ function run(cmd, opts = {}) {
 
 log(`Platform: ${platform}, Preset: ${preset}`);
 
-// Step 1: Configure
-log('Step 1: Configure');
-if (!existsSync('out')) mkdirSync('out', { recursive: true });
-run(`cmake --preset ${preset}`);
+// Step 1: Configure — the canonical build/ tree (not the out/<preset> tree):
+// every downstream step (fast-gate ctest, external-consumer/moved-prefix/
+// debug-release installs) resolves against build/, so configuring the preset's
+// out/ tree here would BUILD a tree the rest of the matrix never consumes
+// (preset 'release' -> out/release, Ninja; build/ is the MSVC multi-config
+// tree the gates install from).
+log('Step 1: Configure (build/)');
+if (!existsSync('build')) mkdirSync('build', { recursive: true });
+run(`cmake -S . -B build`);
 
 // Step 2: Build
-log('Step 2: Build');
-run(`cmake --build --preset ${preset}`);
+log('Step 2: Build (build/ Release)');
+run(`cmake --build build --config Release`);
 
 // Step 3: Unit tests (fast gate)
 log('Step 3: Unit tests');
@@ -44,6 +49,13 @@ run('node tools/portability/external-consumer-gate.mjs');
 // consumer builds/runs against the relocated prefix)
 log('Step 5b: Moved-prefix gate');
 run('node tools/portability/moved-prefix-gate.mjs');
+
+// Step 5c: Debug/Release gate (§1 item 6 — compatibilidade debug/release):
+// install BOTH configs into one prefix, then build+run the consumer in Debug
+// AND Release against it. The package config must select lib/Debug/ for a
+// Debug consumer and lib/ for a Release consumer (MSVC runtime compatibility).
+log('Step 5c: Debug/Release gate');
+run('node tools/portability/debug-release-gate.mjs');
 
 // Step 6: Status report
 log('Step 6: Status report');

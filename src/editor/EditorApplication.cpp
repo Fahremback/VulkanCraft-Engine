@@ -186,6 +186,33 @@ EditorApplication::EditorApplication() {
     register_editor_panels();
     register_project_templates();
     m_uiDocJson = build_ui_doc_json();
+    apply_layout_defaults();
+    build_message_catalog();
+    build_shortcut_doc();
+    build_command_index();
+    refresh_play_mode();
+    m_frameProfiler = engine::profiling::create_frame_profiler(600, 33.3);
+    refresh_profiler();
+    refresh_undo();
+    build_content_browser();
+    m_windowMode = engine::editor::create_window_mode();
+    refresh_window_mode();
+    {
+        engine::editor::EditorCameraState camState;
+        camState.yaw = m_editorCamera.yaw;
+        camState.pitch = m_editorCamera.pitch;
+        camState.distance = m_editorCamera.orbitDistance;
+        camState.target = engine::editor::CamVec3(
+            m_editorCamera.orbitTarget.x, m_editorCamera.orbitTarget.y,
+            m_editorCamera.orbitTarget.z);
+        camState.fov = m_editorCamera.fov;
+        camState.near_plane = m_editorCamera.nearPlane;
+        camState.far_plane = m_editorCamera.farPlane;
+        m_cameraContract = engine::editor::create_editor_camera(camState);
+    }
+    m_gizmoContract = engine::editor::create_gizmo_controller();
+    refresh_camera();
+    refresh_gizmo();
 
     // Playback sink for the play-in-editor mixer (audio previews + play-mode
     // audio components). Before this the Mixer rendered into a buffer that was
@@ -226,6 +253,255 @@ void EditorApplication::register_project_templates() {
     // Built-in project templates for the wizard (ezEngine pillar). The wizard
     // lists these; create_project_from_template materializes the scaffold.
     Engine::Editor::register_builtin_templates(m_templateRegistry);
+}
+
+void EditorApplication::apply_layout_defaults() {
+    // Safe reset: the shell layout is derived from the panel registry defaults
+    // (a fresh layout never depends on prior state). The real windows consume
+    // this model; GET /layout exposes it for observability.
+    m_layoutModel.reset_from_registry(m_panelRegistry.panels());
+}
+
+void EditorApplication::build_message_catalog() {
+    // Curated user-facing messages (plano agente 2 §C): the shell's status
+    // bar/toasts/dialogs consume these ids instead of ad-hoc strings. Built
+    // once and exposed via GET /messages.
+    using engine::editor::CatalogMessage;
+    using engine::editor::MessageCatalogDoc;
+    MessageCatalogDoc doc;
+    const auto add = [&](const char* id, engine::editor::MessageSeverity sev,
+                         const char* text, const char* action = "") {
+        CatalogMessage m;
+        m.id = id;
+        m.severity = sev;
+        m.text = text;
+        m.action = action;
+        doc.messages.push_back(m);
+    };
+    add("editor.startup", engine::editor::MessageSeverity::Info,
+        "VulkanCraft Editor ready — {0}", "");
+    add("editor.save.ok", engine::editor::MessageSeverity::Info,
+        "Saved {0}", "");
+    add("editor.save.failed", engine::editor::MessageSeverity::Error,
+        "Could not save {0}: {1}", "asset:open_save_settings");
+    add("editor.import.failed", engine::editor::MessageSeverity::Error,
+        "Failed to import {0}: {1}", "asset:open_import_settings");
+    add("editor.command.unknown", engine::editor::MessageSeverity::Warning,
+        "Unknown command {0}", "palette:open");
+    add("editor.scene.unsaved", engine::editor::MessageSeverity::Warning,
+        "Scene has unsaved changes", "editor:save");
+    add("editor.gpu.memory", engine::editor::MessageSeverity::Warning,
+        "GPU memory at {0}%", "dev:open_profiler");
+    m_messageCatalogJson = doc.to_json();
+}
+
+void EditorApplication::build_shortcut_doc() {
+    // The shell's CURRENT shortcuts, rendered as markdown from the IActionMap
+    // contract (plano agente 2 §C). Today the shell wires these directly; the
+    // doc is the single data-driven reference for the Help menu / README, and
+    // reflects any future IActionMap-backed rebinding.
+    using engine::editor::ShortcutDocSpec;
+    using engine::editor::ShortcutEntry;
+    using engine::input::ActionBinding;
+    using engine::input::ActionMapSpec;
+    using engine::input::InputBinding;
+    using engine::input::InputSource;
+
+    ShortcutDocSpec spec;
+    spec.title = "VulkanCraft Editor Shortcuts";
+    const auto entry = [&](const char* action, const char* label,
+                           const char* desc) {
+        ShortcutEntry e;
+        e.action = action;
+        e.label = label;
+        e.description = desc;
+        spec.entries.push_back(e);
+    };
+    entry("gizmo.select", "Select", "Select entities in the viewport.");
+    entry("gizmo.move", "Move Gizmo", "Translate the selection.");
+    entry("gizmo.rotate", "Rotate Gizmo", "Rotate the selection.");
+    entry("gizmo.scale", "Scale Gizmo", "Scale the selection.");
+    entry("palette", "Command Palette", "Open the global command palette.");
+    entry("play.toggle", "Play / Stop", "Enter or leave Play mode.");
+
+    ActionMapSpec map;
+    const auto action = [&](const char* name, const char* input) {
+        ActionBinding ab;
+        ab.action = name;
+        InputBinding b;
+        b.source = InputSource::Keyboard;
+        b.input = input;
+        ab.bindings.push_back(b);
+        map.actions.push_back(ab);
+    };
+    action("gizmo.select", "Q");
+    action("gizmo.move", "W");
+    action("gizmo.rotate", "E");
+    action("gizmo.scale", "R");
+    action("palette", "Ctrl+K");
+    action("play.toggle", "Space");
+
+    std::string err;
+    auto doc = engine::editor::create_shortcut_doc(spec, err);
+    if (doc != nullptr) {
+        m_shortcutDocMarkdown = doc->document(map, err);
+    } else {
+        m_shortcutDocMarkdown = std::string();
+    }
+}
+
+void EditorApplication::build_command_index() {
+    // The palette's data-driven command catalog (plano agente 2 §B): the
+    // shell's Ctrl+K global search consumes this index (id/label/category/
+    // keywords/action) — exposed via GET /commands/search. Built once from
+    // the REAL commands the shell offers.
+    using engine::editor::CommandEntry;
+    using engine::editor::CommandIndexDoc;
+    CommandIndexDoc doc;
+    const auto add = [&](const char* id, const char* label,
+                         const char* category, const char* action,
+                         const char* keywords) {
+        CommandEntry e;
+        e.id = id;
+        e.label = label;
+        e.category = category;
+        e.action = action;
+        std::string kw = keywords;
+        std::size_t pos = 0;
+        while ((pos = kw.find(',')) != std::string::npos) {
+            e.keywords.push_back(kw.substr(0, pos));
+            kw.erase(0, pos + 1);
+        }
+        if (!kw.empty()) e.keywords.push_back(kw);
+        doc.entries.push_back(std::move(e));
+    };
+    add("scene.new", "New Scene", "Scene", "scene.new", "create");
+    add("scene.open", "Open Scene", "Scene", "scene.open", "load");
+    add("scene.save", "Save Scene", "Scene", "scene.save", "save,write");
+    add("scene.save_as", "Save Scene As", "Scene", "scene.save_as", "save,export");
+    add("build.game", "Build / Export Game", "Build", "build.game", "exe,package");
+    add("asset.import", "Import Asset", "Asset", "asset.import", "import");
+    add("asset.refresh", "Refresh Assets", "Asset", "asset.refresh", "reload");
+    add("entity.cube", "Add Cube", "Entity", "entity.cube", "mesh");
+    add("entity.empty", "Add Empty Object", "Entity", "entity.empty", "create");
+    add("entity.light", "Add Directional Light", "Entity", "entity.light", "sun,light");
+    add("play.toggle", "Play / Stop", "Play", "play.toggle", "play,run");
+    add("palette", "Command Palette", "Tools", "palette.open", "search,ctrl+k");
+    m_commandIndexJson = doc.to_json();
+}
+
+void EditorApplication::refresh_play_mode() {
+    // The unambiguous play-state machine (plano agente 2 §B) serialized for
+    // observability (GET /play-mode): state, runtime, paused, simulating.
+    // The editor's PlayModeManager is the runtime owner (it clones the scene
+    // on start_play); the PUBLIC IPlayMode contract is the spec — we mirror
+    // the current state into it so the emitted JSON is exactly the contract's
+    // deterministic format (PlayMode.cpp is linked into the editor).
+    std::string err;
+    auto pm = engine::editor::create_play_mode();
+    switch (m_playMode.get_state()) {
+        case PlayState::Edit: break;
+        case PlayState::Play: pm->play(err); break;
+        case PlayState::Simulate: pm->simulate(err); break;
+        case PlayState::Pause:
+            pm->play(err);
+            pm->pause(err);
+            break;
+    }
+    m_playModeJson = pm->to_json();
+}
+
+void EditorApplication::refresh_profiler() {
+    // Deterministic frame/memory stats (plano agente 2 §B) serialized for
+    // observability (GET /profiler): samples, min/max/avg, p95/p99, spikes,
+    // fps, heap. The IFrameProfiler contract is fed every frame in the main
+    // loop (FrameProfiler.cpp is linked into the editor).
+    if (m_frameProfiler) {
+        m_profilerJson = m_frameProfiler->to_json();
+    } else {
+        m_profilerJson = std::string();
+    }
+}
+
+void EditorApplication::refresh_undo() {
+    // The UndoSystem's generic undo/redo stack (plano agente 2 §B), exposed
+    // via GET /undo: depths, can_undo/can_redo, top command. The editor's
+    // UndoSystem delegates its stacks to the IUndoHistory contract (cap 256
+    // evicts the oldest entry — no more unbounded growth).
+    m_undoJson = m_undo.history()->to_json();
+}
+
+void EditorApplication::refresh_window_mode() {
+    // The unambiguous window-mode model (plano agente 2 §B): Windowed /
+    // Borderless / Fullscreen with only valid transitions and geometry
+    // preservation — exposed via GET /window-mode. The GLFW window the shell
+    // drives will drive this contract (WindowMode.cpp is linked in).
+    if (m_windowMode) {
+        m_windowModeJson = m_windowMode->to_json();
+    } else {
+        m_windowModeJson = std::string();
+    }
+}
+
+void EditorApplication::refresh_camera() {
+    // The orbit/pan/zoom/fly camera MODEL (plano agente 2 §B), which drives
+    // the real m_editorCamera — exposed via GET /camera.
+    if (m_cameraContract) {
+        m_cameraJson = m_cameraContract->to_json();
+    } else {
+        m_cameraJson = std::string();
+    }
+}
+
+void EditorApplication::refresh_gizmo() {
+    // The gizmo math contract state (plano agente 2 §B): the live gizmo mode
+    // and snap values the drag math uses — exposed via GET /gizmo.
+    std::ostringstream out;
+    out << "{\"mode\":\"";
+    switch (m_gizmoMode) {
+        case GizmoMode::Translate: out << "translate"; break;
+        case GizmoMode::Rotate: out << "rotate"; break;
+        case GizmoMode::Scale: out << "scale"; break;
+        default: out << "select"; break;
+    }
+    out << "\",\"local\":" << (m_gizmoLocal ? "true" : "false")
+        << ",\"snap_translate\":" << m_snapTranslate
+        << ",\"snap_rotate\":" << m_snapRotate
+        << ",\"snap_scale\":" << m_snapScale << "}";
+    m_gizmoJson = out.str();
+}
+
+void EditorApplication::build_content_browser() {
+    // The Content Browser navigation model (plano agente 2 §B), fed by the
+    // REAL AssetRegistry snapshot — exposed via GET /content-browser. The
+    // visual panel can consume this index instead of ad-hoc tree building.
+    using engine::editor::ContentAsset;
+    using engine::editor::ContentBrowserDoc;
+    ContentBrowserDoc doc;
+    for (const AssetMetadata& meta : m_assetRegistry.snapshot()) {
+        ContentAsset asset;
+        asset.id = meta.id.to_string();
+        asset.name = meta.sourcePath.stem().string();
+        if (asset.name.empty()) asset.name = "asset";
+        switch (meta.type) {
+            case AssetType::Texture: asset.type = "texture"; break;
+            case AssetType::Mesh: asset.type = "model"; break;
+            case AssetType::Material: asset.type = "material"; break;
+            case AssetType::Audio: asset.type = "audio"; break;
+            case AssetType::Skeleton: asset.type = "skeleton"; break;
+            case AssetType::Animation: asset.type = "animation"; break;
+            case AssetType::Scene: asset.type = "scene"; break;
+            case AssetType::VoxelStructure: asset.type = "voxel"; break;
+            case AssetType::Block: asset.type = "block"; break;
+            default: asset.type = "other"; break;
+        }
+        asset.folder = meta.sourcePath.parent_path().filename().string();
+        doc.assets.push_back(std::move(asset));
+    }
+    std::string err;
+    auto browser = engine::editor::create_content_browser(doc, err);
+    m_contentBrowserJson =
+        browser != nullptr ? browser->to_json() : std::string();
 }
 
 std::string EditorApplication::build_ui_doc_json() {
@@ -413,6 +689,11 @@ bool parse_all_floats(const std::string& text, std::vector<float>& out) {
 
 constexpr glm::vec3 kAxisDirs[3] = { {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f} };
 constexpr glm::vec3 kAxisColors[3] = { {1.0f, 0.25f, 0.25f}, {0.30f, 1.0f, 0.45f}, {0.35f, 0.62f, 1.0f} };
+
+// Bridge glm → contract vectors (engine/editor IGizmoController).
+engine::editor::GizVec3 glm_to_giz(const glm::vec3& v) {
+    return engine::editor::GizVec3(v.x, v.y, v.z);
+}
 
 } // namespace
 
@@ -1072,6 +1353,10 @@ void EditorApplication::main_loop() {
         lastTime = currentTime;
         m_fps = 1.0f / std::max(deltaTime, 0.001f);
         m_frameTimeMs = deltaTime * 1000.0f;
+        if (m_frameProfiler) {
+            m_frameProfiler->record(m_frameTimeMs,
+                                    static_cast<double>(m_ramUsageMb));
+        }
 
         // Graphics changes (Opções Gráficas) are deferred to here — before
         // acquire, with nothing in flight — so the swapchain and shadow map
@@ -1160,6 +1445,23 @@ void EditorApplication::main_loop() {
                 api.panels = m_panelRegistry.panel_ids();
                 api.templates = m_templateRegistry.template_ids();
                 api.ui_doc = m_uiDocJson;
+                api.layout = m_layoutModel.snapshot().to_json();
+                api.messages = m_messageCatalogJson;
+                api.shortcuts = m_shortcutDocMarkdown;
+                refresh_play_mode();
+                api.play_mode = m_playModeJson;
+                api.command_index = m_commandIndexJson;
+                refresh_profiler();
+                api.profiler = m_profilerJson;
+                refresh_undo();
+                api.undo = m_undoJson;
+                api.content_browser = m_contentBrowserJson;
+                refresh_window_mode();
+                api.window_mode = m_windowModeJson;
+                refresh_camera();
+                api.camera = m_cameraJson;
+                refresh_gizmo();
+                api.gizmo = m_gizmoJson;
                 switch (m_playScript.status()) {
                     case VMStatus::Idle: api.scriptState = "idle"; break;
                     case VMStatus::Running: api.scriptState = "running"; break;
@@ -9768,16 +10070,22 @@ void EditorApplication::update_editor_camera(float deltaTime) {
     ImGuiIO& io = ImGui::GetIO();
     const bool keysFree = !io.WantTextInput;
 
-    // Orbit (right drag) / pan (middle drag).
+    // Orbit (right drag) / pan (middle drag). The clamps and the pan scale
+    // live in the IEditorCamera contract (plano agente 2 §B) — the editor
+    // feeds raw mouse deltas and mirrors the resulting state back.
     const bool orbitHeld = glfwGetMouseButton(m_window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
     const bool panHeld = glfwGetMouseButton(m_window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
     if (orbitHeld && !m_gizmoDragging) {
-        cam.yaw += mouseDelta.x * cam.sensitivity;
-        cam.pitch = glm::clamp(cam.pitch - mouseDelta.y * cam.sensitivity, -89.0f, 89.0f);
+        m_cameraContract->orbit(mouseDelta.x * cam.sensitivity,
+                                mouseDelta.y * cam.sensitivity);
+        cam.yaw = m_cameraContract->state().yaw;
+        cam.pitch = m_cameraContract->state().pitch;
     }
     if (panHeld) {
-        const float panScale = cam.orbitDistance * 0.0016f;
-        cam.orbitTarget += (-right * mouseDelta.x + up * mouseDelta.y) * panScale;
+        m_cameraContract->pan(static_cast<float>(mouseDelta.x),
+                              static_cast<float>(mouseDelta.y));
+        const engine::editor::CamVec3 t = m_cameraContract->state().target;
+        cam.orbitTarget = glm::vec3(t.x, t.y, t.z);
     }
 
     // Fly (WASD): free-fly whenever the mouse is over the viewport and the
@@ -9792,7 +10100,10 @@ void EditorApplication::update_editor_camera(float deltaTime) {
         if (glfwGetKey(m_window, GLFW_KEY_E) == GLFW_PRESS) move += up;
         if (glfwGetKey(m_window, GLFW_KEY_Q) == GLFW_PRESS) move -= up;
         if (glm::length(move) > 0.0f) {
-            cam.orbitTarget += glm::normalize(move) * speed * deltaTime;
+            m_cameraContract->fly(
+                engine::editor::CamVec3(move.x, move.y, move.z), speed, deltaTime);
+            const engine::editor::CamVec3 t = m_cameraContract->state().target;
+            cam.orbitTarget = glm::vec3(t.x, t.y, t.z);
         }
     }
 
@@ -9805,8 +10116,8 @@ void EditorApplication::update_editor_camera(float deltaTime) {
     // scrolling other panels normally.
     if (m_viewportHovered || m_viewportImageHovered) {
         if (m_scrollAccum != 0.0) {
-            cam.orbitDistance = glm::clamp(
-                cam.orbitDistance * (1.0f - static_cast<float>(m_scrollAccum) * 0.1f), 0.5f, 5000.0f);
+            m_cameraContract->dolly(static_cast<float>(m_scrollAccum) * 0.1f);
+            cam.orbitDistance = m_cameraContract->state().distance;
             m_scrollAccum = 0.0;
         }
     } else {
@@ -9817,10 +10128,11 @@ void EditorApplication::update_editor_camera(float deltaTime) {
 }
 
 void EditorApplication::recompute_editor_camera_position() {
-    // Recompute the camera position from target + spherical offset.
-    m_editorCamera.position = m_editorCamera.orbitTarget -
-                              euler_direction(m_editorCamera.yaw, m_editorCamera.pitch) *
-                              m_editorCamera.orbitDistance;
+    // Recompute the camera position from target + spherical offset — the
+    // derivation now lives in the IEditorCamera contract (plano agente 2 §B):
+    // position = target - dir(yaw,pitch) * distance.
+    const engine::editor::CamVec3 p = m_cameraContract->position();
+    m_editorCamera.position = glm::vec3(p.x, p.y, p.z);
 }
 
 void EditorApplication::process_viewport_input() {
@@ -9898,11 +10210,17 @@ bool EditorApplication::gizmo_axis_hit_test(glm::vec2 mouseScreen) {
                 glm::vec3 v = glm::normalize(glm::cross(dir, u));
                 const glm::vec3 p0 = origin + u * (std::cos(a0) * gizmoLen) + v * (std::sin(a0) * gizmoLen);
                 const glm::vec3 p1 = origin + u * (std::cos(a1) * gizmoLen) + v * (std::sin(a1) * gizmoLen);
-                dist = std::min(dist, dist_point_segment(mouseScreen, project(p0), project(p1)));
+                dist = std::min(dist, m_gizmoContract->dist_point_segment(
+                    engine::editor::GizVec2(mouseScreen.x, mouseScreen.y),
+                    engine::editor::GizVec2(project(p0).x, project(p0).y),
+                    engine::editor::GizVec2(project(p1).x, project(p1).y)));
             }
         } else {
             const glm::vec2 tipScreen = project(origin + axisWorld(axis) * gizmoLen);
-            dist = dist_point_segment(mouseScreen, originScreen, tipScreen);
+            dist = m_gizmoContract->dist_point_segment(
+                engine::editor::GizVec2(mouseScreen.x, mouseScreen.y),
+                engine::editor::GizVec2(originScreen.x, originScreen.y),
+                engine::editor::GizVec2(tipScreen.x, tipScreen.y));
         }
         if (dist < 14.0f && dist < bestDist) {
             bestDist = dist;
@@ -9961,8 +10279,11 @@ void EditorApplication::update_gizmo_drag(glm::vec2 mouseScreen) {
     const int axisIndex = static_cast<int>(m_activeAxis) - 1;
 
     if (m_gizmoMode == GizmoMode::Translate) {
-        float delta = glm::dot(planePoint - m_gizmoDragPlanePoint, m_gizmoAxisWorld);
-        if (snap) delta = std::round(delta / m_snapTranslate) * m_snapTranslate;
+        // Delta along the gizmo axis + snap — math delegates to the
+        // IGizmoController contract (plano agente 2 §B).
+        float delta = m_gizmoContract->translate_delta(
+            glm_to_giz(planePoint - m_gizmoDragPlanePoint),
+            glm_to_giz(m_gizmoAxisWorld), snap ? m_snapTranslate : 0.0f);
         const glm::vec3 newPos = m_gizmoDragEntityStart + m_gizmoAxisWorld * delta;
         m_undo.execute_or_merge_property(
             "Move Entity",
@@ -9976,10 +10297,11 @@ void EditorApplication::update_gizmo_drag(glm::vec2 mouseScreen) {
         glm::vec3 v = toPoint - m_gizmoAxisWorld * glm::dot(toPoint, m_gizmoAxisWorld);
         if (glm::dot(v, v) < 1e-6f) return;
         v = glm::normalize(v);
-        const float angle = glm::degrees(std::atan2(
-            glm::dot(glm::cross(m_gizmoDragAngleRef, v), m_gizmoAxisWorld),
-            glm::dot(m_gizmoDragAngleRef, v)));
-        const float snapped = snap ? std::round(angle / m_snapRotate) * m_snapRotate : angle;
+        // Signed angle around the axis + snap — math delegates to the
+        // IGizmoController contract (plano agente 2 §B).
+        const float snapped = m_gizmoContract->rotate_delta(
+            glm_to_giz(m_gizmoAxisWorld), glm_to_giz(m_gizmoDragAngleRef),
+            glm_to_giz(v), snap ? m_snapRotate : 0.0f);
         glm::vec3 newRot = m_gizmoDragRotStart;
         newRot[axisIndex] += snapped;
         m_undo.execute_or_merge_property(
@@ -9989,7 +10311,11 @@ void EditorApplication::update_gizmo_drag(glm::vec2 mouseScreen) {
                 auto it = m_editorScene->transformComponents.find(id); if (it != m_editorScene->transformComponents.end()) it->second.rotation = start;
             });
     } else if (m_gizmoMode == GizmoMode::Scale) {
-        float delta = glm::dot(planePoint - m_gizmoDragPlanePoint, m_gizmoAxisWorld);
+        // Axis projection delegates to the contract; the factor semantics
+        // (1+delta, snap no fator, clamp 0.02) stay in the editor.
+        float delta = m_gizmoContract->scale_delta(
+            glm_to_giz(planePoint - m_gizmoDragPlanePoint),
+            glm_to_giz(m_gizmoAxisWorld), 0.0f);
         float factor = 1.0f + delta / 1.0f;
         if (snap) factor = std::round(factor / m_snapScale) * m_snapScale;
         factor = std::max(factor, 0.02f);

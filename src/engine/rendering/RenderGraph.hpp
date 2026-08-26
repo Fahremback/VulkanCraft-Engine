@@ -110,7 +110,7 @@ private:
     std::vector<Dependency> dependencies_;
 };
 
-[[nodiscard]] bool render_access_writes(RenderAccess access) noexcept;
-[[nodiscard]] std::string_view render_state_name(RenderResourceState state) noexcept;
+[[nodiscard]] inline bool render_access_writes(RenderAccess access) noexcept;
+[[nodiscard]] inline std::string_view render_state_name(RenderResourceState state) noexcept;
 
 } // namespace Engine::Rendering

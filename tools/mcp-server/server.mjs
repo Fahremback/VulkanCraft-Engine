@@ -570,6 +570,7 @@ let nextSubscriptionId = 1;
 let transportMode = "stdio";  // "stdio" | "http"
 const sseClients = new Set();  // Set<http.ServerResponse>
 let httpServer = null;
+const SERVER_START = Date.now();
 
 function deliverNotification(message) {
   if (transportMode === "http") {
@@ -689,6 +690,21 @@ function startBuildTool(args) {
   };
 }
 
+// task_plan Agente 5 §5 item 5 ("artefatos"): the artifacts a job produces.
+// Deterministic: the log is always an artifact; for a SUCCEEDED single-target
+// build the produced binary lives at build/<config>/<exe>.exe. Computed at
+// read time so a job created before the binary existed still reports it.
+function jobArtifacts(job) {
+  const artifacts = { log: job.log, binaries: [] };
+  if (job.status === "succeeded" && job.exe !== "ALL_BUILD") {
+    const exePath = path.join(ENGINE_ROOT, "build", job.config, `${job.exe}.exe`);
+    if (fs.existsSync(exePath)) {
+      artifacts.binaries.push(path.relative(ENGINE_ROOT, exePath).replaceAll(path.sep, "/"));
+    }
+  }
+  return artifacts;
+}
+
 function buildStatusTool(args) {
   const jobId = Number(args.job_id);
   const job = BUILD_JOBS.get(jobId);
@@ -707,6 +723,7 @@ function buildStatusTool(args) {
     signal: job.signal ?? null,
     error: job.error ?? null,
     log: job.log,
+    artifacts: jobArtifacts(job),
     tail
   };
 }
@@ -736,7 +753,8 @@ function listBuildJobsTool() {
       config: job.config,
       started_at: job.started_at,
       finished_at: job.finished_at ?? null,
-      log: job.log
+      log: job.log,
+      artifacts: jobArtifacts(job)
     }));
   return { jobs };
 }
@@ -976,6 +994,21 @@ const TOOLS = [
       },
       additionalProperties: false
     }
+  },
+  {
+    name: "package_game",
+    description: "Publish a distributable package of a game project: runs VulkanPackageBuilder to stage Bin/<exe> + Content/ + PackageManifest.txt into Projects/<project>/Package (all-or-nothing; the exe must already be built via build_game).",
+    inputSchema: {
+      type: "object",
+      required: ["project"],
+      properties: {
+        project: { type: "string" },
+        exe: { type: "string", default: "VulkanEngineGame" },
+        platform: { type: "string", default: "windows-x64" },
+        configuration: { type: "string", default: "Shipping" }
+      },
+      additionalProperties: false
+    }
   }
 ];
 
@@ -1029,6 +1062,11 @@ const PROMPTS = [
     name: "author_vehicle",
     description: "Create a vehicle asset with physics, wheels, and beam graph.",
     arguments: [{ name: "name", description: "vehicle name", required: true }]
+  },
+  {
+    name: "create_plugin",
+    description: "Register a plugin in a game project (create_game_project registers it; its assets are authored with the same author_* tools).",
+    arguments: [{ name: "name", description: "plugin name", required: true }]
   }
 ];
 
@@ -1182,6 +1220,23 @@ After the project exists, you can add blocks, items, entities, and scenes to it.
         }]
       };
 
+    case "create_plugin":
+      return {
+        messages: [{
+          role: "user",
+          content: { type: "text", text: template(`Register a plugin named "{name}" in a game project. Steps:
+
+1. Call \`create_game_project\` with project name "{name}" (or the desired name) and \`plugins: ["{name}"]\` — the project manifest registers the plugin.
+2. Author the plugin's assets under the project with the SAME tools the project uses:
+   - \`author_registry_asset\` (blocks/items/fluids/recipes/biomes/structures).
+   - \`author_ability_asset\`, \`author_mission_asset\`, \`author_vehicle_asset\`, \`author_gait_asset\`, \`author_world_profile_asset\`.
+   - \`create_material\`, \`create_audio_event\`, \`create_physics_material\`, \`create_prefab\`, \`create_particle_asset\`.
+   - \`create_visual_script\` for behavior graphs.
+3. Call \`validate_game_project\` to verify everything is valid.
+4. Call \`build_game\` to compile the project (including the plugin's assets).`) }
+        }]
+      };
+
     default: throw new Error(`unknown prompt '${name}'`);
   }
 }
@@ -1194,7 +1249,12 @@ const RESOURCE_MAP = new Map([
   ["engine://sdk-manifest", "docs/SDK_MANIFEST.md"],
   ["engine://dependencies", "docs/SOLUCOES_E_DEPENDENCIAS.md"],
   ["engine://determinism", "docs/DETERMINISMO_PROVIDERS.md"],
-  ["engine://dependency-policy", "docs/DEPENDENCY_POLICY.md"]
+  ["engine://dependency-policy", "docs/DEPENDENCY_POLICY.md"],
+  // task_plan Agente 5 §5 item 3 ("métricas"): a DYNAMIC resource generated on
+  // read — live server metrics (uptime, tool counts, audit ring, rate limit,
+  // event subscriptions, SSE clients). The sentinel value "__metrics__" is
+  // special-cased in resources/read (it is not a file).
+  ["engine://metrics", "__metrics__"]
 ]);
 
 // FALTANTES item 5 (MCP server) — limits + audit: every tools/call is recorded
@@ -1368,6 +1428,29 @@ async function handleRequest(message) {
     try {
       const file = RESOURCE_MAP.get(params.uri);
       if (!file) throw new Error(`unknown resource '${params.uri}'`);
+      if (file === "__metrics__") {
+        // §5 item 3 — dynamic metrics resource (no backing file): live server
+        // state. Deterministic shape; uptime/subscriptions move with the
+        // process, everything else is stable per server instance.
+        let subscriptionCount = 0;
+        for (const set of EVENT_SUBSCRIPTIONS.values()) subscriptionCount += set.size;
+        const metrics = {
+          server: "vulkancraft-engine",
+          protocol_version: SUPPORTED_PROTOCOL_VERSION,
+          transport: transportMode,
+          uptime_seconds: Math.trunc((Date.now() - SERVER_START) / 1000),
+          tools: { total: TOOLS.length, semantic: semanticToolDefinitions().length },
+          audit_ring: { entries: AUDIT_RING.length, max: AUDIT_RING_MAX },
+          rate_limit: { per_second: RATE_LIMIT_PER_SECOND, burst: RATE_LIMIT_BURST },
+          event_subscriptions: subscriptionCount,
+          sse_clients: sseClients.size
+        };
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: { contents: [{ uri: params.uri, mimeType: "application/json", text: JSON.stringify(metrics, null, 2) }] }
+        };
+      }
       const source = readText(file);
       return {
         jsonrpc: "2.0",
