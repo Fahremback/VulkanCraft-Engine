@@ -192,6 +192,11 @@
       "default": 1,
       "type": "number"
     },
+    "flammability": {
+      "description": "heat/explosion ignition axis in 0..1 — explosions burn blocks with flammability > 0 (item 10)",
+      "default": 0,
+      "type": "number"
+    },
     "behaviorId": {
       "description": "declarative behavior reference (item 6): namespaced id (ns:name) or empty",
       "type": "string"

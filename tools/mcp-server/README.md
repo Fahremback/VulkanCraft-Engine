@@ -8,6 +8,16 @@ Servidor MCP local e portátil, sem dependências externas, para agentes de IA c
 node <engine>/tools/mcp-server/server.mjs
 ```
 
+Transporte remoto opcional (HTTP + SSE), para clientes que não usam stdio ou que precisam de múltiplos clientes/reconexão:
+
+```powershell
+node <engine>/tools/mcp-server/server.mjs --http [--port 8322]
+# POST /mcp   -> JSON-RPC (resposta na mesma conexão)
+# GET  /events -> SSE (notifications/* transmitidas a todo cliente conectado)
+```
+
+O servidor é `stdio`-first (o transporte padrão do MCP `command`/`args`); o modo HTTP é aditivo e opcional, escuta em `127.0.0.1`, e para de forma limpa com `SIGINT`/`SIGTERM`. Subscriptions de eventos sobrevivem à reconexão do SSE (basta reabrir `/events`).
+
 ## Configuração MCP
 
 ```json
@@ -105,7 +115,17 @@ Este ciclo substitui a validação visual: build → run curto → ler log, tudo
 
 ## CLI sem cliente MCP
 
-O `mcp-call.mjs` inicia o servidor via stdio, chama uma ferramenta e encerra:
+O `semantic-cli.mjs` expõe a **fachada semântica completa** (36 tools: projetos, cenas, entidades, componentes, scripts visuais, materiais, áudio, física, prefabs, partículas, registry/vehicle/ability/mission/world_profile/gait/simulation_lod) **sem servidor MCP** — mesmas factories do servidor (`callSemanticTool`), então nunca diverge da superfície MCP:
+
+```powershell
+node semantic-cli.mjs tools
+node semantic-cli.mjs schema <tool>            # JSON Schema do input
+node semantic-cli.mjs call <tool> '<json-args>' [--engine <root>]
+```
+
+Exit code: `0` sucesso, `2` a ferramenta retornou erro (`isError`), `3` erro de driver/uso.
+
+O `mcp-call.mjs` inicia o servidor via stdio, chama QUALQUER ferramenta (semânticas + manutenção) e encerra:
 
 ```powershell
 node mcp-call.mjs engine_overview

@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/animations/gait.json",
+  "title": "gait animation asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset name (becomes the file name); must be non-empty",
+      "type": "string"
+    },
+    "version": {
+      "description": "must be 1",
+      "default": 1,
+      "type": "integer"
+    },
+    "cycleDuration": {
+      "description": "duration of one full stride cycle (s), > 0",
+      "default": 1,
+      "type": "number"
+    },
+    "stanceFraction": {
+      "description": "stance fraction of the cycle; the rest is swing, in (0, 1)",
+      "default": 0.6,
+      "type": "number"
+    },
+    "stepHeight": {
+      "description": "vertical foot lift during swing, >= 0",
+      "default": 0.25,
+      "type": "number"
+    },
+    "maxStride": {
+      "description": "max horizontal stride per step, > 0",
+      "default": 0.5,
+      "type": "number"
+    },
+    "legPhases": {
+      "description": "per-leg phase offset (fraction of the cycle) in [0, 1); size must equal legs",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "number"
+      }
+    },
+    "legs": {
+      "description": "leg chains (one per leg): [{ name (non-empty), hipOffset: [x,y,z], upperLength > 0, lowerLength > 0, restOffset: [x,y,z], maxReach >= 0 (0 = auto upper+lower), hipBone/kneeBone/footBone (>= 0 binds; -1 = unbound; distinct when set) }]",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  },
+  "required": [
+    "name",
+    "legs"
+  ]
+}

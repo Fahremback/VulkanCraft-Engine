@@ -46,6 +46,7 @@
 #include "EditorControlApi.hpp"
 #include "EditorPlugin.hpp"
 #include "ProjectTemplate.hpp"
+#include "engine/ui/IUiDoc.hpp"
 #include "WindowClamp.hpp"
 #include "tools/WickedToolsPanel.hpp"
 
@@ -903,6 +904,12 @@ private:
     // wizard lists these; create_project_from_template materializes a scaffold.
     Engine::Editor::ProjectTemplateRegistry m_templateRegistry;
     void register_project_templates();
+
+    // The editor's composed UI document (engine/ui IUiDoc), built once at
+    // startup and exposed via GET /ui-doc — the data surface for
+    // reflection/scripting/MCP tooling.
+    std::string m_uiDocJson;
+    std::string build_ui_doc_json();
 
     // Play-mode frame stepping (PASSO button): advance the play world one
     // frame while paused.

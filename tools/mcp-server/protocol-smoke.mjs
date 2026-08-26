@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -609,9 +610,22 @@ try {
   // under src/engine/public must be self-contained (engine//std/vendor only,
   // canonical engine/<domain>/<Header>.hpp includes — never short names). A
   // header with an internal include or a short include breaks this gate.
-  const sdkCheck = spawnSync(process.execPath, [path.join(directory, "..", "sdk", "sdk-check.mjs"), "--expect-count", "74"], { encoding: "utf8" });
+  const sdkCheck = spawnSync(process.execPath, [path.join(directory, "..", "sdk", "sdk-check.mjs"), "--expect-count", "91"], { encoding: "utf8" });
   assert.equal(sdkCheck.status, 0, sdkCheck.stdout + sdkCheck.stderr);
-  assert.match(sdkCheck.stdout, /74 public headers/, sdkCheck.stdout);
+  assert.match(sdkCheck.stdout, /91 public headers/, sdkCheck.stdout);
+
+  // §1 item 1 + §8 item 3: the COMMITTED API inventory (docs/SDK_API_INVENTORY.md)
+  // must equal a fresh generation — it is a GENERATED artifact (single source:
+  // the filesystem walk), never a manual list. Regenerate with:
+  //   node tools/sdk/sdk-check.mjs --write-manifest docs/SDK_API_INVENTORY.md
+  const inventoryPath = path.resolve(directory, "..", "..", "docs", "SDK_API_INVENTORY.md");
+  const inventoryTemp = path.join(directory, "mcp-smoke-inventory.md");
+  const inventoryGen = spawnSync(process.execPath, [path.join(directory, "..", "sdk", "sdk-check.mjs"), "--write-manifest", inventoryTemp], { encoding: "utf8" });
+  assert.equal(inventoryGen.status, 0, inventoryGen.stderr);
+  const committedInventory = fs.readFileSync(inventoryPath, "utf8");
+  const freshInventory = fs.readFileSync(inventoryTemp, "utf8");
+  assert.equal(freshInventory, committedInventory, "docs/SDK_API_INVENTORY.md is fresh (regenerate: sdk-check.mjs --write-manifest docs/SDK_API_INVENTORY.md)");
+  fs.rmSync(inventoryTemp, { force: true });
 
   // The CLI exposes the same artifacts without a running server.
   const cliPath = path.join(directory, "registry-cli.mjs");
@@ -650,6 +664,29 @@ try {
   assert.equal(cliExport.status, 0, cliExport.stderr);
   for (const kind of schemaKinds) assert.ok(fs.existsSync(path.join(schemaOutDir, `${kind}.json`)));
 
+  // §8 item 3: the COMMITTED schemas (schema/registry/) must equal a fresh
+  // regeneration from the single source (REGISTRY_FIELD_SCHEMAS) — no manual
+  // lists, no drift. The fresh export (schemaOutDir) contains every kind the
+  // CLI generates; the committed dir must match it file-for-file and
+  // byte-for-byte. If an agent adds a field/kind, this fails until
+  // `node tools/mcp-server/registry-cli.mjs export-schemas schema/registry`
+  // is re-run (regenerated 2026-08-26, findings #182).
+  const committedSchemaDir = path.resolve(directory, "..", "..", "schema", "registry");
+  const freshKinds = fs.readdirSync(schemaOutDir)
+    .filter((f) => f.endsWith(".json"))
+    .map((f) => f.replace(/\.json$/, ""))
+    .sort();
+  const committedKinds = fs.readdirSync(committedSchemaDir)
+    .filter((f) => f.endsWith(".json"))
+    .map((f) => f.replace(/\.json$/, ""))
+    .sort();
+  assert.deepEqual(committedKinds, freshKinds, "schema/registry/ covers every kind the CLI generates");
+  for (const kind of freshKinds) {
+    const committed = fs.readFileSync(path.join(committedSchemaDir, `${kind}.json`), "utf8");
+    const fresh = fs.readFileSync(path.join(schemaOutDir, `${kind}.json`), "utf8");
+    assert.equal(fresh, committed, `schema/registry/${kind}.json is fresh (regenerate: registry-cli.mjs export-schemas schema/registry)`);
+  }
+
   // Author through the CLI: writes the asset via the same validation; a second
   // author without --update is refused; --dry-run writes nothing.
   const cliAuthor = runCli(["author", "--engine", engineRoot, "--project", smokeProject, "--kind", "block", "--name", "CliStone", "--file", cliDoc]);
@@ -660,6 +697,72 @@ try {
   const cliDryRun = runCli(["author", "--engine", engineRoot, "--project", smokeProject, "--kind", "block", "--name", "CliDry", "--file", cliDoc, "--dry-run"]);
   assert.equal(cliDryRun.status, 0, cliDryRun.stderr);
   assert.ok(!fs.existsSync(path.join(smokeProjectPath, "Content", "Registry", "block", "CliDry.json")));
+
+  // ---- §4 item 2 Command Bus: run_batch (all-or-nothing transaction) ----
+  {
+    const batchOk = await request("tools/call", { name: "run_batch", arguments: {
+      project: smokeProject,
+      operations: [
+        { tool: "author_registry_asset", args: { kind: "item", name: "batch_smoke_ingot" } },
+        { tool: "author_registry_asset", args: { kind: "block", name: "BatchSmokeBlock", hardness: 3, drops: ["vulkancraft:batch_smoke_ingot"] } }
+      ]
+    } });
+    const batchPayload = JSON.parse(batchOk.result.content[0].text);
+    assert.equal(batchOk.result.isError, undefined, JSON.stringify(batchPayload));
+    assert.equal(batchPayload.committed, true, "run_batch commits a valid batch");
+    assert.equal(batchPayload.applied.length, 2, "run_batch applies every operation");
+
+    // Atomic refusal: op0 valid, op1 invalid -> nothing written (op0 absent).
+    const batchRefused = await request("tools/call", { name: "run_batch", arguments: {
+      project: smokeProject,
+      operations: [
+        { tool: "author_registry_asset", args: { kind: "block", name: "BatchNever", hardness: 2 } },
+        { tool: "author_registry_asset", args: { kind: "block", name: "BatchBad", collision_shape: "octagon" } }
+      ]
+    } });
+    const refusedPayload = JSON.parse(batchRefused.result.content[0].text);
+    assert.equal(refusedPayload.refused, true, "run_batch refuses when any op fails validation");
+    assert.equal(refusedPayload.operation, 1, "refusal names the failing operation");
+    assert.ok(!fs.existsSync(path.join(smokeProjectPath, "Content", "Registry", "block", "BatchNever.json")),
+      "refused batch writes NOTHING (op0 rolled back before write)");
+
+    // Rollback on apply failure: duplicate without update -> op0 removed.
+    const batchRollback = await request("tools/call", { name: "run_batch", arguments: {
+      project: smokeProject,
+      operations: [
+        { tool: "author_registry_asset", args: { kind: "block", name: "BatchRollback", hardness: 2 } },
+        { tool: "author_registry_asset", args: { kind: "block", name: "BatchRollback", hardness: 9 } }
+      ]
+    } });
+    const rollbackPayload = JSON.parse(batchRollback.result.content[0].text);
+    assert.equal(rollbackPayload.committed, false, "duplicate inside a batch fails at apply");
+    assert.equal(rollbackPayload.failed_at, 1, "apply failure names the operation");
+    assert.ok(rollbackPayload.rolled_back.length >= 1, "apply failure rolls back prior ops");
+    assert.ok(!fs.existsSync(path.join(smokeProjectPath, "Content", "Registry", "block", "BatchRollback.json")),
+      "rolled-back create leaves no file");
+
+    // Batch-level dry_run: validates but writes nothing.
+    const batchDry = await request("tools/call", { name: "run_batch", arguments: {
+      project: smokeProject,
+      dry_run: true,
+      operations: [
+        { tool: "author_registry_asset", args: { kind: "block", name: "BatchDryOnly", hardness: 1 } }
+      ]
+    } });
+    const dryPayload = JSON.parse(batchDry.result.content[0].text);
+    assert.equal(dryPayload.dry_run, true, "run_batch dry_run validates without writing");
+    assert.ok(!fs.existsSync(path.join(smokeProjectPath, "Content", "Registry", "block", "BatchDryOnly.json")),
+      "batch dry_run writes nothing");
+
+    // Unknown tool inside a batch is refused up front (structured).
+    const batchBadTool = await request("tools/call", { name: "run_batch", arguments: {
+      project: smokeProject,
+      operations: [ { tool: "nope", args: {} } ]
+    } });
+    assert.equal(batchBadTool.result.isError, true);
+    assert.match(batchBadTool.result.content[0].text, /must be one of/);
+    process.stdout.write("run_batch smoke (transaction/atomicity) passed\n");
+  }
 
   // ---- FALTANTES §17 item 12: vehicle assembly authoring ----
 
@@ -1512,6 +1615,115 @@ try {
     lifecycle.stdin.end();
     lifecycle.kill();
     process.stdout.write("Lifecycle smoke (shutdown+exit) passed\n");
+  }
+
+  // ---- optional remote transport (FALTANTES item 5): HTTP + SSE + concurrent clients ----
+  {
+    const httpPort = 8323 + (Date.now() % 1000);
+    const httpChild = spawn(process.execPath, [path.join(directory, "server.mjs"), "--http", "--port", String(httpPort)], {
+      cwd: directory,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true
+    });
+    let httpStderr = "";
+    httpChild.stderr.setEncoding("utf8");
+    httpChild.stderr.on("data", (c) => { httpStderr += c; });
+
+    const httpPost = (body) => new Promise((resolve, reject) => {
+      const payload = JSON.stringify(body);
+      const req = http.request(
+        { host: "127.0.0.1", port: httpPort, path: "/mcp", method: "POST",
+          headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } },
+        (res) => {
+          let data = "";
+          res.setEncoding("utf8");
+          res.on("data", (c) => { data += c; });
+          res.on("end", () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+        });
+      req.on("error", reject);
+      req.end(payload);
+    });
+
+    let ready = false;
+    const deadline = Date.now() + 10000;
+    while (!ready && Date.now() < deadline) {
+      try {
+        await httpPost({ jsonrpc: "2.0", id: 1, method: "ping", params: {} });
+        ready = true;
+      } catch {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+    assert.ok(ready, `HTTP server did not become ready; stderr=${httpStderr}`);
+
+    const init = await httpPost({ jsonrpc: "2.0", id: 2, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "http-smoke", version: "1" } } });
+    assert.equal(init.result.serverInfo.name, "vulkancraft-engine");
+    assert.ok(init.result.capabilities.prompts, "HTTP initialize advertises capabilities");
+
+    const badInit = await httpPost({ jsonrpc: "2.0", id: 3, method: "initialize", params: { protocolVersion: "2099-01-01", capabilities: {} } });
+    assert.equal(badInit.error.code, -32602, "HTTP initialize refuses an unsupported protocol version");
+
+    const pingBurst = await Promise.all(
+      Array.from({ length: 20 }, (_, i) => httpPost({ jsonrpc: "2.0", id: 100 + i, method: "ping", params: {} }))
+    );
+    for (const r of pingBurst) assert.deepEqual(r.result, {}, "concurrent HTTP clients resolve independently");
+
+    const sse = await new Promise((resolve, reject) => {
+      const req = http.request({ host: "127.0.0.1", port: httpPort, path: "/events", method: "GET",
+        headers: { accept: "text/event-stream" } }, (res) => resolve(res));
+      req.on("error", reject);
+      req.end();
+    });
+    assert.equal(sse.statusCode, 200, "SSE endpoint returns 200");
+    let sseBuf = "";
+    sse.setEncoding("utf8");
+    sse.on("data", (c) => { sseBuf += c; });
+    await new Promise((r) => setTimeout(r, 150));
+    assert.match(sseBuf, /connected/, "SSE stream sends a connect ack");
+
+    const sub = await httpPost({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "subscribe_events", arguments: { kinds: ["build.status_changed"] } } });
+    assert.equal(sub.result.isError, undefined, "subscribe_events works over HTTP");
+
+    sse.destroy();
+    const exitInfo = new Promise((resolve) => httpChild.on("exit", (code, signal) => resolve({ code, signal })));
+    httpChild.kill("SIGTERM");
+    const stopResult = await Promise.race([exitInfo, new Promise((r) => setTimeout(() => r("timeout"), 5000))]);
+    assert.notEqual(stopResult, "timeout", "HTTP server stops after SIGTERM");
+    // POSIX runs the graceful handler (exit 0); on Windows child.kill is a forced
+    // termination (signal SIGTERM, code null). Both stop the server.
+    assert.ok(
+      stopResult && (stopResult.code === 0 || stopResult.signal === "SIGTERM"),
+      `HTTP server stopped after SIGTERM (got ${JSON.stringify(stopResult)})`
+    );
+    process.stdout.write("Remote transport smoke (HTTP + SSE + concurrency) passed\n");
+  }
+
+  // ---- Semantic Engine API CLI (§4/§8): the full 36-tool semantic surface
+  // reachable dependency-free via the same factories the MCP server uses.
+  {
+    const tools = spawnSync(process.execPath, [path.join(directory, "semantic-cli.mjs"), "tools"], { encoding: "utf8" });
+    assert.equal(tools.status, 0, tools.stderr);
+    const toolLines = tools.stdout.trim().split(/\r?\n/);
+    assert.ok(toolLines.length >= 36, `semantic CLI exposes the full tool surface (got ${toolLines.length})`);
+    assert.ok(toolLines.some((l) => l.startsWith("create_game_project\t")), "tools lists create_game_project");
+    assert.ok(toolLines.some((l) => l.startsWith("author_ability_asset\t")), "tools lists author_ability_asset");
+
+    const schema = spawnSync(process.execPath, [path.join(directory, "semantic-cli.mjs"), "schema", "create_scene"], { encoding: "utf8" });
+    assert.equal(schema.status, 0, schema.stderr);
+    const sceneSchema = JSON.parse(schema.stdout);
+    assert.deepEqual(sceneSchema.required, ["project", "name"], "schema exposes required args");
+
+    const badSchema = spawnSync(process.execPath, [path.join(directory, "semantic-cli.mjs"), "schema", "nope"], { encoding: "utf8" });
+    assert.equal(badSchema.status, 2, "unknown tool schema exits 2");
+    assert.match(badSchema.stderr, /unknown semantic tool/);
+
+    const badCall = spawnSync(process.execPath, [path.join(directory, "semantic-cli.mjs"), "call", "create_game_project", '{"name":"Bad/Name!"}'], { encoding: "utf8" });
+    assert.equal(badCall.status, 2, "isError result exits 2");
+    assert.match(badCall.stdout, /isError.*true/s);
+
+    const unknown = spawnSync(process.execPath, [path.join(directory, "semantic-cli.mjs"), "call", "nope", "{}"], { encoding: "utf8" });
+    assert.equal(unknown.status, 3, "unknown tool call exits 3");
+    process.stdout.write("Semantic CLI smoke (36 tools, dependency-free) passed\n");
   }
 
   process.stdout.write("MCP protocol smoke test passed\n");

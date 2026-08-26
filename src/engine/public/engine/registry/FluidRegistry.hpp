@@ -59,6 +59,21 @@ struct FluidDefinition {
     // Visual material hint (linear RGBA 0..1) for the renderer milestone.
     glm::vec4 color{ 0.30f, 0.60f, 1.00f, 0.65f };
     bool compressible{ false };
+
+    // ---- Temperature / solidification / combustion (task D.3) ----------
+    // Declared heat axis (Kelvin). Finite; carried into the world's fluid
+    // table. Not a thermal simulation — it is the data-driven marker the
+    // reaction rules below hang off.
+    float temperature{ 300.0f };
+    // Namespaced block an UNFED flowing cell turns into ("solidifies"): the
+    // fluid's cooled/edge solid form (e.g. lava -> obsidian/cobblestone).
+    // Empty = no solidification (normal evaporation/pooling). Resolved at
+    // world build; an unknown block is refused (never guessed).
+    std::string solidifiesInto;
+    // The fluid ignites adjacent flammable blocks (registry blocks with
+    // flammability > 0): they are consumed to air. Deterministic and bounded
+    // to the fluid tick.
+    bool ignites{ false };
     int32_t version{ 1 };
 };
 
@@ -76,6 +91,9 @@ struct FluidDefinition {
 //   "damagePerTick": 4.0,
 //   "color": [1.0, 0.4, 0.1, 0.9],
 //   "compressible": false,
+//   "temperature": 1300.0,          // optional declared heat (Kelvin)
+//   "solidifiesInto": "test:obsidian",  // optional block the edge cell cools into
+//   "ignites": true,                // optional: ignites adjacent flammable blocks
 //   "version": 1
 // }
 class FluidRegistry {

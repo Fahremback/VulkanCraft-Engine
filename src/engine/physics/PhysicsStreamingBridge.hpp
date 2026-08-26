@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -67,6 +68,18 @@ public:
     // Terrain edits: wakes every sleeping dynamic body whose captured
     // position is inside the world AABB. Returns how many were woken.
     std::size_t wake_region(const glm::vec3& minimum, const glm::vec3& maximum);
+
+    // Transactional-edit integration (task B.5): call this right after a
+    // committed world edit (block change / explosion) with the edit's world
+    // AABB. It wakes every sleeping dynamic body inside the region (same as
+    // wake_region) AND marks every tracked terrain chunk overlapping the
+    // region as STALE, so the next sync() re-probes that chunk's surface and
+    // rebuilds its static slab (destroy + recreate) at the new surface. This
+    // is how a committed transaction is reflected in collision within the
+    // same tick loop: a body that was resting on the old surface is woken and
+    // re-resolved against the new one. Returns how many bodies were woken.
+    std::size_t note_region_edited(const glm::vec3& minimum,
+                                   const glm::vec3& maximum);
 
     // Voxel connectivity (FALTANTES §16 item 9): every DETACHED voxel island
     // (a solid component no longer connected to the anchored mass) becomes a
@@ -121,6 +134,9 @@ private:
 
     std::unordered_map<std::uint32_t, Material> materials_;
     std::map<ChunkKey, BodyHandle> terrain_;    // chunk -> static slab body
+    // Chunks whose surface changed since their slab was created; the next
+    // sync() destroys and re-creates their slab (re-probe + material).
+    std::set<ChunkKey> staleTerrain_;
     std::unordered_map<BodyHandle, glm::vec3> dynamic_;            // handle -> captured position
     std::map<ChunkKey, std::vector<BodyHandle>> dynamicByChunk_;   // chunk -> dynamic bodies
     std::size_t unloadedBodies_{ 0 };

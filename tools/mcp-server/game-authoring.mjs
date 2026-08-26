@@ -2013,6 +2013,32 @@ export function semanticToolDefinitions() {
       inputSchema: {
         type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
       }
+    },
+    {
+      name: "run_batch",
+      description: "Transactional command bus: apply N authoring operations (author_registry_asset, author_vehicle_asset, author_ability_asset, author_mission_asset, author_world_profile_asset, author_gait_asset, author_simulation_lod_spec, create_prefab, create_particle_asset) all-or-nothing — every operation is validated (dry_run) before anything is written; on any apply failure the already-applied operations are rolled back (updates restored, creates removed). dry_run: true validates the whole batch without writing.",
+      inputSchema: {
+        type: "object",
+        required: ["project", "operations"],
+        properties: {
+          project: { type: "string" },
+          operations: {
+            type: "array",
+            minItems: 1,
+            items: {
+              type: "object",
+              required: ["tool", "args"],
+              properties: {
+                tool: { type: "string" },
+                args: { type: "object" }
+              },
+              additionalProperties: false
+            }
+          },
+          dry_run: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
     }
   ];
 }
@@ -2055,8 +2081,130 @@ export function callSemanticTool(engineRoot, name, args = {}) {
     case "apply_particle_asset": return applyParticleAsset(engineRoot, args);
     case "inspect_particle_assets": return inspectParticleAssets(engineRoot, args.project);
     case "validate_game_project": return validateProject(engineRoot, args.project);
+    case "run_batch": return runBatch(engineRoot, args);
     default: return undefined;
   }
+}
+
+// FALTANTES item 5 / task_plan Agente 5 §4 item 2 — Command Bus transacional:
+// run_batch executa N authoring operations com semântica all-or-nothing. O
+// surface individual (author_*/create_prefab/create_particle_asset) já tem
+// dry_run (valida sem escrever), update (substitui devolvendo o documento
+// anterior) e rollback — o run_batch orquestra esses contratos:
+//   Phase 1 (validate): TODAS as ops rodam com dry_run:true — qualquer recusa
+//     aborta o batch inteiro sem escrever nada (validação é a fonte da
+//     atomicidade: nada é escrito até tudo validar).
+//   Phase 2 (apply): as ops rodam em ordem com update:true; cada resultado
+//     grava {path, created|updated, previous} para undo.
+//   Phase 3 (rollback): se QUALQUER op falhar no apply, as ops já aplicadas
+//     são desfeitas em ordem reversa (updated -> re-escreve o previous
+//     document; created -> remove o arquivo). O batch nunca deixa o projeto
+//     pela metade.
+const BATCH_TOOLS = new Set([
+  "author_registry_asset", "author_vehicle_asset", "author_ability_asset",
+  "author_mission_asset", "author_world_profile_asset", "author_gait_asset",
+  "author_simulation_lod_spec", "create_prefab", "create_particle_asset"
+]);
+
+function runBatch(engineRoot, args) {
+  const project = requireProject(engineRoot, args.project);
+  const operations = Array.isArray(args.operations) ? args.operations : [];
+  if (operations.length === 0) throw new Error("run_batch requires a non-empty 'operations' array");
+  for (const [index, op] of operations.entries()) {
+    if (!op || typeof op.tool !== "string" || !BATCH_TOOLS.has(op.tool)) {
+      throw new Error(`run_batch operation[${index}] must be one of: ${[...BATCH_TOOLS].join(", ")}`);
+    }
+  }
+
+  // Phase 1 — validate everything first (dry_run; nothing is written until
+  // every operation passes its public-contract validation). Defensive: a tool
+  // that throws during the preview (e.g. a path collision on disk) is caught
+  // and returned as a structured refusal — the batch still writes nothing.
+  for (const [index, op] of operations.entries()) {
+    let preview;
+    try {
+      preview = callSemanticTool(engineRoot, op.tool, { ...op.args, project: project.project, dry_run: true });
+    } catch (error) {
+      return {
+        refused: true,
+        project: project.project,
+        operation: index,
+        tool: op.tool,
+        diagnostics: [error instanceof Error ? error.message : String(error)],
+        reason: `operation[${index}] (${op.tool}) failed during validation; nothing was written`
+      };
+    }
+    if (preview && preview.refused) {
+      return {
+        refused: true,
+        project: project.project,
+        operation: index,
+        tool: op.tool,
+        diagnostics: preview.diagnostics ?? [],
+        reason: `operation[${index}] (${op.tool}) failed validation; nothing was written`
+      };
+    }
+  }
+  if (args.dry_run) {
+    return {
+      dry_run: true,
+      project: project.project,
+      would_apply: operations.map((op) => ({ tool: op.tool, args: op.args })),
+      validated: operations.length
+    };
+  }
+
+  // Phase 2 — apply in order, capturing undo info per applied op. Natural
+  // create semantics (a duplicate inside the batch fails and rolls the batch
+  // back); the batch-level update flag opts into replacement (mirrors the
+  // per-tool update contract).
+  const allowUpdate = Boolean(args.update);
+  const applied = [];
+  for (const [index, op] of operations.entries()) {
+    try {
+      const result = callSemanticTool(engineRoot, op.tool, { ...op.args, project: project.project, ...(allowUpdate ? { update: true } : {}) });
+      const file = result.path ? path.join(project.root, result.path) : null;
+      applied.push({
+        index,
+        tool: op.tool,
+        result,
+        created: Boolean(result.created),
+        file: file && fs.existsSync(file) ? file : null,
+        previous: result.rollback?.document ?? null
+      });
+    } catch (error) {
+      // Phase 3 — roll back every already-applied op, in reverse order.
+      const rolledBack = [];
+      for (const done of applied.reverse()) {
+        try {
+          if (done.file && done.previous !== null) {
+            atomicWriteJson(done.file, done.previous);
+            rolledBack.push({ tool: done.tool, file: done.file, action: "restored" });
+          } else if (done.file && done.created) {
+            fs.rmSync(done.file, { force: true });
+            rolledBack.push({ tool: done.tool, file: done.file, action: "removed" });
+          }
+        } catch {
+          rolledBack.push({ tool: done.tool, file: done.file, action: "rollback-failed" });
+        }
+      }
+      return {
+        committed: false,
+        project: project.project,
+        failed_at: index,
+        tool: op.tool,
+        error: error instanceof Error ? error.message : String(error),
+        rolled_back: rolledBack,
+        applied: applied.map((done) => ({ tool: done.tool, index: done.index }))
+      };
+    }
+  }
+
+  return {
+    committed: true,
+    project: project.project,
+    applied: applied.map((done) => ({ tool: done.tool, index: done.index, path: done.result.path, created: done.created }))
+  };
 }
 
 function listProjects(engineRoot) {

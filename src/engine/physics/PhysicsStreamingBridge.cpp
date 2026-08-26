@@ -142,6 +142,18 @@ void PhysicsStreamingBridge::sync(const glm::vec3& focus) {
         }
     }
 
+    // 1b. Stale terrain refresh (task B.5): chunks whose surface changed
+    //     since their slab was created (a transactional edit raised or
+    //     lowered the surface) get their slab re-probed and rebuilt.
+    for (const ChunkKey& key : staleTerrain_) {
+        const bool loaded = world_.is_chunk_loaded(key.first, key.second);
+        if (loaded && terrain_.find(key) != terrain_.end()) {
+            unload_chunk(key.first, key.second);
+            create_terrain(key.first, key.second);
+        }
+    }
+    staleTerrain_.clear();
+
     // 2. Dynamic membership: reassign buckets from live body positions so a
     //    body that fell across a chunk boundary follows its chunk.
     recompute_membership();
@@ -198,6 +210,30 @@ std::size_t PhysicsStreamingBridge::wake_region(const glm::vec3& minimum,
         if (aabb_contains(minimum, maximum, position)) {
             physics_.wake(handle);
             ++woken;
+        }
+    }
+    return woken;
+}
+
+std::size_t PhysicsStreamingBridge::note_region_edited(
+    const glm::vec3& minimum, const glm::vec3& maximum) {
+    // 1. Wake bodies in the region (same semantics as wake_region).
+    const std::size_t woken = wake_region(minimum, maximum);
+
+    // 2. Mark every tracked terrain chunk overlapping the AABB as stale.
+    //    The next sync() will re-probe its surface and rebuild the slab.
+    const float size = config_.chunkWorldSize;
+    const int minCX = static_cast<int>(std::floor(minimum.x / size));
+    const int maxCX = static_cast<int>(std::floor(maximum.x / size));
+    const int minCZ = static_cast<int>(std::floor(minimum.z / size));
+    const int maxCZ = static_cast<int>(std::floor(maximum.z / size));
+    for (int cx = minCX; cx <= maxCX; ++cx) {
+        for (int cz = minCZ; cz <= maxCZ; ++cz) {
+            // Only stale slabs that actually exist — a chunk that is not yet
+            // loaded has no slab, and sync() will create one when it loads.
+            if (terrain_.find({ cx, cz }) != terrain_.end()) {
+                staleTerrain_.emplace(cx, cz);
+            }
         }
     }
     return woken;

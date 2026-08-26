@@ -221,6 +221,34 @@ bool build_fluid_table(const engine::registry::BlockRegistry& blocks,
         params.damagePerTick = definition.damagePerTick;
         params.color = definition.color;
         params.compressible = definition.compressible;
+        params.temperature = definition.temperature;
+        params.ignites = definition.ignites;
+        if (!definition.solidifiesInto.empty()) {
+            // Resolve the solid form at table build (never guessed): an
+            // unknown block refuses the whole fluid registration.
+            const engine::registry::BlockDefinition* solid =
+                blocks.find_by_name(definition.solidifiesInto);
+            if (solid == nullptr) {
+                errorOut = "fluid '" + definition.block +
+                           "': solidifiesInto '" + definition.solidifiesInto +
+                           "' references an unknown block";
+                return false;
+            }
+            if (solid->hasBuiltinMapping) {
+                params.solidifiesInto =
+                    static_cast<RuntimeBlockId>(solid->builtinId);
+            } else {
+                const std::optional<RuntimeBlockId> solidDynamic =
+                    world.runtime_block_id_for_uuid(solid->uuid);
+                if (!solidDynamic) {
+                    errorOut = "fluid '" + definition.block +
+                               "': solidifiesInto '" + definition.solidifiesInto +
+                               "' has no runtime mapping yet";
+                    return false;
+                }
+                params.solidifiesInto = *solidDynamic;
+            }
+        }
         tableOut[id] = params;  // project definition overrides the engine default
     }
     errorOut.clear();

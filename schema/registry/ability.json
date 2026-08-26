@@ -1,0 +1,80 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/abilities/ability.json",
+  "title": "ability ability",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "ability name (becomes the file name)",
+      "type": "string"
+    },
+    "id": {
+      "description": "persistent UUID; derived from 'abilities:<name>' when omitted",
+      "type": "string"
+    },
+    "version": {
+      "description": "\"version\" ability field",
+      "default": 1,
+      "type": "integer"
+    },
+    "cooldownSeconds": {
+      "description": "cooldown after a cast, >= 0",
+      "default": 0,
+      "type": "number"
+    },
+    "cancelable": {
+      "description": "\"cancelable\" ability field",
+      "default": true,
+      "type": "boolean"
+    },
+    "interruptible": {
+      "description": "\"interruptible\" ability field",
+      "default": true,
+      "type": "boolean"
+    },
+    "attributes": {
+      "description": "named numeric attributes: [{ name, value }]",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "tags": {
+      "description": "named tags ('movement', 'fire', 'ultimate') the runtime never interprets",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "cost": {
+      "description": "resource cost spent from the caster at cast: { resource, amount >= 0 }",
+      "type": "object"
+    },
+    "conditions": {
+      "description": "AND-ed gates: [{ kind: ownerTag|targetTag|ownerAttribute|targetAttribute|distance, tag, attribute, minValue, maxDistance }]",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "targeting": {
+      "description": "{ mode: self|direction|point|body, range >= 0, radius >= 0 }",
+      "type": "object"
+    },
+    "effects": {
+      "description": "composable effects applied in order: [{ type: damage|heal|impulse|telekinesis|flight|blockEdit|periodic, ... }] — see ability_effect_fields",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  },
+  "required": [
+    "name",
+    "effects"
+  ]
+}

@@ -31,7 +31,7 @@ const STD_HEADERS = new Set([
   "cstring", "ctime", "cwchar", "cwctype", "deque", "exception", "filesystem", "functional",
   "initializer_list", "iosfwd", "iterator", "limits", "list", "map", "memory", "mutex",
   "new", "numeric", "optional", "queue", "random", "ratio", "regex", "set", "span",
-  "sstream", "stack", "stdexcept", "string", "thread", "tuple", "type_traits", "unordered_map",
+  "sstream", "stack", "stdexcept", "string", "string_view", "thread", "tuple", "type_traits", "unordered_map",
   "unordered_set", "utility", "variant", "vector"
 ]);
 const VENDOR_PREFIXES = ["glm/", "miniz/", "stb/", "jolt/", "recast/", "detour/", "zstd/", "blake3/"];
@@ -75,10 +75,42 @@ for (const file of publicHeaders) {
 const manifest = publicHeaders.map((file) => path.relative(PUBLIC_ROOT, file).replaceAll(path.sep, "/"));
 
 const emitManifest = process.argv.includes("--emit-manifest");
+const writeIndex = process.argv.indexOf("--write-manifest");
+const writeManifest = writeIndex >= 0 ? process.argv[writeIndex + 1] : null;
 const expectIndex = process.argv.indexOf("--expect-count");
 const expectCount = expectIndex >= 0 ? Number(process.argv[expectIndex + 1]) : null;
 
-if (emitManifest) {
+if (writeManifest) {
+  // task_plan Agente 5 §1 item 1 — persist the API inventory as a GENERATED
+  // artifact (no manual list): the single source is the filesystem walk below,
+  // so the doc can never drift from the SDK. Re-generate with:
+  //   node tools/sdk/sdk-check.mjs --write-manifest docs/SDK_API_INVENTORY.md
+  const domains = new Map();
+  for (const entry of manifest) {
+    const domain = entry.split("/")[1] ?? "(root)";
+    if (!domains.has(domain)) domains.set(domain, []);
+    domains.get(domain).push(entry);
+  }
+  const lines = [
+    "# VulkanCraft Engine — Inventário da API pública (SDK)",
+    "",
+    "Gerado automaticamente por `node tools/sdk/sdk-check.mjs --write-manifest docs/SDK_API_INVENTORY.md` — NÃO editar à mão.",
+    "Fonte única: o walk do filesystem em `src/engine/public/` (único include dir exposto aos consumidores).",
+    "",
+    `Total: **${publicHeaders.length} headers públicos** em ${domains.size} domínios.`,
+    "",
+    "## Domínios",
+    ""
+  ];
+  for (const [domain, entries] of [...domains.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    lines.push(`### ${domain} (${entries.length})`);
+    lines.push("");
+    for (const entry of entries.sort()) lines.push(`- \`${entry}\``);
+    lines.push("");
+  }
+  fs.writeFileSync(path.resolve(ENGINE_ROOT, writeManifest), lines.join("\n"), "utf8");
+  console.log(`sdk-check: wrote ${publicHeaders.length} public headers to ${writeManifest}`);
+} else if (emitManifest) {
   for (const entry of manifest) console.log(entry);
 } else {
   console.log(`sdk-check: ${publicHeaders.length} public headers under src/engine/public`);

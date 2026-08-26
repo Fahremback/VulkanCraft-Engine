@@ -1,0 +1,176 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/scene/particle.json",
+  "title": "particle particle emitter asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset name (becomes the file name)",
+      "type": "string"
+    },
+    "version": {
+      "description": "must be 1",
+      "default": 1,
+      "type": "integer"
+    },
+    "px": {
+      "description": "ParticleEmitter.px (component schema default 0)",
+      "default": 0,
+      "type": "number"
+    },
+    "py": {
+      "description": "ParticleEmitter.py (component schema default 0)",
+      "default": 0,
+      "type": "number"
+    },
+    "pz": {
+      "description": "ParticleEmitter.pz (component schema default 0)",
+      "default": 0,
+      "type": "number"
+    },
+    "dx": {
+      "description": "ParticleEmitter.dx (component schema default 0)",
+      "default": 0,
+      "type": "number"
+    },
+    "dy": {
+      "description": "ParticleEmitter.dy (component schema default 1)",
+      "default": 1,
+      "type": "number"
+    },
+    "dz": {
+      "description": "ParticleEmitter.dz (component schema default 0)",
+      "default": 0,
+      "type": "number"
+    },
+    "cone": {
+      "description": "ParticleEmitter.cone (component schema default 0.4)",
+      "default": 0.4,
+      "type": "number"
+    },
+    "rate": {
+      "description": "ParticleEmitter.rate (component schema default 20)",
+      "default": 20,
+      "type": "number"
+    },
+    "speedMin": {
+      "description": "ParticleEmitter.speedMin (component schema default 1)",
+      "default": 1,
+      "type": "number"
+    },
+    "speedMax": {
+      "description": "ParticleEmitter.speedMax (component schema default 3)",
+      "default": 3,
+      "type": "number"
+    },
+    "lifeMin": {
+      "description": "ParticleEmitter.lifeMin (component schema default 0.5)",
+      "default": 0.5,
+      "type": "number"
+    },
+    "lifeMax": {
+      "description": "ParticleEmitter.lifeMax (component schema default 1.5)",
+      "default": 1.5,
+      "type": "number"
+    },
+    "sizeStart": {
+      "description": "ParticleEmitter.sizeStart (component schema default 0.12)",
+      "default": 0.12,
+      "type": "number"
+    },
+    "sizeEnd": {
+      "description": "ParticleEmitter.sizeEnd (component schema default 0)",
+      "default": 0,
+      "type": "number"
+    },
+    "cr": {
+      "description": "ParticleEmitter.cr (component schema default 1)",
+      "default": 1,
+      "type": "number"
+    },
+    "cg": {
+      "description": "ParticleEmitter.cg (component schema default 1)",
+      "default": 1,
+      "type": "number"
+    },
+    "cb": {
+      "description": "ParticleEmitter.cb (component schema default 1)",
+      "default": 1,
+      "type": "number"
+    },
+    "ca": {
+      "description": "ParticleEmitter.ca (component schema default 1)",
+      "default": 1,
+      "type": "number"
+    },
+    "er": {
+      "description": "ParticleEmitter.er (component schema default 1)",
+      "default": 1,
+      "type": "number"
+    },
+    "eg": {
+      "description": "ParticleEmitter.eg (component schema default 1)",
+      "default": 1,
+      "type": "number"
+    },
+    "eb": {
+      "description": "ParticleEmitter.eb (component schema default 1)",
+      "default": 1,
+      "type": "number"
+    },
+    "ea": {
+      "description": "ParticleEmitter.ea (component schema default 0)",
+      "default": 0,
+      "type": "number"
+    },
+    "ax": {
+      "description": "ParticleEmitter.ax (component schema default 0)",
+      "default": 0,
+      "type": "number"
+    },
+    "ay": {
+      "description": "ParticleEmitter.ay (component schema default -9.81)",
+      "default": -9.81,
+      "type": "number"
+    },
+    "az": {
+      "description": "ParticleEmitter.az (component schema default 0)",
+      "default": 0,
+      "type": "number"
+    },
+    "drag": {
+      "description": "ParticleEmitter.drag (component schema default 0.05)",
+      "default": 0.05,
+      "type": "number"
+    },
+    "turbulence": {
+      "description": "ParticleEmitter.turbulence (component schema default 0)",
+      "default": 0,
+      "type": "number"
+    },
+    "restitution": {
+      "description": "ParticleEmitter.restitution (component schema default 0.35)",
+      "default": 0.35,
+      "type": "number"
+    },
+    "burst": {
+      "description": "ParticleEmitter.burst (component schema default 0)",
+      "default": 0,
+      "type": "number"
+    },
+    "collide": {
+      "description": "ParticleEmitter.collide (component schema default false)",
+      "default": false,
+      "type": "boolean"
+    },
+    "emitting": {
+      "description": "ParticleEmitter.emitting (component schema default true)",
+      "default": true,
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "name"
+  ]
+}

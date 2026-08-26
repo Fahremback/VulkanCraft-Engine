@@ -864,13 +864,21 @@ void World::update_fluid_physics(const glm::vec3& playerPos) {
 
         if (!fed) {
             const uint8_t above = get_fluid_level_at(pos({ cell.x, cell.y + 1, cell.z }));
-            if (above != WATER_LEVEL_NONE) {
+            // Feeding requires the neighbor's BLOCK to be the same fluid: the
+            // level byte is a property of the fluid block, so an air cell with
+            // a stale level (a removed source) must never feed a ring (task
+            // D.3 solidification would never trigger — the ring stays fed
+            // forever by the phantom source).
+            const RuntimeBlockId aboveType = get_block_at(pos({ cell.x, cell.y + 1, cell.z }));
+            if (above != WATER_LEVEL_NONE && aboveType == type) {
                 stableLevel = static_cast<uint8_t>(WATER_FALLING_FLAG | water_base_level(above));
                 fed = true;
             } else {
                 uint8_t best = WATER_LEVEL_NONE;
                 for (const FluidCell& d : horizontal) {
                     const FluidCell neighbor{ cell.x + d.x, cell.y, cell.z + d.z };
+                    const RuntimeBlockId neighborType = get_block_at(pos(neighbor));
+                    if (neighborType != type) continue;
                     const uint8_t level = get_fluid_level_at(pos(neighbor));
                     if (level == WATER_LEVEL_NONE || get_block_at(pos({ neighbor.x, neighbor.y - 1, neighbor.z })) == kRuntimeAirId) continue;
                     const uint8_t candidate = static_cast<uint8_t>(
@@ -885,9 +893,20 @@ void World::update_fluid_physics(const glm::vec3& playerPos) {
         }
 
         if (!fed) {
-            // Unfed non-source cell: evaporate (current water behavior) or
-            // keep its level when the fluid declares no evaporation (pooled).
-            if (params->evaporation) set_block_at(worldPos, kRuntimeAirId);
+            // Unfed non-source cell: it cools into the fluid's declared solid
+            // form (task D.3), else evaporates (current water behavior), else
+            // keeps its level when the fluid declares no evaporation (pooled).
+            // Solidification overrides both: the cell becomes the solid block
+            // regardless of the evaporation flag (the fluid froze at its edge).
+            // The stale level byte on the now-solid cell is inert (fluid reads
+            // answer NONE when the block is not the fluid; set_block_at never
+            // touched the level so a later re-flood via set_block_at resets
+            // it to the source level).
+            if (params->solidifiesInto != kRuntimeAirId) {
+                set_block_at(worldPos, params->solidifiesInto);
+            } else if (params->evaporation) {
+                set_block_at(worldPos, kRuntimeAirId);
+            }
             continue;
         }
         if (stableLevel != oldLevel) set_fluid_level_at(worldPos, stableLevel);
@@ -941,6 +960,18 @@ void World::update_fluid_physics(const glm::vec3& playerPos) {
                 neighborParams != nullptr && neighborType != type;
             const bool denserWins =
                 differentFluid && params->density > neighborParams->density;
+            // Combustion (task D.3): an igniting fluid consumes an adjacent
+            // flammable block (flammability > 0) — solid non-fluid only, and
+            // never a fluid/air. Deterministic: checked once per cell per
+            // fluid step.
+            const bool flammableTarget =
+                params->ignites && neighborParams == nullptr &&
+                neighborType != kRuntimeAirId &&
+                flammability(neighborType) > 0.0f;
+            if (flammableTarget) {
+                set_block_at(pos(neighbor), kRuntimeAirId);
+                continue;
+            }
             if (neighborType == kRuntimeAirId ||
                 (neighborType == type && neighborLevel != WATER_SOURCE_LEVEL &&
                  water_base_level(neighborLevel) > spread) ||
@@ -1438,6 +1469,17 @@ uint8_t World::light_emission(RuntimeBlockId id) const {
     }
     const auto found = runtimeBlocks_.find(id);
     return found == runtimeBlocks_.end() ? 0 : found->second.lightEmission;
+}
+
+float World::flammability(RuntimeBlockId id) const {
+    // Builtin blocks currently declare no flammability in the simulation
+    // table (flammability is a registry/BlockDefinition concept); dynamic
+    // blocks expose it via RuntimeBlockInfo. This accessor is the single
+    // place the fluid combustion (task D.3) consults.
+    if (is_builtin_block(id)) return 0.0f;
+    std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+    const auto found = runtimeBlocks_.find(id);
+    return found == runtimeBlocks_.end() ? 0.0f : found->second.flammability;
 }
 
 uint8_t World::light_absorption(RuntimeBlockId id) const {

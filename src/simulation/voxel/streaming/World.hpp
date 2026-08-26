@@ -43,6 +43,12 @@ struct FluidParams {
     float damagePerTick{ 0.0f };
     glm::vec4 color{ 0.30f, 0.60f, 1.00f, 0.65f };
     bool compressible{ false };
+    // Temperature / solidification / combustion (task D.3): declared heat
+    // axis; the runtime id an unfed flowing cell solidifies into (0 = none);
+    // whether the fluid ignites adjacent flammable blocks.
+    float temperature{ 300.0f };
+    RuntimeBlockId solidifiesInto{ kRuntimeAirId };
+    bool ignites{ false };
 };
 
 struct FluidCellHash {
@@ -309,6 +315,10 @@ private:
     // Emission/absorption tables (builtin + registry-derived dynamic blocks).
     uint8_t light_emission(RuntimeBlockId id) const;
     uint8_t light_absorption(RuntimeBlockId id) const;
+    // Flammability of a runtime block id (0 = not flammable). Builtins declare
+    // none; dynamic blocks expose BlockDefinition.flammability. Consumed by
+    // the fluid combustion rule (task D.3).
+    float flammability(RuntimeBlockId id) const;
     void mark_chunk_light_dirty(int cx, int cz);
 
     // Block entities (META section 8): position -> entity; factories by type

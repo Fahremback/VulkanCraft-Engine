@@ -1,0 +1,110 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/vehicles/vehicle.json",
+  "title": "vehicle vehicle assembly",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset name (becomes the file name)",
+      "type": "string"
+    },
+    "id": {
+      "description": "persistent UUID; derived from 'vehicles:<name>' when omitted",
+      "type": "string"
+    },
+    "version": {
+      "description": "\"version\" vehicle field",
+      "default": 1,
+      "type": "integer"
+    },
+    "provider": {
+      "description": "physics provider (item 5/6): only jolt is vendored — chrono/jsbsim are refused at creation (never a silent fallback)",
+      "default": "jolt",
+      "enum": [
+        "jolt",
+        "chrono",
+        "jsbsim"
+      ]
+    },
+    "kind": {
+      "description": "Jolt controller family: car / motorcycle / tracked",
+      "default": "wheeled",
+      "enum": [
+        "wheeled",
+        "motorcycle",
+        "tracked"
+      ]
+    },
+    "position": {
+      "description": "assembly (spawn) position of the chassis body",
+      "default": [
+        0,
+        0,
+        0
+      ],
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "number"
+      }
+    },
+    "rotation": {
+      "description": "assembly rotation quaternion [x, y, z, w]",
+      "default": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "number"
+      }
+    },
+    "chassis": {
+      "description": "{ shape: box|sphere|capsule, halfExtents: [x,y,z], radius, halfHeight, mass > 0, friction >= 0, restitution >= 0 }",
+      "type": "object"
+    },
+    "wheels": {
+      "description": "[{ localPosition: [x,y,z], radius > 0, suspensionRestLength > 0, suspensionTravel >= 0, springStrength >= 0, damperStrength >= 0, tireGrip >= 0, maxDriveForce >= 0, maxBrakeForce >= 0, maxSteerAngle >= 0, steering: bool, driven: bool }]",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "drivetrain": {
+      "description": "{ engineMaxTorque >= 0, engineMinRPM > 0, engineMaxRPM > engineMinRPM, differentialRatio > 0, gearRatios: [> 0] }",
+      "type": "object"
+    },
+    "propulsion": {
+      "description": "[{ kind: wing|thruster|buoyancy, localPosition, axis (non-zero), maxForce, area, liftCoefficient, fluidDensity, waterLevel }]",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "seats": {
+      "description": "occupant seats (item 8): [{ name, localPosition, exitOffset }]",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "power": {
+      "description": "fuel/energy/controls (item 7): { fuel?: { capacity, initialLevel, burnPerSecond, idleBurnPerSecond, minLevelToRun }, energy?: { capacity, initialCharge, drawPerSecond, regenPerSecond, minChargeToRun }, controls?: { throttleDeadzone, throttleSensitivity, throttleInvert, steeringDeadzone, steeringSensitivity, steeringInvert, brakeDeadzone, brakeSensitivity } }",
+      "type": "object"
+    }
+  },
+  "required": [
+    "name",
+    "chassis",
+    "wheels",
+    "drivetrain"
+  ]
+}

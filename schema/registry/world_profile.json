@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/profiles/world_profile.json",
+  "title": "world_profile world profile",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset file name (e.g. my_world); carried by the file name, NOT a document property",
+      "type": "string"
+    },
+    "version": {
+      "description": "must be 1",
+      "default": 1,
+      "type": "integer"
+    },
+    "height": {
+      "description": "2D height field: a noise graph JSON document",
+      "type": "object"
+    },
+    "baseHeight": {
+      "description": "height = baseHeight + round(h * amplitude); only read when 'height' is present",
+      "default": 0,
+      "type": "integer"
+    },
+    "amplitude": {
+      "description": ">= 0; only read when 'height' is present",
+      "default": 1,
+      "type": "integer"
+    },
+    "climate": {
+      "description": "optional axes, each a noise graph JSON document: { temperature?, moisture?, continentalness?, erosion?, weirdness?, river? }",
+      "type": "object"
+    },
+    "biomes": {
+      "description": "biome registry JSON document (surface + climate per biome)",
+      "type": "object"
+    },
+    "caves": {
+      "description": "{ density?: noise graph JSON, scale?: number, offset?: number }",
+      "type": "object"
+    },
+    "ores": {
+      "description": "{ density?: noise graph JSON, scale?: number, offset?: number, table?: ore table JSON }",
+      "type": "object"
+    },
+    "carver": {
+      "description": "carver JSON document",
+      "type": "object"
+    },
+    "decorators": {
+      "description": "decorator set JSON document",
+      "type": "object"
+    },
+    "structures": {
+      "description": "structure placement document (definitions + spawn rules)",
+      "type": "object"
+    }
+  }
+}

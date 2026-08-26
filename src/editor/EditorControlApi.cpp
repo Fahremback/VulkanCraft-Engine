@@ -277,6 +277,23 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
         send_response(conn, out.str());
         return;
     }
+    if (method == "GET" && path == "/ui-doc") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        if (snapshot.ui_doc.empty()) {
+            send_response(conn, "{\"valid\":false,\"doc\":\"\"}");
+            return;
+        }
+        // The document is already JSON; wrap it so consumers can rely on a
+        // stable envelope ({valid, doc}).
+        std::ostringstream out;
+        out << "{\"valid\":true,\"doc\":" << snapshot.ui_doc << "}";
+        send_response(conn, out.str());
+        return;
+    }
     if (method == "GET" && path == "/health") {
         send_response(conn, "ok", "text/plain");
         return;

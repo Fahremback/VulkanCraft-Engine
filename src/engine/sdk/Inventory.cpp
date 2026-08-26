@@ -125,6 +125,32 @@ void Inventory::clear_history() noexcept {
     redoStack_.clear();
 }
 
+std::string Inventory::pack_nested(const Inventory& nested) {
+    return nested.serialize_json();
+}
+
+bool Inventory::unpack_nested(const std::string& data, int slotCount,
+                              const ItemRegistry& items, Inventory& out,
+                              std::string& errorOut) {
+    if (slotCount < 0) {
+        errorOut = "inventory: nested container slot count must be >= 0";
+        return false;
+    }
+    // All-or-nothing: build a fresh container and validate EVERYTHING before
+    // touching `out`. deserialize_json already refuses wrong slot counts,
+    // unknown items, out-of-range counts and unknown versions.
+    Inventory candidate(slotCount);
+    // The candidate's slots are locked by default; the payload may address any
+    // of them, so open them all (the container's capacity is `slotCount`).
+    SlotFilter any;
+    any.allowAny = true;
+    for (int s = 0; s < candidate.slot_count(); ++s) candidate.set_filter(s, any);
+    if (!candidate.deserialize_json(data, items, errorOut)) return false;
+    out = std::move(candidate);
+    errorOut.clear();
+    return true;
+}
+
 bool Inventory::set(int slot, const ItemStack& stack, const ItemRegistry& items,
                     std::string& errorOut) {
     if (slot < 0 || slot >= slot_count()) {

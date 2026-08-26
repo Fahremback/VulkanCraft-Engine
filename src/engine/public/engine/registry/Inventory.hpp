@@ -96,6 +96,26 @@ public:
         onChange_ = std::move(callback);
     }
 
+    // ---- Nested containers (META section 14, task E.2) ------------------
+    // An item may BE a container (e.g. a backpack): its nested inventory
+    // travels in the item stack's opaque `data` payload as the standard
+    // inventory JSON, so it already survives save/load, replication and
+    // undo/redo (the payload is opaque to the engine). These helpers are the
+    // canonical pack/unpack entry points so projects never hand-roll the
+    // framing; ownership/capacity rules stay with the caller (which slot of
+    // the outer inventory holds the container, and how many slots the
+    // container type declares — chest 27, furnace 3, backpack 9...).
+    //
+    // pack_nested returns the JSON payload to store in ItemStack::data.
+    static std::string pack_nested(const Inventory& nested);
+    // unpack_nested opens a payload into a fresh `slotCount`-slot inventory,
+    // all-or-nothing: a payload with the wrong slot count, an unknown item or
+    // an unknown format version is refused and `out` is left untouched (never
+    // guessed).
+    static bool unpack_nested(const std::string& data, int slotCount,
+                              const ItemRegistry& items, Inventory& out,
+                              std::string& errorOut);
+
     // ---- Undo/redo history (META section 14, task E.3) ------------------
     // Transactional: every successful slot mutation pushes the pre-mutation
     // slot vector, so undo()/redo() restore exact contents with no loss or

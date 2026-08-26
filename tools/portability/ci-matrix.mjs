@@ -40,6 +40,11 @@ run('node tools/portability/fast-gate.mjs voxel');
 log('Step 5: External consumer gate');
 run('node tools/portability/external-consumer-gate.mjs');
 
+// Step 5b: Moved-prefix gate (§8 item 2 "pasta movida": install -> move ->
+// consumer builds/runs against the relocated prefix)
+log('Step 5b: Moved-prefix gate');
+run('node tools/portability/moved-prefix-gate.mjs');
+
 // Step 6: Status report
 log('Step 6: Status report');
 run('node tools/portability/status-report.mjs');

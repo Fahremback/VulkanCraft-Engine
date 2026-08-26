@@ -64,6 +64,10 @@ struct EditorApiState {
     // Project templates (ProjectTemplateRegistry), insertion order — the
     // project wizard's catalog, exposed for CLI/MCP observability.
     std::vector<std::string> templates;
+    // The editor's composed UI document (engine/ui IUiDoc): layout + widgets
+    // + viewport + confirmations as ONE versioned JSON doc — the data surface
+    // for reflection/scripting/MCP tooling.
+    std::string ui_doc;
 };
 
 class EditorControlApi {

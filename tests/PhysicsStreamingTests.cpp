@@ -155,6 +155,83 @@ void test_streaming_sleep_wake() {
                 "wake_region wakes: OK\n");
 }
 
+// Task B.5: a COMMITTED TRANSACTIONAL edit is reflected in collision within
+// the same tick loop. The static terrain slab is probed once at creation; the
+// edit path (note_region_edited after a commit) marks the affected chunk
+// STALE and wakes overlapping bodies, and the next sync() re-probes the
+// surface and rebuilds the slab. A body sleeping on the OLD surface is woken
+// and re-resolved onto the NEW one — it no longer rests inside the freshly
+// placed blocks.
+void test_transactional_edit_refreshes_terrain() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> world =
+        engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(96));
+    const glm::vec3 focus{ 8.0f, 200.0f, 8.0f };
+    check(boot_world(*world, focus, 2), "boot world (flat 96, budget 2)");
+
+    PhysicsRuntime physics(WorldSettings{}, PhysicsBackendKind::Jolt);
+    PhysicsStreamingBridge bridge(*world, physics);
+    bridge.sync(focus);
+    check(bridge.terrain_body_count() >= 1, "chunk (0,0) slab before edit");
+
+    // A dynamic sphere rests and SLEEPS on the flat surface (slab top at 97
+    // -> resting center ~97.5, radius 0.5).
+    BodyDesc sphere;
+    sphere.position = glm::vec3(8.0f, 120.0f, 8.0f);
+    sphere.collider.shape = SphereShape{ 0.5f };
+    const BodyHandle ball = bridge.spawn_dynamic(sphere);
+    check(ball != InvalidBody, "bridge spawns the dynamic body");
+    check(settle(*world, physics, bridge, focus,
+                 [&]() {
+                     const RigidBody* rb = bridge.body(ball);
+                     return rb != nullptr && rb->sleeping;
+                 }),
+          "body rests and sleeps at the old surface");
+    {
+        const RigidBody* rest = bridge.body(ball);
+        check(rest != nullptr && std::fabs(rest->position.y - 97.5f) < 1.0f,
+              "resting height matches the pre-edit surface");
+    }
+
+    // Transactional commit: raise the surface AT THE SLAB PROBE POINT (the
+    // chunk center (8, *, 8)) by stacking blocks y=97..105 -> new top at 106.
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx =
+            world->begin_transaction();
+        for (int y = 97; y <= 105; ++y) {
+            tx->set_block(8, y, 8, 3);  // stone (builtin id)
+        }
+        std::string error;
+        check(tx->commit(error) && error.empty(),
+              "transaction raising the surface commits");
+    }
+
+    // The physics side reflects the commit: wake the body + mark the chunk's
+    // slab stale; sync() then rebuilds it at the new surface.
+    const std::size_t woken = bridge.note_region_edited(
+        glm::vec3(0.0f, 90.0f, 0.0f), glm::vec3(16.0f, 130.0f, 16.0f));
+    check(woken == 1, "note_region_edited wakes the overlapping body");
+    const std::size_t slabsBefore = bridge.terrain_body_count();
+    bridge.sync(focus);
+    check(bridge.terrain_body_count() == slabsBefore,
+          "slab rebuilt in place (no leak: same terrain body count)");
+
+    // The woken body is re-resolved onto the NEW surface (pillar top at 106
+    // -> resting center ~106.5).
+    const bool onNewSurface = settle(
+        *world, physics, bridge, focus,
+        [&]() {
+            const RigidBody* rb = bridge.body(ball);
+            return rb != nullptr && rb->sleeping &&
+                   std::fabs(rb->position.y - 106.5f) < 1.5f;
+        });
+    check(onNewSurface,
+          "body re-rests on the post-edit surface (pillar top)");
+
+    std::printf("[streaming] transactional edit refreshes the terrain slab "
+                "(commit -> note_region_edited -> sync): OK\n");
+}
+
 // 2. Server authority: a body spawned into a chunk that is NOT loaded is
 //    despawned on the next sync; when the focus moves / budget shrinks and
 //    chunks leave the loaded set, their slabs AND contained dynamic bodies are
@@ -384,6 +461,7 @@ void test_streaming_physical_materials() {
 int main() {
     std::printf("[streaming] physics x streaming bridge tests\n");
     test_streaming_sleep_wake();
+    test_transactional_edit_refreshes_terrain();
     test_streaming_authority_unload();
     test_streaming_physical_materials();
     if (g_failures != 0) {

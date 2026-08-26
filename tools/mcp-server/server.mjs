@@ -2,6 +2,7 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -425,6 +426,70 @@ async function runGameTool(args) {
   };
 }
 
+// task_plan Agente 5 §4 item 3 — "cobrir ... empacotar projetos". The engine's
+// VulkanPackageBuilder (C++) publishes a distributable package: Bin/<exe> +
+// Content/ + PackageManifest.txt, all-or-nothing (staging + rename; removes the
+// staging dir on failure). This tool drives it through the same run/log
+// pattern as runGameTool (spawn + timeout + log + kill), so "empacotar" is
+// reachable from MCP/CLI/editor like every other capability.
+function packageGameTool(args) {
+  const project = String(args.project ?? "").trim();
+  if (!project) throw new Error("project is required");
+  const projectRoot = path.join(ENGINE_ROOT, "Projects", project);
+  if (!fs.existsSync(path.join(projectRoot, "project.json"))) throw new Error(`project '${project}' does not exist`);
+  const exe = String(args.exe ?? "VulkanEngineGame");
+  const exeRelative = RUNNABLE_EXES.get(exe);
+  if (!exeRelative) throw new Error(`unknown exe '${exe}'; allowed: ${[...RUNNABLE_EXES.keys()].join(", ")}`);
+  const exePath = path.join(ENGINE_ROOT, exeRelative);
+  if (!fs.existsSync(exePath)) throw new Error(`not built: ${exeRelative} (rode build_game primeiro)`);
+  const contentDir = path.join(projectRoot, "Content");
+  if (!fs.existsSync(contentDir)) throw new Error(`project has no Content dir: ${contentDir}`);
+  const platform = String(args.platform ?? "windows-x64");
+  const configuration = String(args.configuration ?? "Shipping");
+
+  fs.mkdirSync(GAME_RUN_ROOT, { recursive: true });
+  const name = `package-${project}-${exe}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const logPath = path.join(GAME_RUN_ROOT, `${name}.log`);
+  const output = path.join(projectRoot, "Package");
+  const stream = fs.createWriteStream(logPath, { flags: "a" });
+  const child = spawn(path.join(ENGINE_ROOT, "build/Release/VulkanPackageBuilder.exe"),
+    [exePath, contentDir, output, platform, configuration],
+    { cwd: ENGINE_ROOT, windowsHide: true });
+  child.stdout.on("data", (chunk) => stream.write(chunk));
+  child.stderr.on("data", (chunk) => stream.write(chunk));
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill();
+      stream.end();
+      resolve({ exe, project, status: "timeout", log: path.relative(ENGINE_ROOT, logPath).replaceAll(path.sep, "/") });
+    }, 120000);
+    child.on("exit", (code, signal) => {
+      clearTimeout(timer);
+      stream.end();
+      const tail = tailLines(logPath, 40);
+      const manifestPath = path.join(output, "PackageManifest.txt");
+      const manifest = fs.existsSync(manifestPath) ? readText(manifestPath).content : null;
+      resolve({
+        exe,
+        project,
+        status: code === 0 ? "published" : "failed",
+        exit_code: code,
+        signal: signal ?? null,
+        log: path.relative(ENGINE_ROOT, logPath).replaceAll(path.sep, "/"),
+        output: `Projects/${project}/Package`,
+        manifest,
+        tail
+      });
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      stream.end();
+      reject(error);
+    });
+  });
+}
+
 function listGameLogsTool() {
   if (!fs.existsSync(GAME_RUN_ROOT)) return { logs: [], dir: "Projects/.runs" };
   const logs = fs.readdirSync(GAME_RUN_ROOT)
@@ -496,11 +561,32 @@ const EVENT_SUBSCRIPTIONS = new Map();  // eventKind -> Set<subscriptionId>
 const EVENT_TOPICS = new Set(["build.status_changed"]);
 let nextSubscriptionId = 1;
 
+// FALTANTES item 5 — optional remote transport. The server is stdio-first
+// (the MCP `command`/`args` transport), but can also run over HTTP + SSE with
+// `node server.mjs --http [--port N]`. JSON-RPC arrives via POST /mcp and the
+// response returns on the same connection; `emitEvent` broadcasts
+// `notifications/*` to every open SSE client (GET /events), so a reconnecting
+// client keeps receiving events for the kinds it already subscribed to.
+let transportMode = "stdio";  // "stdio" | "http"
+const sseClients = new Set();  // Set<http.ServerResponse>
+let httpServer = null;
+
+function deliverNotification(message) {
+  if (transportMode === "http") {
+    const frame = `data: ${JSON.stringify(message)}\n\n`;
+    for (const res of sseClients) {
+      try { res.write(frame); } catch { sseClients.delete(res); }
+    }
+    return;
+  }
+  send(message);
+}
+
 function emitEvent(kind, payload) {
   const subs = EVENT_SUBSCRIPTIONS.get(kind);
   if (!subs || subs.size === 0) return;
   for (const subId of subs) {
-    send({
+    deliverNotification({
       jsonrpc: "2.0",
       method: `notifications/${kind}`,
       params: { subscription_id: subId, kind, ...payload }
@@ -1207,6 +1293,7 @@ async function toolCall(name, args = {}) {
     case "list_event_topics": result = listEventTopicsTool(); break;
     case "audit_log": result = auditLogTool(args); break;
     case "run_game": result = await runGameTool(args); break;
+    case "package_game": result = await packageGameTool(args); break;
     case "list_game_logs": result = listGameLogsTool(); break;
     case "read_game_log": result = readGameLogTool(args); break;
     default: throw new Error(`unknown tool '${name}'`);
@@ -1296,7 +1383,9 @@ async function handleRequest(message) {
     return { jsonrpc: "2.0", id, result: null };
   }
   if (method === "notifications/exit") {
-    if (shuttingDown) process.exit(0);
+    // stdio lifecycle: shutdown -> notifications/exit ends the process. Over
+    // HTTP the server keeps serving other clients and stops via SIGINT/SIGTERM.
+    if (shuttingDown && transportMode === "stdio") process.exit(0);
     return null;
   }
   if (method?.startsWith("notifications/")) return null;
@@ -1352,10 +1441,92 @@ function dispatch(serialized) {
   });
 }
 
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => { inputBuffer += chunk; drainInput(); });
-process.stdin.on("end", () => process.exit(0));
 process.on("uncaughtException", (error) => { log(error.stack ?? error.message); process.exit(1); });
 process.on("unhandledRejection", (error) => { log(error?.stack ?? String(error)); process.exit(1); });
 
-log(`ready; root=${ENGINE_ROOT}`);
+// ---- optional remote transport (FALTANTES item 5) ----
+function respondJson(res, status, payload) {
+  const body = JSON.stringify(payload ?? { jsonrpc: "2.0", id: null, result: null });
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(body, "utf8"),
+    "cache-control": "no-store"
+  });
+  res.end(body);
+}
+
+function handleHttpRequest(req, res) {
+  let body = "";
+  req.setEncoding("utf8");
+  req.on("data", (chunk) => {
+    body += chunk;
+    if (Buffer.byteLength(body, "utf8") > MAX_TEXT_BYTES) {
+      respondJson(res, 413, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "request too large" } });
+      req.destroy();
+    }
+  });
+  req.on("end", () => {
+    let message;
+    try {
+      message = JSON.parse(body.length > 0 ? body : "{}");
+    } catch (error) {
+      respondJson(res, 200, { jsonrpc: "2.0", id: null, error: { code: -32700, message: `parse error: ${error.message}` } });
+      return;
+    }
+    Promise.resolve(handleRequest(message))
+      .then((reply) => respondJson(res, 200, reply ?? { jsonrpc: "2.0", id: message.id ?? null, result: null }))
+      .catch((error) => respondJson(res, 200, { jsonrpc: "2.0", id: message.id ?? null, error: { code: -32603, message: error.message } }));
+  });
+}
+
+function handleSse(req, res) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-store",
+    "connection": "keep-alive"
+  });
+  res.write(": connected\n\n");
+  sseClients.add(res);
+  req.on("close", () => sseClients.delete(res));
+}
+
+function startHttpTransport(port, host) {
+  transportMode = "http";
+  httpServer = http.createServer((req, res) => {
+    const url = new URL(req.url ?? "/", `http://${host}:${port}`);
+    if (req.method === "GET" && url.pathname === "/events") return handleSse(req, res);
+    if (req.method === "POST" && (url.pathname === "/mcp" || url.pathname === "/")) return handleHttpRequest(req, res);
+    respondJson(res, 404, { jsonrpc: "2.0", id: null, error: { code: -32601, message: `not found: ${req.method} ${url.pathname}` } });
+  });
+  httpServer.on("connection", (socket) => socket.setTimeout(120000));
+  httpServer.listen(port, host, () => log(`ready (http); root=${ENGINE_ROOT}; listening on http://${host}:${port}`));
+}
+
+function installSignalHandlers() {
+  const stop = (sig) => {
+    log(`${sig} received; shutting down`);
+    if (transportMode === "http" && httpServer) {
+      for (const res of sseClients) { try { res.end(); } catch { /* ignore */ } }
+      httpServer.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 2000).unref();
+    } else {
+      process.exit(0);
+    }
+  };
+  process.on("SIGINT", () => stop("SIGINT"));
+  process.on("SIGTERM", () => stop("SIGTERM"));
+}
+installSignalHandlers();
+
+const argv = process.argv.slice(2);
+const httpFlag = argv.indexOf("--http");
+if (httpFlag >= 0) {
+  const portFlag = argv.indexOf("--port");
+  const port = portFlag >= 0 && Number(argv[portFlag + 1]) > 0 ? Number(argv[portFlag + 1]) : 8322;
+  startHttpTransport(port, "127.0.0.1");
+} else {
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => { inputBuffer += chunk; drainInput(); });
+  process.stdin.on("end", () => process.exit(0));
+  log(`ready; root=${ENGINE_ROOT}`);
+}

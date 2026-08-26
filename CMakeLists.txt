@@ -203,6 +203,16 @@ set(VC_FASTWFC_SOURCES
 add_library(vc_fastwfc STATIC ${VC_FASTWFC_SOURCES})
 target_include_directories(vc_fastwfc PUBLIC ${VC_SOLUTIONS_DIR}/fast-wfc/src/include)
 
+# spirv-reflect (KhronosGroup, Apache-2.0) — SPIR-V reflection, promoted
+# 2026-08-26 (Agente 1, task_plan C1). Pinned commit 3954c1e…; the clone's
+# spirv_reflect.cpp shim compiles spirv_reflect.c as C++. The upstream CMake
+# is not used. The public contract engine/rendering/ISpirvReflection.hpp never
+# includes it; only src/engine/sdk/SpirvReflection.cpp does (adapter rule).
+add_library(vc_spirv_reflect STATIC
+    ${VC_SOLUTIONS_DIR}/spirv-reflect/spirv_reflect.cpp)
+target_include_directories(vc_spirv_reflect PUBLIC
+    ${VC_SOLUTIONS_DIR}/spirv-reflect)
+
 # delaunator (Volodymyr Bilonenko, MIT) + earcut.hpp (Mapbox, ISC) — parceling/
 # road graph via Delaunay triangulation and polygon triangulation. Header-only,
 # used directly from the pinned clones; the upstream CMake is not used. The
@@ -258,7 +268,7 @@ FetchContent_Declare(glfw GIT_REPOSITORY https://github.com/glfw/glfw.git GIT_TA
 FetchContent_Declare(glm GIT_REPOSITORY https://github.com/g-truc/glm.git GIT_TAG 1.0.1)
 FetchContent_Declare(vk-bootstrap GIT_REPOSITORY https://github.com/charles-lunarg/vk-bootstrap.git GIT_TAG v0.7)
 FetchContent_Declare(vma GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git GIT_TAG v3.1.0)
-FetchContent_Declare(miniaudio GIT_REPOSITORY https://github.com/mackron/miniaudio.git GIT_TAG 0.11.21)
+FetchContent_Declare(miniaudio GIT_REPOSITORY https://github.com/mackron/miniaudio.git GIT_TAG 4a5b74be GIT_SHALLOW FALSE)
 # Pin the docking branch to an immutable commit. Mutable branch names make
 # otherwise identical builds resolve to different source trees over time.
 FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG 83f668625ad45364de71d385aeb6a5dd04bee02e)
@@ -437,6 +447,32 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/StrandHair.cpp
     src/engine/sdk/BehaviorTree.cpp
     src/engine/sdk/ActionMap.cpp
+    src/engine/sdk/UiLayout.cpp
+    src/engine/sdk/UiInventoryGrid.cpp
+    src/engine/sdk/UiWidgets.cpp
+    src/engine/sdk/UiViewport.cpp
+    src/engine/sdk/UiConfirmation.cpp
+    src/engine/sdk/UiDoc.cpp
+    src/engine/sdk/UiCrafting.cpp
+    src/engine/sdk/Steering.cpp
+    src/engine/sdk/Perception.cpp
+    src/engine/sdk/Fsm.cpp
+    src/engine/sdk/UtilityAi.cpp
+    src/engine/sdk/Planner.cpp
+    src/engine/sdk/AiLod.cpp
+    src/engine/sdk/AiEventBus.cpp
+    src/engine/sdk/FixedTickSim.cpp
+    # Agente 1 — rendering adapters (public contracts; self-contained std+glm).
+    src/engine/sdk/GlobalIllumination.cpp
+    src/engine/sdk/LumenScene.cpp
+    src/engine/sdk/SurfaceCacheCapture.cpp
+    src/engine/sdk/DiffuseGlobalIllumination.cpp
+    src/engine/sdk/SoftwareTracer.cpp
+    src/engine/sdk/RenderingPresets.cpp
+    src/engine/sdk/ScreenSpaceTracer.cpp
+    src/engine/sdk/RenderingDebugView.cpp
+    src/engine/sdk/RenderGraphCore.cpp
+    src/engine/sdk/SpirvReflection.cpp
     src/engine/sdk/RegistryJson.cpp
 
     src/engine/core/compression/ZstdCompression.cpp
@@ -455,6 +491,7 @@ target_include_directories(vc_sdk_public PRIVATE
     ${VC_SOLUTIONS_DIR}/earcut-hpp/include
     ${VC_SOLUTIONS_DIR}/meshoptimizer/src
     ${VC_SOLUTIONS_DIR}/xatlas/source/xatlas
+    ${VC_SOLUTIONS_DIR}/spirv-reflect
     ${VC_SOLUTIONS_DIR}/ozz-animation/include
     ${VC_SOLUTIONS_DIR}/acl/includes
     ${VC_SOLUTIONS_DIR}/acl/external/rtm/includes
@@ -707,6 +744,13 @@ add_executable(VulkanEngineEditor
     src/engine/sdk/VehicleProvider.cpp
     src/engine/sdk/MotionDatabase.cpp
     src/engine/sdk/XpbdDeformable.cpp
+    # Public UI contracts (plano agente 2 §A): the editor composes its own
+    # UI document (GET /ui-doc) from these sdk TUs — same direct-TU pattern.
+    src/engine/sdk/UiLayout.cpp
+    src/engine/sdk/UiWidgets.cpp
+    src/engine/sdk/UiViewport.cpp
+    src/engine/sdk/UiConfirmation.cpp
+    src/engine/sdk/UiDoc.cpp
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:src/engine/audio/SoundEngine.cpp>
     $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:src/plugins/voxel/VoxelPlugin.cpp>
     # Frontend port (Wicked Editor, MIT): the UI base font (Liberation Sans) is
@@ -870,6 +914,63 @@ target_include_directories(rendering_presets_tests PRIVATE
 )
 target_link_libraries(rendering_presets_tests PRIVATE vc_build_options glm)
 add_test(NAME rendering_presets_tests COMMAND rendering_presets_tests)
+
+# Public screen-space tracer (Agente 1, task_plan A.6): the headless
+# IScreenSpaceTracer gate — screen ray march, off-screen fallback, reprojection,
+# disocclusion, determinism.
+add_executable(screen_space_tracer_tests
+    tests/ScreenSpaceTracerTests.cpp
+    src/engine/sdk/ScreenSpaceTracer.cpp
+)
+target_include_directories(screen_space_tracer_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(screen_space_tracer_tests PRIVATE vc_build_options glm)
+add_test(NAME screen_space_tracer_tests COMMAND screen_space_tracer_tests)
+
+# Public debug-view data model (Agente 1, task_plan A.17): the headless
+# IRenderingDebugView gate — snapshot aggregation + deterministic JSON emitter.
+add_executable(rendering_debug_view_tests
+    tests/RenderingDebugViewTests.cpp
+    src/engine/sdk/RenderingDebugView.cpp
+)
+target_include_directories(rendering_debug_view_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(rendering_debug_view_tests PRIVATE vc_build_options glm)
+add_test(NAME rendering_debug_view_tests COMMAND rendering_debug_view_tests)
+
+# IRenderGraph gate — public Render Graph DAG core: topological compile,
+# hazards/barriers/lifetimes, cycle detection, and BIT-EXACT equivalence with
+# the internal RenderGraph (compiled in the probe TU with renamed helpers).
+add_executable(render_graph_core_tests
+    tests/RenderGraphCoreTests.cpp
+    tests/RenderGraphInternalProbe.cpp
+    src/engine/sdk/RenderGraphCore.cpp
+)
+target_include_directories(render_graph_core_tests PRIVATE
+    src/engine/public
+    src
+    tests
+)
+target_link_libraries(render_graph_core_tests PRIVATE vc_build_options glm)
+add_test(NAME render_graph_core_tests COMMAND render_graph_core_tests)
+
+# ISpirvReflection gate — SPIR-V reflection (descriptors/sets/push constants)
+# of a real module (embedded sample.spv), determinism, all-or-nothing refusals.
+add_executable(spirv_reflection_tests
+    tests/SpirvReflectionTests.cpp
+    src/engine/sdk/SpirvReflection.cpp
+)
+target_include_directories(spirv_reflection_tests PRIVATE
+    src/engine/public
+    src
+    ${VC_SOLUTIONS_DIR}/spirv-reflect
+)
+target_link_libraries(spirv_reflection_tests PRIVATE vc_build_options glm vc_spirv_reflect)
+add_test(NAME spirv_reflection_tests COMMAND spirv_reflection_tests)
 
 add_executable(voxel_box_merger_tests
     tests/VoxelBoxMergerTests.cpp
@@ -1192,6 +1293,246 @@ target_include_directories(action_map_tests PRIVATE
 )
 target_link_libraries(action_map_tests PRIVATE vc_build_options glm)
 add_test(NAME action_map_tests COMMAND action_map_tests)
+
+# Data-driven UI layout + data binding (FALTANTES item 21 / plano agente 2 §A):
+# a widget tree resolves into absolute rects deterministically; nodes bind
+# visible/text to a typed store via expressions. Model-only — headless gate.
+add_executable(ui_layout_tests
+    tests/UiLayoutTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/UiLayout.cpp
+)
+target_include_directories(ui_layout_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(ui_layout_tests PRIVATE vc_build_options)
+add_test(NAME ui_layout_tests COMMAND ui_layout_tests)
+
+# Inventory-slot presentation (FALTANTES item 21 / plano agente 2 §A item 2):
+# a slot grid resolves rects/icon/tooltip and drives drag-and-drop by
+# DELEGATING to engine::registry::Inventory (transfer/swap — no gameplay logic
+# duplication). Model-only headless gate. Links Inventory.cpp for the real
+# authoritative mutation under test.
+add_executable(ui_inventory_grid_tests
+    tests/UiInventoryGridTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/UiInventoryGrid.cpp
+    src/engine/sdk/Inventory.cpp
+    src/engine/sdk/ItemRegistry.cpp
+)
+target_include_directories(ui_inventory_grid_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(ui_inventory_grid_tests PRIVATE vc_build_options)
+add_test(NAME ui_inventory_grid_tests COMMAND ui_inventory_grid_tests)
+
+# Interactive widgets (FALTANTES item 21 / plano agente 2 §A item 3): bars,
+# modals and deterministic grid focus navigation — model-only headless gate.
+# UiWidgets.cpp reuses eval_binding from UiLayout.cpp (shared grammar).
+add_executable(ui_widgets_tests
+    tests/UiWidgetsTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/UiLayout.cpp
+    src/engine/sdk/UiWidgets.cpp
+)
+target_include_directories(ui_widgets_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(ui_widgets_tests PRIVATE vc_build_options)
+add_test(NAME ui_widgets_tests COMMAND ui_widgets_tests)
+
+# Viewport / scale / safe-area / accessibility (FALTANTES item 21 / plano
+# agente 2 §A item 4): maps the reference space onto the usable area with a
+# uniform scale (None/Fit/Fill) + safe-area insets + a11y flags. Headless gate.
+add_executable(ui_viewport_tests
+    tests/UiViewportTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/UiViewport.cpp
+)
+target_include_directories(ui_viewport_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(ui_viewport_tests PRIVATE vc_build_options)
+add_test(NAME ui_viewport_tests COMMAND ui_viewport_tests)
+
+# Action confirmation + server authority (FALTANTES item 21 / plano agente 2
+# §A item 5): deterministic decision state machine (None -> Pending ->
+# Confirmed | Cancelled | Rejected) with an injectable authority gate that
+# runs on confirm() BEFORE the action executes. Headless gate.
+add_executable(ui_confirmation_tests
+    tests/UiConfirmationTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/UiConfirmation.cpp
+)
+target_include_directories(ui_confirmation_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(ui_confirmation_tests PRIVATE vc_build_options)
+add_test(NAME ui_confirmation_tests COMMAND ui_confirmation_tests)
+
+# UI composition document (FALTANTES item 21 / plano agente 2 §A item 6):
+# one versioned JSON doc composing layout + widgets + viewport +
+# confirmations — the data surface for reflection/scripting/MCP. Delegates
+# JSON to each sub-contract's own loader. Headless gate.
+add_executable(ui_doc_tests
+    tests/UiDocTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/UiLayout.cpp
+    src/engine/sdk/UiWidgets.cpp
+    src/engine/sdk/UiViewport.cpp
+    src/engine/sdk/UiConfirmation.cpp
+    src/engine/sdk/UiDoc.cpp
+)
+target_include_directories(ui_doc_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(ui_doc_tests PRIVATE vc_build_options)
+add_test(NAME ui_doc_tests COMMAND ui_doc_tests)
+
+# Crafting UI session (FALTANTES item 21 / plano agente 2 §A item 7):
+# presentation/decision layer that DELEGATES craftability + craft to the
+# authoritative RecipeRegistry (atomic consume/produce). Headless gate.
+add_executable(ui_crafting_tests
+    tests/UiCraftingTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/UiCrafting.cpp
+    src/engine/sdk/ItemRegistry.cpp
+    src/engine/sdk/Inventory.cpp
+    src/engine/sdk/RecipeRegistry.cpp
+)
+target_include_directories(ui_crafting_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(ui_crafting_tests PRIVATE vc_build_options)
+add_test(NAME ui_crafting_tests COMMAND ui_crafting_tests)
+
+# Steering behaviors (agente 4 §3 item 3): forças de Reynolds puras e
+# determinísticas (seek/flee/arrive/pursue/separation/alignment/cohesion/
+# obstacle_avoidance/blend) — contrato self-contained std, gate headless
+# (o padrão behavior_tree_tests/action_map_tests).
+add_executable(steering_tests
+    tests/SteeringTests.cpp
+    src/engine/sdk/Steering.cpp
+)
+target_include_directories(steering_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(steering_tests PRIVATE vc_build_options glm)
+add_test(NAME steering_tests COMMAND steering_tests)
+
+# Perception/sensores (agente 4 §3 item 34): visão cone+FOV+alcance, audição
+# por raio·loudness, proximidade, memória com TTL, ameaça mais próxima —
+# contrato self-contained std, JSON all-or-nothing bit-exact, gate headless.
+add_executable(perception_tests
+    tests/PerceptionTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/Perception.cpp
+)
+target_include_directories(perception_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(perception_tests PRIVATE vc_build_options glm)
+add_test(NAME perception_tests COMMAND perception_tests)
+
+# FSM data-driven (agente 4 §3 item 3): transições por evento/condição/timer,
+# actions enter/update/exit, terminal — contrato self-contained std, JSON
+# versionado all-or-nothing bit-exact, gate headless.
+add_executable(fsm_tests
+    tests/FsmTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/Fsm.cpp
+)
+target_include_directories(fsm_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(fsm_tests PRIVATE vc_build_options glm)
+add_test(NAME fsm_tests COMMAND fsm_tests)
+
+# Utility AI (agente 4 §3 item 3): seleção por utilidade — curvas
+# linear/inverse/step, pesos, remap min/max — puro/determinístico, JSON
+# versionado all-or-nothing bit-exact, gate headless.
+add_executable(utility_ai_tests
+    tests/UtilityAiTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/UtilityAi.cpp
+)
+target_include_directories(utility_ai_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(utility_ai_tests PRIVATE vc_build_options glm)
+add_test(NAME utility_ai_tests COMMAND utility_ai_tests)
+
+# GOAP planner (agente 4 §3 item 3): planejamento por objetivo — átomos
+# booleanos, preconditions/effects, custo, uniform-cost determinístico com
+# limite de plano — JSON versionado all-or-nothing bit-exact, gate headless.
+add_executable(planner_tests
+    tests/PlannerTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/Planner.cpp
+)
+target_include_directories(planner_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(planner_tests PRIVATE vc_build_options glm)
+add_test(NAME planner_tests COMMAND planner_tests)
+
+# AI LOD por entidade (agente 4 §3 item 5): tiers full/reduced/aggregate/
+# dormant por distância, intervalos determinísticos, budgets com rebaixamento
+# do mais distante — contrato self-contained std, JSON versionado all-or-
+# nothing bit-exact, gate headless.
+add_executable(ai_lod_tests
+    tests/AiLodTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/AiLod.cpp
+)
+target_include_directories(ai_lod_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(ai_lod_tests PRIVATE vc_build_options glm)
+add_test(NAME ai_lod_tests COMMAND ai_lod_tests)
+
+# AI event bus (agente 4 §3 item 1): log determinístico de eventos de IA —
+# ordem preservada, drenagem por frame, cap FIFO, JSON all-or-nothing
+# bit-exact, gate headless.
+add_executable(ai_event_bus_tests
+    tests/AiEventBusTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/AiEventBus.cpp
+)
+target_include_directories(ai_event_bus_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(ai_event_bus_tests PRIVATE vc_build_options glm)
+add_test(NAME ai_event_bus_tests COMMAND ai_event_bus_tests)
+
+# Fixed timestep (agente 4 §1 item 19): acumulador determinístico — ticks por
+# frame com budget, alpha de interpolação, independente do FPS — JSON
+# versionado all-or-nothing bit-exact, gate headless.
+add_executable(fixed_tick_sim_tests
+    tests/FixedTickSimTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/FixedTickSim.cpp
+)
+target_include_directories(fixed_tick_sim_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(fixed_tick_sim_tests PRIVATE vc_build_options glm)
+add_test(NAME fixed_tick_sim_tests COMMAND fixed_tick_sim_tests)
 
 # Mission/dialogue assets (FALTANTES item 23 "missões e diálogos"): a mission
 # is a data-driven JSON asset (objectives, dialogue graph, unlock conditions,
@@ -2730,6 +3071,16 @@ install(DIRECTORY assets/ DESTINATION assets OPTIONAL)
 install(DIRECTORY src/engine/public/ DESTINATION include FILES_MATCHING PATTERN "*.hpp")
 install(DIRECTORY tools/mcp-server DESTINATION tools
     FILES_MATCHING PATTERN "*.mjs" PATTERN "package.json" PATTERN "README.md")
+# FALTANTES item 11 / §24 + task_plan Agente 5 §1 — project TEMPLATES in the
+# SDK package: the external-consumer scaffolds (tools/external-project*), each
+# a self-contained consumer whose ONLY dependency is find_package(vulkan_craft_sdk
+# CONFIG). Shipping them means a user can scaffold a new project straight from
+# the INSTALLED SDK (no engine tree), which the moved-prefix gate verifies
+# (tools/portability/moved-prefix-gate.mjs builds a consumer scaffolded from
+# the installed copy, findings #183).
+install(DIRECTORY tools/external-project tools/external-project-empty
+    tools/external-project-advanced tools/external-project-differentials
+    DESTINATION templates FILES_MATCHING PATTERN "*")
 install(FILES docs/SDK_MANIFEST.md DESTINATION . RENAME SDK.md)
 if(WIN32)
     install(DIRECTORY "${CMAKE_BINARY_DIR}/Release/" DESTINATION bin OPTIONAL

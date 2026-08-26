@@ -29,6 +29,10 @@ bool add_fluid_from_json(FluidRegistry& registry, const sdk::JsonValue& object,
     definition.damagePerTick = static_cast<float>(
         sdk::json_number(object, "damagePerTick", 0.0));
     definition.compressible = sdk::json_bool(object, "compressible", false);
+    definition.temperature = static_cast<float>(
+        sdk::json_number(object, "temperature", 300.0));
+    definition.solidifiesInto = sdk::json_string(object, "solidifiesInto", "");
+    definition.ignites = sdk::json_bool(object, "ignites", false);
     definition.version = static_cast<int32_t>(sdk::json_number(object, "version", 1.0));
     const std::vector<double> color = sdk::json_number_array(object, "color");
     if (color.size() >= 3) {
@@ -129,6 +133,10 @@ bool FluidRegistry::add(FluidDefinition definition, std::string& errorOut) {
     definition.range = std::clamp(definition.range, 1, 7);
     definition.tickInterval = std::max(definition.tickInterval, 0.0f);
     definition.damagePerTick = std::max(definition.damagePerTick, 0.0f);
+    if (!std::isfinite(definition.temperature)) {
+        errorOut = "fluid '" + definition.block + "': temperature must be finite";
+        return false;
+    }
 
     definition.uuid = sdk::uuid_or_derived(definition.uuid, definition.block);
     if (byBlock_.count(definition.block) != 0) {

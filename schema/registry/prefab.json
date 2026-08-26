@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/scene/prefab.json",
+  "title": "prefab reusable entity set",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset name (becomes the file name)",
+      "type": "string"
+    },
+    "version": {
+      "description": "must be 1",
+      "default": 1,
+      "type": "integer"
+    },
+    "entities": {
+      "description": "reusable entity set extracted from a scene: each entry is an entity document WITHOUT its id (regenerated on instantiate) — { name, Transform, ...components }",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "root_entity": {
+      "description": "name of the prefab root entity (instantiation origin when offset is applied)",
+      "type": "string"
+    },
+    "source_scene": {
+      "description": "scene the prefab was extracted from (informational)",
+      "type": "string"
+    },
+    "source_entity_ids": {
+      "description": "entity UUIDs the prefab was extracted from (informational)",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "name",
+    "entities"
+  ]
+}

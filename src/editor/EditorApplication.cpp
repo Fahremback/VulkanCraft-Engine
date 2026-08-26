@@ -185,6 +185,7 @@ EditorApplication::EditorApplication() {
     // control API can expose it from the very first frame.
     register_editor_panels();
     register_project_templates();
+    m_uiDocJson = build_ui_doc_json();
 
     // Playback sink for the play-in-editor mixer (audio previews + play-mode
     // audio components). Before this the Mixer rendered into a buffer that was
@@ -225,6 +226,80 @@ void EditorApplication::register_project_templates() {
     // Built-in project templates for the wizard (ezEngine pillar). The wizard
     // lists these; create_project_from_template materializes the scaffold.
     Engine::Editor::register_builtin_templates(m_templateRegistry);
+}
+
+std::string EditorApplication::build_ui_doc_json() {
+    // Composes the editor's UI as ONE versioned JSON document (engine/ui
+    // IUiDoc): layout + widgets + viewport + confirmations. Exposed via
+    // GET /ui-doc as the data surface for reflection/scripting/MCP tooling.
+    using namespace engine::ui;
+
+    UiDoc doc;
+
+    // Layout: screen -> header + viewport + footer.
+    doc.layout.version = 1;
+    doc.layout.root = "screen";
+    doc.layout.tree.id = "screen";
+    LayoutNode header;
+    header.id = "header";
+    header.weight = 0.0;
+    header.min_h = 40.0;
+    header.text_binding = "\"VulkanCraft Editor\"";
+    doc.layout.tree.children.push_back(header);
+    LayoutNode viewport;
+    viewport.id = "viewport";
+    viewport.weight = 1.0;
+    doc.layout.tree.children.push_back(viewport);
+    LayoutNode footer;
+    footer.id = "footer";
+    footer.weight = 0.0;
+    footer.min_h = 32.0;
+    doc.layout.tree.children.push_back(footer);
+
+    // Widgets: fps bar, a confirmation modal, a 2-column focus grid.
+    UiBarSpec fps;
+    fps.id = "fps";
+    fps.value_binding = "$fps";
+    fps.min = 0.0;
+    fps.max = 120.0;
+    doc.widgets.bars.push_back(fps);
+
+    UiModalSpec modal;
+    modal.id = "exit_confirm";
+    modal.title_binding = "\"Exit editor?\"";
+    modal.visible_binding = "$exit_open";
+    modal.confirm_label = "Exit";
+    modal.cancel_label = "Cancel";
+    modal.on_confirm = "editor:exit";
+    modal.on_cancel = "editor:dismiss";
+    doc.widgets.modals.push_back(modal);
+
+    UiFocusSpec focus;
+    focus.id = "shell";
+    focus.ids = { "hierarchy", "inspector", "viewport", "console" };
+    focus.cols = 2;
+    doc.widgets.focus.push_back(focus);
+
+    // Viewport: 16:9 reference, Fit, small safe-area (editor margins).
+    doc.viewport.version = 1;
+    doc.viewport.reference_width = 1920.0;
+    doc.viewport.reference_height = 1080.0;
+    doc.viewport.scale_mode = UiScaleMode::Fit;
+    doc.viewport.safe_area.left = 20.0;
+    doc.viewport.safe_area.top = 40.0;
+    doc.viewport.text_scale = 1.25;
+    doc.viewport.high_contrast = true;
+
+    // Confirmation: destructive actions go through the authority gate.
+    ConfirmActionSpec exitAction;
+    exitAction.id = "exit";
+    exitAction.title = "Exit editor";
+    exitAction.severity = ConfirmSeverity::Danger;
+    exitAction.on_confirm = "editor:exit";
+    exitAction.on_cancel = "editor:dismiss";
+    doc.confirmations.push_back(exitAction);
+
+    return doc.to_json();
 }
 
 void EditorApplication::register_editor_panels() {
@@ -1084,6 +1159,7 @@ void EditorApplication::main_loop() {
                 api.lastSelfTest = m_lastSelfTestResult;
                 api.panels = m_panelRegistry.panel_ids();
                 api.templates = m_templateRegistry.template_ids();
+                api.ui_doc = m_uiDocJson;
                 switch (m_playScript.status()) {
                     case VMStatus::Idle: api.scriptState = "idle"; break;
                     case VMStatus::Running: api.scriptState = "running"; break;

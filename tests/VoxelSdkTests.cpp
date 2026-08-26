@@ -2850,6 +2850,121 @@ void test_block_entity_persistence() {
     std::cout << "[sdk] block entities: versioned persistence roundtrip OK\n";
 }
 
+// B.3: the canonical stateful blocks (chest, furnace, sign, door, TNT,
+// machine) are defined OUTSIDE the engine — JSON block registry + block entity
+// factories — and round-trip through attach -> tick -> persist -> reload. The
+// engine owns storage/ticking/persistence framing; the project owns behavior.
+void test_block_entities_json_defined() {
+    // One project-owned entity, parameterized by type id. The engine never
+    // interprets the state blob (it only frames it for persistence).
+    class ProjectEntity final : public engine::voxel::IVoxelBlockEntity {
+    public:
+        explicit ProjectEntity(std::string typeId) : typeId_(std::move(typeId)) {}
+        std::string type_id() const override { return typeId_; }
+        void on_tick(uint64_t) override { ++ticks_; }
+        uint32_t data_version() const override { return 1; }
+        std::vector<uint8_t> serialize_state() const override {
+            std::vector<uint8_t> blob(4);
+            for (int i = 0; i < 4; ++i) {
+                blob[static_cast<std::size_t>(i)] =
+                    static_cast<uint8_t>((counter_ >> (8 * i)) & 0xFFu);
+            }
+            return blob;
+        }
+        bool deserialize_state(const std::vector<uint8_t>& data,
+                               uint32_t version) override {
+            if (version != 1 || data.size() < 4) return false;
+            counter_ = 0;
+            for (int i = 0; i < 4; ++i) {
+                counter_ |= static_cast<uint32_t>(data[static_cast<std::size_t>(i)])
+                            << (8 * i);
+            }
+            return true;
+        }
+        std::string typeId_;
+        uint32_t counter_{ 0 };  // persisted project state
+        uint64_t ticks_{ 0 };    // runtime only (not persisted)
+    };
+
+    const std::array<const char*, 6> kNames = {
+        "chest", "furnace", "sign", "door", "tnt", "machine",
+    };
+    const std::string kBlocksJson =
+        R"([
+          {"name":"chest","namespace":"test","color":[0.6,0.4,0.2]},
+          {"name":"furnace","namespace":"test","color":[0.4,0.4,0.4]},
+          {"name":"sign","namespace":"test","color":[0.7,0.5,0.3]},
+          {"name":"door","namespace":"test","color":[0.5,0.3,0.1]},
+          {"name":"tnt","namespace":"test","color":[0.9,0.1,0.1]},
+          {"name":"machine","namespace":"test","color":[0.2,0.6,0.8]}
+        ])";
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+
+    const auto build = [&](std::unique_ptr<engine::voxel::IVoxelWorld>& out) {
+        auto world = engine::voxel::create_default_voxel_world();
+        world->register_generator(std::make_shared<FlatGenerator>(96));
+        auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+        std::string error;
+        CHECK(blocks->load_from_json(kBlocksJson, error));
+        world->set_block_registry(blocks);
+        for (const char* name : kNames) {
+            const std::string typeId = std::string("project:") + name;
+            world->register_block_entity_type(typeId, [typeId] {
+                return std::make_shared<ProjectEntity>(typeId);
+            });
+        }
+        CHECK(boot_world(*world, player, 16));
+        out = std::move(world);
+    };
+
+    // World A: place the six JSON-defined blocks and attach one entity each.
+    std::unique_ptr<engine::voxel::IVoxelWorld> a;
+    build(a);
+    std::string error;
+    for (int i = 0; i < 6; ++i) {
+        const std::string blockName = std::string("test:") + kNames[i];
+        uint32_t id = 0;
+        CHECK(a->resolve_block_id(blockName, id, error));
+        a->set_block(8 + i, 97, 8, id);
+        auto entity = std::make_shared<ProjectEntity>(
+            std::string("project:") + kNames[i]);
+        entity->counter_ = static_cast<uint32_t>(i + 1);
+        CHECK(a->attach_block_entity(8 + i, 97, 8, entity, error));
+    }
+    CHECK(a->block_entity_count() == 6);
+    // The blocks are the JSON-defined blocks, not builtins.
+    uint32_t chestId = 0;
+    CHECK(a->resolve_block_id("test:chest", chestId, error));
+    CHECK(a->get_block(8, 97, 8) == chestId);
+
+    const std::string bytes = a->serialize_world(error);
+    CHECK(error.empty());
+
+    // World B: same project assets (JSON registry + factories), fresh world.
+    std::unique_ptr<engine::voxel::IVoxelWorld> b;
+    build(b);
+    CHECK(b->deserialize_world(bytes, error));
+    CHECK(error.empty());
+    CHECK(b->block_entity_count() == 6);
+    for (int i = 0; i < 6; ++i) {
+        auto e = std::dynamic_pointer_cast<ProjectEntity>(
+            b->block_entity_at(8 + i, 97, 8));
+        CHECK(e != nullptr);
+        CHECK(e->typeId_ == std::string("project:") + kNames[i]);
+        CHECK(e->counter_ == static_cast<uint32_t>(i + 1));  // state restored
+        CHECK(e->ticks_ == 0);  // runtime-only state is NOT persisted
+    }
+    // Restored entities tick again.
+    b->update(player, 0.09f);
+    b->update(player, 0.09f);
+    auto e0 = std::dynamic_pointer_cast<ProjectEntity>(b->block_entity_at(8, 97, 8));
+    CHECK(e0 != nullptr);
+    CHECK(e0->ticks_ >= 2);
+
+    std::cout << "[sdk] block entities: chest/furnace/sign/door/tnt/machine "
+                 "JSON-defined outside the engine, full roundtrip OK\n";
+}
+
 // Discrete world lighting (META section 12), through the public contract:
 // skylight from column occlusion, block light from data-driven emitters,
 // attenuation through air, opaque blocking, chunk borders and determinism.
@@ -5607,6 +5722,92 @@ void test_fluid_density_displacement() {
                  "flows around) OK\n";
 }
 
+// Task D.3 (META section 13): temperature (declared heat axis), solidification
+// and combustion. A fluid declares its solid form (solidifiesInto) and whether
+// it ignites adjacent flammable blocks. Unfed edge cells cool into the solid
+// form; an igniting fluid consumes a flammable REGISTRY block it touches (a
+// non-flammable block is never consumed).
+void test_fluid_solidification_combustion() {
+    const auto build = [](std::unique_ptr<engine::voxel::IVoxelWorld>& worldOut,
+                          uint32_t& fluidId, uint32_t& solidId,
+                          uint32_t& woodId, uint32_t& stoneId) {
+        auto world = engine::voxel::create_default_voxel_world();
+        world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+        auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+        std::string error;
+        CHECK(blocks->load_from_json(
+            R"([
+              {"name":"magma","namespace":"test","class":"fluid","color":[0.9,0.3,0.1]},
+              {"name":"obsidian","namespace":"test","color":[0.1,0.1,0.15]},
+              {"name":"wood","namespace":"test","flammability":1.0,"color":[0.6,0.4,0.2]},
+              {"name":"stone","namespace":"test","color":[0.5,0.5,0.5]}
+            ])", error));
+        world->set_block_registry(blocks);
+        auto fluids = std::make_shared<engine::registry::FluidRegistry>();
+        CHECK(fluids->load_from_json(
+            R"([{"block":"test:magma","viscosity":1.0,"range":1,"falling":false,
+                 "evaporation":false,"density":2.0,"temperature":1400.0,
+                 "solidifiesInto":"test:obsidian","ignites":true}])", error));
+        CHECK(world->set_fluid_registry(fluids, error));
+        CHECK(error.empty());
+        CHECK(boot_world(*world, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+        CHECK(world->resolve_block_id("test:magma", fluidId, error));
+        CHECK(world->resolve_block_id("test:obsidian", solidId, error));
+        CHECK(world->resolve_block_id("test:wood", woodId, error));
+        CHECK(world->resolve_block_id("test:stone", stoneId, error));
+        worldOut = std::move(world);
+    };
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    const int y = kFluidTestGroundedY;
+
+    // (1) Solidification: remove the source; the unfed edge cells cool into
+    //     the declared solid form instead of evaporating.
+    {
+        std::unique_ptr<engine::voxel::IVoxelWorld> world;
+        uint32_t fluidId = 0, solidId = 0, woodId = 0, stoneId = 0;
+        build(world, fluidId, solidId, woodId, stoneId);
+        world->set_block(8, y, 8, fluidId);  // source
+        CHECK(settle(*world, player, [&] {
+            return world->get_fluid_level(9, y, 8) == 1;  // range 1 -> ring lvl1
+        }));
+        world->set_block(8, y, 8, kBlockAir);  // remove source
+        CHECK(settle(*world, player, [&] {
+            return world->get_block(9, y, 8) == solidId;
+        }));
+        CHECK(world->get_block(9, y, 8) == solidId);  // edge solidified
+    }
+
+    // (2) Combustion: an igniting fluid consumes an adjacent flammable block.
+    {
+        std::unique_ptr<engine::voxel::IVoxelWorld> world;
+        uint32_t fluidId = 0, solidId = 0, woodId = 0, stoneId = 0;
+        build(world, fluidId, solidId, woodId, stoneId);
+        world->set_block(9, y, 8, woodId);   // flammable neighbor
+        world->set_block(8, y, 8, fluidId);  // igniting source
+        CHECK(settle(*world, player, [&] {
+            return world->get_block(9, y, 8) != woodId;  // wood consumed
+        }));
+        CHECK(world->get_block(9, y, 8) != woodId);
+    }
+
+    // (3) Combustion gate: a NON-flammable block is never consumed; the fluid
+    //     simply cannot spread into it (it spreads around instead).
+    {
+        std::unique_ptr<engine::voxel::IVoxelWorld> world;
+        uint32_t fluidId = 0, solidId = 0, woodId = 0, stoneId = 0;
+        build(world, fluidId, solidId, woodId, stoneId);
+        world->set_block(9, y, 8, stoneId);  // non-flammable neighbor
+        world->set_block(8, y, 8, fluidId);  // igniting source
+        CHECK(settle(*world, player, [&] {
+            return world->get_fluid_level(7, y, 8) == 1;  // spread to the open side
+        }));
+        CHECK(world->get_block(9, y, 8) == stoneId);  // stone never consumed
+    }
+
+    std::cout << "[sdk] fluids: solidification (edge cools to solid) + "
+                 "combustion (ignites flammable, spares stone) OK\n";
+}
+
 void test_block_registry() {
     engine::registry::BlockRegistry blocks;
     CHECK(blocks.size() > 40);  // builtin table registered
@@ -6338,6 +6539,107 @@ void test_inventory_undo_redo() {
 
     std::cout << "[sdk] inventory: transactional undo/redo (exact restore, "
                  "no loss/duplication, redo-tail clearing) OK\n";
+}
+
+// Task E.2 (META section 14): nested containers. An item may BE a container
+// (backpack): its nested inventory travels in ItemStack::data as the standard
+// inventory JSON, so it survives the outer inventory's save/load/replication
+// (the payload is opaque). pack_nested/unpack_nested are the canonical
+// pack/unpack entry points; unpack is all-or-nothing (wrong slot count,
+// unknown item or bad version refused with the target untouched).
+void test_inventory_nested_containers() {
+    using engine::registry::Inventory;
+    using engine::registry::ItemStack;
+    using engine::registry::SlotFilter;
+
+    engine::registry::ItemRegistry items;
+    std::string error;
+    {
+        engine::registry::ItemDefinition def;
+        def.ns = "vulkancraft";
+        def.name = "backpack";
+        def.maxStack = 1;
+        def.tags = { "container" };
+        CHECK(items.register_item(def, error));
+        def = {};
+        def.ns = "vulkancraft";
+        def.name = "cobblestone";
+        def.maxStack = 64;
+        CHECK(items.register_item(def, error));
+        def = {};
+        def.ns = "vulkancraft";
+        def.name = "iron_ingot";
+        def.maxStack = 64;
+        CHECK(items.register_item(def, error));
+    }
+    SlotFilter any;
+    any.allowAny = true;
+
+    // Fill a 9-slot backpack with items.
+    Inventory backpack(9);
+    for (int s = 0; s < 9; ++s) backpack.set_filter(s, any);
+    ItemStack stone;
+    stone.item = "vulkancraft:cobblestone";
+    stone.count = 30;
+    ItemStack ingot;
+    ingot.item = "vulkancraft:iron_ingot";
+    ingot.count = 7;
+    CHECK(backpack.set(0, stone, items, error));
+    CHECK(backpack.set(1, ingot, items, error));
+
+    // (1) Pack into the backpack ITEM's data payload.
+    ItemStack backpackItem;
+    backpackItem.item = "vulkancraft:backpack";
+    backpackItem.count = 1;
+    backpackItem.data = Inventory::pack_nested(backpack);
+    CHECK(!backpackItem.data.empty());
+
+    // (2) The container travels in an OUTER inventory and survives the
+    //     serialization round-trip byte-identically (save/load/replication
+    //     see it as opaque data).
+    Inventory outer(4);
+    for (int s = 0; s < 4; ++s) outer.set_filter(s, any);
+    CHECK(outer.set(2, backpackItem, items, error));
+    const std::string outerJson = outer.serialize_json();
+    Inventory outerLoaded(4);
+    for (int s = 0; s < 4; ++s) outerLoaded.set_filter(s, any);
+    CHECK(outerLoaded.deserialize_json(outerJson, items, error));
+    CHECK(outerLoaded.get(2).item == "vulkancraft:backpack");
+    CHECK(outerLoaded.get(2).data == backpackItem.data);
+
+    // (3) Unpack restores the nested contents (slot count must match).
+    // `out` is assigned from the validated candidate, so its initial size is
+    // irrelevant (Inventory has no default constructor).
+    Inventory opened(1);
+    CHECK(Inventory::unpack_nested(outerLoaded.get(2).data, 9, items, opened, error));
+    CHECK(opened.slot_count() == 9);
+    CHECK(opened.get(0).count == 30);
+    CHECK(opened.get(1).item == "vulkancraft:iron_ingot");
+    CHECK(opened.get(1).count == 7);
+    CHECK(opened.serialize_json() == backpack.serialize_json());
+
+    // (4) Wrong slot count refused all-or-nothing (target untouched).
+    Inventory untouched(3);
+    CHECK(!Inventory::unpack_nested(backpackItem.data, 5, items, opened, error));
+    CHECK(!error.empty());
+    CHECK(opened.serialize_json() == backpack.serialize_json());
+
+    // (5) Unknown item inside the payload refused (never guessed).
+    std::string corrupt =
+        R"({"version":1,"slots":[{"item":"vulkancraft:ghost","count":1},"null"}])";
+    CHECK(!Inventory::unpack_nested(corrupt, 2, items, opened, error));
+    CHECK(!error.empty());
+    CHECK(opened.serialize_json() == backpack.serialize_json());
+
+    // (6) Undo/redo treats the container as opaque: the outer mutation that
+    //     placed the backpack is undoable and restores the exact payload.
+    CHECK(outer.undo());
+    CHECK(outer.get(2).empty());
+    CHECK(outer.redo());
+    CHECK(outer.get(2).data == backpackItem.data);
+
+    std::cout << "[sdk] inventory: nested containers (item-as-inventory, "
+                 "opaque payload round-trip, all-or-nothing unpack) OK\n";
 }
 
 // META section 14: data-driven recipe graph — inputs (item/tag/alternatives),
@@ -12562,6 +12864,7 @@ int main(int argc, char** argv) {
         test_block_entity_lifecycle();
         test_block_entity_atomic_destroy();
         test_block_entity_persistence();
+        test_block_entities_json_defined();
         test_light_skylight();
         test_light_block_emitter();
         test_light_chunk_boundary();
@@ -12598,6 +12901,7 @@ int main(int argc, char** argv) {
         test_material_simulation_separation();
         test_project_defined_fluids();
         test_fluid_density_displacement();
+        test_fluid_solidification_combustion();
         test_block_registry();
         test_item_registry();
         test_cross_reference_validation();
@@ -12605,6 +12909,7 @@ int main(int argc, char** argv) {
         test_block_tool_physics();
         test_item_stack_inventory();
         test_inventory_undo_redo();
+        test_inventory_nested_containers();
         test_recipe_graph();
         test_entity_world();
         test_entity_world_save();

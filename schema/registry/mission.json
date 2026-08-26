@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/missions/mission.json",
+  "title": "mission mission asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "mission name (becomes the file name)",
+      "type": "string"
+    },
+    "id": {
+      "description": "persistent UUID; derived from 'missions:<name>' when omitted",
+      "type": "string"
+    },
+    "version": {
+      "description": "\"version\" mission field",
+      "default": 1,
+      "type": "integer"
+    },
+    "objectives": {
+      "description": "ALL must complete: [{ id, kind: reach|collect|kill|interact, target, count >= 1, x, z, radius >= 0, conditions }]",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "dialogue": {
+      "description": "dialogue graph: [{ id (must include 'start'), speaker, text, choices: [{ text, next, conditions }] }]",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "unlockConditions": {
+      "description": "ALL must pass to accept: [{ kind: flag|counter|objectiveDone|attribute, key, op: ==|!=|>=|<=|>|<, value, flagValue }]",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "reward": {
+      "description": "{ itemId, count >= 0, xp >= 0, setFlag } applied on completion",
+      "type": "object"
+    },
+    "repeatable": {
+      "description": "\"repeatable\" mission field",
+      "default": false,
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "name",
+    "objectives"
+  ]
+}

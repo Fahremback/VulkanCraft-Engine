@@ -1,0 +1,108 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/vehicles/beam.json",
+  "title": "beam vehicle assembly",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset name (becomes the file name)",
+      "type": "string"
+    },
+    "id": {
+      "description": "persistent UUID; derived from 'beams:<name>' when omitted",
+      "type": "string"
+    },
+    "version": {
+      "description": "\"version\" vehicle field",
+      "default": 1,
+      "type": "integer"
+    },
+    "provider": {
+      "description": "physics provider (item 5/6): only jolt is vendored — chrono/jsbsim are refused at creation (never a silent fallback)",
+      "default": "jolt",
+      "enum": [
+        "jolt",
+        "chrono",
+        "jsbsim"
+      ]
+    },
+    "position": {
+      "description": "\"position\" vehicle field",
+      "default": [
+        0,
+        0,
+        0
+      ],
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "number"
+      }
+    },
+    "rotation": {
+      "description": "\"rotation\" vehicle field",
+      "default": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "number"
+      }
+    },
+    "mass": {
+      "description": "total chassis mass (kg), > 0",
+      "default": 1200,
+      "type": "number"
+    },
+    "nodes": {
+      "description": "mass points: [{ position: [x,y,z], fixed: bool }] (1..4096)",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "beams": {
+      "description": "distance constraints: [{ a: int, b: int (valid node indices), stiffness in (0, 1] }]",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "wheels": {
+      "description": "wheel mounts: [{ node: int, steering: bool, driven: bool, wheel: { localPosition, radius, suspensionRestLength, suspensionTravel, springStrength, damperStrength, tireGrip, maxDriveForce, maxBrakeForce, maxSteerAngle, steering, driven } }]",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "seats": {
+      "description": "occupant seats (item 8)",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "power": {
+      "description": "fuel/energy/controls (item 7)",
+      "type": "object"
+    },
+    "solver": {
+      "description": "XPBD solver config: { substeps: 1..16, solverIterations: 1..64, stiffness in (0, 1], damping in [0, 1), gravity: [x,y,z] (magnitude <= 1000) }",
+      "type": "object"
+    }
+  },
+  "required": [
+    "name",
+    "nodes",
+    "beams"
+  ]
+}
