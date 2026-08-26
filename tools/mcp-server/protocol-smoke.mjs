@@ -91,6 +91,40 @@ function request(method, params = {}) {
 try {
   const initialized = await request("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "smoke", version: "1" } });
   assert.equal(initialized.result.serverInfo.name, "vulkancraft-engine");
+  assert.ok(initialized.result.capabilities.prompts, "initialize advertises the prompts capability");
+
+  // ---- prompts: game-creation recipes (FALTANTES item 5) ----
+  const promptsListed = await request("prompts/list");
+  const promptNames = promptsListed.result.prompts.map((p) => p.name);
+  for (const expected of ["create_game_project", "author_block", "author_item",
+    "author_biome", "create_material", "add_entity", "author_ability",
+    "author_mission", "author_vehicle"]) {
+    assert.ok(promptNames.includes(expected), `prompts/list includes ${expected}`);
+  }
+  // Each prompt declares its arguments (at least the named template argument).
+  const blockPrompt = promptsListed.result.prompts.find((p) => p.name === "author_block");
+  assert.ok(blockPrompt.arguments.some((a) => a.name === "name" && a.required), "author_block requires a name argument");
+
+  // prompts/get renders a grounded recipe referencing real tool calls, with
+  // the argument interpolated into the message.
+  const blockRecipe = await request("prompts/get", { name: "author_block", arguments: { name: "SmokeBrick" } });
+  assert.ok(Array.isArray(blockRecipe.result.messages), "prompts/get returns messages");
+  assert.equal(blockRecipe.result.messages[0].role, "user");
+  assert.match(blockRecipe.result.messages[0].content.text, /author_registry_asset/);
+  assert.match(blockRecipe.result.messages[0].content.text, /SmokeBrick/);
+  assert.match(blockRecipe.result.messages[0].content.text, /block/);
+
+  // Every listed prompt resolves (no dangling templates) and mentions a real tool.
+  for (const p of promptsListed.result.prompts) {
+    const got = await request("prompts/get", { name: p.name, arguments: { name: "Smoke" } });
+    assert.equal(got.result.messages[0].role, "user", `${p.name} renders a user message`);
+    assert.ok(got.result.messages[0].content.text.length > 0, `${p.name} has non-empty text`);
+  }
+
+  // Unknown prompt is refused with a protocol error.
+  const unknownPrompt = await request("prompts/get", { name: "does_not_exist" });
+  assert.equal(unknownPrompt.error.code, -32602);
+  assert.match(unknownPrompt.error.message, /unknown prompt/);
 
   const listed = await request("tools/list");
   assert.ok(listed.result.tools.some((tool) => tool.name === "apply_text_edits"));
@@ -529,9 +563,9 @@ try {
   // under src/engine/public must be self-contained (engine//std/vendor only,
   // canonical engine/<domain>/<Header>.hpp includes — never short names). A
   // header with an internal include or a short include breaks this gate.
-  const sdkCheck = spawnSync(process.execPath, [path.join(directory, "..", "sdk", "sdk-check.mjs"), "--expect-count", "65"], { encoding: "utf8" });
+  const sdkCheck = spawnSync(process.execPath, [path.join(directory, "..", "sdk", "sdk-check.mjs"), "--expect-count", "67"], { encoding: "utf8" });
   assert.equal(sdkCheck.status, 0, sdkCheck.stdout + sdkCheck.stderr);
-  assert.match(sdkCheck.stdout, /65 public headers/, sdkCheck.stdout);
+  assert.match(sdkCheck.stdout, /67 public headers/, sdkCheck.stdout);
 
   // The CLI exposes the same artifacts without a running server.
   const cliPath = path.join(directory, "registry-cli.mjs");

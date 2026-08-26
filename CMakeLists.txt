@@ -324,7 +324,7 @@ target_link_libraries(vc_build_options INTERFACE
     glm
     vk-bootstrap
     Vulkan::Vulkan
-    jolt
+    vulkan_jolt
     bullet
 )
 
@@ -738,7 +738,7 @@ target_include_directories(VulkanEngineServer PRIVATE
 target_link_libraries(VulkanEngineServer PRIVATE
     vc_build_options
     vc_ozz vc_acl
-    glm jolt bullet
+    glm vulkan_jolt bullet
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -770,6 +770,22 @@ add_test(NAME gltf_geometry_tests COMMAND gltf_geometry_tests)
 add_executable(radiance_cache_math_tests tests/RadianceCacheMathTests.cpp)
 target_link_libraries(radiance_cache_math_tests PRIVATE vc_build_options glm)
 add_test(NAME radiance_cache_math_tests COMMAND radiance_cache_math_tests)
+
+# Public GI/reflection contracts (Agente 1, task_plan A.1/A.2): the
+# IGiCore/IGlobalIlluminationProvider/IReflectionProvider headless gate —
+# deterministic pure core (toroidal clipmaps, budget, sun revision) + data-
+# driven backend selection + capability-check refusal. No GPU required.
+add_executable(global_illumination_tests
+    tests/GlobalIlluminationTests.cpp
+    src/engine/sdk/GlobalIllumination.cpp
+)
+target_include_directories(global_illumination_tests PRIVATE
+    src/engine/public
+    src/engine/rendering/lighting
+    src
+)
+target_link_libraries(global_illumination_tests PRIVATE vc_build_options glm)
+add_test(NAME global_illumination_tests COMMAND global_illumination_tests)
 
 add_executable(voxel_box_merger_tests
     tests/VoxelBoxMergerTests.cpp
@@ -2599,10 +2615,11 @@ if(TARGET vc_generate_world_save)
     add_dependencies(vc_sdk vc_generate_world_save)
 endif()
 
-# The engine's jolt target shares its OUTPUT_NAME with the Jolt target created
-# by Jolt.cmake; pin it so the installed archive name is deterministic on every
-# filesystem (the build already writes Jolt.lib via case-insensitive collision).
-set_target_properties(jolt PROPERTIES OUTPUT_NAME Jolt)
+# The engine's jolt target is renamed vulkan_jolt (its project no longer
+# case-collides with the vendored Jolt.vcxproj in the .slnx — MSB4025) and its
+# OUTPUT_NAME is pinned to Jolt so the installed archive name stays the
+# deterministic Jolt.lib consumers already link.
+set_target_properties(vulkan_jolt PROPERTIES OUTPUT_NAME Jolt)
 
 # The vc_sdk archive links vc_sdk_public, which includes the storage TUs
 # (zstd/blake3/rocksdb/flatbuffers) unconditionally — it cannot be built when
@@ -2619,7 +2636,7 @@ foreach(vc_lib vc_zstd vc_blake3 vc_navigation vc_fastwfc vc_meshoptimizer vc_xa
         install(FILES "$<TARGET_FILE:${vc_lib}>" DESTINATION lib OPTIONAL)
     endif()
 endforeach()
-foreach(vc_lib flatbuffers rocksdb jolt bullet)
+foreach(vc_lib flatbuffers rocksdb vulkan_jolt bullet)
     if(TARGET ${vc_lib})
         install(FILES "$<TARGET_FILE:${vc_lib}>" DESTINATION lib OPTIONAL)
     endif()
@@ -2631,7 +2648,7 @@ install(DIRECTORY ${glm_SOURCE_DIR}/glm DESTINATION include)
 # Relocatable package config: every path resolves from this file's location, so
 # the staged prefix can move or be consumed from another checkout/machine.
 set(VULKAN_CRAFT_SDK_LINK_LIBS "")
-foreach(vc_lib vc_zstd vc_blake3 vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas flatbuffers rocksdb jolt bullet)
+foreach(vc_lib vc_zstd vc_blake3 vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas flatbuffers rocksdb vulkan_jolt bullet)
     if(TARGET ${vc_lib})
         get_target_property(_vc_on ${vc_lib} OUTPUT_NAME)
         if(NOT _vc_on)
@@ -2652,4 +2669,5 @@ add_executable(far_terrain_sampling_benchmark
 )
 target_link_libraries(far_terrain_sampling_benchmark PRIVATE vc_build_options)
 add_test(NAME far_terrain_sampling_benchmark COMMAND far_terrain_sampling_benchmark)
-set_tests_properties(far_terrain_sampling_benchmark PROPERTIES LABELS "benchmark;far-terrain")
+# Test labels for suite-based gating (Agent 6)
+include(cmake/TestLabels.cmake)

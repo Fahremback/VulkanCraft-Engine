@@ -602,6 +602,213 @@ const TOOLS = [
   }
 ];
 
+// FALTANTES item 5 (MCP server) — prompts: game-creation recipes that guide the
+// LLM through the exact tool call sequence. Each prompt is a starting template;
+// the LLM calls the tools directly (the prompt returns a message, not a tool
+// result). Templates are grounded ONLY in real authoring tools (no UI/plugin
+// tools exist yet — those surfaces are deferred).
+const PROMPTS = [
+  {
+    name: "create_game_project",
+    description: "Start a new VulkanCraft game project.",
+    arguments: [{ name: "name", description: "project name (must be a valid directory name)", required: true }]
+  },
+  {
+    name: "author_block",
+    description: "Add a custom block type to the registry.",
+    arguments: [{ name: "name", description: "block name (becomes the file name)", required: true }]
+  },
+  {
+    name: "author_item",
+    description: "Add a custom item type to the registry.",
+    arguments: [{ name: "name", description: "item name (becomes the file name)", required: true }]
+  },
+  {
+    name: "author_biome",
+    description: "Add a custom biome to the world profile.",
+    arguments: [{ name: "name", description: "biome name (human-readable id)", required: true }]
+  },
+  {
+    name: "create_material",
+    description: "Create a visual material (base color, roughness, metallic, emissive).",
+    arguments: [{ name: "name", description: "material name", required: true }]
+  },
+  {
+    name: "add_entity",
+    description: "Add an entity with a component to a scene.",
+    arguments: [{ name: "name", description: "entity name", required: true }]
+  },
+  {
+    name: "author_ability",
+    description: "Create an ability asset (damage, heal, impulse, flight, block edit, periodic).",
+    arguments: [{ name: "name", description: "ability name", required: true }]
+  },
+  {
+    name: "author_mission",
+    description: "Create a mission asset with objectives, dialogue, and rewards.",
+    arguments: [{ name: "name", description: "mission name", required: true }]
+  },
+  {
+    name: "author_vehicle",
+    description: "Create a vehicle asset with physics, wheels, and beam graph.",
+    arguments: [{ name: "name", description: "vehicle name", required: true }]
+  }
+];
+
+function renderPrompt(name, args = {}) {
+  const template = (s) => s.replace(/\{([a-zA-Z_]+)\}/g, (_, key) => args[key] ?? `{${key}}`);
+  switch (name) {
+    case "create_game_project":
+      return {
+        messages: [{
+          role: "user",
+          content: { type: "text", text: template(`Create a new VulkanCraft game project named "{name}". Steps:
+
+1. Call \`create_game_project\` with project: "{name}".
+2. Call \`build_game\` with project: "{name}" to compile the defaults.
+3. Call \`run_game\` with project: "{name}" to verify it starts.
+
+After the project exists, you can add blocks, items, entities, and scenes to it.`) }
+        }]
+      };
+
+    case "author_block":
+      return {
+        messages: [{
+          role: "user",
+          content: { type: "text", text: template(`Create a custom block named "{name}". Steps:
+
+1. Call \`author_registry_asset\` with kind: "block", name: "{name}", and the block fields:
+   - \`hardness\` (number, >= 0): mining hardness.
+   - \`collisionShape\` (string): "full", "cross", "slab", "stairs", "fence", "wall", "carpet", "none".
+   - \`opaque\` (boolean): whether the block blocks light.
+   - \`lightEmission\` (number, 0-15): emitted light level.
+   - \`color\` (string): "R,G,B" or "R,G,B,A" in 0-255.
+2. Call \`validate_game_project\` to verify the asset is valid.
+3. Call \`build_game\` to compile the block into the game.`) }
+        }]
+      };
+
+    case "author_item":
+      return {
+        messages: [{
+          role: "user",
+          content: { type: "text", text: template(`Create a custom item named "{name}". Steps:
+
+1. Call \`author_registry_asset\` with kind: "item", name: "{name}", and the item fields:
+   - \`stackSize\` (integer, >= 1): max stack size.
+   - \`equipSlot\` (string): "none", "head", "chest", "legs", "feet", "hand", "offhand".
+   - \`placeBlock\` (string): block id to place when used.
+   - \`color\` (string): "R,G,B" or "R,G,B,A" in 0-255.
+2. Call \`validate_game_project\` to verify the asset is valid.
+3. Call \`build_game\` to compile the item into the game.`) }
+        }]
+      };
+
+    case "author_biome":
+      return {
+        messages: [{
+          role: "user",
+          content: { type: "text", text: template(`Create a custom biome named "{name}". Steps:
+
+1. Call \`author_world_profile_asset\` with name: "{name}" and a world profile document containing:
+   - \`biomes\`: { biomes: [{ name: "{name}", engineBiomeIndex: <number> }] }.
+   - Optional: \`height\`, \`climate\`, \`caves\`, \`ores\`, \`carver\`, \`decorators\`, \`structures\`.
+2. Call \`validate_game_project\` to verify the profile is valid.
+3. Call \`build_game\` to compile the profile into the game.`) }
+        }]
+      };
+
+    case "create_material":
+      return {
+        messages: [{
+          role: "user",
+          content: { type: "text", text: template(`Create a visual material named "{name}". Steps:
+
+1. Call \`create_material\` with name: "{name}" and the material fields:
+   - \`ar\`, \`ag\`, \`ab\` (number, 0-1): base color.
+   - \`roughness\` (number, 0-1): surface roughness.
+   - \`metallic\` (number, 0-1): metalness.
+   - \`er\`, \`eg\`, \`eb\` (number, 0-1): emissive color.
+   - \`emissiveIntensity\` (number, >= 0): emissive brightness.
+2. Call \`build_game\` to compile the material into the game.`) }
+        }]
+      };
+
+    case "add_entity":
+      return {
+        messages: [{
+          role: "user",
+          content: { type: "text", text: template(`Add an entity named "{name}" to a scene. Steps:
+
+1. Call \`create_entity\` with name: "{name}" to create the entity.
+2. Call \`set_component\` with the entity id and the component you want:
+   - \`Transform\` (px, py, pz, rx, ry, rz, sx, sy, sz) — position, rotation, scale.
+   - \`MeshRenderer\` (mesh, material, visible, castShadows) — a visible mesh.
+   - \`Rigidbody\` (mass, friction, restitution, kinematic, gravity) — physics.
+   - \`Light\` (r, g, b, intensity, range, castShadows, type: 0=point).
+   - \`Camera\` (fov, near, far, primary) — a camera.
+   - \`ParticleEmitter\` (spawn rate, speed, life, color, gravity, etc.) — particles.
+   - \`Audio\` (clip, volume, pitch, spatial, looping, playOnStart) — sound.
+3. Call \`build_game\` to compile the entities into the game.`) }
+        }]
+      };
+
+    case "author_ability":
+      return {
+        messages: [{
+          role: "user",
+          content: { type: "text", text: template(`Create an ability named "{name}". Steps:
+
+1. Call \`author_ability_asset\` with name: "{name}" and the ability fields:
+   - \`effects\` (required): array of effects. Each effect has a \`type\` (damage, heal, impulse, telekinesis, flight, blockEdit, periodic) and type-specific fields.
+   - \`cooldownSeconds\` (number, >= 0): cooldown time.
+   - \`targeting\` (object): { mode: self|direction|point|body, range, radius }.
+   - \`cost\` (object): { resource: "mana"|"stamina", amount }.
+   - \`conditions\` (array): [{ kind: ownerTag|targetTag|ownerAttribute|targetAttribute|distance, ... }].
+2. Call \`validate_game_project\` to verify the asset is valid.
+3. Call \`build_game\` to compile the ability into the game.`) }
+        }]
+      };
+
+    case "author_mission":
+      return {
+        messages: [{
+          role: "user",
+          content: { type: "text", text: template(`Create a mission named "{name}". Steps:
+
+1. Call \`author_mission_asset\` with name: "{name}" and the mission fields:
+   - \`objectives\` (required): [{ id, kind: reach|collect|kill|interact, target, count, x, z, radius }].
+   - \`dialogue\` (optional): [{ id (must include 'start'), speaker, text, choices: [{ text, next, conditions }] }].
+   - \`reward\` (optional): { itemId, count, xp, setFlag }.
+   - \`repeatable\` (boolean).
+2. Call \`validate_game_project\` to verify the asset is valid.
+3. Call \`build_game\` to compile the mission into the game.`) }
+        }]
+      };
+
+    case "author_vehicle":
+      return {
+        messages: [{
+          role: "user",
+          content: { type: "text", text: template(`Create a vehicle named "{name}". Steps:
+
+1. Call \`author_vehicle_asset\` with name: "{name}" and the vehicle fields:
+   - \`enginePower\` (number): motor power.
+   - \`mass\` (number): vehicle mass.
+   - \`wheelRadius\` (number): wheel radius.
+   - \`wheelBase\` (number): distance between front and rear axles.
+   - \`track\` (number): distance between left and right wheels.
+   - \`fwd\` (boolean): front-wheel drive.
+2. Call \`validate_game_project\` to verify the asset is valid.
+3. Call \`build_game\` to compile the vehicle into the game.`) }
+        }]
+      };
+
+    default: throw new Error(`unknown prompt '${name}'`);
+  }
+}
+
 const RESOURCE_MAP = new Map([
   ["engine://readme", "README.md"],
   ["engine://architecture", "docs/ARCHITECTURE.md"],
@@ -639,13 +846,30 @@ async function handleRequest(message) {
       id,
       result: {
         protocolVersion: params.protocolVersion ?? "2025-03-26",
-        capabilities: { tools: { listChanged: false }, resources: { subscribe: false, listChanged: false } },
+        capabilities: { tools: { listChanged: false }, resources: { subscribe: false, listChanged: false }, prompts: { listChanged: false } },
         serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
         instructions: "Create games through game_capabilities and the semantic game-authoring tools. Do not modify engine source code for supported capabilities. Use source-maintenance tools only when explicitly asked to develop the engine. For existing engine files, call read_file and pass its expected_sha256 to apply_text_edits."
       }
     };
   }
   if (method === "ping") return { jsonrpc: "2.0", id, result: {} };
+  if (method === "prompts/list") {
+    return {
+      jsonrpc: "2.0",
+      id,
+      result: { prompts: PROMPTS.map(({ name, description, arguments: args }) => ({ name, description, arguments: args })) }
+    };
+  }
+  if (method === "prompts/get") {
+    try {
+      const prompt = PROMPTS.find((p) => p.name === params.name);
+      if (!prompt) throw new Error(`unknown prompt '${params.name}'`);
+      const rendered = renderPrompt(prompt.name, params.arguments ?? {});
+      return { jsonrpc: "2.0", id, result: { description: prompt.description, messages: rendered.messages } };
+    } catch (error) {
+      return { jsonrpc: "2.0", id, error: { code: -32602, message: error instanceof Error ? error.message : String(error) } };
+    }
+  }
   if (method === "tools/list") return { jsonrpc: "2.0", id, result: { tools: TOOLS } };
   if (method === "tools/call") {
     try {
