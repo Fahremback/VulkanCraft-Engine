@@ -256,6 +256,7 @@ ChunkSnapshot World::create_chunk_snapshot(const Chunk& chunk) const {
                 const std::size_t index = static_cast<std::size_t>(z * CHUNK_SIZE_X + x);
                 center.blocks[index] = chunk.get_block(x, y, z);
                 center.water[index] = chunk.get_water_level(x, y, z);
+                center.stateIndices[index] = chunk.get_state(x, y, z);
             }
         }
         for (int localZ = -1; localZ <= CHUNK_SIZE_Z; ++localZ) {
@@ -434,6 +435,44 @@ uint8_t World::get_water_level_at(const glm::vec3& worldPos) const {
     const ChunkState state = it->second->state.load(std::memory_order_acquire);
     return state != ChunkState::Generating && state != ChunkState::Unloaded
         ? it->second->get_water_level(bx, by, bz) : WATER_LEVEL_NONE;
+}
+
+uint8_t World::get_state_at(const glm::vec3& worldPos) const {
+    const int cx = static_cast<int>(std::floor(worldPos.x / CHUNK_SIZE_X));
+    const int cz = static_cast<int>(std::floor(worldPos.z / CHUNK_SIZE_Z));
+    const int bx = static_cast<int>(std::floor(worldPos.x)) - cx * CHUNK_SIZE_X;
+    const int by = static_cast<int>(std::floor(worldPos.y));
+    const int bz = static_cast<int>(std::floor(worldPos.z)) - cz * CHUNK_SIZE_Z;
+    if (by < 0 || by >= CHUNK_SIZE_Y) return 0;
+    std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+    auto it = chunks.find({ cx, cz });
+    if (it == chunks.end() || !it->second) return 0;
+    const ChunkState st = it->second->state.load(std::memory_order_acquire);
+    return st != ChunkState::Generating && st != ChunkState::Unloaded
+        ? it->second->get_state(bx, by, bz) : 0;
+}
+
+void World::set_state_at(const glm::vec3& worldPos, uint8_t stateIndex) {
+    const int cx = static_cast<int>(std::floor(worldPos.x / CHUNK_SIZE_X));
+    const int cz = static_cast<int>(std::floor(worldPos.z / CHUNK_SIZE_Z));
+    const int bx = static_cast<int>(std::floor(worldPos.x)) - cx * CHUNK_SIZE_X;
+    const int by = static_cast<int>(std::floor(worldPos.y));
+    const int bz = static_cast<int>(std::floor(worldPos.z)) - cz * CHUNK_SIZE_Z;
+    if (by < 0 || by >= CHUNK_SIZE_Y) return;
+    std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+    auto it = chunks.find({ cx, cz });
+    if (it == chunks.end() || !it->second) return;
+    const ChunkState st = it->second->state.load(std::memory_order_acquire);
+    if (st == ChunkState::Unloaded || st == ChunkState::Generating) return;
+    it->second->set_state(bx, by, bz, stateIndex);
+    it->second->isDirty = true;
+    it->second->hasUnsavedEdits.store(true, std::memory_order_release);
+    // State can change lightEmission: relight the chunk and its neighbors.
+    mark_chunk_light_dirty(cx, cz);
+    mark_chunk_light_dirty(cx - 1, cz);
+    mark_chunk_light_dirty(cx + 1, cz);
+    mark_chunk_light_dirty(cx, cz - 1);
+    mark_chunk_light_dirty(cx, cz + 1);
 }
 
 void World::enqueue_fluid_neighborhood(const glm::vec3& worldPos) {
@@ -711,6 +750,7 @@ bool World::ensure_chunk_restored(int cx, int cz, const glm::vec3& playerPos,
 
 bool World::restore_chunk_data(int cx, int cz, int extent,
                                const RuntimeBlockId* blocks, const uint8_t* water,
+                               const uint8_t* stateIndices,
                                const glm::vec3& playerPos,
                                WorldRenderBridge& renderBridge) {
     if (extent <= 0 || extent > CHUNK_SIZE_Y) return false;
@@ -735,6 +775,7 @@ bool World::restore_chunk_data(int cx, int cz, int extent,
             for (int x = 0; x < CHUNK_SIZE_X; ++x) {
                 chunk->blocks[x][y][z] = blocks[index];
                 const uint8_t level = water[index];
+                chunk->stateIndices[x][y][z] = stateIndices ? stateIndices[index] : 0;
                 ++index;
                 // Fluid levels are only meaningful on fluid blocks (mirrors
                 // the old per-voxel restore semantics); a stored byte on a

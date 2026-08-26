@@ -53,6 +53,7 @@ void Chunk::set_block(int x, int y, int z, RuntimeBlockId type) {
             section.blocks[x][y % VERTICAL_SECTION_SIZE][z] = type;
             section.waterLevels[x][y % VERTICAL_SECTION_SIZE][z] =
                 type == waterId ? WATER_SOURCE_LEVEL : WATER_LEVEL_NONE;
+            section.stateIndices[x][y % VERTICAL_SECTION_SIZE][z] = 0;  // reset state on block change
             if (type != kRuntimeAirId) highestOccupiedY = std::max(highestOccupiedY, y);
             dataVersion.fetch_add(1, std::memory_order_release);
             return;
@@ -60,10 +61,53 @@ void Chunk::set_block(int x, int y, int z, RuntimeBlockId type) {
         const uint32_t key = dense_key(x, y, z);
         const uint8_t level = type == waterId ? WATER_SOURCE_LEVEL : WATER_LEVEL_NONE;
         if (blocks[x][y][z] == type && waterLevels[x][y][z] == level) voxelOverrides.erase(key);
-        else voxelOverrides[key] = VoxelOverride{ type, level };
+        else voxelOverrides[key] = VoxelOverride{ type, level, 0 };  // state resets on block change
         if (type != kRuntimeAirId) highestOccupiedY = std::max(highestOccupiedY, y);
         dataVersion.fetch_add(1, std::memory_order_release);
     }
+}
+
+uint8_t Chunk::get_state(int x, int y, int z) const {
+    if (x < 0 || x >= CHUNK_SIZE_X || y < 0 || y >= CHUNK_SIZE_Y || z < 0 || z >= CHUNK_SIZE_Z) {
+        return 0;
+    }
+    if (y < GENERATED_TERRAIN_HEIGHT) {
+        const auto changed = voxelOverrides.find(dense_key(x, y, z));
+        return changed == voxelOverrides.end() ? stateIndices[x][y][z]
+                                               : changed->second.stateIndex;
+    }
+    const int sectionIndex = y / VERTICAL_SECTION_SIZE;
+    const auto found = upperSections.find(sectionIndex);
+    if (found == upperSections.end()) return 0;
+    return found->second->stateIndices[x][y % VERTICAL_SECTION_SIZE][z];
+}
+
+void Chunk::set_state(int x, int y, int z, uint8_t stateIndex) {
+    if (x < 0 || x >= CHUNK_SIZE_X || y < 0 || y >= CHUNK_SIZE_Y || z < 0 || z >= CHUNK_SIZE_Z) return;
+    if (y >= GENERATED_TERRAIN_HEIGHT) {
+        const int sectionIndex = y / VERTICAL_SECTION_SIZE;
+        auto found = upperSections.find(sectionIndex);
+        if (found == upperSections.end()) {
+            if (stateIndex == 0) return;  // default state, no change needed
+            found = upperSections.emplace(sectionIndex, std::make_unique<SparseVoxelSection>()).first;
+        }
+        found->second->stateIndices[x][y % VERTICAL_SECTION_SIZE][z] = stateIndex;
+        dataVersion.fetch_add(1, std::memory_order_release);
+        return;
+    }
+    const uint32_t key = dense_key(x, y, z);
+    if (stateIndices[x][y][z] == stateIndex && voxelOverrides.find(key) == voxelOverrides.end()) return;
+    auto it = voxelOverrides.find(key);
+    if (it != voxelOverrides.end()) {
+        it->second.stateIndex = stateIndex;
+        // If the override is now all-default (air, no water, state 0), remove it
+        if (it->second.type == kRuntimeAirId && it->second.waterLevel == WATER_LEVEL_NONE && stateIndex == 0) {
+            voxelOverrides.erase(it);
+        }
+    } else if (stateIndex != 0) {
+        voxelOverrides[key] = VoxelOverride{ blocks[x][y][z], waterLevels[x][y][z], stateIndex };
+    }
+    dataVersion.fetch_add(1, std::memory_order_release);
 }
 
 uint8_t Chunk::get_sky_light(int x, int y, int z) const {

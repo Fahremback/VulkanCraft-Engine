@@ -143,6 +143,53 @@ export const ABILITY_EFFECT_FIELDS = Object.freeze({
 // Presentation hooks every effect accepts (particles/audio/animation).
 const ABILITY_EFFECT_HOOKS = ["castAnimation", "particleEffect", "soundEffect"];
 
+// Mission/dialogue asset kind (FALTANTES item 23 "missões e diálogos"): the
+// MCP authors a mission (objectives reach/collect/kill/interact, dialogue
+// graph with condition-gated choices, unlock conditions, reward) as a
+// versioned JSON document under Content/Missions/<name>.json. Mirrors EXACTLY
+// the versioned JSON the public C++ factory parses
+// (engine/gameplay/IMissionAsset.hpp, implemented by
+// src/engine/sdk/MissionAsset.cpp — all-or-nothing, never clamped), so an
+// authored asset loads through `MissionDefinition::load_from_json` unchanged
+// (proved by tests/MissionAssetTests.cpp).
+export const MISSION_KINDS = Object.freeze(["mission"]);
+const MISSION_CONDITION_KINDS = new Set(["flag", "counter", "objectiveDone", "attribute"]);
+const MISSION_OBJECTIVE_KINDS = new Set(["reach", "collect", "kill", "interact"]);
+const MISSION_OPS = new Set(["==", "!=", ">=", "<=", ">", "<"]);
+
+// Compact field contracts surfaced by game_capabilities so an agent can author
+// a mission without reading the engine source. Single source for the exported
+// JSON Schema (buildMissionJsonSchema) and the author tool.
+export const MISSION_FIELD_SCHEMAS = Object.freeze({
+  mission: [
+    { name: "name", type: "string", required: true, description: "mission name (becomes the file name)" },
+    { name: "id", type: "string", required: false, description: "persistent UUID; derived from 'missions:<name>' when omitted" },
+    { name: "version", type: "integer", required: false, default: 1 },
+    { name: "objectives", type: "array[object]", required: true, description: "ALL must complete: [{ id, kind: reach|collect|kill|interact, target, count >= 1, x, z, radius >= 0, conditions }]" },
+    { name: "dialogue", type: "array[object]", required: false, default: [], description: "dialogue graph: [{ id (must include 'start'), speaker, text, choices: [{ text, next, conditions }] }]" },
+    { name: "unlockConditions", type: "array[object]", required: false, default: [], description: "ALL must pass to accept: [{ kind: flag|counter|objectiveDone|attribute, key, op: ==|!=|>=|<=|>|<, value, flagValue }]" },
+    { name: "reward", type: "object", required: false, description: "{ itemId, count >= 0, xp >= 0, setFlag } applied on completion" },
+    { name: "repeatable", type: "boolean", required: false, default: false }
+  ]
+});
+
+// Per-kind contract shapes surfaced in the capability document (objective and
+// condition field contracts).
+export const MISSION_OBJECTIVE_FIELDS = Object.freeze({
+  reach: [{ name: "x", type: "number", required: false, default: 0 }, { name: "z", type: "number", required: false, default: 0 }, { name: "radius", type: "number", required: false, default: 0, description: ">= 0; distance within which the reach completes" }],
+  collect: [{ name: "target", type: "string", required: true, description: "item id the world counts" }, { name: "count", type: "integer", required: false, default: 1, description: ">= 1" }],
+  kill: [{ name: "target", type: "string", required: true, description: "entity id the world counts" }, { name: "count", type: "integer", required: false, default: 1, description: ">= 1" }],
+  interact: [{ name: "target", type: "string", required: true, description: "interaction id the world counts" }, { name: "count", type: "integer", required: false, default: 1, description: ">= 1" }]
+});
+
+const MISSION_CONDITION_FIELDS = [
+  { name: "kind", type: "enum", values: [...MISSION_CONDITION_KINDS], required: true },
+  { name: "key", type: "string", required: true, description: "world key (flag/counter/attribute) or objective id (objectiveDone)" },
+  { name: "op", type: "enum", values: [...MISSION_OPS], required: false, default: ">=", description: "counter/attribute comparison" },
+  { name: "value", type: "number", required: false, default: 0, description: "counter/attribute threshold" },
+  { name: "flagValue", type: "boolean", required: false, default: true }
+];
+
 // Compact field contracts surfaced by game_capabilities so an agent can author
 // a vehicle assembly without reading the engine source. Single source for the
 // exported JSON Schema (buildVehicleJsonSchema) and the author tool.
@@ -2376,6 +2423,280 @@ function inspectVehicleAssets(engineRoot, projectName) {
   return { project: project.project, vehicle_assets: assets, count: assets.length };
 }
 
+// ---- abilities (FALTANTES §19 — data-driven, mirror of AbilitySystem.cpp) ----
+
+// Builds one effect object from author args. snake_case args map to the
+// camelCase DOCUMENT keys the C++ factory parses (see ABILITY_DOC_KEYS); the
+// defaults match AbilitySystem.cpp parse_effect exactly.
+function buildAbilityEffect(effect) {
+  const built = { type: String(effect.type ?? "damage") };
+  switch (built.type) {
+    case "damage":
+    case "heal":
+      built.amount = Number(effect.amount ?? 0);
+      break;
+    case "impulse":
+      built.force = Number(effect.force ?? 0);
+      break;
+    case "telekinesis":
+      built.holdOffset = finiteVec(effect.holdOffset, 3) ? effect.holdOffset.map(Number) : (finiteVec(effect.hold_offset, 3) ? effect.hold_offset.map(Number) : [0, 1.5, 0]);
+      built.grabForce = Number(effect.grab_force ?? effect.grabForce ?? 240);
+      built.durationSeconds = Number(effect.duration_seconds ?? effect.durationSeconds ?? 0);
+      break;
+    case "flight":
+      built.thrust = Number(effect.thrust ?? 320);
+      built.durationSeconds = Number(effect.duration_seconds ?? effect.durationSeconds ?? 0);
+      break;
+    case "blockEdit":
+      built.min = finiteVec(effect.min, 3) ? effect.min.map(Number) : [-1, -1, -1];
+      built.max = finiteVec(effect.max, 3) ? effect.max.map(Number) : [1, 1, 1];
+      built.blockId = Number(effect.block_id ?? effect.blockId ?? 1);
+      built.relative = effect.relative !== undefined ? Boolean(effect.relative) : true;
+      break;
+    case "periodic":
+      built.intervalSeconds = Number(effect.interval_seconds ?? effect.intervalSeconds ?? 0.5);
+      built.ticks = Number(effect.ticks ?? 4);
+      if (effect.subEffect !== undefined && effect.subEffect !== null) {
+        built.subEffect = buildAbilityEffect(effect.subEffect);
+      }
+      break;
+  }
+  for (const [argKey, docKey] of [
+    ["cast_animation", "castAnimation"], ["particle_effect", "particleEffect"], ["sound_effect", "soundEffect"],
+    ["castAnimation", "castAnimation"], ["particleEffect", "particleEffect"], ["soundEffect", "soundEffect"]
+  ]) {
+    if (effect[argKey] !== undefined) built[docKey] = String(effect[argKey]);
+  }
+  return built;
+}
+
+// Builds the full ability document from author args. Defaults match
+// AbilitySystem.cpp load_from_json exactly (all-or-nothing, never clamped).
+function buildAbilityDocument(kind, args) {
+  if (kind !== "ability") throw new Error(`unsupported ability kind '${kind}'`);
+  const document = {
+    name: String(args.name),
+    version: args.version !== undefined ? Number(args.version) : 1,
+    cooldownSeconds: Number(args.cooldown_seconds ?? args.cooldownSeconds ?? 0),
+    cancelable: args.cancelable !== undefined ? Boolean(args.cancelable) : true,
+    interruptible: args.interruptible !== undefined ? Boolean(args.interruptible) : true,
+    attributes: (args.attributes ?? []).map((attribute) => ({ name: String(attribute.name ?? ""), value: Number(attribute.value ?? 0) })),
+    tags: (args.tags ?? []).map(String),
+    cost: { resource: String(args.cost?.resource ?? ""), amount: Number(args.cost?.amount ?? 0) },
+    conditions: (args.conditions ?? []).map((condition) => ({
+      kind: String(condition.kind ?? "ownerTag"),
+      tag: String(condition.tag ?? ""),
+      attribute: String(condition.attribute ?? ""),
+      minValue: Number(condition.min_value ?? condition.minValue ?? 0),
+      maxDistance: Number(condition.max_distance ?? condition.maxDistance ?? 0)
+    })),
+    targeting: {
+      mode: String(args.targeting?.mode ?? "self"),
+      range: Number(args.targeting?.range ?? 0),
+      radius: Number(args.targeting?.radius ?? 0)
+    },
+    effects: (args.effects ?? []).map(buildAbilityEffect)
+  };
+  if (args.id !== undefined) document.id = String(args.id);
+  return document;
+}
+
+// Structured validation mirroring the public C++ factory (AbilityDefinition::
+// load_from_json — all-or-nothing, never clamp or guess). Returns { valid, errors }.
+function validateAbilityEffect(effect, index, errors) {
+  const fail = (message) => errors.push(`ability asset effect ${index}: ${message}`);
+  if (!effect || typeof effect !== "object" || Array.isArray(effect)) return fail("must be an object");
+  const type = String(effect.type ?? "");
+  if (!ABILITY_EFFECT_TYPES.has(type)) return fail(`unknown type '${type}' (must be damage|heal|impulse|telekinesis|flight|blockEdit|periodic)`);
+  switch (type) {
+    case "damage":
+    case "heal":
+      if (!finiteNumber(effect.amount) || effect.amount < 0) fail("'amount' must be finite and >= 0");
+      break;
+    case "impulse":
+      if (!finiteNumber(effect.force) || effect.force < 0) fail("'force' must be finite and >= 0");
+      break;
+    case "telekinesis":
+      if (!finiteVec(effect.holdOffset, 3)) fail("'holdOffset' must be a finite [x,y,z] array");
+      if (!finiteNumber(effect.grabForce) || effect.grabForce < 0) fail("'grabForce' must be finite and >= 0");
+      if (!finiteNumber(effect.durationSeconds) || effect.durationSeconds < 0) fail("'durationSeconds' must be finite and >= 0");
+      break;
+    case "flight":
+      if (!finiteNumber(effect.thrust) || effect.thrust < 0) fail("'thrust' must be finite and >= 0");
+      if (!finiteNumber(effect.durationSeconds) || effect.durationSeconds < 0) fail("'durationSeconds' must be finite and >= 0");
+      break;
+    case "blockEdit": {
+      if (!finiteVec(effect.min, 3) || !finiteVec(effect.max, 3) ||
+          effect.min.some((value) => !Number.isInteger(value)) || effect.max.some((value) => !Number.isInteger(value))) {
+        fail("'min'/'max' must be [x,y,z] integer arrays");
+      } else {
+        const [dx, dy, dz] = [0, 1, 2].map((axis) => effect.max[axis] - effect.min[axis] + 1);
+        if (dx <= 0 || dy <= 0 || dz <= 0) fail("'min'/'max' must satisfy max >= min per axis");
+        else if (dx * dy * dz > ABILITY_MAX_BLOCK_EDIT_VOLUME) fail(`blockEdit box exceeds the ${ABILITY_MAX_BLOCK_EDIT_VOLUME} cell volume limit`);
+      }
+      if (!finiteNumber(effect.blockId) || effect.blockId < 0) fail("'blockId' must be finite and >= 0");
+      if (effect.relative !== undefined && typeof effect.relative !== "boolean") fail("'relative' must be a boolean");
+      break;
+    }
+    case "periodic":
+      if (!finiteNumber(effect.intervalSeconds) || effect.intervalSeconds <= 0) fail("'intervalSeconds' must be finite and > 0");
+      if (!Number.isInteger(effect.ticks) || effect.ticks < 1) fail("'ticks' must be an integer >= 1");
+      if (effect.subEffect !== undefined) validateAbilityEffect(effect.subEffect, `${index}.subEffect`, errors);
+      break;
+  }
+  for (const key of ABILITY_EFFECT_HOOKS) {
+    if (effect[key] !== undefined && typeof effect[key] !== "string") fail(`'${key}' must be a string`);
+  }
+}
+
+export function validateAbilityDocument(kind, document) {
+  const errors = [];
+  const fail = (message) => errors.push(`ability asset ${message}`);
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
+    return { valid: false, errors: ["ability asset must be a JSON object"] };
+  }
+  if (kind !== "ability") return { valid: false, errors: [`unsupported ability kind '${kind}'`] };
+  if (document.version !== undefined && document.version !== 1) fail("'version' must be 1");
+  if (typeof document.name !== "string" || !document.name) fail("'name' is required");
+  if (!finiteNumber(document.cooldownSeconds) || document.cooldownSeconds < 0) fail("'cooldownSeconds' must be finite and >= 0");
+  if (document.cancelable !== undefined && typeof document.cancelable !== "boolean") fail("'cancelable' must be a boolean");
+  if (document.interruptible !== undefined && typeof document.interruptible !== "boolean") fail("'interruptible' must be a boolean");
+  if (document.attributes !== undefined) {
+    if (!Array.isArray(document.attributes)) fail("'attributes' must be an array");
+    else document.attributes.forEach((attribute, index) => {
+      if (!attribute || typeof attribute !== "object" || Array.isArray(attribute)) return fail(`attribute ${index} must be an object`);
+      if (typeof attribute.name !== "string" || !attribute.name) fail(`attribute ${index} 'name' must be a non-empty string`);
+      if (!finiteNumber(attribute.value)) fail(`attribute ${index} 'value' must be finite`);
+    });
+  }
+  if (document.tags !== undefined && (!Array.isArray(document.tags) || document.tags.some((tag) => typeof tag !== "string"))) {
+    fail("'tags' must be an array of strings");
+  }
+  if (document.cost !== undefined) {
+    if (!document.cost || typeof document.cost !== "object" || Array.isArray(document.cost)) fail("'cost' must be an object");
+    else if (!finiteNumber(document.cost.amount) || document.cost.amount < 0) fail("cost 'amount' must be finite and >= 0");
+  }
+  if (document.conditions !== undefined) {
+    if (!Array.isArray(document.conditions)) fail("'conditions' must be an array");
+    else document.conditions.forEach((condition, index) => {
+      if (!condition || typeof condition !== "object" || Array.isArray(condition)) return fail(`condition ${index} must be an object`);
+      const kind = String(condition.kind ?? "");
+      if (!ABILITY_CONDITION_KINDS.has(kind)) return fail(`condition ${index} 'kind' must be ownerTag|targetTag|ownerAttribute|targetAttribute|distance`);
+      if ((kind === "ownerTag" || kind === "targetTag") && (typeof condition.tag !== "string" || !condition.tag)) fail(`condition ${index} requires a 'tag'`);
+      if ((kind === "ownerAttribute" || kind === "targetAttribute") && (typeof condition.attribute !== "string" || !condition.attribute)) fail(`condition ${index} requires an 'attribute'`);
+      if (kind === "distance" && (!finiteNumber(condition.maxDistance) || condition.maxDistance < 0)) fail(`condition ${index} 'maxDistance' must be finite and >= 0`);
+      if (condition.minValue !== undefined && !finiteNumber(condition.minValue)) fail(`condition ${index} 'minValue' must be finite`);
+    });
+  }
+  if (document.targeting !== undefined) {
+    if (!document.targeting || typeof document.targeting !== "object" || Array.isArray(document.targeting)) fail("'targeting' must be an object");
+    else {
+      if (!ABILITY_TARGET_MODES.has(String(document.targeting.mode ?? "self"))) fail("targeting 'mode' must be self|direction|point|body");
+      if (!finiteNumber(document.targeting.range) || document.targeting.range < 0) fail("targeting 'range' must be finite and >= 0");
+      if (!finiteNumber(document.targeting.radius) || document.targeting.radius < 0) fail("targeting 'radius' must be finite and >= 0");
+    }
+  }
+  if (!Array.isArray(document.effects) || document.effects.length === 0) {
+    fail("'effects' must be a non-empty array");
+  } else {
+    document.effects.forEach((effect, index) => validateAbilityEffect(effect, index, errors));
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+function abilityDiff(previous, document) {
+  const keys = new Set([...Object.keys(previous), ...Object.keys(document)]);
+  const changed = [...keys].filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(document[key])).sort();
+  return { changed_fields: changed };
+}
+
+function authorAbilityAsset(engineRoot, args) {
+  const project = requireProject(engineRoot, args.project);
+  const kind = String(args.kind ?? "ability");
+  if (!ABILITY_KINDS.includes(kind)) throw new Error(`unsupported ability kind '${kind}' (supported: ${ABILITY_KINDS.join(", ")})`);
+  const name = assetName(args.name);
+  const document = buildAbilityDocument(kind, args);
+  const validation = validateAbilityDocument(kind, document);
+  if (!validation.valid) {
+    return {
+      refused: true,
+      project: project.project,
+      kind,
+      name,
+      diagnostics: validation.errors,
+      reason: "ability asset fails public-contract validation; nothing was written"
+    };
+  }
+  const file = path.join(project.abilities, `${name}.json`);
+  const previous = fs.existsSync(file) ? readJson(file) : null;
+  const diff = previous ? abilityDiff(previous, document) : null;
+  const relative = path.relative(project.root, file).replaceAll(path.sep, "/");
+  if (args.dry_run) {
+    return {
+      dry_run: true,
+      would_write: relative,
+      project: project.project,
+      kind,
+      name,
+      document,
+      diagnostics: [],
+      diff
+    };
+  }
+  if (previous && !args.update) throw new Error(`ability asset '${name}' already exists (pass update: true to replace, or use dry_run to preview the diff)`);
+  atomicWriteJson(file, document);
+  return {
+    created: !previous,
+    updated: Boolean(previous),
+    project: project.project,
+    kind,
+    name,
+    path: relative,
+    sha256: sha256File(file),
+    diagnostics: [],
+    diff,
+    rollback: previous ? { document: previous, hint: "re-author with update: true and this document to restore" } : undefined
+  };
+}
+
+// Reads every ability asset of a project with its structural diagnostics
+// (mirrors readVehicleAssets).
+function readAbilityAssets(project) {
+  const assets = [];
+  if (!fs.existsSync(project.abilities)) return assets;
+  for (const fileName of fs.readdirSync(project.abilities).filter((file) => file.endsWith(".json")).sort()) {
+    const file = path.join(project.abilities, fileName);
+    const baseName = fileName.replace(/\.json$/, "");
+    let document = null;
+    const diagnostics = [];
+    try {
+      document = readJson(file);
+    } catch (error) {
+      diagnostics.push(`malformed JSON: ${error.message}`);
+    }
+    if (document && typeof document === "object" && !Array.isArray(document)) {
+      diagnostics.push(...validateAbilityDocument("ability", document).errors);
+    } else if (document) {
+      diagnostics.push("ability asset must be a JSON object");
+    }
+    assets.push({
+      kind: "ability",
+      name: baseName,
+      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      document,
+      valid: diagnostics.length === 0,
+      diagnostics
+    });
+  }
+  return assets;
+}
+
+function inspectAbilityAssets(engineRoot, projectName) {
+  const project = requireProject(engineRoot, projectName);
+  const assets = readAbilityAssets(project);
+  return { project: project.project, ability_assets: assets, count: assets.length };
+}
+
 function registryDiff(previous, document) {
   const keys = new Set([...Object.keys(previous), ...Object.keys(document)]);
   const changed = [...keys].filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(document[key])).sort();
@@ -2599,5 +2920,14 @@ function validateProject(engineRoot, projectName) {
     }
   }
 
-  return { project: project.project, valid: errors.length === 0, errors, warnings, scenes: sceneFiles.length, registry_assets: registryAssets.length, vehicle_assets: vehicleAssets.length };
+  // Ability assets (FALTANTES §19 — abilities data-driven): structural
+  // validation mirroring the public C++ AbilityDefinition factory.
+  const abilityAssets = readAbilityAssets(project);
+  for (const asset of abilityAssets) {
+    for (const diagnostic of asset.diagnostics) {
+      errors.push(`Content/Abilities/${asset.name}.json: ${diagnostic}`);
+    }
+  }
+
+  return { project: project.project, valid: errors.length === 0, errors, warnings, scenes: sceneFiles.length, registry_assets: registryAssets.length, vehicle_assets: vehicleAssets.length, ability_assets: abilityAssets.length };
 }

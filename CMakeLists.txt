@@ -385,6 +385,8 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/ClimateBiome.cpp
     src/engine/sdk/WorldFeatures.cpp
     src/engine/sdk/FastWfcStructures.cpp
+    src/engine/sdk/StructurePlacement.cpp
+    src/engine/sdk/WorldProfile.cpp
     src/engine/sdk/Parcellation.cpp
     src/engine/sdk/ShapeGrammar.cpp
     src/engine/sdk/HeightmapErosion.cpp
@@ -406,6 +408,8 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/VehicleReplication.cpp
     src/engine/sdk/VehicleProvider.cpp
     src/engine/sdk/AbilitySystem.cpp
+    src/engine/sdk/SimulationLod.cpp
+    src/engine/sdk/MissionAsset.cpp
     src/engine/sdk/MotionDatabase.cpp
     src/engine/sdk/GaitPlanner.cpp
     src/engine/sdk/FootPlacement.cpp
@@ -1027,6 +1031,48 @@ target_include_directories(ability_system_tests PRIVATE
 )
 target_link_libraries(ability_system_tests PRIVATE vc_build_options glm)
 add_test(NAME ability_system_tests COMMAND ability_system_tests)
+
+# Simulation LOD (FALTANTES §20): regions + per-tier simulation frequency,
+# sleeping, deterministic aggregate evolution, world clock/climate/seasons,
+# scheduled events, budgets and coherent reactivation — a pure deterministic
+# decision engine over the caller-owned state (the IAnimationLod pattern). The
+# contract compiles with public SDK headers only; the gate drives it headless
+# (no engine internal is touched).
+add_executable(simulation_lod_tests
+    tests/SimulationLodTests.cpp
+    # SimulationLod.cpp uses the shared RegistryJson helpers; both live in
+    # vc_sdk_public. This light target compiles the TUs directly (the
+    # ability_system_tests pattern) so the gate needs no other SDK module.
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/SimulationLod.cpp
+)
+target_include_directories(simulation_lod_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(simulation_lod_tests PRIVATE vc_build_options glm)
+add_test(NAME simulation_lod_tests COMMAND simulation_lod_tests)
+
+# Mission/dialogue assets (FALTANTES item 23 "missões e diálogos"): a mission
+# is a data-driven JSON asset (objectives, dialogue graph, unlock conditions,
+# reward) applied through the public IMissionWorld seam — deterministic,
+# caller-owned progress, bit-exact state serialization. The contract compiles
+# with public SDK headers only; the gate drives a deterministic mock world
+# (the ability_system_tests pattern).
+add_executable(mission_asset_tests
+    tests/MissionAssetTests.cpp
+    # MissionAsset.cpp uses the shared RegistryJson helpers; both live in
+    # vc_sdk_public. This light target compiles the TUs directly (the
+    # ability_system_tests pattern) so the gate needs no other SDK module.
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/MissionAsset.cpp
+)
+target_include_directories(mission_asset_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(mission_asset_tests PRIVATE vc_build_options glm)
+add_test(NAME mission_asset_tests COMMAND mission_asset_tests)
 
 add_executable(visual_authoring_tests
     tests/VisualAuthoringTests.cpp

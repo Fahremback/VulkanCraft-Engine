@@ -28,6 +28,12 @@ uint8_t ChunkSnapshot::water_level(int x, int y, int z) const {
     return layer == center.end() ? WATER_LEVEL_NONE : layer->second.water[center_index(x, z)];
 }
 
+uint8_t ChunkSnapshot::state(int x, int y, int z) const {
+    if (x < 0 || x >= CHUNK_SIZE_X || z < 0 || z >= CHUNK_SIZE_Z) return 0;
+    const auto layer = center.find(y);
+    return layer == center.end() ? 0 : layer->second.stateIndices[center_index(x, z)];
+}
+
 RuntimeBlockId ChunkSnapshot::halo_block(int x, int y, int z, bool& isKnown) const {
     const auto layer = halo.find(y);
     if (layer == halo.end() || x < -1 || x > CHUNK_SIZE_X || z < -1 || z > CHUNK_SIZE_Z) {

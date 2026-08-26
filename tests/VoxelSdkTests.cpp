@@ -30,6 +30,8 @@
 #include <engine/procgen/IClimateBiome.hpp>
 #include <engine/procgen/IWorldFeatures.hpp>
 #include <engine/procgen/IStructureGenerator.hpp>
+#include <engine/procgen/IStructurePlacement.hpp>
+#include <engine/procgen/IWorldProfile.hpp>
 #include <engine/procgen/IParcellation.hpp>
 #include <engine/procgen/IShapeGrammar.hpp>
 #include <engine/procgen/IHeightmapErosion.hpp>
@@ -70,6 +72,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -2431,6 +2434,110 @@ void test_world_metadata_persistence() {
                  "versions + registry fingerprint ride the v5 save, restore on "
                  "load, detect registry change, migrate with identity, manager "
                  "save/load keeps the seed\n";
+}
+
+// Per-voxel block state index (FALTANTES item 2 "variantes de modelo"): set/get
+// round-trip through the public API, persistence via save/load, and idempotency.
+void test_per_voxel_state() {
+    // World A: custom registry with a lamp that has 2 states, place blocks,
+    // set states, serialize.
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    auto registryA = std::make_shared<engine::registry::BlockRegistry>();
+    std::string error;
+    CHECK(registryA->load_from_json(
+        R"({"name":"lamp","namespace":"test","states":[)"
+        R"({"name":"base","color":[0.4,0.4,0.4]},)"
+        R"({"name":"lit","color":[1.0,0.6,0.1],"lightEmission":0.8}]})",
+        error));
+    a->set_block_registry(registryA);
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    uint32_t lampId = 0;
+    CHECK(a->resolve_block_id("test:lamp", lampId, error));
+
+    // Place 3 lamps and set different states.
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(3, 130, 3, lampId);  // default state (0)
+        tx->set_block(5, 130, 5, lampId);  // will set state 1 ("lit")
+        tx->set_block(7, 130, 7, lampId);  // will set state 0 explicitly
+        std::string txErr;
+        CHECK(tx->commit(txErr));
+        CHECK(txErr.empty());
+    }
+    // Default state for all 3.
+    CHECK(a->get_block_state(3, 130, 3) == 0);
+    CHECK(a->get_block_state(5, 130, 5) == 0);
+    CHECK(a->get_block_state(7, 130, 7) == 0);
+
+    // Set states: 5→1 (lit), 7→0 (explicit default).
+    a->set_block_state(5, 130, 5, 1);
+    a->set_block_state(7, 130, 7, 0);  // no-op: already 0
+    CHECK(a->get_block_state(3, 130, 3) == 0);
+    CHECK(a->get_block_state(5, 130, 5) == 1);
+    CHECK(a->get_block_state(7, 130, 7) == 0);
+
+    // Serialize.
+    std::string saveErr;
+    const std::string bytes = a->serialize_world(saveErr);
+    CHECK(saveErr.empty());
+
+    // World B: same registry, restore the save, verify states.
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    auto registryB = std::make_shared<engine::registry::BlockRegistry>();
+    CHECK(registryB->load_from_json(
+        R"({"name":"lamp","namespace":"test","states":[)"
+        R"({"name":"base","color":[0.4,0.4,0.4]},)"
+        R"({"name":"lit","color":[1.0,0.6,0.1],"lightEmission":0.8}]})",
+        error));
+    b->set_block_registry(registryB);
+    CHECK(boot_world(*b, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+
+    std::string loadErr;
+    CHECK(b->deserialize_world(bytes, loadErr));
+    CHECK(loadErr.empty());
+
+    // Block ids restored.
+    CHECK(b->get_block(3, 130, 3) == static_cast<uint32_t>(lampId));
+    CHECK(b->get_block(5, 130, 5) == static_cast<uint32_t>(lampId));
+    CHECK(b->get_block(7, 130, 7) == static_cast<uint32_t>(lampId));
+
+    // States restored.
+    CHECK(b->get_block_state(3, 130, 3) == 0);
+    CHECK(b->get_block_state(5, 130, 5) == 1);
+    CHECK(b->get_block_state(7, 130, 7) == 0);
+
+    // Out-of-bounds returns 0.
+    CHECK(b->get_block_state(0, 0, 0) == 0);
+
+    // Re-serialization is idempotent.
+    std::string reErr;
+    const std::string bytesB = b->serialize_world(reErr);
+    CHECK(reErr.empty());
+    CHECK(bytesB == bytes);
+
+    // Setting a new block resets state to 0.
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = b->begin_transaction();
+        tx->set_block(9, 130, 9, lampId);
+        std::string txErr;
+        CHECK(tx->commit(txErr));
+    }
+    CHECK(b->get_block_state(9, 130, 9) == 0);
+    b->set_block_state(9, 130, 9, 1);
+    CHECK(b->get_block_state(9, 130, 9) == 1);
+    // Setting a block replaces the state.
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = b->begin_transaction();
+        tx->set_block(9, 130, 9, 0);  // air
+        std::string txErr;
+        CHECK(tx->commit(txErr));
+    }
+    CHECK(b->get_block_state(9, 130, 9) == 0);  // state resets on block change
+
+    std::cout << "[sdk] per-voxel state: set/get round-trip, save/load restore, "
+                 "idempotency, block change resets state OK\n";
 }
 
 // Block entities (META section 8): lifecycle, deterministic ticking through
@@ -6326,6 +6433,296 @@ void test_navigation_voxel_world() {
                  "world OK\n";
 }
 
+// FALTANTES item 12 sub-1 — local navigation update after block transactions:
+// tiled navmesh (NavmeshConfig::tileSize > 0) where update() re-bakes ONLY
+// the tiles overlapping a block change and the result is equivalent to a
+// full rebuild — plus the voxel-world flow where a transaction places a wall
+// (detour) and removing it restores the straight path, with per-tile
+// revisions proving no tile outside the change was re-baked.
+void test_navigation_local_update() {
+    using engine::navigation::NavmeshConfig;
+    using engine::navigation::PathResult;
+    using engine::navigation::VoxelColumn;
+
+    const float step = 0.5f;
+    const float minCoord = 0.0f, maxCoord = 32.0f;
+
+    const auto ground_columns = [&]() {
+        std::vector<VoxelColumn> columns;
+        for (float x = minCoord; x <= maxCoord; x += step) {
+            for (float z = minCoord; z <= maxCoord; z += step) {
+                VoxelColumn column;
+                column.x = x;
+                column.z = z;
+                column.solidMinY = 0.0f;
+                column.solidMaxY = 1.0f;
+                column.solid = true;
+                columns.push_back(column);
+            }
+        }
+        return columns;
+    };
+    const auto with_wall = [&](std::vector<VoxelColumn> columns, float wallX) {
+        // A 3-block-high wall at x = wallX, z in [10, 14] — deliberately kept
+        // >= 2 world units away from every tile border so exactly ONE tile is
+        // affected (the tile containing (wallX, 12)).
+        for (VoxelColumn& column : columns) {
+            if (std::fabs(column.x - wallX) <= step / 2.0f &&
+                column.z >= 10.0f && column.z <= 14.0f) {
+                column.solidMinY = 0.0f;
+                column.solidMaxY = 3.0f;
+            }
+        }
+        return columns;
+    };
+
+    NavmeshConfig config;
+    config.boundsMinX = minCoord;
+    config.boundsMaxX = maxCoord;
+    config.boundsMinZ = minCoord;
+    config.boundsMaxZ = maxCoord;
+    config.cellSize = step;
+    config.tileSize = 8.0f;  // tiled mode: 4x4 tiles of 8 world units
+
+    // ---- Tiled build on flat ground: cross-tile path must work ----
+    std::string error;
+    std::unique_ptr<engine::navigation::INavigationProvider> nav =
+        engine::navigation::create_recast_navigation_provider();
+    const auto flatColumns = ground_columns();
+    CHECK(nav->build(config, flatColumns, error));
+    CHECK(error.empty());
+    CHECK(nav->valid());
+    PathResult flat;
+    // Diagonal across tiles (0,0) -> (3,3): proves border connectivity.
+    CHECK(nav->find_path(2.0f, 1.5f, 2.0f, 30.0f, 1.5f, 30.0f, flat));
+    CHECK(flat.found);
+    const float straight = std::sqrt(28.0f * 28.0f * 2.0f);
+    CHECK(flat.totalLength > straight - 1.0f);
+    CHECK(flat.totalLength < straight + 3.0f);
+    const uint64_t r0 = nav->revision();
+    CHECK(r0 > 0);
+    // Per-tile revisions exist in tiled mode and are uniform after build.
+    const uint64_t tile00 = nav->tile_revision(4.0f, 4.0f);    // tile (0,0)
+    const uint64_t tile22 = nav->tile_revision(20.0f, 20.0f);  // tile (2,2)
+    CHECK(tile00 > 0);
+    CHECK(tile22 > 0);
+    CHECK(tile00 == tile22);
+
+    // ---- update(): a wall inside tile (1,1) detours the path locally ----
+    const auto walled = with_wall(ground_columns(), 12.0f);
+    std::vector<VoxelColumn> changed;
+    for (const VoxelColumn& c : walled) {
+        if (std::fabs(c.x - 12.0f) <= step / 2.0f && c.z >= 10.0f && c.z <= 14.0f) {
+            changed.push_back(c);
+        }
+    }
+    CHECK(!changed.empty());
+    CHECK(nav->update(changed, error));
+    CHECK(error.empty());
+    PathResult detour;
+    CHECK(nav->find_path(4.0f, 1.5f, 12.0f, 28.0f, 1.5f, 12.0f, detour));
+    CHECK(detour.found);
+    // The 5-block wall forces a small but deterministic detour (measured
+    // ~0.56 over the 24-unit straight path) with real intermediate waypoints.
+    CHECK(detour.totalLength > 24.0f + 0.25f);
+    CHECK(detour.totalLength < 24.0f + 3.0f);
+    CHECK(detour.waypoints.size() > 2);
+    CHECK(nav->revision() > r0);
+    // Locality: ONLY tile (1,1) was re-baked; (0,0) and (2,2) are untouched.
+    CHECK(nav->tile_revision(12.0f, 12.0f) > tile00);   // tile (1,1) bumped
+    CHECK(nav->tile_revision(4.0f, 4.0f) == tile00);    // tile (0,0) untouched
+    CHECK(nav->tile_revision(20.0f, 20.0f) == tile22);  // tile (2,2) untouched
+
+    // ---- Equivalence: update() == a full rebuild over the updated set ----
+    std::unique_ptr<engine::navigation::INavigationProvider> fresh =
+        engine::navigation::create_recast_navigation_provider();
+    CHECK(fresh->build(config, walled, error));
+    CHECK(error.empty());
+    PathResult freshDetour;
+    CHECK(fresh->find_path(4.0f, 1.5f, 12.0f, 28.0f, 1.5f, 12.0f, freshDetour));
+    CHECK(freshDetour.found);
+    CHECK(detour.totalLength == freshDetour.totalLength);  // bit-exact
+    CHECK(detour.waypoints == freshDetour.waypoints);
+
+    // ---- Long wall: a bigger obstacle forces an unambiguous detour ----
+    // z in [2, 30] at x = 12 crosses the path (4,12)->(28,12); the route must
+    // swing around one end. Affected tiles: all four z-tiles of x-tile 1;
+    // tiles in x-tiles 0 and 2 must stay untouched.
+    const auto longWallColumns = [&]() {
+        std::vector<VoxelColumn> columns = ground_columns();
+        for (VoxelColumn& column : columns) {
+            if (std::fabs(column.x - 12.0f) <= step / 2.0f &&
+                column.z >= 2.0f && column.z <= 30.0f) {
+                column.solidMinY = 0.0f;
+                column.solidMaxY = 3.0f;
+            }
+        }
+        return columns;
+    };
+    std::unique_ptr<engine::navigation::INavigationProvider> navLong =
+        engine::navigation::create_recast_navigation_provider();
+    CHECK(navLong->build(config, longWallColumns(), error));
+    CHECK(error.empty());
+    PathResult longDetour;
+    CHECK(navLong->find_path(4.0f, 1.5f, 12.0f, 28.0f, 1.5f, 12.0f, longDetour));
+    CHECK(longDetour.found);
+    CHECK(longDetour.totalLength > 24.0f + 5.0f);   // real detour (~32.3)
+    CHECK(longDetour.totalLength < 24.0f + 20.0f);
+
+    // ---- Revert: removing the wall restores the straight path ----
+    std::vector<VoxelColumn> reverted;
+    for (const VoxelColumn& c : flatColumns) {
+        if (std::fabs(c.x - 12.0f) <= step / 2.0f && c.z >= 10.0f && c.z <= 14.0f) {
+            reverted.push_back(c);
+        }
+    }
+    CHECK(nav->update(reverted, error));
+    CHECK(error.empty());
+    PathResult back;
+    CHECK(nav->find_path(4.0f, 1.5f, 12.0f, 28.0f, 1.5f, 12.0f, back));
+    CHECK(back.found);
+    CHECK(back.totalLength < 24.0f + 1.0f);  // straight again
+
+    // ---- Refusals (all-or-nothing / mode guards) ----
+    std::string refused;
+    CHECK(!nav->update({}, refused));           // empty change set
+    CHECK(!refused.empty());
+    NavmeshConfig legacyConfig = config;
+    legacyConfig.tileSize = 0.0f;
+    std::unique_ptr<engine::navigation::INavigationProvider> legacy =
+        engine::navigation::create_recast_navigation_provider();
+    CHECK(legacy->build(legacyConfig, flatColumns, error));
+    CHECK(error.empty());
+    CHECK(legacy->tile_revision(4.0f, 4.0f) == 0);  // no tiles in single mode
+    CHECK(!legacy->update(changed, refused));        // refused outside tiled mode
+    CHECK(!refused.empty());
+    NavmeshConfig badTile = config;
+    badTile.tileSize = config.cellSize * 0.5f;       // < cellSize
+    std::unique_ptr<engine::navigation::INavigationProvider> bad =
+        engine::navigation::create_recast_navigation_provider();
+    CHECK(!bad->build(badTile, flatColumns, refused));
+    CHECK(!refused.empty());
+
+    std::cout << "[sdk] navigation local update: tiled navmesh, one-tile "
+                 "re-bake, equivalence to full rebuild, revert and refusals OK\n";
+}
+
+// FALTANTES item 12 sub-1 — the same local update, driven by real block
+// transactions on a voxel world: placing a wall through a transaction is
+// followed by sampling ONLY the affected region and update(), which detours
+// the path; removing the wall and updating again restores the straight path.
+void test_navigation_local_update_world() {
+    using engine::navigation::NavmeshConfig;
+    using engine::navigation::PathResult;
+
+    const auto surface_y = [](engine::voxel::IVoxelWorld& world, int x, int z) {
+        for (int y = 160; y >= 0; --y) {
+            if (world.get_block(x, y, z) != 0) return y;
+        }
+        return -1;
+    };
+
+    NavmeshConfig config;
+    config.boundsMinX = 0.0f;
+    config.boundsMaxX = 32.0f;
+    config.boundsMinZ = 0.0f;
+    config.boundsMaxZ = 32.0f;
+    config.boundsMinY = 0.0f;
+    config.boundsMaxY = 130.0f;
+    config.cellSize = 0.5f;
+    config.tileSize = 8.0f;  // tiled mode
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> world =
+        engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*world, glm::vec3(16.0f, 200.0f, 16.0f), 24));
+    CHECK(settle(*world, glm::vec3(16.0f, 200.0f, 16.0f), [&] {
+        return world->is_chunk_loaded(1, 0) && world->is_chunk_loaded(0, 1) &&
+               world->is_chunk_loaded(1, 1);
+    }));
+    const int surface = surface_y(*world, 8, 8);
+    CHECK(surface > 0);
+
+    std::string error;
+    auto columns = engine::navigation::sample_voxel_columns(*world, config, error);
+    CHECK(error.empty());
+    std::unique_ptr<engine::navigation::INavigationProvider> nav =
+        engine::navigation::create_recast_navigation_provider();
+    CHECK(nav->build(config, columns, error));
+    CHECK(error.empty());
+    const float agentY = static_cast<float>(surface) + 1.5f;
+    PathResult openPath;
+    CHECK(nav->find_path(4.0f, agentY, 12.0f, 28.0f, agentY, 12.0f, openPath));
+    CHECK(openPath.found);
+    CHECK(openPath.totalLength < 24.0f + 1.0f);  // straight across tiles
+    const uint64_t rOpen = nav->revision();
+    CHECK(rOpen > 0);
+
+    // Transaction 1: a 3-block stone wall at x=12, z in [8, 24] (crosses the
+    // path (4,12)->(28,12); its ends stay clear of the world borders so the
+    // ground around them remains navigable).
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = world->begin_transaction();
+        for (int z = 8; z <= 24; ++z) {
+            for (int y = surface + 1; y <= surface + 3; ++y) {
+                tx->set_block(12, y, z, kBlockStone);
+            }
+        }
+        std::string txError;
+        CHECK(tx->commit(txError));
+        CHECK(txError.empty());
+    }
+
+    // Sample ONLY the affected region (same cellSize grid, so the column
+    // keys match the stored set) and update the navmesh locally.
+    NavmeshConfig affectedConfig = config;
+    affectedConfig.boundsMinX = 11.0f;
+    affectedConfig.boundsMaxX = 13.0f;
+    affectedConfig.boundsMinZ = 7.0f;
+    affectedConfig.boundsMaxZ = 25.0f;
+    const auto changed =
+        engine::navigation::sample_voxel_columns(*world, affectedConfig, error);
+    CHECK(error.empty());
+    CHECK(changed.size() >= 100);  // wall footprint + margin
+    CHECK(nav->update(changed, error));
+    CHECK(error.empty());
+    PathResult walledPath;
+    CHECK(nav->find_path(4.0f, agentY, 12.0f, 28.0f, agentY, 12.0f, walledPath));
+    CHECK(walledPath.found);
+    // Deterministic detour (~26.6 vs 24.0 straight).
+    CHECK(walledPath.totalLength > openPath.totalLength + 1.5f);
+    CHECK(walledPath.totalLength < openPath.totalLength + 6.0f);
+    CHECK(nav->tile_revision(12.0f, 12.0f) > rOpen);   // tile (1,1) re-baked
+    CHECK(nav->tile_revision(4.0f, 4.0f) == rOpen);    // tile (0,0) untouched
+    CHECK(nav->tile_revision(20.0f, 20.0f) == rOpen);  // tile (2,2) untouched
+
+    // Transaction 2: remove the wall; a fresh sample of the same region
+    // restores the straight path.
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = world->begin_transaction();
+        for (int z = 8; z <= 24; ++z) {
+            for (int y = surface + 1; y <= surface + 3; ++y) {
+                tx->set_block(12, y, z, 0);  // Air
+            }
+        }
+        std::string txError;
+        CHECK(tx->commit(txError));
+        CHECK(txError.empty());
+    }
+    const auto reverted =
+        engine::navigation::sample_voxel_columns(*world, affectedConfig, error);
+    CHECK(nav->update(reverted, error));
+    CHECK(error.empty());
+    PathResult restored;
+    CHECK(nav->find_path(4.0f, agentY, 12.0f, 28.0f, agentY, 12.0f, restored));
+    CHECK(restored.found);
+    CHECK(restored.totalLength < openPath.totalLength + 1.0f);  // straight again
+
+    std::cout << "[sdk] navigation local update world: transaction places a "
+                 "wall (detour), removing it restores the path, only the "
+                 "tile of the change re-baked OK\n";
+}
+
 // ---- META section 17 / FALTANTES item 13: authoritative voxel replication ----
 // Server validates and applies client edits (cooldown, bounds, loaded chunk,
 // block registry), broadcasts ordered deltas over the generic networking
@@ -8909,6 +9306,422 @@ void test_structure_generator() {
                  "consistency, extrusion, JSON, ground) OK\n";
 }
 
+// ---- Item 14: data-driven structures, sockets and spawn rules ----
+
+void test_structure_placement() {
+    std::string error;
+    auto system = engine::procgen::create_structure_placement_system();
+    CHECK(system != nullptr);
+
+    // ---- definitions + sockets ----
+    engine::procgen::StructureDefinition room;
+    room.id = "test:room";
+    room.spec = make_room_spec(7);
+    room.outputWidth = 12;
+    room.outputHeight = 8;
+    room.sockets.push_back(
+        engine::procgen::StructureSocket{ "door", { 0, 1, 0 }, 0, "door" });
+    room.sockets.push_back(
+        engine::procgen::StructureSocket{ "window", { 6, 2, 0 }, 2, "" });
+    CHECK(system->add_definition(room, error) && error.empty());
+    CHECK(system->definition("test:room") != nullptr);
+    CHECK(system->definition("test:nope") == nullptr);
+    CHECK(system->definition_ids().size() == 1);
+
+    // Duplicate id refused.
+    CHECK(!system->add_definition(room, error) && !error.empty());
+
+    // Invalid structure asset refused (the SAME validation the generator
+    // factory applies — patternSize 2 cannot fit a 1x1 sample).
+    auto badRoom = room;
+    badRoom.id = "test:bad";
+    badRoom.spec.sampleWidth = 1;
+    badRoom.spec.sample.resize(1);
+    CHECK(!system->add_definition(badRoom, error) && !error.empty());
+
+    // Duplicate socket name refused.
+    auto dupSockets = room;
+    dupSockets.id = "test:dupsockets";
+    dupSockets.sockets.push_back(dupSockets.sockets[0]);
+    CHECK(!system->add_definition(dupSockets, error) && !error.empty());
+
+    // ---- rules ----
+    engine::procgen::StructureSpawnRule rule;
+    rule.structureId = "test:room";
+    rule.biomes = { "plains" };
+    rule.minSurfaceHeight = 100;
+    rule.maxSurfaceHeight = 200;
+    rule.density = 1.0f;  // always spawns when the other gates pass
+    rule.spacing = 8;
+    rule.yOffset = 1;
+    rule.seedOffset = 3;
+    CHECK(system->set_rules({ rule }, error) && error.empty());
+    CHECK(system->rules().size() == 1);
+
+    // Dangling rule refused all-or-nothing (state unchanged).
+    auto dangling = rule;
+    dangling.structureId = "test:nonexistent";
+    CHECK(!system->set_rules({ rule, dangling }, error) && !error.empty());
+    CHECK(system->rules().size() == 1);
+
+    // ---- try_place: spawns at the cell origin, deterministic ----
+    const std::uint32_t worldSeed = 42u;
+    engine::procgen::StructurePlacement placed;
+    CHECK(system->try_place({ rule }, 8, 8, 120, "plains", worldSeed, placed,
+                            error));
+    CHECK(placed.structureId == "test:room");
+    CHECK(placed.origin == glm::ivec3(8, 121, 8));  // cell + surface + yOffset
+    CHECK(placed.output.succeeded);
+    CHECK(placed.output.width == 12 && placed.output.height == 8);
+
+    // Canonical cell: querying anywhere inside the same cell produces the
+    // same placement (origin, per-cell seed and content).
+    engine::procgen::StructurePlacement inside;
+    CHECK(system->try_place({ rule }, 12, 15, 120, "plains", worldSeed, inside,
+                            error));
+    CHECK(inside.origin == placed.origin);
+    CHECK(inside.placementSeed == placed.placementSeed);
+    CHECK(inside.output.blocks == placed.output.blocks);
+
+    // Determinism across a second system rebuilt from JSON.
+    std::string document;
+    CHECK(system->serialize(document));
+    CHECK(document.find("\"id\":\"test:room\"") != std::string::npos);
+    CHECK(document.find("\"connectTag\":\"door\"") != std::string::npos);
+    CHECK(document.find("\"structureId\":\"test:room\"") != std::string::npos);
+    auto restored =
+        engine::procgen::create_structure_placement_system_from_json(document,
+                                                                     error);
+    CHECK(restored != nullptr && error.empty());
+    CHECK(restored->definition("test:room") != nullptr);
+    CHECK(restored->rules().size() == 1);
+    engine::procgen::StructurePlacement restoredPlaced;
+    CHECK(restored->try_place({}, 8, 8, 120, "plains", worldSeed, restoredPlaced,
+                              error));
+    CHECK(restoredPlaced.origin == placed.origin);
+    CHECK(restoredPlaced.placementSeed == placed.placementSeed);
+    CHECK(restoredPlaced.output.blocks == placed.output.blocks);
+    // Byte-identical JSON round-trip.
+    std::string restoredDoc;
+    CHECK(restored->serialize(restoredDoc));
+    CHECK(restoredDoc == document);
+
+    // Empty rules fall back to the system's stored rules.
+    engine::procgen::StructurePlacement stored;
+    CHECK(system->try_place({}, 8, 8, 120, "plains", worldSeed, stored, error));
+    CHECK(stored.origin == placed.origin);
+
+    // Gates: wrong biome, no biome info, surface out of range -> no match
+    // (normal outcome, no diagnostic).
+    engine::procgen::StructurePlacement miss;
+    CHECK(!system->try_place({ rule }, 8, 8, 120, "desert", worldSeed, miss,
+                             error) &&
+          error.empty());
+    CHECK(!system->try_place({ rule }, 8, 8, 120, "", worldSeed, miss, error) &&
+          error.empty());
+    CHECK(!system->try_place({ rule }, 8, 8, 90, "plains", worldSeed, miss,
+                             error) &&
+          error.empty());
+
+    // density 0 never spawns.
+    auto neverRule = rule;
+    neverRule.density = 0.0f;
+    CHECK(!system->try_place({ neverRule }, 8, 8, 120, "plains", worldSeed, miss,
+                             error) &&
+          error.empty());
+
+    // First matching rule wins (rule order is the priority).
+    auto secondRule = rule;
+    secondRule.yOffset = 5;
+    CHECK(system->try_place({ rule, secondRule }, 8, 8, 120, "plains",
+                            worldSeed, placed, error));
+    CHECK(placed.origin.y == 121);  // first rule's yOffset won
+
+    // Unknown structureId at placement time is a hard error with diagnostic.
+    auto ghostRule = rule;
+    ghostRule.structureId = "test:ghost";
+    CHECK(!system->try_place({ ghostRule }, 8, 8, 120, "plains", worldSeed,
+                             placed, error) &&
+          !error.empty());
+    CHECK(error.find("test:ghost") != std::string::npos);
+
+    // ---- plan_region: deterministic region planning ----
+    // Flat world (surface 120 everywhere, biome "plains"), 2x2 chunks =
+    // 16 candidate cells at spacing 8; density 1 -> all spawn.
+    const auto surfaceAt = [](int, int) { return 120; };
+    const auto biomeAt = [](int, int) { return std::string("plains"); };
+    std::vector<engine::procgen::StructurePlacement> plan;
+    CHECK(system->plan_region({ rule }, 0, 0, 2, 2, surfaceAt, biomeAt, worldSeed,
+                              plan, error));
+    CHECK(plan.size() == 16);
+    // Every planned placement equals a direct try_place at its own origin.
+    for (const auto& p : plan) {
+        engine::procgen::StructurePlacement direct;
+        CHECK(system->try_place({ rule }, p.origin.x, p.origin.z, 120, "plains",
+                                worldSeed, direct, error));
+        CHECK(direct.structureId == p.structureId);
+        CHECK(direct.origin == p.origin);
+    }
+    // Per-cell seeds are distinct.
+    std::set<std::uint32_t> seeds;
+    for (const auto& p : plan) seeds.insert(p.placementSeed);
+    CHECK(seeds.size() == plan.size());
+    // Deterministic across repeated calls.
+    std::vector<engine::procgen::StructurePlacement> plan2;
+    CHECK(system->plan_region({ rule }, 0, 0, 2, 2, surfaceAt, biomeAt, worldSeed,
+                              plan2, error));
+    CHECK(plan2.size() == plan.size());
+    for (std::size_t i = 0; i < plan.size(); ++i) {
+        CHECK(plan[i].origin == plan2[i].origin);
+        CHECK(plan[i].placementSeed == plan2[i].placementSeed);
+        CHECK(plan[i].output.blocks == plan2[i].output.blocks);
+    }
+
+    // ---- sockets: resolve to world space, connect with opposing facings ----
+    std::vector<engine::procgen::StructureSocket> worldSockets;
+    CHECK(system->resolve_sockets(placed, worldSockets, error) && error.empty());
+    CHECK(worldSockets.size() == 2);
+    CHECK(worldSockets[0].name == "door");
+    CHECK(worldSockets[0].position == glm::ivec3(8, 122, 8));    // (0,1,0)+origin
+    CHECK(worldSockets[1].name == "window");
+    CHECK(worldSockets[1].position == glm::ivec3(14, 123, 8));   // (6,2,0)+origin
+
+    // A second structure whose socket faces -Z (opposes the window's +Z).
+    engine::procgen::StructureDefinition hub;
+    hub.id = "test:hub";
+    hub.spec = make_room_spec(9);
+    hub.outputWidth = 8;
+    hub.outputHeight = 6;
+    hub.sockets.push_back(
+        engine::procgen::StructureSocket{ "door", { 0, 1, 0 }, 3, "door" });
+    CHECK(system->add_definition(hub, error) && error.empty());
+    engine::procgen::StructureSpawnRule hubRule;
+    hubRule.structureId = "test:hub";
+    hubRule.density = 1.0f;
+    hubRule.spacing = 8;
+    engine::procgen::StructurePlacement b;
+    CHECK(system->try_place({ hubRule }, 0, 0, 120, "", worldSeed, b, error));
+    CHECK(b.origin == glm::ivec3(0, 121, 0));
+    // connect a's window (+Z, tag "") to b's door (-Z, tag "door"): b must
+    // move so its door sits exactly at the window's world position.
+    glm::ivec3 bOrigin;
+    CHECK(system->connect_sockets(placed, "window", b, "door", bOrigin, error) &&
+          error.empty());
+    CHECK(bOrigin == glm::ivec3(14, 122, 8));
+    // b at that origin puts its door at the window: (14,122,8)+(0,1,0) ==
+    // placed origin (8,121,8) + (6,2,0).
+    CHECK(bOrigin + glm::ivec3(0, 1, 0) ==
+          placed.origin + glm::ivec3(6, 2, 0));
+
+    // Non-opposing facings refused with a diagnostic.
+    auto posHub = hub;
+    posHub.id = "test:hubpos";
+    posHub.sockets[0].facing = 2;  // +Z — same direction as the window
+    CHECK(system->add_definition(posHub, error) && error.empty());
+    engine::procgen::StructureSpawnRule posRule = hubRule;
+    posRule.structureId = "test:hubpos";
+    engine::procgen::StructurePlacement bPos;
+    CHECK(system->try_place({ posRule }, 0, 0, 120, "", worldSeed, bPos, error));
+    CHECK(!system->connect_sockets(placed, "window", bPos, "door", bOrigin,
+                                  error) &&
+          !error.empty());
+
+    // Tag mismatch refused (both tags non-empty and different).
+    auto tagHub = hub;
+    tagHub.id = "test:hubtag";
+    tagHub.sockets[0].connectTag = "window";
+    CHECK(system->add_definition(tagHub, error) && error.empty());
+    engine::procgen::StructureSpawnRule tagRule = hubRule;
+    tagRule.structureId = "test:hubtag";
+    engine::procgen::StructurePlacement bTag;
+    CHECK(system->try_place({ tagRule }, 0, 0, 120, "", worldSeed, bTag, error));
+    CHECK(!system->connect_sockets(placed, "door", bTag, "door", bOrigin,
+                                  error) &&
+          !error.empty());
+
+    // Unknown sockets refused.
+    CHECK(!system->connect_sockets(placed, "nosuch", b, "door", bOrigin, error) &&
+          !error.empty());
+    CHECK(!system->connect_sockets(placed, "window", b, "nosuch", bOrigin, error) &&
+          !error.empty());
+
+    // ---- JSON all-or-nothing ----
+    CHECK(!system->deserialize("{nope", error) && !error.empty());
+    CHECK(system->definition("test:room") != nullptr);  // previous state kept
+    CHECK(system->rules().size() == 1);
+    CHECK(!system->deserialize("{\"version\":99}", error) && !error.empty());
+    CHECK(!restored->deserialize(
+              "{\"version\":1,\"definitions\":[],\"rules\":[{\"structureId\":\"nope\"}]}",
+              error) &&
+          !error.empty());
+    CHECK(restored->definition("test:room") != nullptr);  // untouched
+    // A document with an invalid asset is refused too.
+    CHECK(!restored->deserialize(
+              "{\"version\":1,\"definitions\":[{\"id\":\"x\",\"spec\":{\"version\":1,\"sampleWidth\":1,\"sampleHeight\":1,\"sample\":[1]}}]}",
+              error) &&
+          !error.empty());
+
+    std::cout << "[sdk] procgen: structure placement (definitions, sockets, "
+                 "spawn rules, determinism, JSON all-or-nothing) OK\n";
+}
+
+// ---- Item 14/16: world profile — ONE JSON document composes every
+// generation domain (noise + climate + biomes + surface + caves/ores +
+// carver + decorators + structures) without per-world C++ assembly ----
+
+const char* kProfileAsset = R"({
+  "version": 1,
+  "height": {"version":1,"seed":2026,"root":1,"nodes":[
+    {"type":"perlin","params":[0.05,0.0],"sources":[]},
+    {"type":"fbm","params":[4,0.5,2.0,0.0],"sources":[0]}]},
+  "baseHeight": 131, "amplitude": 4,
+  "climate": {
+    "temperature": {"version":1,"seed":1,"root":0,"nodes":[{"type":"constant","params":[0.7],"sources":[]}]},
+    "moisture": {"version":1,"seed":1,"root":0,"nodes":[{"type":"constant","params":[-0.7],"sources":[]}]},
+    "continentalness": {"version":1,"seed":1,"root":0,"nodes":[{"type":"constant","params":[0.5],"sources":[]}]}},
+  "biomes": {"version":1,"biomes":[
+    {"name":"desert_rule","engineBiomeIndex":8,
+     "climate":{"temperature":[0.25,1.0],"moisture":[-1.0,-0.2]},
+     "surface":[{"blockId":50,"minDepth":0,"maxDepth":0}]},
+    {"name":"meadow","engineBiomeIndex":7}]},
+  "caves": {"density":{"version":1,"seed":2,"root":0,"nodes":[{"type":"constant","params":[0.0],"sources":[]}]}},
+  "ores": {"density":{"version":1,"seed":3,"root":0,"nodes":[{"type":"constant","params":[0.75],"sources":[]}]},
+           "table":{"version":1,"rules":[{"blockId":18,"minDensity":0.7,"maxDensity":0.8,"minY":10,"maxY":120}]}},
+  "carver": {"version":1,"fluidMaxY":60,"fluidBlockId":12},
+  "decorators": {"version":1,"decorators":[
+    {"type":"column","density":1.0,"params":[2,2],"blocks":[50]}]},
+  "structures": {"version":1,"definitions":[
+    {"id":"p:room","outputWidth":12,"outputHeight":8,
+     "spec":{"version":1,"sampleWidth":8,"sampleHeight":5,"patternSize":2,
+             "symmetry":1,"periodicOutput":false,"ground":false,"seed":7,
+             "sample":[1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,1,1,2,2,2,2,2,2,1,1,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1],
+             "profiles":[{"blockId":1,"layers":[3,3,3]},{"blockId":2,"layers":[5]}]},
+     "sockets":[{"name":"door","position":[0,1,0],"facing":0,"connectTag":"door"}]}],
+   "rules":[{"structureId":"p:room","biomes":["desert_rule"],"density":1.0,
+              "spacing":8,"yOffset":1,"seedOffset":3}]}
+})";
+
+void test_world_profile() {
+    std::string error;
+    auto profile = engine::procgen::create_world_profile_from_json(kProfileAsset,
+                                                                   error);
+    CHECK(profile != nullptr && error.empty());
+    auto gen = profile->generator();
+    CHECK(gen != nullptr);
+    auto placement = profile->structure_placement();
+    CHECK(placement != nullptr);
+    CHECK(placement->definition("p:room") != nullptr);
+    CHECK(placement->definition("p:room")->sockets.size() == 1);
+    CHECK(placement->rules().size() == 1);
+
+    // The composed generator wires the data-driven hooks directly: ore table,
+    // carver fill and biome surface rule resolve through the generator API.
+    CHECK(gen->ore_block(0.75f, 60, 0) == 18);        // DiamondOre rule
+    CHECK(gen->ore_block(0.75f, 5, 0) == 0);          // y-gate: no rule -> 0
+    CHECK(gen->carve_block(0.5f, 40, 20, 0) == 12);   // fluid pool <= 60
+    CHECK(gen->carve_block(0.5f, 100, 20, 0) == 0);   // pure air above pool
+
+    // Boot a world with the profile generator: ores, biome surface rule and
+    // decorators all reach the voxels.
+    std::unique_ptr<engine::voxel::IVoxelWorld> world =
+        engine::voxel::create_default_voxel_world();
+    world->register_generator(gen);
+    CHECK(boot_world(*world, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    CHECK(world->get_block(4, 60, 4) == 18);    // ore rule over builtin GoldOre
+    CHECK(world->get_block(4, 100, 4) == 18);   // ore rule over builtin IronOre
+    CHECK(world->get_block(4, 5, 4) == 17);     // y-gate: builtin GoldOre stays
+    // Columns must be inside the world's decoration band (chunk-local
+    // x/z in [4, CHUNK_SIZE-4)); (12,12) is excluded by the engine.
+    const int landColumns[3][2] = { { 4, 4 }, { 8, 8 }, { 10, 10 } };
+    int decorated = 0;
+    for (const auto& column : landColumns) {
+        const int surface = gen->sample(static_cast<float>(column[0]),
+                                        static_cast<float>(column[1])).height;
+        if (surface <= 129) continue;  // only land columns get decorated
+        ++decorated;
+        CHECK(world->get_block(column[0], surface, column[1]) == 50);  // biome rule
+        CHECK(world->get_block(column[0], surface + 1, column[1]) == 50);
+        CHECK(world->get_block(column[0], surface + 2, column[1]) == 50);
+        CHECK(world->get_block(column[0], surface + 3, column[1]) == 0);
+    }
+    CHECK(decorated > 0);
+
+    // Structures from the profile: try_place with the STORED rules (empty
+    // rules fall back), on the same seed -> deterministic placement.
+    const std::uint32_t worldSeed = 42u;
+    engine::procgen::StructurePlacement placed;
+    CHECK(placement->try_place({}, 8, 8,
+                               gen->sample(8.0f, 8.0f).height, "desert_rule",
+                               worldSeed, placed, error));
+    CHECK(placed.structureId == "p:room");
+    CHECK(placed.origin == glm::ivec3(8, gen->sample(8.0f, 8.0f).height + 1, 8));
+    CHECK(placed.output.width == 12 && placed.output.height == 8);
+    engine::procgen::StructurePlacement again;
+    CHECK(placement->try_place({}, 8, 8,
+                               gen->sample(8.0f, 8.0f).height, "desert_rule",
+                               worldSeed, again, error));
+    CHECK(again.origin == placed.origin);
+    CHECK(again.output.blocks == placed.output.blocks);
+
+    // Round-trip: serialize -> reload -> serialize is byte-identical, and the
+    // restored generator produces an identical world.
+    std::string doc;
+    CHECK(profile->serialize(doc));
+    auto restored = engine::procgen::create_world_profile_from_json(doc, error);
+    CHECK(restored != nullptr && error.empty());
+    std::string doc2;
+    CHECK(restored->serialize(doc2));
+    CHECK(doc2 == doc);
+    std::unique_ptr<engine::voxel::IVoxelWorld> worldB =
+        engine::voxel::create_default_voxel_world();
+    worldB->register_generator(restored->generator());
+    CHECK(boot_world(*worldB, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    bool same = true;
+    for (int x = 4; x <= 12; x += 2) {
+        for (int z = 4; z <= 12; z += 2) {
+            for (int y = 100; y <= 140; ++y) {
+                if (world->get_block(x, y, z) != worldB->get_block(x, y, z)) {
+                    same = false;
+                }
+            }
+        }
+    }
+    CHECK(same);
+
+    // A bare profile (no sections) is still valid: flat generator + empty
+    // placement system.
+    auto bare = engine::procgen::create_world_profile_from_json(
+        "{\"version\":1}", error);
+    CHECK(bare != nullptr && error.empty());
+    CHECK(bare->generator() != nullptr);
+    CHECK(bare->structure_placement()->rules().empty());
+
+    // All-or-nothing: malformed / unknown version / invalid section refused
+    // with a diagnostic (nothing partial is ever composed).
+    CHECK(engine::procgen::create_world_profile_from_json("{nope", error) ==
+              nullptr &&
+          !error.empty());
+    CHECK(engine::procgen::create_world_profile_from_json(
+              "{\"version\":99}", error) == nullptr &&
+          !error.empty());
+    CHECK(engine::procgen::create_world_profile_from_json(
+              "{\"version\":1,\"height\":{\"version\":1,\"seed\":1,\"root\":5,\"nodes\":[]}}",
+              error) == nullptr &&
+          !error.empty());
+    CHECK(engine::procgen::create_world_profile_from_json(
+              "{\"version\":1,\"biomes\":{\"version\":1,\"biomes\":[{\"name\":\"x\"}]}}",
+              error) == nullptr &&
+          !error.empty());
+    CHECK(engine::procgen::create_world_profile_from_json(
+              "{\"version\":1,\"structures\":{\"version\":1,\"rules\":[{\"structureId\":\"nope\"}]}}",
+              error) == nullptr &&
+          !error.empty());
+
+    std::cout << "[sdk] procgen: world profile (one JSON composes noise+"
+                 "climate+biomes+ores+carver+decorators+structures, "
+                 "round-trip, all-or-nothing) OK\n";
+}
+
 void test_road_network() {
     std::string error;
     auto builder = engine::procgen::create_road_network_builder();
@@ -10114,6 +10927,7 @@ int main(int argc, char** argv) {
         test_replication_palette();
         test_json_only_block_e2e();
         test_world_metadata_persistence();
+        test_per_voxel_state();
         test_block_entity_lifecycle();
         test_block_entity_atomic_destroy();
         test_block_entity_persistence();
@@ -10161,6 +10975,8 @@ int main(int argc, char** argv) {
         test_entity_world_save();
         test_navigation_provider();
         test_navigation_voxel_world();
+        test_navigation_local_update();
+        test_navigation_local_update_world();
         test_replication_authority();
         test_replication_deltas_reorder();
         test_commit_replication_persistence();
@@ -10188,6 +11004,8 @@ int main(int argc, char** argv) {
         test_decorator();
         test_world_features();
         test_structure_generator();
+        test_structure_placement();
+        test_world_profile();
         test_road_network();
         test_parcellation();
         test_parcel_triangulation();

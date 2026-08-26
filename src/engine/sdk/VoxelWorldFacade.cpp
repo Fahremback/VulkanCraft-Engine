@@ -363,6 +363,7 @@ struct ChunkSaveSnapshot {
     uint64_t revision = 0;  // dataVersion at capture (delta gating)
     std::vector<RuntimeBlockId> blocks;
     std::vector<uint8_t> fluid;
+    std::vector<uint8_t> stateIndices;  // per-voxel state (FALTANTES item 2)
 };
 
 // Neutral world-save content (FALTANTES §4 item 9, schema migration): the one
@@ -380,6 +381,8 @@ struct WorldSaveData {
         uint32_t extent = 0;
         std::vector<uint16_t> blocks;  // y,z,x order
         std::vector<uint8_t> fluid;    // one byte per voxel
+        // Per-voxel block state index (FALTANTES item 2): 0 = default; >0 = named.
+        std::vector<uint8_t> stateIndices;  // y,z,x order, one byte per voxel
     };
     struct BlockEntity {
         int x = 0;
@@ -979,6 +982,20 @@ public:
                                                    static_cast<float>(z)));
     }
 
+    // Per-voxel block state index (FALTANTES item 2 "variantes de modelo"):
+    // 0 = default state; >0 = named state from BlockDefinition.
+    uint8_t get_block_state(int x, int y, int z) const override {
+        return world_.get_state_at(glm::vec3(static_cast<float>(x),
+                                             static_cast<float>(y),
+                                             static_cast<float>(z)));
+    }
+
+    void set_block_state(int x, int y, int z, uint8_t stateIndex) override {
+        world_.set_state_at(glm::vec3(static_cast<float>(x),
+                                      static_cast<float>(y),
+                                      static_cast<float>(z)), stateIndex);
+    }
+
     // ---- Block entities (META section 8) ----
 
     void register_block_entity_type(
@@ -1172,6 +1189,7 @@ public:
                 static_cast<std::size_t>(extent) * layerBytes;
             outChunk.blocks.reserve(voxelBytes);
             outChunk.fluid.reserve(voxelBytes);
+            outChunk.stateIndices.reserve(voxelBytes);
             for (int y = 0; y < extent; ++y) {
                 for (int z = 0; z < CHUNK_SIZE_Z; ++z) {
                     for (int x = 0; x < CHUNK_SIZE_X; ++x) {
@@ -1180,6 +1198,8 @@ public:
                         // Fluid-level byte for ANY fluid (water is the builtin
                         // case; data-driven fluids carry levels the same way).
                         outChunk.fluid.push_back(chunk.get_fluid_level(x, y, z));
+                        // Per-voxel state index (FALTANTES item 2): 0 = default.
+                        outChunk.stateIndices.push_back(chunk.get_state(x, y, z));
                     }
                 }
             }
@@ -1268,12 +1288,19 @@ public:
         for (const WorldSaveData::Chunk& chunk : data.chunks) {
             const auto blocksVec = builder.CreateVector(chunk.blocks);
             const auto fluidVec = builder.CreateVector(chunk.fluid);
+            // Per-voxel state indices (FALTANTES item 2): optional field —
+            // null means "all state 0" (older saves, backward compatible).
+            flatbuffers::Offset<flatbuffers::Vector<uint8_t>> stateVec;
+            if (!chunk.stateIndices.empty()) {
+                stateVec = builder.CreateVector(chunk.stateIndices);
+            }
             engine::voxel::save::ChunkEntryBuilder entry(builder);
             entry.add_cx(chunk.cx);
             entry.add_cz(chunk.cz);
             entry.add_extent(chunk.extent);
             entry.add_blocks(blocksVec);
             entry.add_fluid(fluidVec);
+            if (stateVec.o) entry.add_state_indices(stateVec);
             chunkOffsets.push_back(entry.Finish());
         }
         const auto chunkVec = builder.CreateVector(chunkOffsets);
@@ -1724,12 +1751,14 @@ public:
                     static_cast<std::size_t>(snap.extent) * layerBytes;
                 snap.blocks.reserve(voxelBytes);
                 snap.fluid.reserve(voxelBytes);
+                snap.stateIndices.reserve(voxelBytes);
                 for (int y = 0; y < snap.extent; ++y) {
                     for (int z = 0; z < CHUNK_SIZE_Z; ++z) {
                         for (int x = 0; x < CHUNK_SIZE_X; ++x) {
                             snap.blocks.push_back(chunk->get_block(x, y, z));
                             snap.fluid.push_back(static_cast<uint8_t>(
                                 chunk->get_fluid_level(x, y, z)));
+                            snap.stateIndices.push_back(chunk->get_state(x, y, z));
                         }
                     }
                 }
@@ -1773,6 +1802,7 @@ public:
             for (auto& [key, snap] : chunks_) {
                 world_.restore_chunk_data(snap.cx, snap.cz, snap.extent,
                                           snap.blocks.data(), snap.fluid.data(),
+                                          snap.stateIndices.data(),
                                           facade_.playerPos_, facade_.bridge_);
                 std::lock_guard<std::recursive_mutex> lock(world_.chunksMutex);
                 auto it = world_.chunks.find(key);
@@ -1963,7 +1993,8 @@ public:
                 body.substr(cursor + blockBytes, voxelBytes);
             cursor += blockBytes + voxelBytes;
 
-            if (!apply_saved_chunk(cx, cz, extent, blockIds, water)) {
+            std::vector<uint8_t> stateIndicesLegacy;  // v1-v4: no state data
+            if (!apply_saved_chunk(cx, cz, extent, blockIds, water, stateIndicesLegacy)) {
                 errorOut = "world restore: chunk (" + std::to_string(cx) + ',' +
                            std::to_string(cz) + ") could not be loaded";
                 return false;
@@ -2143,8 +2174,18 @@ public:
                     water.push_back(static_cast<char>(entry->fluid()->Get(
                         static_cast<flatbuffers::uoffset_t>(i))));
                 }
+                // Per-voxel state indices (FALTANTES item 2): optional — null means
+                // all state 0 (older saves, backward compatible).
+                std::vector<uint8_t> stateIndicesV5;
+                if (entry->state_indices() != nullptr) {
+                    stateIndicesV5.reserve(voxelBytes);
+                    for (std::size_t i = 0; i < voxelBytes; ++i) {
+                        stateIndicesV5.push_back(entry->state_indices()->Get(
+                            static_cast<flatbuffers::uoffset_t>(i)));
+                    }
+                }
                 if (!apply_saved_chunk(cx, cz, static_cast<int>(extent),
-                                       blockIds, water)) {
+                                       blockIds, water, stateIndicesV5)) {
                     errorOut = "world restore: chunk (" + std::to_string(cx) +
                                ',' + std::to_string(cz) +
                                ") could not be loaded";
@@ -2494,7 +2535,8 @@ private:
     // position), then overwrites its voxel content with the saved state.
     bool apply_saved_chunk(int cx, int cz, int extent,
                            const std::vector<RuntimeBlockId>& blocks,
-                           const std::string& water) {
+                           const std::string& water,
+                           const std::vector<uint8_t>& stateIndices) {
         // FALTANTES §4 item 17/18: o chunk é materializado SOB DEMANDA — criado
         // no mapa do mundo ou assumido no lugar (um gerador em voo é esperado),
         // sem depender da janela de streaming e sem gerar o chunk antes de
@@ -2504,7 +2546,9 @@ private:
         // chunks já restaurados nem disparam geração nova de janela.
         return world_.restore_chunk_data(
             cx, cz, extent, blocks.data(),
-            reinterpret_cast<const uint8_t*>(water.data()), playerPos_, bridge_);
+            reinterpret_cast<const uint8_t*>(water.data()),
+            stateIndices.empty() ? nullptr : stateIndices.data(),
+            playerPos_, bridge_);
     }
 
     // ---- Region-paged persistence (FALTANTES §4 item 1) ----
@@ -2614,12 +2658,14 @@ private:
                     static_cast<std::size_t>(snap.extent) * layerBytes;
                 snap.blocks.reserve(voxelBytes);
                 snap.fluid.reserve(voxelBytes);
+                snap.stateIndices.reserve(voxelBytes);
                 for (int y = 0; y < snap.extent; ++y) {
                     for (int z = 0; z < CHUNK_SIZE_Z; ++z) {
                         for (int x = 0; x < CHUNK_SIZE_X; ++x) {
                             snap.blocks.push_back(chunk->get_block(x, y, z));
                             snap.fluid.push_back(static_cast<uint8_t>(
                                 chunk->get_fluid_level(x, y, z)));
+                            snap.stateIndices.push_back(chunk->get_state(x, y, z));
                         }
                     }
                 }
@@ -3286,7 +3332,8 @@ private:
                                std::vector<RuntimeBlockId>& blockIds,
                                const std::string& water,
                                std::string& errorOut) {
-        if (!apply_saved_chunk(cx, cz, extent, blockIds, water)) {
+        std::vector<uint8_t> stateIndicesRegion;
+        if (!apply_saved_chunk(cx, cz, extent, blockIds, water, stateIndicesRegion)) {
             errorOut = "region page: chunk (" + std::to_string(cx) +
                        ',' + std::to_string(cz) + ") could not be loaded";
             return false;

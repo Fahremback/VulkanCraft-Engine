@@ -19,7 +19,8 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
     // Builtin ids resolve through the engine material table; dynamic
     // (registry-defined) ids resolve through the snapshot's runtime table.
     // Workers never touch the registry — the table is embedded at dispatch.
-    auto material_for = [&](RuntimeBlockId id, const glm::vec3& normal) {
+    auto material_for = [&](RuntimeBlockId id, const glm::vec3& normal,
+                            uint8_t stateIndex = 0) {
         glm::vec4 color(1.0f, 0.0f, 1.0f, 1.0f);
         float layer = -1.0f;
         if (is_builtin_block(id)) {
@@ -27,9 +28,9 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
             color = get_block_color(type, normal);
             layer = get_block_texture_layer(type, normal);
         } else if (const RuntimeBlockInfo* info = snapshot.find_runtime_block(id)) {
-            // State-aware material (FALTANTES item 5): state 0 is the default
-            // (base per-face material), identical to the block-level rules.
-            color = resolve_state_material(*info, 0, normal);
+            // State-aware material (FALTANTES item 2): resolve per-voxel
+            // state index (0 = default, >0 = named state from BlockDefinition).
+            color = resolve_state_material(*info, stateIndex, normal);
         }
         return std::pair<glm::vec4, float>{ color, layer };
     };
@@ -60,8 +61,9 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
     float offsetZ = static_cast<float>(snapshot.id.coord.z * CHUNK_SIZE_Z);
 
     auto add_face = [&](const glm::vec3& p0, const glm::vec3& p1, const glm::vec3& p2, const glm::vec3& p3,
-                        const glm::vec3& normal, RuntimeBlockId type) {
-        const auto [col, layer] = material_for(type, normal);
+                        const glm::vec3& normal, RuntimeBlockId type,
+                        uint8_t stateIndex = 0) {
+        const auto [col, layer] = material_for(type, normal, stateIndex);
 
         glm::vec3 uv0(0.0f, 0.0f, layer);
         glm::vec3 uv1(1.0f, 0.0f, layer);
@@ -113,6 +115,7 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
             for (int z = 0; z < CHUNK_SIZE_Z; z++) {
                 RuntimeBlockId type = snapshot.block(x, y, z);
                 if (type == kRuntimeAirId) continue;
+                const uint8_t voxelState = snapshot.state(x, y, z);
 
                 glm::vec3 pos(offsetX + x, static_cast<float>(y), offsetZ + z);
                 auto neighbor_block = [&](int dx, int dy, int dz) {
@@ -192,28 +195,28 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
                     if (topNeighbor != type) {  // same fluid above: no top face
                         add_face(pos + glm::vec3(0, hNW, 1), pos + glm::vec3(1, hNE, 1),
                                  pos + glm::vec3(1, hSE, 0), pos + glm::vec3(0, hSW, 0),
-                                 glm::vec3(0, 1, 0), type);
+                                 glm::vec3(0, 1, 0), type, voxelState);
                     }
                     if (bottomNeighbor == kRuntimeAirId) {
                         add_face(pos + glm::vec3(0, 0, 0), pos + glm::vec3(1, 0, 0),
                                  pos + glm::vec3(1, 0, 1), pos + glm::vec3(0, 0, 1),
-                                 glm::vec3(0, -1, 0), type);
+                                 glm::vec3(0, -1, 0), type, voxelState);
                     }
                     if (eastNeighbor == kRuntimeAirId) {
                         add_face(pos + glm::vec3(1, 0, 0), pos + glm::vec3(1, hSE, 0),
-                                 pos + glm::vec3(1, hNE, 1), pos + glm::vec3(1, 0, 1), glm::vec3(1, 0, 0), type);
+                                 pos + glm::vec3(1, hNE, 1), pos + glm::vec3(1, 0, 1), glm::vec3(1, 0, 0), type, voxelState);
                     }
                     if (westNeighbor == kRuntimeAirId) {
                         add_face(pos + glm::vec3(0, 0, 1), pos + glm::vec3(0, hNW, 1),
-                                 pos + glm::vec3(0, hSW, 0), pos + glm::vec3(0, 0, 0), glm::vec3(-1, 0, 0), type);
+                                 pos + glm::vec3(0, hSW, 0), pos + glm::vec3(0, 0, 0), glm::vec3(-1, 0, 0), type, voxelState);
                     }
                     if (northNeighbor == kRuntimeAirId) {
                         add_face(pos + glm::vec3(1, 0, 1), pos + glm::vec3(1, hNE, 1),
-                                 pos + glm::vec3(0, hNW, 1), pos + glm::vec3(0, 0, 1), glm::vec3(0, 0, 1), type);
+                                 pos + glm::vec3(0, hNW, 1), pos + glm::vec3(0, 0, 1), glm::vec3(0, 0, 1), type, voxelState);
                     }
                     if (southNeighbor == kRuntimeAirId) {
                         add_face(pos + glm::vec3(0, 0, 0), pos + glm::vec3(0, hSW, 0),
-                                 pos + glm::vec3(1, hSE, 0), pos + glm::vec3(1, 0, 0), glm::vec3(0, 0, -1), type);
+                                 pos + glm::vec3(1, hSE, 0), pos + glm::vec3(1, 0, 0), glm::vec3(0, 0, -1), type, voxelState);
                     }
                     continue;
                 }
@@ -221,7 +224,7 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
                 // Top (+Y)
                 if (should_draw_face(type, topNeighbor)) {
                     add_face(pos + glm::vec3(0, 1, 1), pos + glm::vec3(1, 1, 1), pos + glm::vec3(1, 1, 0), pos + glm::vec3(0, 1, 0),
-                             glm::vec3(0, 1, 0), type);
+                             glm::vec3(0, 1, 0), type, voxelState);
 
                     if (type == grassId && topNeighbor == kRuntimeAirId) {
                         uint32_t edgeMask = 0;
@@ -248,27 +251,27 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
                 // Bottom (-Y)
                 if (should_draw_face(type, bottomNeighbor)) {
                     add_face(pos + glm::vec3(0, 0, 0), pos + glm::vec3(1, 0, 0), pos + glm::vec3(1, 0, 1), pos + glm::vec3(0, 0, 1),
-                             glm::vec3(0, -1, 0), type);
+                             glm::vec3(0, -1, 0), type, voxelState);
                 }
                 // East (+X)
                 if (should_draw_face(type, eastNeighbor)) {
                     add_face(pos + glm::vec3(1, 0, 0), pos + glm::vec3(1, 1, 0), pos + glm::vec3(1, 1, 1), pos + glm::vec3(1, 0, 1),
-                             glm::vec3(1, 0, 0), type);
+                             glm::vec3(1, 0, 0), type, voxelState);
                 }
                 // West (-X)
                 if (should_draw_face(type, westNeighbor)) {
                     add_face(pos + glm::vec3(0, 0, 1), pos + glm::vec3(0, 1, 1), pos + glm::vec3(0, 1, 0), pos + glm::vec3(0, 0, 0),
-                             glm::vec3(-1, 0, 0), type);
+                             glm::vec3(-1, 0, 0), type, voxelState);
                 }
                 // North (+Z)
                 if (should_draw_face(type, northNeighbor)) {
                     add_face(pos + glm::vec3(1, 0, 1), pos + glm::vec3(1, 1, 1), pos + glm::vec3(0, 1, 1), pos + glm::vec3(0, 0, 1),
-                             glm::vec3(0, 0, 1), type);
+                             glm::vec3(0, 0, 1), type, voxelState);
                 }
                 // South (-Z)
                 if (should_draw_face(type, southNeighbor)) {
                     add_face(pos + glm::vec3(0, 0, 0), pos + glm::vec3(0, 1, 0), pos + glm::vec3(1, 1, 0), pos + glm::vec3(1, 0, 0),
-                             glm::vec3(0, 0, -1), type);
+                             glm::vec3(0, 0, -1), type, voxelState);
                 }
             }
         }

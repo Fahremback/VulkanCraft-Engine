@@ -13,6 +13,8 @@ struct VoxelLayerSnapshot {
     // Runtime block ids (builtin prefix + dynamic registry blocks).
     std::array<RuntimeBlockId, CHUNK_SIZE_X * CHUNK_SIZE_Z> blocks{};
     std::array<uint8_t, CHUNK_SIZE_X * CHUNK_SIZE_Z> water{};
+    // Per-voxel block state index (FALTANTES item 2): 0 = default; >0 = named.
+    std::array<uint8_t, CHUNK_SIZE_X * CHUNK_SIZE_Z> stateIndices{};
 };
 
 struct NeighborVoxelHaloLayer {
@@ -41,6 +43,7 @@ struct ChunkSnapshot {
     [[nodiscard]] const RuntimeBlockInfo* find_runtime_block(RuntimeBlockId id) const;
     [[nodiscard]] RuntimeBlockId block(int x, int y, int z) const;
     [[nodiscard]] uint8_t water_level(int x, int y, int z) const;
+    [[nodiscard]] uint8_t state(int x, int y, int z) const;
     [[nodiscard]] RuntimeBlockId halo_block(int x, int y, int z, bool& known) const;
     [[nodiscard]] uint8_t halo_water(int x, int y, int z, bool& known) const;
 };

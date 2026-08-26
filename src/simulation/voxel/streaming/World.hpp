@@ -231,6 +231,9 @@ public:
 
     // Runtime block ids (builtin prefix + dynamic registry blocks).
     RuntimeBlockId get_block_at(const glm::vec3& worldPos) const;
+    // Per-voxel block state index (FALTANTES item 2): 0 = default; >0 = named.
+    uint8_t get_state_at(const glm::vec3& worldPos) const;
+    void set_state_at(const glm::vec3& worldPos, uint8_t stateIndex);
     uint8_t get_water_level_at(const glm::vec3& worldPos) const;
     void set_block_at(const glm::vec3& worldPos, RuntimeBlockId type);
     void set_water_at(const glm::vec3& worldPos, uint8_t level);
@@ -259,10 +262,11 @@ public:
     // (absent chunk created directly, in-flight generator waited out via
     // update()); restored content is the persisted state, so hasUnsavedEdits
     // is cleared, never set. `extent` is the vertical count of layers to
-    // restore (rows in [0, extent)); blocks/water are laid out y-major,
-    // layerBytes per layer (16*16).
+    // restore (rows in [0, extent)); blocks/water/stateIndices are laid out y-major,
+    // layerBytes per layer (16*16). stateIndices may be nullptr (legacy saves).
     bool restore_chunk_data(int cx, int cz, int extent,
                             const RuntimeBlockId* blocks, const uint8_t* water,
+                            const uint8_t* stateIndices,
                             const glm::vec3& playerPos,
                             WorldRenderBridge& renderBridge);
 

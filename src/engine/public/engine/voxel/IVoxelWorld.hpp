@@ -369,6 +369,15 @@ public:
     // simulation; 0xFF is returned for non-fluid cells.
     virtual uint8_t get_fluid_level(int x, int y, int z) const = 0;
 
+    // Per-voxel block state index (FALTANTES item 2 "variantes de modelo"):
+    // 0 = default state (states[0] in BlockDefinition); >0 = named state.
+    // The mesher reads this to pick per-state material (color/light);
+    // transitions fire through the gameplay/scripting layer. Stored alongside
+    // blocks so state queries are O(1); persists with the save and replicates
+    // with the region.
+    virtual uint8_t get_block_state(int x, int y, int z) const = 0;
+    virtual void set_block_state(int x, int y, int z, uint8_t stateIndex) = 0;
+
     // Block entities (META section 8): voxels with project-owned state. The
     // engine stores them, ticks them deterministically via the world scheduler
     // (budget, active regions, sleeping), destroys them atomically when their

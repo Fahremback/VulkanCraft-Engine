@@ -492,7 +492,8 @@ try {
   const runCli = (args) => spawnSync(process.execPath, [cliPath, ...args], { encoding: "utf8" });
   const cliKinds = runCli(["kinds"]);
   assert.equal(cliKinds.status, 0, cliKinds.stderr);
-  assert.equal(cliKinds.stdout.split(/\n/).filter(Boolean).length, schemaKinds.length + 2, cliKinds.stdout);
+  // 2 vehicle kinds (§17 item 12) + 1 ability kind (§19).
+  assert.equal(cliKinds.stdout.split(/\n/).filter(Boolean).length, schemaKinds.length + 3, cliKinds.stdout);
   const cliSchema = runCli(["schema", "block"]);
   assert.equal(cliSchema.status, 0, cliSchema.stderr);
   assert.deepEqual(JSON.parse(cliSchema.stdout).properties.collisionShape.enum, ["full", "cross", "none"]);
@@ -657,11 +658,90 @@ try {
   assert.equal(vehiclesValidationPayload.valid, true, JSON.stringify(vehiclesValidationPayload));
   assert.ok(vehiclesValidationPayload.vehicle_assets >= 2);
 
+  // §19 — abilities data-driven: author an ability through the same MCP
+  // surface, mirroring AbilityDefinition::load_from_json (all-or-nothing).
+  const abilityAsset = await request("tools/call", {
+    name: "author_ability_asset",
+    arguments: {
+      project: smokeProject, name: "Grav Shift",
+      cooldown_seconds: 5,
+      attributes: [{ name: "level", value: 3 }],
+      tags: ["movement", "ultimate"],
+      cost: { resource: "mana", amount: 25 },
+      conditions: [
+        { kind: "ownerTag", tag: "mage" },
+        { kind: "ownerAttribute", attribute: "level", min_value: 2 },
+        { kind: "distance", max_distance: 40 }
+      ],
+      targeting: { mode: "point", range: 40, radius: 3 },
+      effects: [
+        { type: "telekinesis", holdOffset: [0, 2, 0], grabForce: 300, durationSeconds: 4, cast_animation: "lift" },
+        { type: "periodic", intervalSeconds: 0.5, ticks: 4, subEffect: { type: "damage", amount: 4 } },
+        { type: "blockEdit", min: [-2, 0, -2], max: [2, 3, 2], blockId: 7, relative: true, sound_effect: "rumble" }
+      ]
+    }
+  });
+  assert.equal(abilityAsset.result.isError, undefined, JSON.stringify(abilityAsset));
+  const abilityPayload = JSON.parse(abilityAsset.result.content[0].text);
+  assert.equal(abilityPayload.created, true);
+  assert.equal(abilityPayload.diagnostics.length, 0, JSON.stringify(abilityPayload));
+  assert.ok(fs.existsSync(path.join(smokeProjectPath, "Content", "Abilities", "Grav_Shift.json")));
+  const abilityDocument = JSON.parse(fs.readFileSync(path.join(smokeProjectPath, "Content", "Abilities", "Grav_Shift.json"), "utf8"));
+  assert.equal(abilityDocument.cooldownSeconds, 5);
+  assert.equal(abilityDocument.effects.length, 3);
+  assert.equal(abilityDocument.effects[1].subEffect.type, "damage");
+
+  // The exported JSON Schema covers the ability kind and accepts the emitted document.
+  assert.ok(capabilitiesPayload.ability_schemas, "game_capabilities exposes ability_schemas");
+  assert.ok(capabilitiesPayload.ability_asset_kinds, "game_capabilities exposes ability_asset_kinds");
+  const abilitySchema = capabilitiesPayload.ability_schemas.ability;
+  assert.equal(abilitySchema.$schema, "http://json-schema.org/draft-07/schema#");
+  assert.equal(abilitySchema.type, "object");
+  assert.ok(abilitySchema.properties.effects, "ability schema declares effects");
+  const abilitySchemaErrors = validateJsonSchema(abilityDocument, abilitySchema);
+  assert.equal(abilitySchemaErrors.length, 0, abilitySchemaErrors.join("; "));
+
+  // §19 all-or-nothing: an unknown effect type is refused and nothing is written.
+  const badAbility = await request("tools/call", {
+    name: "author_ability_asset",
+    arguments: {
+      project: smokeProject, name: "BrokenCast",
+      effects: [{ type: "mindControl" }]
+    }
+  });
+  assert.equal(badAbility.result.isError, undefined, JSON.stringify(badAbility));
+  const badAbilityPayload = JSON.parse(badAbility.result.content[0].text);
+  assert.equal(badAbilityPayload.refused, true, JSON.stringify(badAbilityPayload));
+  assert.ok(badAbilityPayload.diagnostics.some((d) => String(d).includes("mindControl")), JSON.stringify(badAbilityPayload));
+  assert.ok(!fs.existsSync(path.join(smokeProjectPath, "Content", "Abilities", "BrokenCast.json")));
+
+  // Abilities are listed by inspect and counted by validate_game_project.
+  const inspectAbilities = await request("tools/call", {
+    name: "inspect_ability_assets",
+    arguments: { project: smokeProject }
+  });
+  const inspectAbilitiesPayload = JSON.parse(inspectAbilities.result.content[0].text);
+  assert.equal(inspectAbilitiesPayload.count, 1);
+  assert.ok(inspectAbilitiesPayload.ability_assets.every((asset) => asset.valid), JSON.stringify(inspectAbilitiesPayload));
+  const abilitiesValidation = await request("tools/call", {
+    name: "validate_game_project",
+    arguments: { project: smokeProject }
+  });
+  const abilitiesValidationPayload = JSON.parse(abilitiesValidation.result.content[0].text);
+  assert.equal(abilitiesValidationPayload.valid, true, JSON.stringify(abilitiesValidationPayload));
+  assert.ok(abilitiesValidationPayload.ability_assets >= 1);
+
+  // The CLI exposes the ability schema too.
+  const cliAbilitySchema = runCli(["schema", "ability"]);
+  assert.equal(cliAbilitySchema.status, 0, cliAbilitySchema.stderr);
+  assert.ok(JSON.parse(cliAbilitySchema.stdout).properties.effects, "CLI ability schema declares effects");
+
   // ---- Control API (editor_*): drive the RUNNING editor via :8321 ----
 
-  // All 65 control tools are registered.
+  // All 69 control tools are registered (count revalidated — findings #112:
+  // README "66" -> 69 control tools).
   const controlTools = listed.result.tools.filter((t) => t.name.startsWith("editor_"));
-  assert.equal(controlTools.length, 66, `expected 66 editor_* tools, got ${controlTools.length}`);
+  assert.equal(controlTools.length, 69, `expected 69 editor_* tools, got ${controlTools.length}`);
   for (const expected of ["editor_status", "editor_play", "editor_step", "editor_add_entity",
     "editor_set_gizmo", "editor_set_snap", "editor_voxel_paint", "editor_run_self_test",
     "editor_spawn_character", "editor_layer_set", "editor_decal_add", "editor_hair_add",

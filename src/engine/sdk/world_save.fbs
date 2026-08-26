@@ -25,6 +25,10 @@ table ChunkEntry {
   extent: uint;
   blocks: [ushort];
   fluid: [ubyte];
+  // Per-voxel block state index (FALTANTES item 2 "variantes de modelo"):
+  // 0 = default state (states[0]); >0 = named state from BlockDefinition.
+  // Optional: null means "all state 0" (older saves, backward compatible).
+  state_indices: [ubyte];
 }
 
 // One block entity (v3+): position, registered type id, the project's data

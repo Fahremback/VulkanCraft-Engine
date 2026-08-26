@@ -16,24 +16,38 @@
 //   - determinism: identical world + blast -> bit-identical results.
 
 #include <engine/voxel/IVoxelWorld.hpp>
+#include <engine/voxel/IVoxelReplication.hpp>
 #include <engine/registry/BlockRegistry.hpp>
 
 #include "engine/gameplay/ExplosionRuntime.hpp"
+#include "engine/gameplay/IAbilitySystem.hpp"
 #include "engine/physics/PhysicsRuntime.hpp"
 #include "engine/physics/PhysicsStreamingBridge.hpp"
 #include "engine/physics/VoxelConnectivity.hpp"
 
 #include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>
+#define VC_EXPLOSION_GETPID _getpid
+#else
+#include <unistd.h>
+#define VC_EXPLOSION_GETPID getpid
+#endif
 
 using namespace Engine::Physics;
 
@@ -370,6 +384,244 @@ void test_config_validation() {
     std::printf("[explosion] config validation OK\n");
 }
 
+// FALTANTES item 27 sub-2 — expanded-vision proof: an explosion ALTERS the
+// terrain, the alteration SAVES, LOADs back in a fresh world, and REPLICATES
+// to a fresh client. Composes three already-green systems through their
+// public contracts (ExplosionRuntime carve, IVoxelWorld save_world/load_world,
+// IVoxelReplication server-negotiated palette + region state-sync) — no
+// recompilation, no internal headers.
+void test_expanded_vision_explosion_save_replicate() {
+    TestWorld t = make_test_world();
+    check(t.ok, "proof world boots");
+
+    // A JSON-only block (test:obsidian, resistance 100) at the epicenter
+    // survives the blast and must travel to the client by DYNAMIC id via the
+    // server-negotiated palette. A stone cell outside the blast is the intact
+    // control (id captured, never a magic number).
+    t.world->set_block(8, kGroundTop, 8, t.obsidianId);
+    // Control at (8, kGroundTop, 2): cell center (8.5, kGroundTop+0.5, 2.5) is
+    // ~5.5 units from the epicenter — outside the strict blastRadius 4 carve
+    // (the carve measures distance to the CELL CENTER: (8,130,4) sits at
+    // d=3.54 and gets carved, so it cannot be the control).
+    const std::uint32_t intactBefore = t.world->get_block(8, kGroundTop, 2);
+    check(intactBefore != 0, "intact control is terrain (not air)");
+
+    PhysicsRuntime physics(WorldSettings{}, PhysicsBackendKind::Jolt);
+    Engine::Gameplay::ExplosionConfig config;
+    config.blastRadius = 4.0f;
+    config.maxPressure = 40.0f;
+    config.heatRadius = 0.0f;
+    const Engine::Gameplay::ExplosionResult result = Engine::Gameplay::apply_explosion(
+        *t.world, physics, glm::vec3(8.0f, kGroundTop + 0.5f, 8.0f), config);
+    check(result.blocksRemoved > 20, "blast carved a crater in the terrain");
+    check(t.world->get_block(7, kGroundTop, 8) == 0, "crater cell is air after blast");
+    check(t.world->get_block(8, kGroundTop, 8) == t.obsidianId,
+          "reinforced survivor kept at epicenter");
+    check(t.world->get_block(8, kGroundTop, 2) == intactBefore, "intact control untouched");
+
+    // SAVE: the altered terrain (crater + survivor) is persisted (versioned,
+    // checksummed, WAL-backed). Unique-under-temp path so concurrent
+    // instances never collide (same pattern as voxel_sdk_tests::scratch_dir).
+    const std::string proofDir = (std::filesystem::temp_directory_path() /
+        ("vc_explosion_proof_" + std::to_string(VC_EXPLOSION_GETPID()))).string();
+    std::error_code ec;
+    std::filesystem::remove_all(proofDir, ec);
+    std::filesystem::create_directories(proofDir);
+    const std::string savePath = proofDir + "/altered.vcwld";
+    std::string error;
+    check(t.world->save_world(savePath, error), "altered world saves");
+    check(error.empty(), "save error empty");
+
+    // LOAD into a FRESH world (same registry attached first; the save's own
+    // palette restores the dynamic id by UUID — no recompilation).
+    std::unique_ptr<engine::voxel::IVoxelWorld> loaded =
+        engine::voxel::create_default_voxel_world();
+    loaded->set_block_registry(t.registry);
+    loaded->register_generator(std::make_shared<FlatGenerator>(kGroundTop));
+    check(boot_world(*loaded, glm::vec3(8.0f, 200.0f, 8.0f), 16),
+          "fresh world boots for load");
+    check(loaded->load_world(savePath, error), "altered world loads");
+    check(error.empty(), "load error empty");
+    std::uint32_t loadedObsidian = 0;
+    check(loaded->resolve_block_id("test:obsidian", loadedObsidian, error),
+          "dynamic block re-resolved after load");
+    check(loadedObsidian == t.obsidianId, "same UUID -> same dynamic id after load");
+    check(loaded->get_block(7, kGroundTop, 8) == 0, "crater survived save/load");
+    check(loaded->get_block(8, kGroundTop, 8) == loadedObsidian,
+          "survivor survived save/load");
+    check(loaded->get_block(8, kGroundTop, 2) == intactBefore, "intact terrain survived");
+
+    // REPLICATE: the loaded world is the AUTHORITY; a FRESH client (no
+    // registry, no knowledge of test:obsidian) receives the server-negotiated
+    // palette, then the region snapshot with the crater + survivor and
+    // converges on the dynamic id.
+    std::unique_ptr<engine::voxel::IVoxelWorld> client =
+        engine::voxel::create_default_voxel_world();
+    client->register_generator(std::make_shared<FlatGenerator>(kGroundTop));
+    check(boot_world(*client, glm::vec3(8.0f, 200.0f, 8.0f), 16),
+          "fresh client world boots");
+    auto srv = engine::voxel::create_voxel_replication(*loaded);
+    auto cli = engine::voxel::create_voxel_replication(*client);
+    constexpr engine::voxel::ReplicationConnectionId kProofConn = 1;
+    srv->server_register_connection(kProofConn);
+    srv->server_set_interest(kProofConn, {{8, kGroundTop, 8}, 2});
+
+    engine::voxel::ReplicationPalette palette;
+    check(srv->server_pack_palette(kProofConn, palette, error), "server packs palette");
+    check(error.empty(), "palette error empty");
+    check(palette.entries.size() == 3, "palette carries the 3 JSON-only blocks");
+    check(cli->client_apply_palette(palette, error), "client applies palette");
+    check(error.empty(), "client palette error empty");
+    std::uint32_t clientObsidian = 0;
+    check(client->resolve_block_id("test:obsidian", clientObsidian, error),
+          "client resolves dynamic id from palette");
+    check(clientObsidian == t.obsidianId, "client id parity with server");
+
+    srv->server_set_snapshot_window(0, kGroundTop + 8);
+    srv->server_update();
+    engine::voxel::RegionReplicationSnapshot region;
+    check(srv->server_pack_region(kProofConn, region, error), "server packs region");
+    check(error.empty(), "region error empty");
+    check(cli->client_apply_region(region, error), "client applies region");
+    check(error.empty(), "client region error empty");
+    check(client->get_block(7, kGroundTop, 8) == 0, "crater replicated to client");
+    check(client->get_block(8, kGroundTop, 8) == clientObsidian,
+          "survivor replicated by dynamic id");
+    check(client->get_block(8, kGroundTop, 2) == intactBefore, "intact terrain replicated");
+
+    std::error_code rmEc;
+    std::filesystem::remove_all(proofDir, rmEc);
+    std::printf("[explosion] proof 27.2: terrain altered -> saved -> loaded -> "
+                "replicated OK\n");
+}
+
+// ---- Item 27 sub-4 proof seam: IAbilityWorld over the REAL voxel world ----
+// BlockEdit writes route through the authoritative public path
+// (IVoxelWorld::set_block). Physics/health methods are inert: this scenario
+// is terrain-only, so the runtime never exercises them.
+class VoxelAbilityWorld final : public engine::gameplay::IAbilityWorld {
+public:
+    explicit VoxelAbilityWorld(engine::voxel::IVoxelWorld& world) : world_(world) {}
+
+    void add_caster(std::uint32_t id, const glm::vec3& position) {
+        casters_[id] = position;
+    }
+
+    std::uint32_t block_at(int x, int y, int z) const override {
+        return world_.get_block(x, y, z);
+    }
+    bool set_block(int x, int y, int z, std::uint32_t blockId) override {
+        world_.set_block(x, y, z, blockId);  // public surface is void; write issued
+        return true;
+    }
+    bool body_state(const engine::gameplay::AbilityBodyId& body,
+                    engine::gameplay::AbilityBodyState& out) const override {
+        const auto found = casters_.find(body.id);
+        if (found == casters_.end()) return false;
+        out.position = found->second;
+        out.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+        out.linearVelocity = glm::vec3(0.0f);
+        out.angularVelocity = glm::vec3(0.0f);
+        return true;
+    }
+    bool apply_impulse(const engine::gameplay::AbilityBodyId&, const glm::vec3&) override { return true; }
+    bool add_force(const engine::gameplay::AbilityBodyId&, const glm::vec3&) override { return true; }
+    bool set_transform(const engine::gameplay::AbilityBodyId&, const glm::vec3&,
+                       const glm::quat&) override { return true; }
+    bool raycast(const glm::vec3&, const glm::vec3&, float,
+                 engine::gameplay::AbilityRaycastHit&) const override { return false; }
+    float attribute(const engine::gameplay::AbilityBodyId&, const std::string&) const override { return 0.0f; }
+    engine::gameplay::AbilityTagList tags(
+        const engine::gameplay::AbilityBodyId&) const override { return {}; }
+    bool spend_cost(const engine::gameplay::AbilityBodyId&, const std::string&, float) override { return true; }
+    bool health(const engine::gameplay::AbilityBodyId&, float& out) const override { out = 100.0f; return true; }
+    bool damage(const engine::gameplay::AbilityBodyId&, float) override { return true; }
+    bool heal(const engine::gameplay::AbilityBodyId&, float) override { return true; }
+
+private:
+    engine::voxel::IVoxelWorld& world_;
+    std::map<std::uint32_t, glm::vec3> casters_;
+};
+
+// FALTANTES item 27 sub-4 — expanded-vision proof: an ABILITY modifies the
+// scene. A data-driven definition (the JSON document is the bit-exact
+// round-trip contract of the SDK adapter) is cast through the public
+// IAbilitySystem onto a REAL voxel world: BlockEdit writes a box of a
+// JSON-only block (dynamic id) into the terrain. No recompilation, no
+// internal headers; deterministic across identical worlds.
+void test_expanded_vision_ability_alters_scene() {
+    using namespace engine::gameplay;
+
+    TestWorld t = make_test_world();
+    check(t.ok, "proof world boots");
+
+    // Data-driven definition: build -> to_json() -> load_from_json() is the
+    // document contract the MCP/CLI author (findings #120).
+    AbilityDefinition terraform;
+    terraform.name = "terraform";
+    terraform.id = "abilities:terraform";
+    terraform.targeting.mode = AbilityTargetMode::Point;
+    AbilityEffect edit;
+    edit.type = AbilityEffectType::BlockEdit;
+    edit.min = {-2, 0, -2};
+    edit.max = {2, 1, 2};
+    edit.blockId = t.obsidianId;  // JSON-only block (dynamic id)
+    edit.relative = true;
+    terraform.effects.push_back(edit);
+    const std::string json = terraform.to_json();
+    check(json.find("blockEdit") != std::string::npos,
+          "definition document is JSON (data-driven)");
+
+    AbilityDefinition loaded;
+    std::string error;
+    check(loaded.load_from_json(json, error), "data-driven definition loads");
+    check(error.empty(), "definition load error empty");
+    auto system = create_ability_system();
+    check(system->register_ability(loaded, error), "ability registered from JSON");
+    check(error.empty(), "register error empty");
+
+    // Cast at a point above the terrain: the box (relative to the point) is
+    // written through the world seam -> the scene is altered.
+    VoxelAbilityWorld seam(*t.world);
+    AbilityBodyId caster;
+    caster.id = 1;
+    seam.add_caster(caster.id, glm::vec3(8.0f, kGroundTop + 0.5f, 8.0f));
+    AbilityTarget target;
+    target.mode = AbilityTargetMode::Point;
+    target.point = {8.0f, kGroundTop + 1.0f, 8.0f};
+    const CastResult result = system->cast(loaded.id, caster, target, seam);
+    check(result.accepted, "terraform cast accepted on the real world");
+    check(t.world->get_block(6, kGroundTop + 1, 6) == t.obsidianId,
+          "box min corner written (JSON-only block)");
+    check(t.world->get_block(10, kGroundTop + 2, 10) == t.obsidianId,
+          "box max corner written");
+    check(t.world->get_block(8, kGroundTop + 1, 8) == t.obsidianId,
+          "origin written");
+    check(t.world->get_block(11, kGroundTop + 1, 8) == 0,
+          "outside the box untouched");
+    check(t.world->get_block(8, kGroundTop, 8) != t.obsidianId,
+          "below the box untouched (terrain kept)");
+
+    // Determinism: an identical world + the same cast writes the same box.
+    TestWorld t2 = make_test_world();
+    check(t2.ok, "second proof world boots");
+    VoxelAbilityWorld seam2(*t2.world);
+    AbilityBodyId caster2;
+    caster2.id = 1;
+    seam2.add_caster(caster2.id, glm::vec3(8.0f, kGroundTop + 0.5f, 8.0f));
+    const CastResult result2 = system->cast(loaded.id, caster2, target, seam2);
+    check(result2.accepted, "second cast accepted");
+    check(t2.world->get_block(6, kGroundTop + 1, 6) == t2.obsidianId,
+          "deterministic box min");
+    check(t2.world->get_block(10, kGroundTop + 2, 10) == t2.obsidianId,
+          "deterministic box max");
+    check(t2.world->get_block(11, kGroundTop + 1, 8) == 0,
+          "deterministic untouched cell");
+
+    std::printf("[explosion] proof 27.4: data-driven ability altered the real "
+                "scene (JSON-only block) OK\n");
+}
+
 }  // namespace
 
 int main() {
@@ -379,6 +631,8 @@ int main() {
     test_explosion_connectivity();
     test_determinism();
     test_config_validation();
+    test_expanded_vision_explosion_save_replicate();
+    test_expanded_vision_ability_alters_scene();
     if (g_failures == 0) {
         std::printf("[explosion] ALL PASSED\n");
         return 0;
