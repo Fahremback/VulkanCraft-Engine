@@ -221,9 +221,13 @@ public:
     // factories and deserialize their blobs; remove stale entities inside the
     // region), then entity region reconcile (despawn region entities not in
     // the snapshot; spawn/apply snapshot entities with their components — a
-    // §14 inventory rides as a component blob). All-or-nothing for block
-    // entities: every snapshot type must have a registered factory or nothing
-    // is mutated and an error is reported.
+    // §14 inventory rides as a component blob). Region handoff (FALTANTES
+    // item 11 / §17): block entities and entities whose chunk left the
+    // client's interest since the LAST applied region are evicted first, so
+    // moving the interest transfers the client cleanly between regions
+    // (the old region's entities never linger as ghosts). All-or-nothing for
+    // block entities: every snapshot type must have a registered factory or
+    // nothing is mutated and an error is reported.
     virtual bool client_apply_region(const RegionReplicationSnapshot& region,
                                      std::string& errorOut) = 0;
     virtual std::uint32_t client_applied_sequence() const = 0;

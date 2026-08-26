@@ -404,7 +404,7 @@ void test_merge_and_resolve() {
     std::vector<MaterializedEffect> untouched;
     untouched.push_back(spawn);
     std::vector<MaterializedEffect> outBefore;
-    check(reconciler->merge_and_resolve(a, bad, 1, 2, outBefore, error) &&
+    check(!reconciler->merge_and_resolve(a, bad, 1, 2, outBefore, error) &&
               !error.empty() && outBefore.empty(),
           "invalid effect refused, out empty");
 
@@ -498,7 +498,7 @@ void test_composition_with_lod_handoff() {
     check(reconciler->reconcile(state, handoff, effects, error),
           "handoff reconcile ok");
     check(state.complete, "unlimited budget completes in one tick");
-    check(effects.size() == 8, "4 spawns + 3 drops + floor(0.25*2)=0 growth");
+    check(effects.size() == 7, "4 spawns + 3 drops + floor(0.25*2)=0 growth");
     check(effects[0].kind == MaterializedEffect::Kind::SpawnEntity &&
               effects[4].kind == MaterializedEffect::Kind::ResourceDrop,
           "spawns then drops");

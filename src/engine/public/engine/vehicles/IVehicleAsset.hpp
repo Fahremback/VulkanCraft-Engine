@@ -12,7 +12,7 @@
 // validate are implemented by the SDK adapter (src/engine/sdk/VehicleAsset.cpp).
 // The asset is PURE DATA — it never touches physics or rendering.
 
-#include "IVehicleProvider.hpp"
+#include "engine/vehicles/IVehicleProvider.hpp"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>

@@ -312,12 +312,14 @@ public:
         }
         const auto* versionField = doc.field("version");
         const auto* rulesField = doc.field("rules");
-        if (versionField == nullptr || !versionField->is_number() ||
+        if (versionField == nullptr ||
+            versionField->kind != engine::sdk::JsonValue::Kind::Number ||
             versionField->number != 1.0) {
             errorOut = "rules document version must be 1";
             return false;
         }
-        if (rulesField == nullptr || !rulesField->is_array()) {
+        if (rulesField == nullptr ||
+            rulesField->kind != engine::sdk::JsonValue::Kind::Array) {
             errorOut = "rules document must have a rules array";
             return false;
         }
@@ -504,9 +506,9 @@ public:
             return false;
         }
 
-        const std::size_t budget = budget_->maxEffectsPerTick > 0
+        const std::size_t budget = budget_.maxEffectsPerTick > 0
                                        ? static_cast<std::size_t>(
-                                             budget_->maxEffectsPerTick)
+                                             budget_.maxEffectsPerTick)
                                        : batch.size();
         std::size_t emitted = 0;
         while (cursor < batch.size() && emitted < budget) {
@@ -565,12 +567,20 @@ public:
         };
         for (const MaterializedEffect& effect : a) insertWinner(effect, seedA);
         for (const MaterializedEffect& effect : b) insertWinner(effect, seedB);
-        // Second pass: input order, winners in place.
-        const auto keepWinner = [&winners](const MaterializedEffect& effect) {
+        // Second pass: input order, winners in place. A slot is consumed by
+        // its FIRST kept effect — value-identical duplicates from the losing
+        // batch must not also survive (one winner per target slot).
+        std::set<std::string> consumed;
+        const auto keepWinner = [&winners, &consumed](const MaterializedEffect& effect) {
             const std::string key = effect_target_key(effect);
             const auto found = winners.find(key);
-            return found != winners.end() &&
-                   effects_equal(found->second.first, effect);
+            if (found == winners.end() ||
+                !effects_equal(found->second.first, effect)) {
+                return false;
+            }
+            if (consumed.count(key) != 0) return false;
+            consumed.insert(key);
+            return true;
         };
         for (const MaterializedEffect& effect : a) {
             if (keepWinner(effect)) out.push_back(effect);
@@ -636,13 +646,15 @@ public:
         parsed.cursor = static_cast<std::size_t>(cursor);
         parsed.materializationCount = count;
         const auto* completeField = doc.field("complete");
-        if (completeField == nullptr || !completeField->is_bool()) {
+        if (completeField == nullptr ||
+            completeField->kind != engine::sdk::JsonValue::Kind::Bool) {
             errorOut = "state document must have a complete boolean";
             return false;
         }
         parsed.complete = completeField->boolean;
         const auto* pendingField = doc.field("pending");
-        if (pendingField == nullptr || !pendingField->is_array()) {
+        if (pendingField == nullptr ||
+            pendingField->kind != engine::sdk::JsonValue::Kind::Array) {
             errorOut = "state document must have a pending array";
             return false;
         }
@@ -750,7 +762,8 @@ private:
             out = defaultValue;
             return true;
         }
-        if (field->is_number() && field->number >= 0.0) {
+        if (field->kind == engine::sdk::JsonValue::Kind::Number &&
+            field->number >= 0.0) {
             out = static_cast<std::uint64_t>(field->number);
             return true;
         }
@@ -819,7 +832,8 @@ private:
             out = defaultValue;
             return true;
         }
-        if (!field->is_number() || !std::isfinite(field->number) ||
+        if (field->kind != engine::sdk::JsonValue::Kind::Number ||
+            !std::isfinite(field->number) ||
             field->number != std::floor(field->number)) {
             errorOut = "field '" + key + "' must be an integer";
             return false;

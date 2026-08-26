@@ -955,6 +955,44 @@ public:
                 return false;
             }
         }
+        // Region handoff (FALTANTES item 11 / §17 — transfer between
+        // regions): evict block entities and entities whose chunk LEFT the
+        // client's interest since the last applied region (chunks of the
+        // previous region's interest outside the new one). Without this the
+        // old region's entities would stay on the client forever (ghosts).
+        // The new region's chunks are applied below; the intersection is
+        // untouched; deterministic dz/dx order (matches the server's region
+        // traversal). A region applied after none keeps everything (no
+        // previous interest to evict).
+        const glm::ivec2 newCenter{chunk_of(region.origin.x), chunk_of(region.origin.z)};
+        if (clientRegionRadius_ >= 0) {
+            const glm::ivec2 oldCenter{chunk_of(clientRegionOrigin_.x),
+                                       chunk_of(clientRegionOrigin_.z)};
+            auto entityWorld = world_.entity_world();
+            for (int dz = -clientRegionRadius_; dz <= clientRegionRadius_; ++dz) {
+                for (int dx = -clientRegionRadius_; dx <= clientRegionRadius_; ++dx) {
+                    const glm::ivec2 chunk{oldCenter.x + dx, oldCenter.y + dz};
+                    const bool inNew =
+                        std::abs(chunk.x - newCenter.x) <= region.chunkRadius &&
+                        std::abs(chunk.y - newCenter.y) <= region.chunkRadius;
+                    if (inNew) continue;
+                    for (const auto& [position, entity] :
+                         world_.block_entities_in_chunk(chunk.x, chunk.y)) {
+                        (void)entity;
+                        world_.remove_block_entity(position.x, position.y, position.z);
+                    }
+                    if (entityWorld) {
+                        for (const engine::entity::EntityId& handle :
+                             entityWorld->entities_in_chunk(chunk.x, chunk.y)) {
+                            entityWorld->despawn(handle);
+                        }
+                    }
+                }
+            }
+        }
+        clientRegionOrigin_ = region.origin;
+        clientRegionRadius_ = region.chunkRadius;
+
         // 1) Blocks: every chunk window in the region.
         for (const ChunkReplicationSnapshot& chunk : region.chunks) {
             const std::size_t expected =
@@ -1118,6 +1156,10 @@ private:
     int snapshotMinY_{kReplicationDefaultMinY};
     int snapshotHeight_{kReplicationDefaultHeight};
     // Client state (one adapter instance per client world/role).
+    // Last applied region interest — the handoff eviction source for the
+    // next region (chunks that left the interest are removed).
+    glm::ivec3 clientRegionOrigin_{0, 0, 0};
+    int clientRegionRadius_{-1};
     std::uint32_t lastAppliedSequence_{0};
     std::unordered_map<glm::ivec3, std::uint32_t, Ivec3Hash> appliedRevision_;
     std::unordered_map<glm::ivec3, Prediction, Ivec3Hash> predictions_;

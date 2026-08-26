@@ -24,25 +24,41 @@ import {
   ABILITY_KINDS,
   MISSION_KINDS,
   WORLD_PROFILE_KINDS,
+  GAIT_KINDS,
+  SIMULATION_LOD_KINDS,
+  PREFAB_KINDS,
+  PARTICLE_KINDS,
   buildRegistryJsonSchema,
   buildVehicleJsonSchema,
   buildAbilityJsonSchema,
   buildMissionJsonSchema,
   buildWorldProfileJsonSchema,
+  buildGaitJsonSchema,
+  buildSimulationLodJsonSchema,
+  buildPrefabJsonSchema,
+  buildParticleJsonSchema,
   validateRegistryDocument,
   validateVehicleDocument,
   validateAbilityDocument,
   validateMissionDocument,
-  validateWorldProfileDocument
+  validateWorldProfileDocument,
+  validateGaitDocument,
+  validateSimulationLodDocument,
+  validatePrefabDocument,
+  validateParticleDocument
 } from "./game-authoring.mjs";
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ENGINE_ROOT = path.resolve(SERVER_DIR, "..", "..");
-const ALL_KINDS = [...REGISTRY_KINDS, ...VEHICLE_KINDS, ...ABILITY_KINDS, ...MISSION_KINDS, ...WORLD_PROFILE_KINDS];
+const ALL_KINDS = [...REGISTRY_KINDS, ...VEHICLE_KINDS, ...ABILITY_KINDS, ...MISSION_KINDS, ...WORLD_PROFILE_KINDS, ...GAIT_KINDS, ...SIMULATION_LOD_KINDS, ...PREFAB_KINDS, ...PARTICLE_KINDS];
 const VEHICLE_KIND_SET = new Set(VEHICLE_KINDS);
 const ABILITY_KIND_SET = new Set(ABILITY_KINDS);
 const MISSION_KIND_SET = new Set(MISSION_KINDS);
 const WORLD_PROFILE_KIND_SET = new Set(WORLD_PROFILE_KINDS);
+const GAIT_KIND_SET = new Set(GAIT_KINDS);
+const SIMULATION_LOD_KIND_SET = new Set(SIMULATION_LOD_KINDS);
+const PREFAB_KIND_SET = new Set(PREFAB_KINDS);
+const PARTICLE_KIND_SET = new Set(PARTICLE_KINDS);
 
 function fail(message, code = 1) {
   console.error(`registry-cli: ${message}`);
@@ -82,7 +98,15 @@ function cmdSchema(kind) {
         ? buildMissionJsonSchema(kind)
         : WORLD_PROFILE_KIND_SET.has(kind)
           ? buildWorldProfileJsonSchema(kind)
-          : buildRegistryJsonSchema(kind);
+          : GAIT_KIND_SET.has(kind)
+            ? buildGaitJsonSchema(kind)
+            : SIMULATION_LOD_KIND_SET.has(kind)
+              ? buildSimulationLodJsonSchema(kind)
+              : PREFAB_KIND_SET.has(kind)
+                ? buildPrefabJsonSchema(kind)
+                : PARTICLE_KIND_SET.has(kind)
+                  ? buildParticleJsonSchema(kind)
+                  : buildRegistryJsonSchema(kind);
   console.log(JSON.stringify(schema, null, 2));
 }
 
@@ -100,7 +124,14 @@ function cmdExportSchemas(outDir) {
           ? buildMissionJsonSchema(kind)
           : WORLD_PROFILE_KIND_SET.has(kind)
             ? buildWorldProfileJsonSchema(kind)
-            : buildRegistryJsonSchema(kind);
+            : GAIT_KIND_SET.has(kind)
+              ? buildGaitJsonSchema(kind)
+              : SIMULATION_LOD_KIND_SET.has(kind)
+                ? buildSimulationLodJsonSchema(kind)              : PREFAB_KIND_SET.has(kind)
+                ? buildPrefabJsonSchema(kind)
+                : PARTICLE_KIND_SET.has(kind)
+                  ? buildParticleJsonSchema(kind)
+                  : buildRegistryJsonSchema(kind);
     atomicWriteJson(file, schema);
     written.push(file);
   }
@@ -124,7 +155,15 @@ function cmdValidate(kind, file) {
         ? validateMissionDocument(kind, document)
         : WORLD_PROFILE_KIND_SET.has(kind)
           ? validateWorldProfileDocument(kind, document)
-          : validateRegistryDocument(kind, document);
+          : GAIT_KIND_SET.has(kind)
+            ? validateGaitDocument(kind, document)
+            : SIMULATION_LOD_KIND_SET.has(kind)
+              ? validateSimulationLodDocument(kind, document)
+              : PREFAB_KIND_SET.has(kind)
+                ? validatePrefabDocument(document)
+                : PARTICLE_KIND_SET.has(kind)
+                  ? validateParticleDocument(document)
+                  : validateRegistryDocument(kind, document);
   if (!result.valid) {
     for (const diagnostic of result.errors) console.error(`- ${diagnostic}`);
     console.error(`registry-cli: '${file}' is INVALID (${result.errors.length} diagnostic(s))`);
@@ -159,7 +198,15 @@ function cmdAuthor(args) {
         ? validateMissionDocument(kind, document)
         : WORLD_PROFILE_KIND_SET.has(kind)
           ? validateWorldProfileDocument(kind, document)
-          : validateRegistryDocument(kind, document);
+          : GAIT_KIND_SET.has(kind)
+            ? validateGaitDocument(kind, document)
+            : SIMULATION_LOD_KIND_SET.has(kind)
+              ? validateSimulationLodDocument(kind, document)
+              : PREFAB_KIND_SET.has(kind)
+                ? validatePrefabDocument(document)
+                : PARTICLE_KIND_SET.has(kind)
+                  ? validateParticleDocument(document)
+                  : validateRegistryDocument(kind, document);
   if (!validation.valid) {
     for (const diagnostic of validation.errors) console.error(`- ${diagnostic}`);
     fail(`asset '${kind}/${name}' fails public-contract validation; nothing was written`);
@@ -169,10 +216,17 @@ function cmdAuthor(args) {
     : ABILITY_KIND_SET.has(kind)
       ? path.join(engine, "Projects", project, "Content", "Abilities", `${name}.json`)
       : MISSION_KIND_SET.has(kind)
-        ? path.join(engine, "Projects", project, "Content", "Missions", `${name}.json`)
-        : WORLD_PROFILE_KIND_SET.has(kind)
-          ? path.join(engine, "Projects", project, "Content", "Profiles", `${name}.json`)
-          : path.join(engine, "Projects", project, "Content", "Registry", kind, `${name}.json`);
+        ? path.join(engine, "Projects", project, "Content", "Missions", `${name}.json`)          : WORLD_PROFILE_KIND_SET.has(kind)
+            ? path.join(engine, "Projects", project, "Content", "Profiles", `${name}.json`)
+            : GAIT_KIND_SET.has(kind)
+              ? path.join(engine, "Projects", project, "Content", "Animations", `${name}.json`)
+              : SIMULATION_LOD_KIND_SET.has(kind)
+                ? path.join(engine, "Projects", project, "Content", "SimulationLod", `${name}.json`)
+                : PREFAB_KIND_SET.has(kind)
+                  ? path.join(engine, "Projects", project, "Content", "Prefabs", `${name}.prefab`)
+                  : PARTICLE_KIND_SET.has(kind)
+                    ? path.join(engine, "Projects", project, "Content", "Particles", `${name}.particle`)
+                    : path.join(engine, "Projects", project, "Content", "Registry", kind, `${name}.json`);
   const relative = path.relative(path.join(engine, "Projects", project), target).replaceAll(path.sep, "/");
   const previous = fs.existsSync(target) ? readJson(target) : null;
   if (dryRun) {
@@ -208,7 +262,7 @@ function main() {
     default:
       console.error(
         "Usage: node registry-cli.mjs <kinds|schema|export-schemas|validate|author> ...\n" +
-        "  kinds                     list supported registry + vehicle + ability + mission kinds\n" +
+        "  kinds                     list supported registry + vehicle + ability + mission + gait + simulation_lod + prefab + particle kinds\n" +
         "  schema <kind>             print the JSON Schema (draft-07) for a kind\n" +
         "  export-schemas [outDir]   write <kind>.json for every kind\n" +
         "  validate <kind> <file>    validate an asset document (exit 1 on invalid)\n" +

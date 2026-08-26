@@ -989,7 +989,13 @@ void World::update(const glm::vec3& playerPos, WorldRenderBridge& renderBridge, 
         }
 
         for (auto it = chunks.begin(); it != chunks.end(); ) {
-            if (evictions.contains(it->first)) {
+            // Data safety (FALTANTES §4 item 6): a chunk with unsaved edits is
+            // NEVER evicted by the streaming window — the same rule as the
+            // memory-budget eviction below. Evicting it here would regenerate
+            // the chunk from the generator and silently drop the edits before
+            // any save could persist them.
+            if (evictions.contains(it->first) &&
+                !it->second->hasUnsavedEdits.load(std::memory_order_acquire)) {
                 // O fence do frame atual já foi aguardado antes de World::update.
                 // Buffers ainda referenciados pelo outro frame em voo entram na
                 // mesma fila de aposentadoria usada por remeshes e só são

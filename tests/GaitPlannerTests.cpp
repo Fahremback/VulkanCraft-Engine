@@ -302,6 +302,99 @@ void test_ik_integration() {
     std::printf("[gait] IK integration (planner -> ik_two_bone) OK\n");
 }
 
+// FALTANTES item 23 "animações": GaitAsset/LegChainAsset as versioned JSON
+// assets (the AbilityDefinition/MissionDefinition pattern) — bit-exact
+// round-trip %.9g, all-or-nothing, defaults on missing fields, and the same
+// refusal rules the MCP mirror enforces.
+void test_json_roundtrip() {
+    // Full asset: quadruped with named legs, offsets, bones and phases.
+    engine::animation::GaitAsset gait;
+    gait.name = "trot";
+    gait.cycleDuration = 0.8f;
+    gait.stanceFraction = 0.55f;
+    gait.stepHeight = 0.3f;
+    gait.maxStride = 0.75f;
+    gait.legPhases = {0.0f, 0.5f, 0.25f, 0.75f};
+    for (int i = 0; i < 4; ++i) {
+        engine::animation::LegChainAsset leg;
+        leg.name = (i % 2 == 0) ? "front" : "rear";
+        leg.hipOffset = glm::vec3(0.3f, 0.8f, i < 2 ? 0.5f : -0.5f);
+        leg.upperLength = 0.5f + i * 0.1f;
+        leg.lowerLength = 0.6f;
+        leg.restOffset = glm::vec3(0.3f, -1.0f, i < 2 ? 0.5f : -0.5f);
+        leg.maxReach = 0.0f;
+        leg.hipBone = 1 + i * 3;
+        leg.kneeBone = 2 + i * 3;
+        leg.footBone = 3 + i * 3;
+        gait.legs.push_back(leg);
+    }
+    std::string err;
+    check(gait.validate(err), "json: full asset validates");
+
+    const std::string json = gait.to_json();
+    engine::animation::GaitAsset back;
+    check(back.load_from_json(json, err), "json: full asset loads");
+    check(back.to_json() == json, "json: round-trip bit-exact (canonical doc)");
+    check(back.name == "trot" && back.cycleDuration == 0.8f &&
+              back.stanceFraction == 0.55f && back.stepHeight == 0.3f &&
+              back.maxStride == 0.75f,
+          "json: scalar fields round-trip");
+    check(back.legPhases.size() == 4 && back.legs.size() == 4,
+          "json: arrays round-trip");
+    check(back.legs[3].upperLength == 0.8f && back.legs[3].footBone == 12 &&
+              back.legs[3].restOffset.z == -0.5f,
+          "json: leg fields round-trip");
+
+    // Leg asset standalone round-trip.
+    const std::string legJson = gait.legs[0].to_json();
+    engine::animation::LegChainAsset legBack;
+    check(legBack.load_from_json(legJson, err), "json: leg asset loads");
+    check(legBack.to_json() == legJson, "json: leg round-trip bit-exact");
+
+    // Defaults: a minimal document loads and re-emits the canonical doc.
+    const std::string minimal =
+        "{\"version\":1,\"name\":\"amble\",\"legPhases\":[0.0,0.5],"
+        "\"legs\":[{\"name\":\"l1\"},{\"name\":\"l2\"}]}";
+    engine::animation::GaitAsset ambled;
+    check(ambled.load_from_json(minimal, err), "json: minimal doc loads");
+    check(ambled.cycleDuration == 1.0f && ambled.stanceFraction == 0.6f &&
+              ambled.stepHeight == 0.25f && ambled.maxStride == 0.5f &&
+              ambled.legs[0].upperLength == 0.5f &&
+              ambled.legs[0].hipBone == -1,
+          "json: missing fields take documented defaults");
+    check(ambled.to_json() == ambled.to_json(), "json: emission deterministic");
+
+    // All-or-nothing: every refusal leaves the target object untouched.
+    engine::animation::GaitAsset probe = ambled;  // a valid asset
+    const std::string validDoc = probe.to_json();
+    const char* badDocs[] = {
+        "{\"version\":1,\"name\":\"x\",\"legs\":[{\"name\":\"l\"}]",  // malformed JSON
+        "{\"version\":2,\"name\":\"x\",\"legs\":[{\"name\":\"l\"}],\"legPhases\":[0]}",
+        "{\"version\":1,\"name\":\"\",\"legs\":[{\"name\":\"l\"}],\"legPhases\":[0]}",
+        "{\"version\":1,\"name\":\"x\"}",  // empty legs
+        "{\"version\":1,\"name\":\"x\",\"legs\":[{\"name\":\"l\"}]}",  // phases size mismatch
+        "{\"version\":1,\"name\":\"x\",\"legs\":[{\"name\":\"l\"}],\"legPhases\":[1.5]}",
+        "{\"version\":1,\"name\":\"x\",\"legs\":[{\"name\":\"l\",\"upperLength\":0}],\"legPhases\":[0]}",
+        "{\"version\":1,\"name\":\"x\",\"legs\":[{\"name\":\"l\",\"hipOffset\":[1,2]}],\"legPhases\":[0]}",
+        "{\"version\":1,\"name\":\"x\",\"legs\":[{\"name\":\"\",\"hipBone\":1,\"kneeBone\":1}],\"legPhases\":[0]}",
+        "{\"version\":1,\"name\":\"x\",\"legs\":{\"name\":\"l\"},\"legPhases\":[0]}",
+        "{\"version\":1,\"name\":\"x\",\"legs\":[{\"name\":\"l\"}],\"legPhases\":\"oops\"}",
+    };
+    for (const char* doc : badDocs) {
+        engine::animation::GaitAsset target = probe;
+        check(!target.load_from_json(doc, err), "json: bad doc refused");
+        check(target.to_json() == validDoc, "json: refused doc leaves target intact");
+    }
+    // Same rule on the leg asset.
+    engine::animation::LegChainAsset legProbe = gait.legs[0];
+    const std::string legValid = legProbe.to_json();
+    check(!legProbe.load_from_json("{\"name\":\"\"}", err),
+          "json: leg with empty name refused");
+    check(legProbe.to_json() == legValid, "json: refused leg leaves target intact");
+
+    std::printf("[gait] JSON asset round-trip (bit-exact, all-or-nothing) OK\n");
+}
+
 }  // namespace
 
 int main() {
@@ -309,6 +402,7 @@ int main() {
     test_validation();
     test_walking_and_determinism();
     test_ik_integration();
+    test_json_roundtrip();
     if (g_failures == 0) {
         std::printf("[gait] ALL PASSED\n");
         return 0;

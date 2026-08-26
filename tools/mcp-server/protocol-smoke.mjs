@@ -486,14 +486,25 @@ try {
   const badItemSchemaErrors = validateJsonSchema(badItemSchemaDoc, capabilitiesPayload.registry_schemas.item);
   assert.ok(badItemSchemaErrors.some((error) => error.includes("wings")), JSON.stringify(badItemSchemaErrors));
 
+  // FALTANTES item 22 sub-1/sub-2 — SDK contract gate: every public header
+  // under src/engine/public must be self-contained (engine//std/vendor only,
+  // canonical engine/<domain>/<Header>.hpp includes — never short names). A
+  // header with an internal include or a short include breaks this gate.
+  const sdkCheck = spawnSync(process.execPath, [path.join(directory, "..", "sdk", "sdk-check.mjs"), "--expect-count", "65"], { encoding: "utf8" });
+  assert.equal(sdkCheck.status, 0, sdkCheck.stdout + sdkCheck.stderr);
+  assert.match(sdkCheck.stdout, /65 public headers/, sdkCheck.stdout);
+
   // The CLI exposes the same artifacts without a running server.
   const cliPath = path.join(directory, "registry-cli.mjs");
   const engineRoot = path.resolve(directory, "..", "..");
   const runCli = (args) => spawnSync(process.execPath, [cliPath, ...args], { encoding: "utf8" });
   const cliKinds = runCli(["kinds"]);
   assert.equal(cliKinds.status, 0, cliKinds.stderr);
-  // 2 vehicle kinds (§17 item 12) + 1 ability kind (§19) + 1 mission kind (item 23).
-  assert.equal(cliKinds.stdout.split(/\n/).filter(Boolean).length, schemaKinds.length + 4, cliKinds.stdout);
+  // 2 vehicle kinds (§17 item 12) + 1 ability kind (§19) + 1 mission kind
+  // (item 23) + 1 world profile kind (item 23 — geração procedural) + 1 gait
+  // kind (item 23 — animações) + 1 simulation LOD kind (§20) + 1 prefab kind
+  // (item 23 — prefabs) + 1 particle kind (item 23 — partículas).
+  assert.equal(cliKinds.stdout.split(/\n/).filter(Boolean).length, schemaKinds.length + 9, cliKinds.stdout);
   const cliSchema = runCli(["schema", "block"]);
   assert.equal(cliSchema.status, 0, cliSchema.stderr);
   assert.deepEqual(JSON.parse(cliSchema.stdout).properties.collisionShape.enum, ["full", "cross", "none"]);
@@ -814,6 +825,452 @@ try {
   const cliMissionSchema = runCli(["schema", "mission"]);
   assert.equal(cliMissionSchema.status, 0, cliMissionSchema.stderr);
   assert.ok(JSON.parse(cliMissionSchema.stdout).properties.objectives, "CLI mission schema declares objectives");
+
+  // Item 23 — geração procedural: author a world profile through the same MCP
+  // surface, mirroring the public world-profile document
+  // (create_world_profile_from_json, IWorldProfile). The MCP validates the
+  // top-level structure; sections are validated by their own C++ parsers.
+  const profileAsset = await request("tools/call", {
+    name: "author_world_profile_asset",
+    arguments: {
+      project: smokeProject, name: "Test World",
+      height: { version: 1, seed: 2026, root: 1, nodes: [
+        { type: "perlin", params: [0.05, 0.0], sources: [] },
+        { type: "fbm", params: [4, 0.5, 2.0, 0.0], sources: [0] }] },
+      baseHeight: 131, amplitude: 4,
+      climate: { temperature: { version: 1, seed: 1, root: 0, nodes: [{ type: "constant", params: [0.7], sources: [] }] } },
+      biomes: { version: 1, biomes: [{ name: "meadow", engineBiomeIndex: 7 }] },
+      caves: { density: { version: 1, seed: 2, root: 0, nodes: [{ type: "constant", params: [0.0], sources: [] }] } },
+      ores: { density: { version: 1, seed: 3, root: 0, nodes: [{ type: "constant", params: [0.75], sources: [] }] }, table: { version: 1, rules: [{ blockId: 18, minDensity: 0.7, maxDensity: 0.8, minY: 10, maxY: 120 }] } },
+      carver: { version: 1, fluidMaxY: 60, fluidBlockId: 12 },
+      decorators: { version: 1, decorators: [{ type: "column", density: 1.0, params: [2, 2], blocks: [50] }] },
+      structures: { version: 1, definitions: [], rules: [] }
+    }
+  });
+  assert.equal(profileAsset.result.isError, undefined, JSON.stringify(profileAsset));
+  const profilePayload = JSON.parse(profileAsset.result.content[0].text);
+  assert.equal(profilePayload.created, true);
+  assert.equal(profilePayload.diagnostics.length, 0, JSON.stringify(profilePayload));
+  assert.ok(fs.existsSync(path.join(smokeProjectPath, "Content", "Profiles", "Test_World.json")));
+  const profileDocument = JSON.parse(fs.readFileSync(path.join(smokeProjectPath, "Content", "Profiles", "Test_World.json"), "utf8"));
+  assert.equal(profileDocument.version, 1);
+  assert.equal(profileDocument.height.nodes.length, 2);
+  assert.equal(profileDocument.baseHeight, 131);
+
+  // The exported JSON Schema covers the world profile kind and accepts the
+  // emitted document.
+  assert.ok(capabilitiesPayload.world_profile_schemas, "game_capabilities exposes world_profile_schemas");
+  assert.ok(capabilitiesPayload.world_profile_asset_kinds, "game_capabilities exposes world_profile_asset_kinds");
+  const profileSchema = capabilitiesPayload.world_profile_schemas.world_profile;
+  assert.equal(profileSchema.$schema, "http://json-schema.org/draft-07/schema#");
+  assert.equal(profileSchema.type, "object");
+  assert.ok(profileSchema.properties.height, "world profile schema declares height");
+  const profileSchemaErrors = validateJsonSchema(profileDocument, profileSchema);
+  assert.equal(profileSchemaErrors.length, 0, profileSchemaErrors.join("; "));
+
+  // Item 23 all-or-nothing: a negative amplitude is refused.
+  const badProfile = await request("tools/call", {
+    name: "author_world_profile_asset",
+    arguments: {
+      project: smokeProject, name: "BrokenProfile",
+      height: { version: 1, seed: 1, root: 0, nodes: [{ type: "constant", params: [0.5], sources: [] }] },
+      baseHeight: 0, amplitude: -3
+    }
+  });
+  assert.equal(badProfile.result.isError, undefined, JSON.stringify(badProfile));
+  const badProfilePayload = JSON.parse(badProfile.result.content[0].text);
+  assert.equal(badProfilePayload.refused, true, JSON.stringify(badProfilePayload));
+  assert.ok(badProfilePayload.diagnostics.some((d) => String(d).includes("amplitude")), JSON.stringify(badProfilePayload));
+  assert.ok(!fs.existsSync(path.join(smokeProjectPath, "Content", "Profiles", "BrokenProfile.json")));
+
+  // World profiles are listed by inspect and counted by validate_game_project.
+  const inspectProfiles = await request("tools/call", {
+    name: "inspect_world_profile_assets",
+    arguments: { project: smokeProject }
+  });
+  const inspectProfilesPayload = JSON.parse(inspectProfiles.result.content[0].text);
+  assert.equal(inspectProfilesPayload.count, 1);
+  assert.ok(inspectProfilesPayload.world_profiles.every((asset) => asset.valid), JSON.stringify(inspectProfilesPayload));
+  const profilesValidation = await request("tools/call", {
+    name: "validate_game_project",
+    arguments: { project: smokeProject }
+  });
+  const profilesValidationPayload = JSON.parse(profilesValidation.result.content[0].text);
+  assert.equal(profilesValidationPayload.valid, true, JSON.stringify(profilesValidationPayload));
+  assert.ok(profilesValidationPayload.world_profiles >= 1);
+
+  // The CLI exposes the world profile schema too.
+  const cliProfileSchema = runCli(["schema", "world_profile"]);
+  assert.equal(cliProfileSchema.status, 0, cliProfileSchema.stderr);
+  assert.ok(JSON.parse(cliProfileSchema.stdout).properties.height, "CLI world profile schema declares height");
+
+  // Item 23 — animações: author a gait asset through the same MCP surface,
+  // mirroring GaitAsset::load_from_json (bit-exact %.9g round-trip,
+  // all-or-nothing). Creature locomotion: cycle timing + per-leg phase
+  // offsets + hip-anchored two-bone leg chains.
+  const gaitAsset = await request("tools/call", {
+    name: "author_gait_asset",
+    arguments: {
+      project: smokeProject, name: "Trot",
+      cycleDuration: 0.8, stanceFraction: 0.55, stepHeight: 0.3, maxStride: 0.75,
+      legPhases: [0, 0.5, 0.25, 0.75],
+      legs: [
+        { name: "front_left", hipOffset: [0.3, 0.8, 0.5], upperLength: 0.5, lowerLength: 0.6, restOffset: [0.3, -1, 0.5], hipBone: 1, kneeBone: 2, footBone: 3 },
+        { name: "front_right", hipOffset: [0.3, 0.8, -0.5], upperLength: 0.6, lowerLength: 0.6, restOffset: [0.3, -1, -0.5], hipBone: 4, kneeBone: 5, footBone: 6 },
+        { name: "rear_left", hipOffset: [-0.3, 0.8, 0.5], upperLength: 0.7, lowerLength: 0.6, restOffset: [-0.3, -1, 0.5], hipBone: 7, kneeBone: 8, footBone: 9 },
+        { name: "rear_right", hipOffset: [-0.3, 0.8, -0.5], upperLength: 0.8, lowerLength: 0.6, restOffset: [-0.3, -1, -0.5], hipBone: 10, kneeBone: 11, footBone: 12 }
+      ]
+    }
+  });
+  assert.equal(gaitAsset.result.isError, undefined, JSON.stringify(gaitAsset));
+  const gaitPayload = JSON.parse(gaitAsset.result.content[0].text);
+  assert.equal(gaitPayload.created, true);
+  assert.equal(gaitPayload.diagnostics.length, 0, JSON.stringify(gaitPayload));
+  assert.ok(fs.existsSync(path.join(smokeProjectPath, "Content", "Animations", "Trot.json")));
+  const gaitDocument = JSON.parse(fs.readFileSync(path.join(smokeProjectPath, "Content", "Animations", "Trot.json"), "utf8"));
+  assert.equal(gaitDocument.version, 1);
+  assert.equal(gaitDocument.legs.length, 4);
+  assert.equal(gaitDocument.legPhases.length, 4);
+  assert.equal(gaitDocument.legs[3].footBone, 12);
+
+  // The exported JSON Schema covers the gait kind and accepts the emitted
+  // document.
+  assert.ok(capabilitiesPayload.gait_schemas, "game_capabilities exposes gait_schemas");
+  assert.ok(capabilitiesPayload.gait_asset_kinds, "game_capabilities exposes gait_asset_kinds");
+  const gaitSchema = capabilitiesPayload.gait_schemas.gait;
+  assert.equal(gaitSchema.$schema, "http://json-schema.org/draft-07/schema#");
+  assert.equal(gaitSchema.type, "object");
+  assert.ok(gaitSchema.properties.legs, "gait schema declares legs");
+  const gaitSchemaErrors = validateJsonSchema(gaitDocument, gaitSchema);
+  assert.equal(gaitSchemaErrors.length, 0, gaitSchemaErrors.join("; "));
+
+  // Item 23 all-or-nothing: a stanceFraction outside (0, 1) is refused.
+  const badGait = await request("tools/call", {
+    name: "author_gait_asset",
+    arguments: {
+      project: smokeProject, name: "BrokenGait",
+      stanceFraction: 1.5,
+      legs: [{ name: "l" }], legPhases: [0]
+    }
+  });
+  assert.equal(badGait.result.isError, undefined, JSON.stringify(badGait));
+  const badGaitPayload = JSON.parse(badGait.result.content[0].text);
+  assert.equal(badGaitPayload.refused, true, JSON.stringify(badGaitPayload));
+  assert.ok(badGaitPayload.diagnostics.some((d) => String(d).includes("stanceFraction")), JSON.stringify(badGaitPayload));
+  assert.ok(!fs.existsSync(path.join(smokeProjectPath, "Content", "Animations", "BrokenGait.json")));
+
+  // Gaits are listed by inspect and counted by validate_game_project.
+  const inspectGaits = await request("tools/call", {
+    name: "inspect_gait_assets",
+    arguments: { project: smokeProject }
+  });
+  const inspectGaitsPayload = JSON.parse(inspectGaits.result.content[0].text);
+  assert.equal(inspectGaitsPayload.count, 1);
+  assert.ok(inspectGaitsPayload.gaits.every((asset) => asset.valid), JSON.stringify(inspectGaitsPayload));
+  const gaitsValidation = await request("tools/call", {
+    name: "validate_game_project",
+    arguments: { project: smokeProject }
+  });
+  const gaitsValidationPayload = JSON.parse(gaitsValidation.result.content[0].text);
+  assert.equal(gaitsValidationPayload.valid, true, JSON.stringify(gaitsValidationPayload));
+  assert.ok(gaitsValidationPayload.gait_assets >= 1);
+
+  // The CLI exposes the gait schema too.
+  const cliGaitSchema = runCli(["schema", "gait"]);
+  assert.equal(cliGaitSchema.status, 0, cliGaitSchema.stderr);
+  assert.ok(JSON.parse(cliGaitSchema.stdout).properties.legs, "CLI gait schema declares legs");
+
+  // FALTANTES §20 — simulation LOD specs through the same MCP surface
+  // (SimulationLodSpec::load_from_json; bit-exact %.9g round-trip).
+  const simLodAuthor = await request("tools/call", {
+    name: "author_simulation_lod_spec",
+    arguments: {
+      project: smokeProject, name: "WorldBudget",
+      version: 1, cellSize: 16, fullRadius: 48, falloffRadius: 320,
+      dayLengthSeconds: 240, daysPerSeason: 30,
+      tiers: [
+        { name: "full", mode: "full", minRelevance: 0.8, maxRegions: 128 },
+        { name: "coarse", mode: "coarse", minRelevance: 0.4, updateInterval: 0.25, maxRegions: 512 },
+        { name: "aggregate", mode: "aggregate", minRelevance: 0.1, aggregateInterval: 0.5, maxRegions: 2048 },
+        { name: "sleeping", mode: "sleeping", minRelevance: 0.0, sleepAfterIdle: 30.0, maxRegions: 8192 }
+      ]
+    }
+  });
+  assert.equal(simLodAuthor.result.isError, undefined, JSON.stringify(simLodAuthor));
+  const simLodPayload = JSON.parse(simLodAuthor.result.content[0].text);
+  assert.equal(simLodPayload.created, true);
+  assert.equal(simLodPayload.diagnostics.length, 0, JSON.stringify(simLodPayload));
+  assert.ok(fs.existsSync(path.join(smokeProjectPath, "Content", "SimulationLod", "WorldBudget.json")));
+  const simLodDocument = JSON.parse(fs.readFileSync(path.join(smokeProjectPath, "Content", "SimulationLod", "WorldBudget.json"), "utf8"));
+  assert.equal(simLodDocument.version, 1);
+  assert.equal(simLodDocument.tiers.length, 4);
+  assert.equal(simLodDocument.tiers[0].name, "full");
+  assert.equal(simLodDocument.tiers[3].mode, "sleeping");
+
+  // The exported JSON Schema covers the simulation_lod kind and accepts the
+  // emitted document.
+  assert.ok(capabilitiesPayload.simulation_lod_schemas, "game_capabilities exposes simulation_lod_schemas");
+  assert.ok(capabilitiesPayload.simulation_lod_asset_kinds, "game_capabilities exposes simulation_lod_asset_kinds");
+  const simLodSchema = capabilitiesPayload.simulation_lod_schemas.simulation_lod;
+  assert.equal(simLodSchema.$schema, "http://json-schema.org/draft-07/schema#");
+  assert.ok(simLodSchema.properties.tiers, "simulation_lod schema declares tiers");
+  const simLodSchemaErrors = validateJsonSchema(simLodDocument, simLodSchema);
+  assert.equal(simLodSchemaErrors.length, 0, simLodSchemaErrors.join("; "));
+
+  // All-or-nothing: tiers not sorted by minRelevance descending are refused.
+  const badSimLod = await request("tools/call", {
+    name: "author_simulation_lod_spec",
+    arguments: {
+      project: smokeProject, name: "BrokenBudget",
+      cellSize: 16, fullRadius: 48, falloffRadius: 320,
+      dayLengthSeconds: 240, daysPerSeason: 30,
+      tiers: [
+        { name: "coarse", mode: "coarse", minRelevance: 0.4 },
+        { name: "full", mode: "full", minRelevance: 0.8 }
+      ]
+    }
+  });
+  assert.equal(badSimLod.result.isError, undefined, JSON.stringify(badSimLod));
+  const badSimLodPayload = JSON.parse(badSimLod.result.content[0].text);
+  assert.equal(badSimLodPayload.refused, true, JSON.stringify(badSimLodPayload));
+  assert.ok(badSimLodPayload.diagnostics.some((d) => String(d).includes("minRelevance")), JSON.stringify(badSimLodPayload));
+  assert.ok(!fs.existsSync(path.join(smokeProjectPath, "Content", "SimulationLod", "BrokenBudget.json")));
+
+  // Specs are listed by inspect and counted by validate_game_project.
+  const inspectSimLods = await request("tools/call", {
+    name: "inspect_simulation_lod_specs",
+    arguments: { project: smokeProject }
+  });
+  const inspectSimLodsPayload = JSON.parse(inspectSimLods.result.content[0].text);
+  assert.equal(inspectSimLodsPayload.count, 1);
+  assert.ok(inspectSimLodsPayload.simulation_lod_specs.every((asset) => asset.valid), JSON.stringify(inspectSimLodsPayload));
+  const simLodsValidation = await request("tools/call", {
+    name: "validate_game_project",
+    arguments: { project: smokeProject }
+  });
+  const simLodsValidationPayload = JSON.parse(simLodsValidation.result.content[0].text);
+  assert.equal(simLodsValidationPayload.valid, true, JSON.stringify(simLodsValidationPayload));
+  assert.ok(simLodsValidationPayload.simulation_lod_specs >= 1);
+
+  // The CLI exposes the simulation_lod schema and kind too.
+  const cliSimLodSchema = runCli(["schema", "simulation_lod"]);
+  assert.equal(cliSimLodSchema.status, 0, cliSimLodSchema.stderr);
+  assert.ok(JSON.parse(cliSimLodSchema.stdout).properties.tiers, "CLI simulation_lod schema declares tiers");
+
+  // FALTANTES item 23 — prefabs: extract a reusable entity set from a scene,
+  // instantiate it into another scene with fresh UUIDs + Hierarchy remap.
+  const prefabScene = await request("tools/call", {
+    name: "create_scene", arguments: { project: smokeProject, name: "PrefabSource" }
+  });
+  assert.equal(prefabScene.result.isError, undefined, JSON.stringify(prefabScene));
+  const prefabNpc = await request("tools/call", {
+    name: "create_entity", arguments: {
+      project: smokeProject, scene: "PrefabSource", name: "Villager",
+      transform: { px: 5, py: 0, pz: 5 },
+      components: { Rigidbody: { mass: 60 }, Audio: { clip: "villager_hello" } }
+    }
+  });
+  const prefabNpcPayload = JSON.parse(prefabNpc.result.content[0].text);
+  assert.equal(prefabNpc.result.isError, undefined, JSON.stringify(prefabNpc));
+  const prefabNpcId = prefabNpcPayload.entity_id;
+  const prefabTorch = await request("tools/call", {
+    name: "create_entity", arguments: {
+      project: smokeProject, scene: "PrefabSource", name: "Lantern",
+      transform: { px: 5.5, py: 1.5, pz: 5 },
+      components: { Light: { r: 1, g: 0.6, b: 0.3, intensity: 800 }, Hierarchy: { parent_id: prefabNpcId } }
+    }
+  });
+  assert.equal(prefabTorch.result.isError, undefined, JSON.stringify(prefabTorch));
+  const prefabCreate = await request("tools/call", {
+    name: "create_prefab", arguments: {
+      project: smokeProject, scene: "PrefabSource", name: "VillagerSet",
+      entity_ids: [prefabNpcId, JSON.parse(prefabTorch.result.content[0].text).entity_id],
+      root_entity: "Villager"
+    }
+  });
+  assert.equal(prefabCreate.result.isError, undefined, JSON.stringify(prefabCreate));
+  const prefabCreatePayload = JSON.parse(prefabCreate.result.content[0].text);
+  assert.equal(prefabCreatePayload.created, true);
+  assert.equal(prefabCreatePayload.path, "Content/Prefabs/VillagerSet.prefab");
+  const prefabDoc = JSON.parse(fs.readFileSync(path.join(smokeProjectPath, "Content", "Prefabs", "VillagerSet.prefab"), "utf8"));
+  assert.equal(prefabDoc.format, "VulkanEngine.Prefab");
+  assert.equal(prefabDoc.entities.length, 2);
+  assert.ok(prefabDoc.entities.every((entity) => entity.id === undefined), "prefab strips entity ids");
+  assert.equal(prefabDoc.entities.find((entity) => entity.name === "Lantern").Hierarchy.parent_id, "Villager", "internal Hierarchy remapped to entity NAME");
+
+  // The exported JSON Schema covers the prefab kind and accepts the emitted
+  // document.
+  assert.ok(capabilitiesPayload.prefab_schemas, "game_capabilities exposes prefab_schemas");
+  assert.ok(capabilitiesPayload.prefab_asset_kinds, "game_capabilities exposes prefab_asset_kinds");
+  const prefabSchema = capabilitiesPayload.prefab_schemas.prefab;
+  assert.equal(prefabSchema.$schema, "http://json-schema.org/draft-07/schema#");
+  assert.ok(prefabSchema.properties.entities, "prefab schema declares entities");
+  const prefabSchemaErrors = validateJsonSchema(prefabDoc, prefabSchema);
+  assert.equal(prefabSchemaErrors.length, 0, prefabSchemaErrors.join("; "));
+
+  // All-or-nothing: extracting with an unknown entity id refuses everything.
+  const badPrefab = await request("tools/call", {
+    name: "create_prefab", arguments: {
+      project: smokeProject, scene: "PrefabSource", name: "BrokenPrefab",
+      entity_ids: [prefabNpcId, "00000000-0000-0000-0000-000000000000"]
+    }
+  });
+  assert.equal(badPrefab.result.isError, undefined, JSON.stringify(badPrefab));
+  const badPrefabPayload = JSON.parse(badPrefab.result.content[0].text);
+  assert.equal(badPrefabPayload.refused, true, JSON.stringify(badPrefabPayload));
+  assert.ok(badPrefabPayload.diagnostics[0].includes("00000000-0000-0000-0000-000000000000"), JSON.stringify(badPrefabPayload));
+  assert.ok(!fs.existsSync(path.join(smokeProjectPath, "Content", "Prefabs", "BrokenPrefab.prefab")));
+
+  // Instantiate into a target scene: fresh UUIDs + remap + offset.
+  await request("tools/call", { name: "create_scene", arguments: { project: smokeProject, name: "Village" } });
+  const prefabInst = await request("tools/call", {
+    name: "instantiate_prefab", arguments: {
+      project: smokeProject, scene: "Village", prefab: "VillagerSet", offset: [100, 0, 200]
+    }
+  });
+  assert.equal(prefabInst.result.isError, undefined, JSON.stringify(prefabInst));
+  const prefabInstPayload = JSON.parse(prefabInst.result.content[0].text);
+  assert.equal(prefabInstPayload.instantiated, 2);
+  const villageDoc = JSON.parse(fs.readFileSync(path.join(smokeProjectPath, "Content", "Scenes", "Village.scene"), "utf8"));
+  const villagerClone = villageDoc.entities.find((entity) => entity.name === "Villager");
+  const lanternClone = villageDoc.entities.find((entity) => entity.name === "Lantern");
+  assert.ok(villagerClone && lanternClone, "both clones present");
+  assert.equal(villagerClone.Transform.px, 105, "offset shifts the whole set (5+100)");
+  assert.equal(lanternClone.Transform.px, 105.5, "relative offset preserved (5.5+100)");
+  assert.equal(lanternClone.Hierarchy.parent_id, villagerClone.id, "internal Hierarchy remapped to fresh id");
+
+  // Prefabs are listed by inspect, counted by validate_game_project, and the
+  // CLI exposes the prefab schema/kind.
+  const inspectPrefabs = await request("tools/call", {
+    name: "inspect_prefabs", arguments: { project: smokeProject }
+  });
+  const inspectPrefabsPayload = JSON.parse(inspectPrefabs.result.content[0].text);
+  assert.equal(inspectPrefabsPayload.count, 1);
+  assert.ok(inspectPrefabsPayload.prefabs.every((asset) => asset.valid), JSON.stringify(inspectPrefabsPayload));
+  const prefabsValidation = await request("tools/call", {
+    name: "validate_game_project", arguments: { project: smokeProject }
+  });
+  const prefabsValidationPayload = JSON.parse(prefabsValidation.result.content[0].text);
+  assert.equal(prefabsValidationPayload.valid, true, JSON.stringify(prefabsValidationPayload));
+  assert.ok(prefabsValidationPayload.prefabs >= 1);
+  const cliPrefabSchema = runCli(["schema", "prefab"]);
+  assert.equal(cliPrefabSchema.status, 0, cliPrefabSchema.stderr);
+  assert.ok(JSON.parse(cliPrefabSchema.stdout).properties.entities, "CLI prefab schema declares entities");
+
+  // FALTANTES item 23 — partículas: author a reusable emitter asset and apply
+  // it to an entity's ParticleEmitter component.
+  const particleAuthor = await request("tools/call", {
+    name: "create_particle_asset",
+    arguments: {
+      project: smokeProject, name: "Fire",
+      rate: 40, speedMin: 1.5, speedMax: 3.5, lifeMin: 0.8, lifeMax: 2.0,
+      sizeStart: 0.15, sizeEnd: 0, cr: 1, cg: 0.55, cb: 0.2, ca: 1,
+      er: 1, eg: 0.5, eb: 0.1, ea: 0.5, ay: 0.8, drag: 0.02, emitting: true
+    }
+  });
+  assert.equal(particleAuthor.result.isError, undefined, JSON.stringify(particleAuthor));
+  const particleAuthorPayload = JSON.parse(particleAuthor.result.content[0].text);
+  assert.equal(particleAuthorPayload.created, true);
+  assert.equal(particleAuthorPayload.path, "Content/Particles/Fire.particle");
+  const particleDoc = JSON.parse(fs.readFileSync(path.join(smokeProjectPath, "Content", "Particles", "Fire.particle"), "utf8"));
+  assert.equal(particleDoc.format, "VulkanEngine.Particle");
+  assert.equal(particleDoc.rate, 40);
+  assert.equal(particleDoc.ay, 0.8);
+
+  // The exported JSON Schema covers the particle kind and accepts the emitted
+  // document.
+  assert.ok(capabilitiesPayload.particle_schemas, "game_capabilities exposes particle_schemas");
+  assert.ok(capabilitiesPayload.particle_asset_kinds, "game_capabilities exposes particle_asset_kinds");
+  const particleSchema = capabilitiesPayload.particle_schemas.particle;
+  assert.equal(particleSchema.$schema, "http://json-schema.org/draft-07/schema#");
+  assert.ok(particleSchema.properties.rate, "particle schema declares emitter fields");
+  const particleSchemaErrors = validateJsonSchema(particleDoc, particleSchema);
+  assert.equal(particleSchemaErrors.length, 0, particleSchemaErrors.join("; "));
+
+  // All-or-nothing: an unknown emitter field is refused (never silently
+  // dropped).
+  const badParticle = await request("tools/call", {
+    name: "create_particle_asset", arguments: { project: smokeProject, name: "BadParticle", rate: 10, glorp: 5 }
+  });
+  assert.equal(badParticle.result.isError, undefined, JSON.stringify(badParticle));
+  const badParticlePayload = JSON.parse(badParticle.result.content[0].text);
+  assert.equal(badParticlePayload.refused, true, JSON.stringify(badParticlePayload));
+  assert.ok(badParticlePayload.diagnostics.some((d) => String(d).includes("glorp")), JSON.stringify(badParticlePayload));
+  assert.ok(!fs.existsSync(path.join(smokeProjectPath, "Content", "Particles", "BadParticle.particle")));
+
+  // Apply the asset to an entity's ParticleEmitter component.
+  const particleTarget = await request("tools/call", {
+    name: "create_entity", arguments: {
+      project: smokeProject, scene: "PrefabSource", name: "Campfire",
+      transform: { px: 0, py: 1, pz: 0 }
+    }
+  });
+  const particleTargetPayload = JSON.parse(particleTarget.result.content[0].text);
+  const particleApply = await request("tools/call", {
+    name: "apply_particle_asset", arguments: {
+      project: smokeProject, scene: "PrefabSource", entity_id: particleTargetPayload.entity_id, asset: "Fire"
+    }
+  });
+  assert.equal(particleApply.result.isError, undefined, JSON.stringify(particleApply));
+  const particleApplyPayload = JSON.parse(particleApply.result.content[0].text);
+  assert.equal(particleApplyPayload.applied, true);
+  assert.equal(particleApplyPayload.value.rate, 40);
+
+  // Particle assets are listed by inspect, counted by validate_game_project,
+  // and the CLI exposes the particle schema/kind.
+  const inspectParticles = await request("tools/call", {
+    name: "inspect_particle_assets", arguments: { project: smokeProject }
+  });
+  const inspectParticlesPayload = JSON.parse(inspectParticles.result.content[0].text);
+  assert.equal(inspectParticlesPayload.count, 1);
+  assert.ok(inspectParticlesPayload.particle_assets.every((asset) => asset.valid), JSON.stringify(inspectParticlesPayload));
+  const particlesValidation = await request("tools/call", {
+    name: "validate_game_project", arguments: { project: smokeProject }
+  });
+  const particlesValidationPayload = JSON.parse(particlesValidation.result.content[0].text);
+  assert.equal(particlesValidationPayload.valid, true, JSON.stringify(particlesValidationPayload));
+  assert.ok(particlesValidationPayload.particle_assets >= 1);
+  const cliParticleSchema = runCli(["schema", "particle"]);
+  assert.equal(cliParticleSchema.status, 0, cliParticleSchema.stderr);
+  assert.ok(JSON.parse(cliParticleSchema.stdout).properties.rate, "CLI particle schema declares emitter fields");
+
+  // Item 23 final checkbox — "criar um jogo completo usando somente MCP + APIs
+  // públicas": the accumulated smokeProject IS that game (registry content,
+  // vehicle, ability, mission, world profile, gait, scene + entities +
+  // components, material, audio event, physics material, visual script).
+  // One validate_game_project must come out CLEAN with every category
+  // counted together, and inspect_game_project lists the whole stack.
+  const completeGameValidation = await request("tools/call", {
+    name: "validate_game_project",
+    arguments: { project: smokeProject }
+  });
+  const completeGame = JSON.parse(completeGameValidation.result.content[0].text);
+  assert.equal(completeGame.valid, true, JSON.stringify(completeGame));
+  assert.ok(completeGame.registry_assets >= 9, `registry_assets >= 9 (${completeGame.registry_assets})`);
+  assert.ok(completeGame.vehicle_assets >= 2, `vehicle_assets >= 2 (${completeGame.vehicle_assets})`);
+  assert.ok(completeGame.ability_assets >= 1, `ability_assets >= 1 (${completeGame.ability_assets})`);
+  assert.ok(completeGame.mission_assets >= 1, `mission_assets >= 1 (${completeGame.mission_assets})`);
+  assert.ok(completeGame.world_profiles >= 1, `world_profiles >= 1 (${completeGame.world_profiles})`);
+  assert.ok(completeGame.gait_assets >= 1, `gait_assets >= 1 (${completeGame.gait_assets})`);
+  assert.ok(completeGame.simulation_lod_specs >= 1, `simulation_lod_specs >= 1 (${completeGame.simulation_lod_specs})`);
+  assert.ok(completeGame.prefabs >= 1, `prefabs >= 1 (${completeGame.prefabs})`);
+  assert.ok(completeGame.particle_assets >= 1, `particle_assets >= 1 (${completeGame.particle_assets})`);
+  assert.ok(completeGame.scenes >= 1, `scenes >= 1 (${completeGame.scenes})`);
+  const completeGameInspect = await request("tools/call", {
+    name: "inspect_game_project",
+    arguments: { project: smokeProject }
+  });
+  const completeGameInspectPayload = JSON.parse(completeGameInspect.result.content[0].text);
+  assert.ok(completeGameInspectPayload.vehicles.length >= 2, "inspect lists vehicles");
+  assert.ok(completeGameInspectPayload.abilities.length >= 1, "inspect lists abilities");
+  assert.ok(completeGameInspectPayload.missions.length >= 1, "inspect lists missions");
+  assert.ok(completeGameInspectPayload.world_profiles.length >= 1, "inspect lists world profiles");
+  assert.ok(completeGameInspectPayload.gaits.length >= 1, "inspect lists gaits");
+  assert.ok(completeGameInspectPayload.simulation_lod_specs.length >= 1, "inspect lists simulation LOD specs");
+  assert.ok(completeGameInspectPayload.prefabs.length >= 1, "inspect lists prefabs");
+  assert.ok(completeGameInspectPayload.particle_assets.length >= 1, "inspect lists particle assets");
+  assert.ok(completeGameInspectPayload.scenes.length >= 1, "inspect lists scenes");
+  assert.equal(completeGameInspectPayload.validation.valid, true, JSON.stringify(completeGameInspectPayload.validation));
 
   // ---- Control API (editor_*): drive the RUNNING editor via :8321 ----
 

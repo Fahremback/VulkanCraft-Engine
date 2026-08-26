@@ -16,7 +16,7 @@
 // Self-contained (glm only). load_from_json / to_json / validate are
 // implemented by the SDK adapter (src/engine/sdk/BeamGraphAsset.cpp).
 
-#include "IVehicleAsset.hpp"  // WheelComponent (suspension/tire/steer), VehicleProviderKind
+#include "engine/vehicles/IVehicleAsset.hpp"  // WheelComponent (suspension/tire/steer), VehicleProviderKind
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>

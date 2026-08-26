@@ -2937,6 +2937,131 @@ void test_light_determinism() {
     std::cout << "[sdk] lighting: deterministic across instances OK\n";
 }
 
+// FALTANTES item 158: edição durante propagação já é testada; faltavam LOAD e
+// UNLOAD. O orçamento de streaming + a re-sujeição garantem que o campo de luz
+// converge ao MESMO fixpoint independente do timing de load/unload dos chunks:
+// (a) LOAD durante propagação — emissor na última coluna do chunk (0,0) com o
+// chunk (1,0) NÃO carregado (budget 8 para o player em (-8,200,8), o mesmo
+// padrão do teste de fluido em fronteira não carregada); o campo converge no
+// (0,0), a fronteira não carregada fica escura (0); quando o player vai para
+// leste o (1,0) streama DURANTE a propagação e a fronteira preenche idêntico
+// ao controle (budget 16, (1,0) carregado desde o início).
+// (b) UNLOAD durante propagação — chunk limpo (sem edits) com skylight
+// convergido é evictado quando o player teleporta longe e, ao voltar, o campo
+// reconverge idêntico ao controle que nunca descarregou.
+void test_light_load_unload_during_propagation() {
+    const auto buildLantern = [&](const glm::vec3& player, int budget) {
+        auto world = engine::voxel::create_default_voxel_world();
+        world->register_generator(std::make_shared<FlatGenerator>(96));
+        auto registry = std::make_shared<engine::registry::BlockRegistry>();
+        std::string error;
+        CHECK(registry->load_from_json(
+            R"([{"name":"lantern","namespace":"test","color":[1.0,0.9,0.3],"lightEmission":1.0}])",
+            error));
+        world->set_block_registry(registry);
+        CHECK(boot_world(*world, player, budget));
+        uint32_t lanternId = 0;
+        CHECK(world->resolve_block_id("test:lantern", lanternId, error));
+        // Emitter on the LAST column of chunk (0,0): the frontier crosses
+        // into chunk (1,0) once that chunk loads.
+        world->set_block(15, 130, 8, lanternId);
+        return world;
+    };
+
+    const glm::vec3 west{ -8.0f, 200.0f, 8.0f };  // centers chunk (-1,0)
+    const glm::vec3 east{ 24.0f, 200.0f, 8.0f };  // centers chunk (1,0)
+    const glm::vec3 home{ 8.0f, 200.0f, 8.0f };   // centers chunk (0,0)
+
+    // Control: player centered on (0,0) with budget 16 — chunk (1,0) is ring
+    // 1 and loads from the start (the same geometry as test_light_chunk_boundary).
+    std::unique_ptr<engine::voxel::IVoxelWorld> control =
+        buildLantern(home, 16);
+    CHECK(settle(*control, home, [&] {
+        return control->get_block_light(15, 130, 8) == 15 &&
+               control->get_block_light(16, 130, 8) == 14;
+    }));
+
+    // Subject: budget 8 loads chunk (0,0) but stops BEFORE chunk (1,0).
+    std::unique_ptr<engine::voxel::IVoxelWorld> subject =
+        buildLantern(west, 8);
+    CHECK(subject->is_chunk_loaded(0, 0));
+    CHECK(!subject->is_chunk_loaded(1, 0));
+    // The emitter's field converges inside (0,0); the unloaded frontier stays
+    // dark (the world reports 0 for a chunk that is not loaded).
+    CHECK(settle(*subject, west,
+        [&] { return subject->get_block_light(15, 130, 8) == 15; }));
+    CHECK(subject->get_block_light(16, 130, 8) == 0);
+
+    // Move east: (1,0) streams in while the field is live; the frontier must
+    // fill exactly like the control (load-during-propagation convergence).
+    CHECK(settle(*subject, east, [&] { return subject->is_chunk_loaded(1, 0); }));
+    CHECK(settle(*subject, east,
+        [&] { return subject->get_block_light(16, 130, 8) == 14; }));
+    for (int x = 13; x <= 24; ++x) {
+        CHECK(subject->get_block_light(x, 130, 8) ==
+              control->get_block_light(x, 130, 8));
+    }
+
+    // (b) UNLOAD: a clean (edit-free) skylight chunk is evicted when the
+    // player leaves and reconverges identically on reload.
+    const auto buildSkylight = [&]() {
+        auto world = engine::voxel::create_default_voxel_world();
+        world->register_generator(std::make_shared<FlatGenerator>(96));
+        CHECK(boot_world(*world, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+        return world;
+    };
+    std::unique_ptr<engine::voxel::IVoxelWorld> keep = buildSkylight();
+    std::unique_ptr<engine::voxel::IVoxelWorld> evict = buildSkylight();
+    const auto skylightConverged = [](engine::voxel::IVoxelWorld& w) {
+        return w.get_sky_light(8, 96, 8) == 0 &&   // stone occludes
+               w.get_sky_light(8, 200, 8) == 15;   // open air: full sun
+    };
+    CHECK(settle(*keep, home, [&] { return skylightConverged(*keep); }));
+    CHECK(settle(*evict, home, [&] { return skylightConverged(*evict); }));
+
+    // Teleport far away: the clean (0,0) chunk falls out of the streaming
+    // window and is evicted.
+    const glm::vec3 far{ 2000.0f, 200.0f, 2000.0f };
+    CHECK(settle(*evict, far, [&] { return !evict->is_chunk_loaded(0, 0); }));
+    // Return: the chunk reloads and the skylight field reconverges to the
+    // exact same column profile as the never-unloaded control.
+    CHECK(settle(*evict, home, [&] { return evict->is_chunk_loaded(0, 0); }));
+    CHECK(settle(*evict, home, [&] { return skylightConverged(*evict); }));
+    for (int y = 90; y <= 100; ++y) {
+        CHECK(evict->get_sky_light(8, y, 8) == keep->get_sky_light(8, y, 8));
+    }
+
+    std::cout << "[sdk] lighting: load/unload during propagation converge OK\n";
+}
+
+// FALTANTES §4 item 6 (data safety): the STREAMING-window eviction (player
+// walks away) must not drop unsaved edits — the same guarantee the
+// memory-budget eviction already has (test_chunk_memory_budget). Without it,
+// an edited chunk evicted from the window is regenerated from the generator
+// and the edit is silently lost before any save.
+void test_eviction_preserves_edits() {
+    auto world = engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(96));
+    const glm::vec3 home{ 8.0f, 200.0f, 8.0f };
+    CHECK(boot_world(*world, home, 16));
+
+    // An unmistakable edit high above the terrain surface.
+    world->set_block(8, 130, 8, kBlockStone);
+    CHECK(world->get_block(8, 130, 8) == kBlockStone);
+
+    // Player walks far away: the chunk leaves the streaming window. (With the
+    // bug it is evicted despite carrying an unsaved edit; with the fix it
+    // stays resident — either way the edit must survive the trip.)
+    const glm::vec3 far{ 2000.0f, 200.0f, 2000.0f };
+    for (int i = 0; i < 60 * 5; ++i) world->update(far, 1.0f / 60.0f);
+
+    // Player returns: the chunk is (re)loaded and the edit is still there.
+    CHECK(settle(*world, home, [&] { return world->is_chunk_loaded(0, 0); }));
+    CHECK(world->get_block(8, 130, 8) == kBlockStone);
+
+    std::cout << "[sdk] streaming eviction preserves unsaved edits OK\n";
+}
+
 // The block registry is the source of truth for settable ids on the world
 // (META section 7 + Prioridade 0 item 1): a builtin block resolves to its
 // engine id; a catalog-only JSON block gets a DYNAMIC runtime id (>= Count,
@@ -6986,6 +7111,164 @@ void test_navigation_dynamic_obstacle() {
                  "== full rebuild bit-exact, refusals OK\n";
 }
 
+// FALTANTES item 12 — per-area traversal costs (material/danger) and slope
+// cost areas: columns can carry a cost area (0 = default walkable, 1..62 =
+// custom); steep-but-walkable terrain is tagged with the slope cost area at
+// the heightfield level (exact per-cell slope); set_area_cost weights the
+// query filter so find_path routes around expensive areas when a cheaper
+// alternative exists.
+void test_navigation_area_costs() {
+    using engine::navigation::NavmeshConfig;
+    using engine::navigation::PathResult;
+    using engine::navigation::VoxelColumn;
+
+    const float step = 0.5f;
+    const auto flat_columns = [&]() {
+        std::vector<VoxelColumn> columns;
+        for (float x = 0.25f; x <= 31.75f; x += step) {
+            for (float z = 0.25f; z <= 31.75f; z += step) {
+                VoxelColumn column;
+                column.x = x;
+                column.z = z;
+                column.solidMinY = 0.0f;
+                column.solidMaxY = 1.0f;
+                column.solid = true;
+                columns.push_back(column);
+            }
+        }
+        return columns;
+    };
+    // A cost strip crossing the path line z=12 at x in [14,18], spanning from
+    // the top map edge (z=0) down past the line (z=24): the only free
+    // crossing is the gap z>24, so a real detour is forced when costed.
+    const auto strip_columns = [&](uint8_t tagArea) {
+        std::vector<VoxelColumn> columns = flat_columns();
+        for (VoxelColumn& column : columns) {
+            if (tagArea != 0 && column.x >= 14.0f && column.x <= 18.0f &&
+                column.z >= 0.0f && column.z <= 24.0f) {
+                column.area = tagArea;
+            }
+        }
+        return columns;
+    };
+    // A traversable hump crossing the path line: top = 1 + 0.5*(4-|x-16|) for
+    // x in [12,20] (rises to y=3 at x=16, connects at y=1 on both ends), z in
+    // [0,24] so the free crossing is the gap z>24. The sloped faces are the
+    // slope cost area when slopeCostArea is set.
+    const auto hump_columns = [&]() {
+        std::vector<VoxelColumn> columns = flat_columns();
+        for (VoxelColumn& column : columns) {
+            if (column.x >= 12.0f && column.x <= 20.0f && column.z >= 0.0f &&
+                column.z <= 24.0f) {
+                column.solidMaxY =
+                    1.0f + 0.5f * (4.0f - std::fabs(column.x - 16.0f));
+            }
+        }
+        return columns;
+    };
+
+    const auto path_len = [](engine::navigation::INavigationProvider& nav) {
+        PathResult r;
+        if (!nav.find_path(2.0f, 0.5f, 12.0f, 30.0f, 0.5f, 12.0f, r))
+            return -1.0f;
+        return r.totalLength;
+    };
+
+    NavmeshConfig config;
+    config.boundsMinX = 0.0f;
+    config.boundsMaxX = 32.0f;
+    config.boundsMinZ = 0.0f;
+    config.boundsMaxZ = 32.0f;
+    config.cellSize = step;
+    config.tileSize = 8.0f;  // tiled mode: 4x4 tiles of 8 world units
+
+    std::string error;
+
+    // ---- material/danger cost strip: straight at cost 1, detour at 10 ----
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav->build(config, strip_columns(1), error));
+        CHECK(error.empty());
+        CHECK(nav->valid());
+        CHECK(nav->area_cost(1) == 1.0f);  // default cost
+
+        const float straightLen = path_len(*nav);
+        CHECK(straightLen > 0.0f);
+        CHECK(std::fabs(straightLen - 28.0f) < 1.0f);  // straight across
+
+        CHECK(nav->set_area_cost(1, 10.0f, error));  // cost the strip
+        CHECK(error.empty());
+        CHECK(nav->area_cost(1) == 10.0f);
+        const float detourLen = path_len(*nav);
+        CHECK(detourLen > straightLen + 2.0f);  // routed around the strip
+
+        // Doubling the cost keeps the detour; restoring cost 1 restores the
+        // straight path (the cost is live, not baked).
+        CHECK(nav->set_area_cost(1, 20.0f, error));
+        CHECK(error.empty());
+        CHECK(path_len(*nav) > straightLen + 2.0f);
+        CHECK(nav->set_area_cost(1, 1.0f, error));
+        CHECK(error.empty());
+        CHECK(std::fabs(path_len(*nav) - straightLen) < 0.001f);
+    }
+
+    // ---- strip WITHOUT the cost tag: costed area unused, no detour ----
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav->build(config, strip_columns(0), error));
+        CHECK(error.empty());
+        CHECK(nav->set_area_cost(1, 10.0f, error));
+        CHECK(error.empty());
+        CHECK(std::fabs(path_len(*nav) - 28.0f) < 1.0f);  // still straight
+    }
+
+    // ---- slope cost: hump tagged at the heightfield, detours when costed ----
+    {
+        NavmeshConfig slopeConfig = config;
+        slopeConfig.slopeCostArea = 2;
+        slopeConfig.slopeCostStartDegrees = 15.0f;  // hump faces are 26.6 deg
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav->build(slopeConfig, hump_columns(), error));
+        CHECK(error.empty());
+
+        // At default cost the path crosses straight over the hump (it is
+        // walkable, just costed).
+        CHECK(nav->set_area_cost(2, 1.0f, error));
+        CHECK(error.empty());
+        const float over = path_len(*nav);
+        CHECK(over > 0.0f);
+        CHECK(over < 40.0f);  // straight over, not around
+
+        // Cost the slope area: the query routes around the hump.
+        CHECK(nav->set_area_cost(2, 50.0f, error));
+        CHECK(error.empty());
+        const float around = path_len(*nav);
+        CHECK(around > over + 1.0f);
+    }
+
+    // ---- refusals (out of range / invalid cost) ----
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav->build(config, flat_columns(), error));
+        CHECK(error.empty());
+        CHECK(!nav->set_area_cost(64, 1.0f, error));   // area out of range
+        CHECK(!error.empty());
+        CHECK(!nav->set_area_cost(1, -1.0f, error));   // negative cost
+        CHECK(!error.empty());
+        CHECK(!nav->set_area_cost(1, std::nanf(""), error));  // NaN
+        CHECK(!error.empty());
+        CHECK(nav->area_cost(1) == 1.0f);  // unchanged after refusals
+    }
+
+    std::cout << "[sdk] navigation area costs: material strip detours at cost "
+                 "10 (straight at 1), slope hump tagged at the heightfield "
+                 "detours at cost 50, refusals OK\n";
+}
+
 // ---- META section 17 / FALTANTES item 13: authoritative voxel replication ----
 // Server validates and applies client edits (cooldown, bounds, loaded chunk,
 // block registry), broadcasts ordered deltas over the generic networking
@@ -8026,6 +8309,154 @@ void test_region_replication() {
 
     std::cout << "[sdk] replication: region state (block entities + fluids/light "
                  "cells + entities/inventories) OK\n";
+}
+
+// FALTANTES item 11 / §17 — transfer between regions: when the client's
+// interest moves, block entities and entities whose chunk LEFT the previous
+// interest are evicted (no ghosts), while the new region's content arrives
+// and the intersection is untouched.
+void test_replication_region_handoff() {
+    constexpr std::uint32_t kBlockStoneHandoff = 3;
+    auto registerChest = [](engine::voxel::IVoxelWorld& world) {
+        world.register_block_entity_type("project:counter_machine",
+            [] { return std::make_shared<CounterMachine>(); });
+    };
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> server = make_flat_world();
+    CHECK(server != nullptr);
+    registerChest(*server);
+    const int surface = helper_surface_y(*server, 8, 8);
+    CHECK(surface > 0);
+
+    // Region A (chunk 0,0): a block entity + an entity.
+    std::string error;
+    server->set_block(8, surface + 1, 8, kBlockStoneHandoff);
+    auto machineA = std::make_shared<CounterMachine>();
+    machineA->counter_ = 42;
+    CHECK(server->attach_block_entity(8, surface + 1, 8, machineA, error));
+    auto entityWorld = server->entity_world();
+    CHECK(entityWorld != nullptr);
+    std::string spawnError;
+    const engine::entity::EntityId holderA =
+        entityWorld->spawn("project:inventory_holder",
+                           { static_cast<float>(9), static_cast<float>(surface + 1),
+                             static_cast<float>(9) },
+                           spawnError);
+    CHECK(holderA.valid());
+
+    auto srv = engine::voxel::create_voxel_replication(*server);
+    srv->server_register_connection(kRepConnA);
+    srv->server_set_snapshot_window(surface - 24, 48);
+    srv->server_set_interest(kRepConnA, {{8, surface, 8}, 0});
+    srv->server_update();
+    engine::voxel::RegionReplicationSnapshot regionA;
+    std::string regionError;
+    CHECK(srv->server_pack_region(kRepConnA, regionA, regionError));
+    CHECK(regionA.chunks.size() == 1);
+    CHECK(regionA.blockEntities.size() == 1);
+    CHECK(regionA.entities.size() == 1);
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> client = make_flat_world();
+    CHECK(client != nullptr);
+    registerChest(*client);
+    auto cli = engine::voxel::create_voxel_replication(*client);
+    std::string applyError;
+    CHECK(cli->client_apply_region(regionA, applyError));
+    CHECK(applyError.empty());
+    auto machineAClient = client->block_entity_at(8, surface + 1, 8);
+    CHECK(machineAClient != nullptr);
+    auto* counterA = dynamic_cast<CounterMachine*>(machineAClient.get());
+    CHECK(counterA != nullptr && counterA->counter_ == 42);
+    CHECK(client->entity_world()->entities_in_chunk(0, 0).size() == 1);
+
+    // Region B (chunk 2,2): a DIFFERENT block entity + entity. The client
+    // interest moves there — region A's content must be evicted. boot_world
+    // only guarantees the boot focus chunk; settle until (2,2) is loaded
+    // before writing into it (same gate the placer hit).
+    CHECK(settle(*server, glm::vec3(40.0f, 200.0f, 40.0f),
+                 [&]() { return server->is_chunk_loaded(2, 2); }));
+    server->set_block(40, surface + 1, 40, kBlockStoneHandoff);
+    auto machineB = std::make_shared<CounterMachine>();
+    machineB->counter_ = 7;
+    CHECK(server->attach_block_entity(40, surface + 1, 40, machineB, error));
+    const engine::entity::EntityId holderB =
+        entityWorld->spawn("project:inventory_holder",
+                           { static_cast<float>(41), static_cast<float>(surface + 1),
+                             static_cast<float>(41) },
+                           spawnError);
+    CHECK(holderB.valid());
+    srv->server_set_interest(kRepConnA, {{40, surface, 40}, 0});
+    srv->server_update();
+    engine::voxel::RegionReplicationSnapshot regionB;
+    CHECK(srv->server_pack_region(kRepConnA, regionB, regionError));
+    CHECK(regionB.chunks.size() == 1);
+    CHECK(regionB.chunks[0].chunkX == 2 && regionB.chunks[0].chunkZ == 2);
+    CHECK(regionB.blockEntities.size() == 1);
+    CHECK(regionB.blockEntities[0].position == glm::ivec3(40, surface + 1, 40));
+    CHECK(regionB.entities.size() == 1);
+
+    // The client's chunk (2,2) must be loaded before the region applies
+    // (attach_block_entity needs a loaded non-empty block — same gate the
+    // placer hit). boot_world only guarantees the boot focus chunk.
+    CHECK(settle(*client, glm::vec3(40.0f, 200.0f, 40.0f),
+                 [&]() { return client->is_chunk_loaded(2, 2); }));
+    CHECK(cli->client_apply_region(regionB, applyError));
+    CHECK(applyError.empty());
+    // Region A's block entity and entity are GONE (chunk 0,0 left the
+    // interest — no ghosts).
+    CHECK(client->block_entity_at(8, surface + 1, 8) == nullptr);
+    CHECK(client->entity_world()->entities_in_chunk(0, 0).empty());
+    // Region B's content arrived.
+    auto machineBClient = client->block_entity_at(40, surface + 1, 40);
+    CHECK(machineBClient != nullptr);
+    auto* counterB = dynamic_cast<CounterMachine*>(machineBClient.get());
+    CHECK(counterB != nullptr && counterB->counter_ == 7);
+    CHECK(client->entity_world()->entities_in_chunk(2, 2).size() == 1);
+    // Intersection untouched: the client's total block entity + entity counts
+    // match exactly the new region (no accumulation across handoffs).
+    CHECK(client->block_entity_count() == 1);
+    CHECK(client->entity_world()->size() == 1);
+
+    // Determinism: an identical second server produces an identical region B.
+    std::unique_ptr<engine::voxel::IVoxelWorld> server2 = make_flat_world();
+    CHECK(server2 != nullptr);
+    registerChest(*server2);
+    const int surface2 = helper_surface_y(*server2, 8, 8);
+    CHECK(surface2 == surface);
+    auto machineB2 = std::make_shared<CounterMachine>();
+    machineB2->counter_ = 7;
+    CHECK(settle(*server2, glm::vec3(40.0f, 200.0f, 40.0f),
+                 [&]() { return server2->is_chunk_loaded(2, 2); }));
+    server2->set_block(40, surface2 + 1, 40, kBlockStoneHandoff);
+    CHECK(server2->attach_block_entity(40, surface2 + 1, 40, machineB2, error));
+    auto entityWorld2 = server2->entity_world();
+    const engine::entity::EntityId holderB2 =
+        entityWorld2->spawn("project:inventory_holder",
+                            { static_cast<float>(41), static_cast<float>(surface2 + 1),
+                              static_cast<float>(41) },
+                            spawnError);
+    CHECK(holderB2.valid());
+    auto srv2 = engine::voxel::create_voxel_replication(*server2);
+    srv2->server_register_connection(kRepConnB);
+    srv2->server_set_snapshot_window(surface2 - 24, 48);
+    srv2->server_set_interest(kRepConnB, {{40, surface2, 40}, 0});
+    srv2->server_update();
+    engine::voxel::RegionReplicationSnapshot regionB2;
+    CHECK(srv2->server_pack_region(kRepConnB, regionB2, regionError));
+    // Bit-identical CONTENT across identical servers (per-connection sequence
+    // differs: this server only packed once; the first one packed region A
+    // first — the sequence is per-connection, the content is the unit).
+    // Bit-identical CONTENT across identical servers (per-connection sequence
+    // differs: this server only packed once; the first one packed region A
+    // first — the sequence is per-connection, the content is the unit).
+    for (auto& chunk : regionB.chunks) chunk.sequence = 0;
+    for (auto& chunk : regionB2.chunks) chunk.sequence = 0;
+    regionB.sequence = 0;
+    regionB2.sequence = 0;
+    CHECK(encode_replication_region(regionB2) == encode_replication_region(regionB));
+
+    std::cout << "[sdk] replication: region handoff (interest transfer, "
+                 "no ghosts, intersection untouched) OK\n";
 }
 
 // ---- FALTANTES item 11: mobs are IEntityWorld entities (the legacy Mob/
@@ -11420,6 +11851,8 @@ int main(int argc, char** argv) {
         test_light_block_emitter();
         test_light_chunk_boundary();
         test_light_determinism();
+        test_light_load_unload_during_propagation();
+        test_eviction_preserves_edits();
         test_fluid_registry();
         test_block_inline_fluid();
         test_fluid_generalized();
@@ -11463,6 +11896,7 @@ int main(int argc, char** argv) {
         test_navigation_local_update();
         test_navigation_local_update_world();
         test_navigation_dynamic_obstacle();
+        test_navigation_area_costs();
         test_replication_authority();
         test_replication_deltas_reorder();
         test_commit_replication_persistence();
@@ -11476,6 +11910,7 @@ int main(int argc, char** argv) {
         test_replication_codec();
         test_replication_multiclient();
         test_region_replication();
+        test_replication_region_handoff();
         test_mob_behavior();
         test_world_manager();
         test_noise_graph_determinism();

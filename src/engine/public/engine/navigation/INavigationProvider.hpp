@@ -45,6 +45,16 @@ struct NavmeshConfig {
     // require a full rebake. Tiles are linked by Detour at their shared
     // borders, so paths cross tiles transparently.
     float tileSize{ 0.0f };
+    // Slope cost (FALTANTES item 12 — "inclinação"): when slopeCostArea != 0,
+    // walkable spans whose local surface slope is in
+    // [slopeCostStartDegrees, agentMaxSlope) are tagged with slopeCostArea at
+    // bake time (heightfield level — the per-cell slope is exact, and
+    // rcBuildRegions keeps different areas separate), so the caller can cost
+    // steep terrain via set_area_cost (a ramp is traversable but expensive).
+    // Slopes >= agentMaxSlope remain rejected (RC_NULL_AREA). 0 = disabled
+    // (every walkable poly is the default walkable area — current behavior).
+    uint8_t slopeCostArea{ 0 };
+    float slopeCostStartDegrees{ 20.0f };
 };
 
 // One solid voxel column fed to the baker. The walkable surface is the TOP of
@@ -57,6 +67,13 @@ struct VoxelColumn {
     float solidMinY{ 0.0f };  // bottom of the solid span
     float solidMaxY{ 0.0f };  // top of the solid span (>= solidMinY)
     bool solid{ false };
+    // Surface cost area (FALTANTES item 12 — costs by material/danger): 0 =
+    // the default walkable area; 1..62 = a custom cost area whose traversal
+    // multiplier is set with set_area_cost. Columns of expensive/dangerous
+    // material (water, lava, gravel, etc.) are tagged by the caller and the
+    // baker preserves the area onto the produced polygons, so find_path
+    // prefers cheaper terrain.
+    uint8_t area{ 0 };
 };
 
 struct PathResult {
@@ -144,6 +161,21 @@ public:
     // id or in single-navmesh mode.
     virtual bool set_obstacle_active(uint64_t id, bool active,
                                      std::string& errorOut) = 0;
+
+    // Sets the traversal cost multiplier of a surface cost area (FALTANTES
+    // item 12 — costs by material/inclination/danger): find_path minimizes
+    // (path length * area cost), so an area with cost 3.0 is three times as
+    // expensive to cross and the query routes around it when a cheaper route
+    // exists. area 0 = the default walkable area; 1..62 = custom areas tagged
+    // on VoxelColumn::area / NavmeshConfig::slopeCostArea. The default cost
+    // of every area is 1.0. Refused for an out-of-range area or a
+    // negative/non-finite cost. Applies to subsequent find_path/is_walkable
+    // queries.
+    virtual bool set_area_cost(int area, float cost,
+                               std::string& errorOut) = 0;
+
+    // Current cost multiplier of a surface cost area (1.0 when never set).
+    virtual float area_cost(int area) const = 0;
 };
 
 // Recast + Detour-backed implementation (the only TU with Recast headers).

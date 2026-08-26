@@ -324,7 +324,7 @@ target_link_libraries(vc_build_options INTERFACE
     glm
     vk-bootstrap
     Vulkan::Vulkan
-    jolt
+    vulkan_jolt
     bullet
 )
 
@@ -406,6 +406,10 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/TimelineGraph.cpp
     src/engine/sdk/CausalResolver.cpp
     src/engine/sdk/MacroMicroReconciler.cpp
+    src/engine/sdk/WorldDirector.cpp
+    src/engine/sdk/EpisodeCompiler.cpp
+    src/engine/sdk/SimulationFarm.cpp
+    src/engine/sdk/SemanticApi.cpp
     src/engine/sdk/VehicleAsset.cpp
     src/engine/sdk/BeamGraphAsset.cpp
     src/engine/sdk/VehicleReplication.cpp
@@ -734,7 +738,7 @@ target_include_directories(VulkanEngineServer PRIVATE
 target_link_libraries(VulkanEngineServer PRIVATE
     vc_build_options
     vc_ozz vc_acl
-    glm jolt bullet
+    glm vulkan_jolt bullet
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1694,6 +1698,131 @@ target_include_directories(macro_micro_reconciler_tests PRIVATE
 target_link_libraries(macro_micro_reconciler_tests PRIVATE vc_build_options glm)
 add_test(NAME macro_micro_reconciler_tests COMMAND macro_micro_reconciler_tests)
 
+# Differential engine (META §32 / FALTANTES "diferenciais próprios"):
+# WorldDirector — event selection by RULES (data-driven gates: requiresAll /
+# excludesAny / cooldown / concurrency / daily limit), UTILITY (deterministic
+# scoring), COHERENCE (world-state tags) and DIVERSITY (recency penalty), all
+# bit-exact deterministic. Engine-own code. The contract compiles with public
+# SDK headers only; the gate drives it headless (the ability_system_tests
+# light pattern — RegistryJson + this TU; independent of the WorldManager WIP).
+add_executable(world_director_tests
+    tests/WorldDirectorTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/WorldDirector.cpp
+)
+target_include_directories(world_director_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(world_director_tests PRIVATE vc_build_options glm)
+add_test(NAME world_director_tests COMMAND world_director_tests)
+
+# Differential engine (META §32 / FALTANTES "diferenciais próprios"):
+# EpisodeCompiler — the deterministic, signed, all-or-nothing content
+# pipeline: VALIDATE, SIMULATE, TEST, COMPRESS, SIGN and PUBLISH authored
+# content into a self-describing package (kind-agnostic stage hooks; codec /
+# hasher seams default to identity + a deterministic content digest —
+# production wires Zstandard/BLAKE3). Engine-own code. The contract compiles
+# with public SDK headers only; the gate drives it headless (the
+# ability_system_tests light pattern — RegistryJson + this TU).
+add_executable(episode_compiler_tests
+    tests/EpisodeCompilerTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/EpisodeCompiler.cpp
+)
+target_include_directories(episode_compiler_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(episode_compiler_tests PRIVATE vc_build_options glm)
+add_test(NAME episode_compiler_tests COMMAND episode_compiler_tests)
+
+# Differential engine (META §32 / FALTANTES "diferenciais próprios"):
+# HeadlessSimulationFarm — run thousands of seeds/profiles headlessly to find
+# SOFTLOCKS (stalled progress) and REPETITION (state cycles), bit-exact
+# deterministic, with a progress-oracle seam and all-or-nothing refusals.
+# Composes EpisodeCompiler (compiled content driven headlessly in bulk).
+# Engine-own code. The contract compiles with public SDK headers only; the
+# gate drives it headless (the light pattern — this TU + EpisodeCompiler TU).
+add_executable(simulation_farm_tests
+    tests/SimulationFarmTests.cpp
+    src/engine/sdk/SimulationFarm.cpp
+    src/engine/sdk/EpisodeCompiler.cpp
+    src/engine/sdk/RegistryJson.cpp
+)
+target_include_directories(simulation_farm_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(simulation_farm_tests PRIVATE vc_build_options glm)
+add_test(NAME simulation_farm_tests COMMAND simulation_farm_tests)
+
+# Differential engine (META §32 / FALTANTES "diferenciais próprios"):
+# SemanticEngineAPI — ONE surface for C++, editor, scripting, CLI and MCP:
+# the deterministic kind-agnostic semantic core (schema per kind + all-or-
+# nothing validation + bit-exact canonicalization). Engine-own code. The
+# contract compiles with public SDK headers only; the gate drives it headless
+# and composes with EpisodeCompiler (canonical documents compile/verify).
+add_executable(semantic_api_tests
+    tests/SemanticApiTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/SemanticApi.cpp
+    src/engine/sdk/EpisodeCompiler.cpp
+)
+target_include_directories(semantic_api_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(semantic_api_tests PRIVATE vc_build_options glm)
+add_test(NAME semantic_api_tests COMMAND semantic_api_tests)
+
+# Integration gate for the differentials (META §32): the THREE content-
+# pipeline contracts chained end-to-end — SemanticEngineAPI canonicalizes
+# authored docs -> EpisodeCompiler compiles+verifies them as an episode ->
+# HeadlessSimulationFarm drives the COMPILED content headlessly and finds a
+# softlock in a stalling entry. Proves the differentials compose into ONE
+# deterministic pipeline (one surface, one pipeline, one detector).
+add_executable(semantic_episode_farm_tests
+    tests/SemanticEpisodeFarmTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/SemanticApi.cpp
+    src/engine/sdk/EpisodeCompiler.cpp
+    src/engine/sdk/SimulationFarm.cpp
+)
+target_include_directories(semantic_episode_farm_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(semantic_episode_farm_tests PRIVATE vc_build_options glm)
+add_test(NAME semantic_episode_farm_tests COMMAND semantic_episode_farm_tests)
+
+# Production-wiring gate for the EpisodeCompiler differential (#140): the
+# contract spec says the codec/hash SEAMS are production-wired through the
+# promoted Zstandard (engine/compression) and BLAKE3 (engine/hashing)
+# adapters. This light gate compiles the REAL provider TUs (the same ones
+# backing the persistent world save) and drives the pipeline through them:
+# zstd-shrunk payload, BLAKE3-256 signature, verify/unpack round-trip,
+# tamper detection, empty-episode boundary.
+add_executable(episode_compiler_zstd_blake3_tests
+    tests/EpisodeCompilerZstdBlake3Tests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/EpisodeCompiler.cpp
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:src/engine/core/compression/ZstdCompression.cpp>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:src/engine/core/hashing/Blake3Hash.cpp>
+)
+target_include_directories(episode_compiler_zstd_blake3_tests PRIVATE
+    src/engine/public
+    src
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:${VC_SOLUTIONS_DIR}/zstd/lib>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:${VC_SOLUTIONS_DIR}/blake3/c>
+)
+target_link_libraries(episode_compiler_zstd_blake3_tests PRIVATE
+    vc_build_options glm
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+)
+add_test(NAME episode_compiler_zstd_blake3_tests COMMAND episode_compiler_zstd_blake3_tests)
+
 # Multi-scale streaming (META §19 / FALTANTES §15 vision "streaming
 # multi-escala", Fase 5 checkbox): the world function streamed at several
 # scales around a focus — fine voxel detail near, coarser height-fields far —
@@ -2144,6 +2273,7 @@ add_executable(gait_planner_tests
     tests/GaitPlannerTests.cpp
     src/engine/sdk/GaitPlanner.cpp
     src/engine/sdk/MotionDatabase.cpp
+    src/engine/sdk/RegistryJson.cpp
 )
 target_compile_features(gait_planner_tests PRIVATE cxx_std_20)
 target_include_directories(gait_planner_tests PRIVATE
@@ -2172,6 +2302,7 @@ add_executable(procedural_legs_tests
     src/engine/sdk/ProceduralLegs.cpp
     src/engine/sdk/GaitPlanner.cpp
     src/engine/sdk/MotionDatabase.cpp
+    src/engine/sdk/RegistryJson.cpp
 )
 target_compile_features(procedural_legs_tests PRIVATE cxx_std_20)
 target_include_directories(procedural_legs_tests PRIVATE
@@ -2339,6 +2470,7 @@ add_executable(pose_warp_tests
     src/engine/sdk/GaitPlanner.cpp
     src/engine/sdk/FootPlacement.cpp
     src/engine/sdk/MotionDatabase.cpp
+    src/engine/sdk/RegistryJson.cpp
 )
 target_compile_features(pose_warp_tests PRIVATE cxx_std_20)
 target_include_directories(pose_warp_tests PRIVATE
@@ -2422,10 +2554,11 @@ if(TARGET vc_generate_world_save)
     add_dependencies(vc_sdk vc_generate_world_save)
 endif()
 
-# The engine's jolt target shares its OUTPUT_NAME with the Jolt target created
-# by Jolt.cmake; pin it so the installed archive name is deterministic on every
-# filesystem (the build already writes Jolt.lib via case-insensitive collision).
-set_target_properties(jolt PROPERTIES OUTPUT_NAME Jolt)
+# The engine's jolt target is named vulkan_jolt (its vcxproj must not collide
+# with the vendored Jolt target's third_party/Jolt.vcxproj — case-insensitive
+# slnx collision, MSB4025); OUTPUT_NAME stays Jolt so the installed archive
+# remains lib/Jolt.lib, deterministic on every filesystem.
+set_target_properties(vulkan_jolt PROPERTIES OUTPUT_NAME Jolt)
 
 # The vc_sdk archive links vc_sdk_public, which includes the storage TUs
 # (zstd/blake3/rocksdb/flatbuffers) unconditionally — it cannot be built when
@@ -2442,7 +2575,7 @@ foreach(vc_lib vc_zstd vc_blake3 vc_navigation vc_fastwfc vc_meshoptimizer vc_xa
         install(FILES "$<TARGET_FILE:${vc_lib}>" DESTINATION lib OPTIONAL)
     endif()
 endforeach()
-foreach(vc_lib flatbuffers rocksdb jolt bullet)
+foreach(vc_lib flatbuffers rocksdb vulkan_jolt bullet)
     if(TARGET ${vc_lib})
         install(FILES "$<TARGET_FILE:${vc_lib}>" DESTINATION lib OPTIONAL)
     endif()
@@ -2454,7 +2587,7 @@ install(DIRECTORY ${glm_SOURCE_DIR}/glm DESTINATION include)
 # Relocatable package config: every path resolves from this file's location, so
 # the staged prefix can move or be consumed from another checkout/machine.
 set(VULKAN_CRAFT_SDK_LINK_LIBS "")
-foreach(vc_lib vc_zstd vc_blake3 vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas flatbuffers rocksdb jolt bullet)
+foreach(vc_lib vc_zstd vc_blake3 vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas flatbuffers rocksdb vulkan_jolt bullet)
     if(TARGET ${vc_lib})
         get_target_property(_vc_on ${vc_lib} OUTPUT_NAME)
         if(NOT _vc_on)

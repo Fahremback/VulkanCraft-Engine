@@ -81,6 +81,51 @@ bool same_grid_column(const VoxelColumn& a, const VoxelColumn& b,
            a.solidMaxY == b.solidMaxY;
 }
 
+// Tags walkable spans whose local surface slope is >= slopeCostStartDegrees
+// with the slope cost area. The surface of a span is its top (chf span y, in
+// cell units); the slope to a neighbor is |dy|*ch/cs. Cells without a
+// walkable neighbor are skipped (ledges were already filtered). Regions of
+// different area types are never merged by rcBuildRegions, so the tagged
+// cells form their own cost regions that survive onto the poly mesh.
+void tag_slope_cost_spans(rcCompactHeightfield& chf, float cellSize,
+                          float cellHeight, float slopeCostStartDegrees,
+                          unsigned char slopeCostArea) {
+    const float cs = cellSize;
+    const float ch = cellHeight;
+    const float slopeLimit = std::tan(slopeCostStartDegrees * (RC_PI / 180.0f));
+    const int w = chf.width;
+    const int h = chf.height;
+    std::vector<unsigned char> toTag(chf.spanCount, 0);
+    for (int z = 0; z < h; ++z) {
+        for (int x = 0; x < w; ++x) {
+            const int ci = x + z * w;
+            if (chf.cells[ci].count == 0) continue;
+            const int si = chf.cells[ci].index;
+            const rcCompactSpan& span = chf.spans[si];
+            if (chf.areas[si] == RC_NULL_AREA) continue;
+            const float y = static_cast<float>(span.y) * ch;
+            float steepest = 0.0f;
+            for (int dir = 0; dir < 4; ++dir) {
+                const int nx = x + rcGetDirOffsetX(dir);
+                const int nz = z + rcGetDirOffsetY(dir);
+                if (nx < 0 || nx >= w || nz < 0 || nz >= h) continue;
+                const int nci = nx + nz * w;
+                if (chf.cells[nci].count == 0) continue;
+                const int nsi = chf.cells[nci].index;
+                if (chf.areas[nsi] == RC_NULL_AREA) continue;
+                const float dy =
+                    static_cast<float>(chf.spans[nsi].y) - span.y;
+                const float slope = std::fabs(dy * ch) / cs;
+                if (slope > steepest) steepest = slope;
+            }
+            if (steepest >= slopeLimit) toTag[si] = 1;
+        }
+    }
+    for (std::size_t i = 0; i < toTag.size(); ++i) {
+        if (toTag[i]) chf.areas[i] = slopeCostArea;
+    }
+}
+
 // Tile grid key (tile indices on the tiled navmesh).
 struct TileKey {
     int x{ 0 };
@@ -115,6 +160,8 @@ bool bake_navmesh_data(const NavmeshConfig& config,
                        std::vector<std::byte>& outData,
                        int outTileX, int outTileY,
                        std::string& errorOut) {
+    const bool tagSlopeCostHF = config.slopeCostArea != 0 &&
+                                config.slopeCostArea < 63;
     outData.clear();
     const float bmin[3] = { minX - borderCells * config.cellSize,
                             config.boundsMinY,
@@ -156,9 +203,16 @@ bool bake_navmesh_data(const NavmeshConfig& config,
         const int spanMax = world_to_cell(column.solidMaxY, bmin[1],
                                           config.cellHeight);
         if (spanMax <= spanMin) continue;
+        // Surface cost area: 0 (default) bakes as the standard walkable area
+        // (RC_WALKABLE_AREA); 1..62 are custom cost areas preserved onto the
+        // produced polygons so find_path can weight them (set_area_cost).
+        const unsigned char spanArea = (column.area == 0)
+                                           ? kWalkableArea
+                                           : static_cast<unsigned char>(
+                                                 std::min<int>(column.area, 62));
         if (rcAddSpan(&context, solid, x, z,
                       static_cast<unsigned short>(std::max(spanMin, 0)),
-                      static_cast<unsigned short>(spanMax), kWalkableArea,
+                      static_cast<unsigned short>(spanMax), spanArea,
                       1000)) {
             ++rasterized;
         }
@@ -186,6 +240,21 @@ bool bake_navmesh_data(const NavmeshConfig& config,
         errorOut = "navigation: rcErodeWalkableArea failed";
         return false;
     }
+
+    // Slope cost tagging at the heightfield level: spans whose local surface
+    // slope is in [slopeCostStartDegrees, agentMaxSlope) stay walkable but
+    // are tagged with the slope cost area (steep terrain is traversable yet
+    // expensive). The per-cell slope is exact here (unlike a post-hoc test on
+    // the simplified poly mesh, which contour simplification can flatten), and
+    // rcBuildRegions never merges regions of different area types, so the tag
+    // survives onto the produced polygons. Only active when
+    // NavmeshConfig::slopeCostArea is set (default 0 = off).
+    if (tagSlopeCostHF) {
+        tag_slope_cost_spans(chf, config.cellSize, config.cellHeight,
+                             config.slopeCostStartDegrees,
+                             static_cast<unsigned char>(config.slopeCostArea));
+    }
+
     if (!rcBuildDistanceField(&context, chf)) {
         errorOut = "navigation: rcBuildDistanceField failed";
         return false;
@@ -226,11 +295,13 @@ bool bake_navmesh_data(const NavmeshConfig& config,
         return true;
     }
 
-    // Slope rejection: this Recast build (new API) keeps no triangle list
-    // on the poly mesh, so decompose each polygon into a fan and test the
-    // face slope against agentMaxSlope; steeper polygons are marked
-    // RC_NULL_AREA (not walkable) so they never appear in queries.
-    const float walkableLimitY = std::cos(config.agentMaxSlope * (RC_PI / 180.0f));
+    // Slope rejection: this Recast build (new API) keeps no triangle list on
+    // the poly mesh, so decompose each polygon into a fan and test the face
+    // slope. Polygons steeper than agentMaxSlope are marked RC_NULL_AREA
+    // (not walkable). (The slope COST tagging happens earlier, at the
+    // heightfield level, where the per-cell slope is exact — see
+    // tag_slope_cost_spans above.)
+    const float maxSlopeLimitY = std::cos(config.agentMaxSlope * (RC_PI / 180.0f));
     for (int i = 0; i < mesh.npolys; ++i) {
         const unsigned short* p = &mesh.polys[i * mesh.nvp * 2];
         int nv = 0;
@@ -243,8 +314,8 @@ bool bake_navmesh_data(const NavmeshConfig& config,
         const float v0x = static_cast<float>(v0[0]);
         const float v0y = static_cast<float>(v0[1]);
         const float v0z = static_cast<float>(v0[2]);
-        bool steep = false;
-        for (int j = 1; j + 1 < nv && !steep; ++j) {
+        float maxSlopeRatio = 1.0f;  // cos(slope); 1 = flat, lower = steeper
+        for (int j = 1; j + 1 < nv; ++j) {
             const unsigned short* va = &mesh.verts[p[j] * 3];
             const unsigned short* vb = &mesh.verts[p[j + 1] * 3];
             // World-space edges: x/z scale by cs, y by ch.
@@ -261,9 +332,12 @@ bool bake_navmesh_data(const NavmeshConfig& config,
             if (len <= 0.0f) continue;
             // |ny|/len: faces are wound CCW viewed from above; taking the
             // absolute keeps the slope test correct for either winding.
-            if (std::fabs(ny) / len <= walkableLimitY) steep = true;
+            const float ratio = std::fabs(ny) / len;
+            if (ratio < maxSlopeRatio) maxSlopeRatio = ratio;
         }
-        if (steep) mesh.areas[i] = RC_NULL_AREA;
+        if (maxSlopeRatio <= maxSlopeLimitY) {
+            mesh.areas[i] = RC_NULL_AREA;  // steeper than agentMaxSlope
+        }
     }
 
     // Package the poly mesh into Detour tile data. Only walkable-area
@@ -271,7 +345,10 @@ bool bake_navmesh_data(const NavmeshConfig& config,
     // keep flag 0 and are excluded by the query filter.
     std::vector<unsigned short> polyFlags(mesh.npolys, 0);
     for (int i = 0; i < mesh.npolys; ++i) {
-        if (mesh.areas[i] == RC_WALKABLE_AREA) polyFlags[i] = kWalkFlag;
+        // Any non-NULL area is traversable: the default walkable area, the
+        // custom material/danger cost areas and the slope cost area all get
+        // the walk flag — the cost difference is applied by the query filter.
+        if (mesh.areas[i] != RC_NULL_AREA) polyFlags[i] = kWalkFlag;
     }
     dtNavMeshCreateParams params;
     std::memset(&params, 0, sizeof(params));
@@ -657,14 +734,13 @@ public:
         const float goal[3] = { goalX, goalY, goalZ };
         const float ext[3] = { config_.agentRadius * 4.0f, config_.agentHeight,
                                config_.agentRadius * 4.0f };
-        dtQueryFilter filter;  // default: includes all flags (0xffff)
 
         dtPolyRef startRef = 0, goalRef = 0;
         float startPt[3], goalPt[3];
-        if (dtStatusFailed(query_->findNearestPoly(start, ext, &filter, &startRef,
-                                                   startPt)) ||
-            dtStatusFailed(query_->findNearestPoly(goal, ext, &filter, &goalRef,
-                                                   goalPt))) {
+        if (dtStatusFailed(query_->findNearestPoly(start, ext, &queryFilter_,
+                                                   &startRef, startPt)) ||
+            dtStatusFailed(query_->findNearestPoly(goal, ext, &queryFilter_,
+                                                   &goalRef, goalPt))) {
             return false;
         }
         if (startRef == 0 || goalRef == 0) return false;
@@ -672,8 +748,8 @@ public:
         dtPolyRef path[2048];
         int pathCount = 0;
         const dtStatus pathStatus =
-            query_->findPath(startRef, goalRef, startPt, goalPt, &filter, path,
-                             &pathCount, config_.maxPolys);
+            query_->findPath(startRef, goalRef, startPt, goalPt, &queryFilter_,
+                             path, &pathCount, config_.maxPolys);
         if (dtStatusFailed(pathStatus) || (pathStatus & DT_PARTIAL_RESULT)) {
             // Partial result = the query could not reach the goal polygon
             // (e.g. an island cut off by maxClimb); report the goal as
@@ -720,14 +796,34 @@ public:
         const float pos[3] = { x, y, z };
         const float ext[3] = { config_.agentRadius * 2.0f, config_.agentHeight,
                                config_.agentRadius * 2.0f };
-        dtQueryFilter filter;
         dtPolyRef ref = 0;
         float nearest[3];
-        if (dtStatusFailed(query_->findNearestPoly(pos, ext, &filter, &ref,
+        if (dtStatusFailed(query_->findNearestPoly(pos, ext, &queryFilter_, &ref,
                                                    nearest))) {
             return false;
         }
         return ref != 0;
+    }
+
+    bool set_area_cost(int area, float cost,
+                       std::string& errorOut) override {
+        if (area < 0 || area >= DT_MAX_AREAS) {
+            errorOut = "navigation: area cost out of range (0.." +
+                       std::to_string(DT_MAX_AREAS - 1) + ")";
+            return false;
+        }
+        if (cost < 0.0f || !std::isfinite(cost)) {
+            errorOut = "navigation: area cost must be a finite non-negative value";
+            return false;
+        }
+        queryFilter_.setAreaCost(area, cost);
+        errorOut.clear();
+        return true;
+    }
+
+    float area_cost(int area) const override {
+        if (area < 0 || area >= DT_MAX_AREAS) return 1.0f;
+        return queryFilter_.getAreaCost(area);
     }
 
     uint64_t revision() const override { return revision_; }
@@ -923,6 +1019,10 @@ private:
     dtNavMeshQuery* query_{ nullptr };
     NavmeshConfig config_;
     uint64_t revision_{ 0 };
+    // Persistent query filter: carries the per-area traversal costs set with
+    // set_area_cost (dtQueryFilter default: include all flags, cost 1.0 for
+    // every area) across build/update and all find_path/is_walkable queries.
+    dtQueryFilter queryFilter_;
 
     // Tiled mode state.
     float tileSize_{ 0.0f };

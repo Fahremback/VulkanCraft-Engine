@@ -4,7 +4,8 @@
 // transfer is transactional (all-or-nothing: the source is only mutated after
 // the destination accepts the rebuild); portals are generic position mappings
 // between two world spaces. Pure composition of the public voxel/entity layers
-// — no backend of its own.#include "engine/world/IWorldManager.hpp"
+// — no backend of its own.
+#include "engine/world/IWorldManager.hpp"
 #include "engine/procgen/IWorldProfile.hpp"
 #include "RegistryJson.hpp"
 

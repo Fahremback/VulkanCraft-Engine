@@ -322,19 +322,35 @@ bool scenario_mesher_consumes_light() {
     const ChunkMeshResult dark = VoxelMesher::build(make_snapshot(true, 0, 3));
     // No light capture: legacy full-bright material color (brightness 1.0).
     const ChunkMeshResult unlit = VoxelMesher::build(make_snapshot(false, 0, 4));
-    CHECK(full.valid);
-    CHECK(half.valid);
-    CHECK(dark.valid);
-    CHECK(unlit.valid);
-    CHECK(!full.mesh.meshVertices.empty());
-    CHECK(!half.mesh.meshVertices.empty());
-    CHECK(!dark.mesh.meshVertices.empty());
-    CHECK(!unlit.mesh.meshVertices.empty());
 
-    const glm::vec4 fullColor = full.mesh.meshVertices.front().color;
-    const glm::vec4 halfColor = half.mesh.meshVertices.front().color;
-    const glm::vec4 darkColor = dark.mesh.meshVertices.front().color;
-    const glm::vec4 baseColor = unlit.mesh.meshVertices.front().color;
+    // Shading is per-face (the face samples the ADJACENT cell it exposes):
+    // sample the EAST face of the block at (8,130,8), whose neighbor
+    // (9,130,8) lies in the captured layer. The top/bottom faces sample
+    // missing layers (sky fallback) and are not used here.
+    const auto east_face_color = [](const ChunkMeshResult& result) {
+        glm::vec4 sum(0.0f);
+        int n = 0;
+        for (const VoxelVertex& v : result.mesh.meshVertices) {
+            // East face only (normal +X): its neighbor (9,130,8) lies in the
+            // captured layer; top/bottom faces sample missing layers (sky).
+            if (v.normal.x > 0.9f && v.position.x > 8.99f && v.position.x < 9.01f &&
+                v.position.y > 130.0f && v.position.y < 131.01f &&
+                v.position.z > 8.0f && v.position.z < 9.01f) {
+                sum += v.color;
+                ++n;
+            }
+        }
+        return std::make_pair(n, n > 0 ? sum / static_cast<float>(n)
+                                       : glm::vec4(0.0f));
+    };
+    const auto [nFull, fullColor] = east_face_color(full);
+    const auto [nHalf, halfColor] = east_face_color(half);
+    const auto [nDark, darkColor] = east_face_color(dark);
+    const auto [nUnlit, baseColor] = east_face_color(unlit);
+    CHECK(nFull > 0);
+    CHECK(nHalf > 0);
+    CHECK(nDark > 0);
+    CHECK(nUnlit > 0);
 
     // light=15 == the unlit material color exactly (and alpha untouched).
     for (int c = 0; c < 3; ++c) {
@@ -349,16 +365,18 @@ bool scenario_mesher_consumes_light() {
     CHECK(fullColor.r > halfColor.r);
     CHECK(halfColor.r > darkColor.r);
 
-    // Sky fallback for cells with no occupied layer (open air above the
+    // Sky fallback for cells with NO occupied layer (open air above the
     // surface): the accessor uses the column's occlusion height.
-    const ChunkSnapshot& skySnapshot = make_snapshot(true, 0, 5);
-    CHECK(skySnapshot.light(8, 131, 8) == 0);  // layer 131 missing, no sky data
-    auto skyVisible = skySnapshot;
-    skyVisible.skyOcclusionTop[8 * CHUNK_SIZE_X + 8] = 130;
-    CHECK(skyVisible.light(8, 131, 8) == 15);  // above the occluding column
-    auto skyBlocked = skyVisible;
-    skyBlocked.skyOcclusionTop[8 * CHUNK_SIZE_X + 8] = 255;
-    CHECK(skyBlocked.light(8, 131, 8) == 0);  // column occluded above the cell
+    auto skyProbe = make_snapshot(true, 0, 5);
+    skyProbe.skyOcclusionTop.fill(255);  // fully occluded: no sky anywhere
+    CHECK(skyProbe.light(8, 131, 8) == 0);
+    skyProbe.skyOcclusionTop[8 * CHUNK_SIZE_X + 8] = 130;
+    CHECK(skyProbe.light(8, 131, 8) == 15);  // above the occluding column
+    skyProbe.skyOcclusionTop[8 * CHUNK_SIZE_X + 8] = 255;
+    CHECK(skyProbe.light(8, 131, 8) == 0);
+    // A layer that EXISTS returns its captured value regardless of sky.
+    auto layerProbe = make_snapshot(true, 7, 6);
+    CHECK(layerProbe.light(8, 130, 8) == 7);
 
     std::cout << "[test] mesher shades vertex colors by block light ("
               << fullColor.r << " > " << halfColor.r << " > " << darkColor.r
@@ -377,18 +395,23 @@ bool scenario_mesher_light_capture() {
 
     // Underground (below the terrain occlusion line, so sky light = 0): an
     // air tunnel along +x inside chunk (0,0). Glowstone emits 15 by default
-    // (builtin light table); stone probes border the tunnel.
+    // (builtin light table). The two stone probes border the tunnel with
+    // faces looking INTO it: near (10,y,8) faces air at light 14, far (0,y,8)
+    // faces air at light 8 — an opaque block has no drawn face against
+    // another opaque block, so each probe has exactly one drawn face.
     const RuntimeBlockId airId = kRuntimeAirId;
     const RuntimeBlockId stoneId = runtime_id(BlockType::Stone);
     const RuntimeBlockId emitterId = runtime_id(BlockType::Glowstone);
     const int y = 40;
     const glm::vec3 emitter(8.0f, static_cast<float>(y), 8.0f);
-    const glm::vec3 nearBlock(9.0f, static_cast<float>(y), 8.0f);
+    const glm::vec3 nearBlock(10.0f, static_cast<float>(y), 8.0f);
     const glm::vec3 farBlock(0.0f, static_cast<float>(y), 8.0f);
-    for (int x = 2; x <= 7; ++x) {
+    for (int x = 1; x <= 7; ++x) {
         test.world.set_block_at(
             glm::vec3(static_cast<float>(x), static_cast<float>(y), 8.0f), airId);
     }
+    test.world.set_block_at(
+        glm::vec3(9.0f, static_cast<float>(y), 8.0f), airId);
     test.world.set_block_at(emitter, emitterId);
     test.world.set_block_at(nearBlock, stoneId);
     test.world.set_block_at(farBlock, stoneId);
@@ -401,10 +424,6 @@ bool scenario_mesher_light_capture() {
         const uint8_t far = test.world.get_block_light(farAir);
         return test.world.get_block_light(emitter) == 15 && far >= 8 && far <= 10;
     });
-    std::cout << "[dbg] light emitter="
-              << static_cast<int>(test.world.get_block_light(emitter))
-              << " farAir=" << static_cast<int>(test.world.get_block_light(farAir))
-              << " lit=" << lit << "\n";
     CHECK(lit);
 
     // Meshing runs one frame BEFORE the light pass in update(), so the last

@@ -210,7 +210,7 @@ const WORLD_PROFILE_CLIMATE_AXES = ["temperature", "moisture", "continentalness"
 // a world profile without reading the engine source.
 export const WORLD_PROFILE_FIELD_SCHEMAS = Object.freeze({
   world_profile: [
-    { name: "name", type: "string", required: true, description: "profile name (becomes the file name)" },
+    { name: "name", type: "string", required: false, description: "asset file name (e.g. my_world); carried by the file name, NOT a document property" },
     { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
     { name: "height", type: "object", required: false, description: "2D height field: a noise graph JSON document" },
     { name: "baseHeight", type: "integer", required: false, default: 0, description: "height = baseHeight + round(h * amplitude); only read when 'height' is present" },
@@ -222,6 +222,106 @@ export const WORLD_PROFILE_FIELD_SCHEMAS = Object.freeze({
     { name: "carver", type: "object", required: false, description: "carver JSON document" },
     { name: "decorators", type: "object", required: false, description: "decorator set JSON document" },
     { name: "structures", type: "object", required: false, description: "structure placement document (definitions + spawn rules)" }
+  ]
+});
+
+// MCP authors a gait asset (FALTANTES item 23 "animações"): a data-driven
+// creature locomotion asset — cycle timing, per-leg phase offsets and the
+// hip-anchored two-bone leg chains — that the public C++ contract parses via
+// GaitAsset::load_from_json (src/engine/sdk/GaitPlanner.cpp, bit-exact %.9g
+// round-trip, all-or-nothing). The planner (IContactPlanner) consumes the
+// asset to map body state + gait clock to per-foot targets. File:
+// Content/Animations/<name>.json.
+export const GAIT_KINDS = Object.freeze(["gait"]);
+
+// Compact field contracts surfaced by game_capabilities so an agent can author
+// a gait without reading the engine source. Single source for the exported
+// JSON Schema (buildGaitJsonSchema) and the author tool.
+export const GAIT_FIELD_SCHEMAS = Object.freeze({
+  gait: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name); must be non-empty" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "cycleDuration", type: "number", required: false, default: 1.0, description: "duration of one full stride cycle (s), > 0" },
+    { name: "stanceFraction", type: "number", required: false, default: 0.6, description: "stance fraction of the cycle; the rest is swing, in (0, 1)" },
+    { name: "stepHeight", type: "number", required: false, default: 0.25, description: "vertical foot lift during swing, >= 0" },
+    { name: "maxStride", type: "number", required: false, default: 0.5, description: "max horizontal stride per step, > 0" },
+    { name: "legPhases", type: "array[number]", required: false, default: [], description: "per-leg phase offset (fraction of the cycle) in [0, 1); size must equal legs" },
+    { name: "legs", type: "array[object]", required: true, description: "leg chains (one per leg): [{ name (non-empty), hipOffset: [x,y,z], upperLength > 0, lowerLength > 0, restOffset: [x,y,z], maxReach >= 0 (0 = auto upper+lower), hipBone/kneeBone/footBone (>= 0 binds; -1 = unbound; distinct when set) }]" }
+  ]
+});
+
+// MCP authors a simulation LOD spec (FALTANTES §20 — the AGENT-4 Item 20
+// contract, findings #123-sim-lod): the data-driven budget that maps region
+// RELEVANCE to simulation tiers (Full/Coarse/Aggregate/Sleeping) plus the
+// world clock and region grid. The public C++ factory parses it via
+// SimulationLodSpec::load_from_json (src/engine/sdk/SimulationLod.cpp,
+// bit-exact %.9g round-trip, all-or-nothing) and the pure ISimulationLod
+// runtime consumes it. File: Content/SimulationLod/<name>.json.
+export const SIMULATION_LOD_KINDS = Object.freeze(["simulation_lod"]);
+const SIMULATION_LOD_MODES = new Set(["full", "coarse", "aggregate", "sleeping"]);
+
+// Compact field contracts surfaced by game_capabilities so an agent can author
+// a simulation LOD spec without reading the engine source. Single source for
+// the exported JSON Schema (buildSimulationLodJsonSchema) and the author tool.
+export const SIMULATION_LOD_FIELD_SCHEMAS = Object.freeze({
+  simulation_lod: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "cellSize", type: "number", required: false, default: 16.0, description: "region cell size in world units, > 0" },
+    { name: "fullRadius", type: "number", required: false, default: 48.0, description: "distance within which relevance == 1, >= 0" },
+    { name: "falloffRadius", type: "number", required: false, default: 320.0, description: "distance at which relevance == 0, > fullRadius" },
+    { name: "dayLengthSeconds", type: "number", required: false, default: 240.0, description: "length of a world day (s), > 0" },
+    { name: "daysPerSeason", type: "integer", required: false, default: 30, description: ">= 1 (4 seasons)" },
+    { name: "tiers", type: "array[object]", required: true, description: "simulation budget tiers, non-empty, sorted by minRelevance DESCENDING: [{ name (unique), mode: full|coarse|aggregate|sleeping, minRelevance in [0, 1] (strictly descending), updateInterval >= 0 (s between ticks; 0 = every update), sleepAfterIdle >= 0, maxRegions >= 0 (0 = unlimited), aggregateInterval >= 0 }]" }
+  ]
+});
+
+// Prefab assets (FALTANTES item 23 — "cenas, entidades, componentes e
+// prefabs"): a prefab is a REUSABLE entity set extracted from a scene — a
+// scene-shaped document with the component payload preserved and entity ids
+// stripped (they are regenerated on instantiation). The MCP authors it from an
+// existing scene (create_prefab) and instantiates it into a target scene
+// (instantiate_prefab) with fresh UUIDs and internal Hierarchy.parent_id
+// remapping. File: Content/Prefabs/<name>.prefab.
+export const PREFAB_KINDS = Object.freeze(["prefab"]);
+
+// Compact field contracts surfaced by game_capabilities so an agent can author
+// a prefab without reading the engine source. Single source for the exported
+// JSON Schema (buildPrefabJsonSchema) and the author tool.
+export const PREFAB_FIELD_SCHEMAS = Object.freeze({
+  prefab: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "entities", type: "array[object]", required: true, description: "reusable entity set extracted from a scene: each entry is an entity document WITHOUT its id (regenerated on instantiate) — { name, Transform, ...components }" },
+    { name: "root_entity", type: "string", required: false, description: "name of the prefab root entity (instantiation origin when offset is applied)" },
+    { name: "source_scene", type: "string", required: false, description: "scene the prefab was extracted from (informational)" },
+    { name: "source_entity_ids", type: "array[string]", required: false, description: "entity UUIDs the prefab was extracted from (informational)" }
+  ]
+});
+
+// Particle emitter assets (FALTANTES item 23 — "Configurar física, partículas,
+// áudio e navegação"): a REUSABLE particle emitter configuration. The emitter
+// fields are EXACTLY the public ParticleEmitter component schema (single
+// source of truth — derived from COMPONENT_SCHEMAS, no duplication); the MCP
+// validates the fields and apply_particle_asset writes them into an entity's
+// ParticleEmitter component. File: Content/Particles/<name>.particle.
+export const PARTICLE_KINDS = Object.freeze(["particle"]);
+
+// Compact field contracts surfaced by game_capabilities so an agent can author
+// a particle asset without reading the engine source. Single source for the
+// exported JSON Schema (buildParticleJsonSchema) and the author tool — the
+// emitter fields come straight from COMPONENT_SCHEMAS.ParticleEmitter.
+export const PARTICLE_FIELD_SCHEMAS = Object.freeze({
+  particle: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    ...Object.entries(COMPONENT_SCHEMAS.ParticleEmitter).map(([field, defaultValue]) => ({
+      name: field,
+      type: typeof defaultValue === "boolean" ? "boolean" : "number",
+      required: false,
+      default: defaultValue,
+      description: `ParticleEmitter.${field} (component schema default ${JSON.stringify(defaultValue)})`
+    }))
   ]
 });
 
@@ -647,6 +747,146 @@ export function buildWorldProfileJsonSchema(kind) {
   };
 }
 
+export function buildGaitJsonSchema(kind) {
+  const fields = GAIT_FIELD_SCHEMAS[kind];
+  if (!fields) throw new Error(`unsupported gait kind '${kind}'`);
+  const properties = {};
+  const required = [];
+  for (const field of fields) {
+    let schema = { description: field.description ?? `\"${field.name}\" gait field` };
+    if (field.default !== undefined) schema.default = field.default;
+    switch (field.type) {
+      case "string": schema.type = "string"; break;
+      case "boolean": schema.type = "boolean"; break;
+      case "number": schema.type = "number"; break;
+      case "integer": schema.type = "integer"; break;
+      case "enum": schema.enum = [...field.values]; break;
+      case "object": schema.type = "object"; break;
+      case "array": schema.type = "array"; break;
+      case "array[object]": schema.type = "array"; schema.items = { type: "object" }; break;
+      case "array[number]": schema.type = "array"; schema.items = { type: "number" }; break;
+      case "array[string]": schema.type = "array"; schema.items = { type: "string" }; break;
+      default: throw new Error(`unknown gait field type '${field.type}' in ${kind} schema`);
+    }
+    properties[field.name] = schema;
+    if (field.required) required.push(field.name);
+  }
+  return {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    $id: `https://vulkancraft.engine/schema/animations/${kind}.json`,
+    title: `${kind} animation asset`,
+    type: "object",
+    additionalProperties: true,
+    properties,
+    ...(required.length > 0 ? { required } : {})
+  };
+}
+
+export function buildSimulationLodJsonSchema(kind) {
+  const fields = SIMULATION_LOD_FIELD_SCHEMAS[kind];
+  if (!fields) throw new Error(`unsupported simulation lod kind '${kind}'`);
+  const properties = {};
+  const required = [];
+  for (const field of fields) {
+    let schema = { description: field.description ?? `\"${field.name}\" simulation lod field` };
+    if (field.default !== undefined) schema.default = field.default;
+    switch (field.type) {
+      case "string": schema.type = "string"; break;
+      case "boolean": schema.type = "boolean"; break;
+      case "number": schema.type = "number"; break;
+      case "integer": schema.type = "integer"; break;
+      case "enum": schema.enum = [...field.values]; break;
+      case "object": schema.type = "object"; break;
+      case "array": schema.type = "array"; break;
+      case "array[object]": schema.type = "array"; schema.items = { type: "object" }; break;
+      case "array[number]": schema.type = "array"; schema.items = { type: "number" }; break;
+      case "array[string]": schema.type = "array"; schema.items = { type: "string" }; break;
+      default: throw new Error(`unknown simulation lod field type '${field.type}' in ${kind} schema`);
+    }
+    properties[field.name] = schema;
+    if (field.required) required.push(field.name);
+  }
+  return {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    $id: `https://vulkancraft.engine/schema/simulation/${kind}.json`,
+    title: `${kind} simulation LOD spec`,
+    type: "object",
+    additionalProperties: true,
+    properties,
+    ...(required.length > 0 ? { required } : {})
+  };
+}
+
+export function buildPrefabJsonSchema(kind) {
+  const fields = PREFAB_FIELD_SCHEMAS[kind];
+  if (!fields) throw new Error(`unsupported prefab kind '${kind}'`);
+  const properties = {};
+  const required = [];
+  for (const field of fields) {
+    let schema = { description: field.description ?? `\"${field.name}\" prefab field` };
+    if (field.default !== undefined) schema.default = field.default;
+    switch (field.type) {
+      case "string": schema.type = "string"; break;
+      case "boolean": schema.type = "boolean"; break;
+      case "number": schema.type = "number"; break;
+      case "integer": schema.type = "integer"; break;
+      case "enum": schema.enum = [...field.values]; break;
+      case "object": schema.type = "object"; break;
+      case "array": schema.type = "array"; break;
+      case "array[object]": schema.type = "array"; schema.items = { type: "object" }; break;
+      case "array[number]": schema.type = "array"; schema.items = { type: "number" }; break;
+      case "array[string]": schema.type = "array"; schema.items = { type: "string" }; break;
+      default: throw new Error(`unknown prefab field type '${field.type}' in ${kind} schema`);
+    }
+    properties[field.name] = schema;
+    if (field.required) required.push(field.name);
+  }
+  return {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    $id: `https://vulkancraft.engine/schema/scene/${kind}.json`,
+    title: `${kind} reusable entity set`,
+    type: "object",
+    additionalProperties: true,
+    properties,
+    ...(required.length > 0 ? { required } : {})
+  };
+}
+
+export function buildParticleJsonSchema(kind) {
+  const fields = PARTICLE_FIELD_SCHEMAS[kind];
+  if (!fields) throw new Error(`unsupported particle kind '${kind}'`);
+  const properties = {};
+  const required = [];
+  for (const field of fields) {
+    let schema = { description: field.description ?? `\"${field.name}\" particle field` };
+    if (field.default !== undefined) schema.default = field.default;
+    switch (field.type) {
+      case "string": schema.type = "string"; break;
+      case "boolean": schema.type = "boolean"; break;
+      case "number": schema.type = "number"; break;
+      case "integer": schema.type = "integer"; break;
+      case "enum": schema.enum = [...field.values]; break;
+      case "object": schema.type = "object"; break;
+      case "array": schema.type = "array"; break;
+      case "array[object]": schema.type = "array"; schema.items = { type: "object" }; break;
+      case "array[number]": schema.type = "array"; schema.items = { type: "number" }; break;
+      case "array[string]": schema.type = "array"; schema.items = { type: "string" }; break;
+      default: throw new Error(`unknown particle field type '${field.type}' in ${kind} schema`);
+    }
+    properties[field.name] = schema;
+    if (field.required) required.push(field.name);
+  }
+  return {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    $id: `https://vulkancraft.engine/schema/scene/${kind}.json`,
+    title: `${kind} particle emitter asset`,
+    type: "object",
+    additionalProperties: true,
+    properties,
+    ...(required.length > 0 ? { required } : {})
+  };
+}
+
 const PROJECT_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const PROFILE_NAMES = new Set(["Debug", "Development", "Shipping", "Server", "Editor"]);
 const PLATFORM_NAMES = new Set(["windows-x64", "linux-x64", "macos-universal", "dedicated-server"]);
@@ -712,7 +952,11 @@ function projectPaths(engineRoot, projectName) {
     vehicles: path.join(root, "Content", "Vehicles"),
     abilities: path.join(root, "Content", "Abilities"),
     missions: path.join(root, "Content", "Missions"),
-    profiles: path.join(root, "Content", "Profiles")
+    profiles: path.join(root, "Content", "Profiles"),
+    animations: path.join(root, "Content", "Animations"),
+    simulationLod: path.join(root, "Content", "SimulationLod"),
+    prefabs: path.join(root, "Content", "Prefabs"),
+    particles: path.join(root, "Content", "Particles")
   };
 }
 
@@ -798,7 +1042,17 @@ function capabilityDocument() {
       "author mission assets (data-driven missions: reach/collect/kill/interact objectives, dialogue graph with condition-gated choices, unlock conditions, rewards)",
       "inspect mission assets", "dry-run mission asset updates",
       "author world profiles (ONE JSON composing height/climate/biomes/caves/ores/carver/decorators/structures into the world generator — IWorldProfile)",
-      "inspect world profiles", "dry-run world profile updates"
+      "inspect world profiles", "dry-run world profile updates",
+      "author gait assets (data-driven creature locomotion: cycle timing + per-leg phase offsets + hip-anchored two-bone leg chains — IContactPlanner/GaitAsset)",
+      "inspect gait assets", "dry-run gait asset updates",
+      "author simulation LOD specs (data-driven region simulation budgets: tiers Full/Coarse/Aggregate/Sleeping by relevance + world clock + region grid — ISimulationLod)",
+      "inspect simulation LOD specs", "dry-run simulation LOD spec updates",
+      "author prefabs (reusable entity sets extracted from scenes — entity ids stripped, internal Hierarchy links remapped to entity names; Content/Prefabs/<name>.prefab)",
+      "instantiate prefabs (insert into a target scene with fresh UUIDs, internal Hierarchy remapped, optional offset/parent)",
+      "inspect prefabs",
+      "author particle assets (reusable emitter configurations — fields exactly the public ParticleEmitter component schema; Content/Particles/<name>.particle)",
+      "apply particle assets (write an asset into an entity's ParticleEmitter component through the scene component validation)",
+      "inspect particle assets"
     ],
     components: COMPONENT_SCHEMAS,
     light_types: { Directional: 0, Point: 1, Spot: 2, Area: 3 },
@@ -877,6 +1131,72 @@ function capabilityDocument() {
       note: "The MCP validates the TOP-LEVEL structure (version, section types, amplitude >= 0, finite scale/offset); every present section is validated all-or-nothing by its OWN subsystem parser when the C++ factory loads the document (create_world_profile_from_json, src/engine/sdk/WorldProfile.cpp) — the MCP never re-implements the subsystem parsers.",
       dry_run: "author_world_profile_asset accepts dry_run: true to validate and preview the document/diff without writing.",
       rollback: "Updates return the previous document; re-authoring it with update: true restores the prior state."
+    },
+    // Gait assets (FALTANTES item 23 "animações"): a data-driven creature
+    // locomotion asset (cycle timing + per-leg phase offsets + hip-anchored
+    // two-bone leg chains) under Content/Animations/<name>.json.
+    gait_asset_kinds: GAIT_KINDS.map((kind) => ({
+      kind,
+      file: `Content/Animations/<name>.json`,
+      fields: GAIT_FIELD_SCHEMAS[kind]
+    })),
+    gait_schemas: Object.fromEntries(
+      GAIT_KINDS.map((kind) => [kind, buildGaitJsonSchema(kind)])
+    ),
+    gait_validation: {
+      note: "Each document mirrors exactly the versioned JSON the public C++ factory parses (GaitAsset::load_from_json / LegChainAsset::load_from_json, implemented by src/engine/sdk/GaitPlanner.cpp — bit-exact %.9g round-trip, all-or-nothing); the MCP validates structure only — the runtime validates the same document again on load.",
+      dry_run: "author_gait_asset accepts dry_run: true to validate and preview the document/diff without writing.",
+      rollback: "Updates return the previous document; re-authoring it with update: true restores the prior state."
+    },
+    // Simulation LOD specs (FALTANTES §20 — SimulationLodSpec, the AGENT-4
+    // Item 20 contract): region simulation budgets by relevance under
+    // Content/SimulationLod/<name>.json.
+    simulation_lod_asset_kinds: SIMULATION_LOD_KINDS.map((kind) => ({
+      kind,
+      file: `Content/SimulationLod/<name>.json`,
+      fields: SIMULATION_LOD_FIELD_SCHEMAS[kind],
+      tier_modes: [...SIMULATION_LOD_MODES]
+    })),
+    simulation_lod_schemas: Object.fromEntries(
+      SIMULATION_LOD_KINDS.map((kind) => [kind, buildSimulationLodJsonSchema(kind)])
+    ),
+    simulation_lod_validation: {
+      note: "Each document mirrors exactly the versioned JSON the public C++ factory parses (SimulationLodSpec::load_from_json, implemented by src/engine/sdk/SimulationLod.cpp — bit-exact %.9g round-trip, all-or-nothing); the MCP validates structure only — the runtime validates the same document again on load.",
+      dry_run: "author_simulation_lod_spec accepts dry_run: true to validate and preview the document/diff without writing.",
+      rollback: "Updates return the previous document; re-authoring it with update: true restores the prior state."
+    },
+    // Prefabs (FALTANTES item 23 — "cenas, entidades, componentes e
+    // prefabs"): reusable entity sets extracted from scenes under
+    // Content/Prefabs/<name>.prefab; instantiated into target scenes with
+    // fresh UUIDs (internal Hierarchy.parent_id remapped).
+    prefab_asset_kinds: PREFAB_KINDS.map((kind) => ({
+      kind,
+      file: `Content/Prefabs/<name>.prefab`,
+      fields: PREFAB_FIELD_SCHEMAS[kind]
+    })),
+    prefab_schemas: Object.fromEntries(
+      PREFAB_KINDS.map((kind) => [kind, buildPrefabJsonSchema(kind)])
+    ),
+    prefab_validation: {
+      note: "A prefab is a scene-shaped document with entity ids STRIPPED (they are regenerated on instantiation). create_prefab extracts entity documents from an existing scene preserving every component; instantiate_prefab inserts them into a target scene with fresh UUIDs and remaps internal Hierarchy.parent_id links (links to entities outside the prefab are preserved — the target scene must provide them).",
+      dry_run: "create_prefab accepts dry_run: true to preview the extracted document without writing.",
+      rollback: "create_prefab with update: true replaces the asset and returns the previous document for rollback; instantiate_prefab is append-only (never rewrites existing entities)."
+    },
+    // Particle emitter assets (FALTANTES item 23 — partículas): reusable
+    // emitter configurations under Content/Particles/<name>.particle, applied
+    // to an entity's ParticleEmitter component via apply_particle_asset.
+    particle_asset_kinds: PARTICLE_KINDS.map((kind) => ({
+      kind,
+      file: `Content/Particles/<name>.particle`,
+      fields: PARTICLE_FIELD_SCHEMAS[kind]
+    })),
+    particle_schemas: Object.fromEntries(
+      PARTICLE_KINDS.map((kind) => [kind, buildParticleJsonSchema(kind)])
+    ),
+    particle_validation: {
+      note: "A particle asset is EXACTLY the public ParticleEmitter component schema (derived from COMPONENT_SCHEMAS.ParticleEmitter — single source of truth, no duplication) plus name/version. create_particle_asset validates every emitter field (type + finite); apply_particle_asset writes the asset into an entity's ParticleEmitter component through the same component validation the scene uses.",
+      dry_run: "create_particle_asset accepts dry_run: true to preview the document without writing.",
+      rollback: "create_particle_asset with update: true replaces the asset and returns the previous document for rollback."
     },
     // Full JSON Schema (draft-07) per registry kind (FALTANTES item 10): the
     // editor/IDE, scripting and CI validate or auto-complete assets against
@@ -1483,6 +1803,164 @@ export function semanticToolDefinitions() {
       }
     },
     {
+      name: "author_gait_asset",
+      description: "Author a data-driven gait asset (FALTANTES item 23 — animações) as a versioned JSON document in Content/Animations/, mirroring exactly the public C++ gait JSON schema (GaitAsset::load_from_json, IContactPlanner — creature locomotion: cycle timing + per-leg phase offsets + hip-anchored two-bone leg chains). Validates structure against the public contract (name non-empty, cycleDuration > 0, stanceFraction in (0, 1), stepHeight >= 0, maxStride > 0, legs non-empty with distinct bone indices when set, legPhases in [0, 1) sized to legs); dry_run previews the document/diff without writing; update replaces an existing asset and returns the previous document for rollback.",
+      inputSchema: {
+        type: "object",
+        required: ["project", "name"],
+        properties: {
+          project: { type: "string" },
+          name: { type: "string", minLength: 1, description: "gait name (becomes the file name)" },
+          dry_run: { type: "boolean", default: false },
+          update: { type: "boolean", default: false },
+          version: { type: "integer", default: 1 },
+          cycleDuration: { type: "number", default: 1.0, description: "> 0" },
+          stanceFraction: { type: "number", default: 0.6, description: "in (0, 1)" },
+          stepHeight: { type: "number", default: 0.25, description: ">= 0" },
+          maxStride: { type: "number", default: 0.5, description: "> 0" },
+          legPhases: { type: "array", items: { type: "number" }, description: "in [0, 1); size must equal legs" },
+          legs: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["name"],
+              properties: {
+                name: { type: "string", minLength: 1 },
+                hipOffset: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
+                upperLength: { type: "number", description: "> 0" },
+                lowerLength: { type: "number", description: "> 0" },
+                restOffset: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
+                maxReach: { type: "number", description: ">= 0; 0 = auto (upper + lower)" },
+                hipBone: { type: "integer", description: "-1 = unbound" },
+                kneeBone: { type: "integer", description: "-1 = unbound" },
+                footBone: { type: "integer", description: "-1 = unbound" }
+              },
+              additionalProperties: false
+            }
+          }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_gait_assets",
+      description: "List and validate every gait asset under Content/Animations for a project (structural diagnostics mirroring GaitAsset::load_from_json).",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "author_simulation_lod_spec",
+      description: "Author a data-driven simulation LOD spec (FALTANTES §20) as a versioned JSON document in Content/SimulationLod/, mirroring exactly the public C++ simulation LOD JSON schema (SimulationLodSpec::load_from_json, ISimulationLod — region simulation budgets: tiers Full/Coarse/Aggregate/Sleeping selected by relevance, world clock + region grid). Validates structure against the public contract (version 1, cellSize > 0, fullRadius >= 0, falloffRadius > fullRadius, dayLengthSeconds > 0, daysPerSeason >= 1, tiers non-empty with unique names, strictly descending minRelevance in [0, 1], finite non-negative intervals/budgets); dry_run previews the document/diff without writing; update replaces an existing asset and returns the previous document for rollback.",
+      inputSchema: {
+        type: "object",
+        required: ["project", "name"],
+        properties: {
+          project: { type: "string" },
+          name: { type: "string", minLength: 1, description: "spec name (becomes the file name)" },
+          dry_run: { type: "boolean", default: false },
+          update: { type: "boolean", default: false },
+          version: { type: "integer", default: 1 },
+          cellSize: { type: "number", default: 16.0, description: "> 0" },
+          fullRadius: { type: "number", default: 48.0, description: ">= 0" },
+          falloffRadius: { type: "number", default: 320.0, description: "> fullRadius" },
+          dayLengthSeconds: { type: "number", default: 240.0, description: "> 0" },
+          daysPerSeason: { type: "integer", default: 30, description: ">= 1" },
+          tiers: {
+            type: "array",
+            minItems: 1,
+            items: {
+              type: "object",
+              required: ["name", "mode"],
+              properties: {
+                name: { type: "string", minLength: 1, description: "unique tier name" },
+                mode: { type: "string", enum: [...SIMULATION_LOD_MODES] },
+                minRelevance: { type: "number", description: "in [0, 1]; tiers must be sorted strictly descending" },
+                updateInterval: { type: "number", default: 0, description: ">= 0" },
+                sleepAfterIdle: { type: "number", default: 0, description: ">= 0" },
+                maxRegions: { type: "integer", default: 0, description: ">= 0; 0 = unlimited" },
+                aggregateInterval: { type: "number", default: 0, description: ">= 0" }
+              },
+              additionalProperties: false
+            }
+          }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_simulation_lod_specs",
+      description: "List and validate every simulation LOD spec under Content/SimulationLod for a project (structural diagnostics mirroring SimulationLodSpec::load_from_json).",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "create_prefab",
+      description: "Extract a reusable entity set (prefab) from an existing scene into Content/Prefabs/<name>.prefab — the entity documents are preserved with every component but their ids are STRIPPED (regenerated on instantiation). Entity ids not found in the scene are refused (all-or-nothing: nothing written). dry_run previews the extracted document without writing; update replaces the asset and returns the previous document for rollback.",
+      inputSchema: {
+        type: "object", required: ["project", "scene", "name", "entity_ids"],
+        properties: {
+          project: { type: "string" }, scene: { type: "string" }, name: { type: "string" },
+          entity_ids: { type: "array", items: { type: "string", format: "uuid" } },
+          root_entity: { type: "string", description: "name of the prefab root (instantiation origin when an offset is applied)" },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "instantiate_prefab",
+      description: "Insert a prefab (Content/Prefabs/<name>.prefab) into a target scene with FRESH UUIDs — internal Hierarchy.parent_id links are remapped to the new ids; links to entities OUTSIDE the prefab are preserved (the target scene must provide them). Optional offset shifts EVERY prefab entity's Transform position by [x, y, z] (scene transforms are global — the whole set moves together, spatial relations preserved). Append-only: existing entities are never rewritten; a missing prefab or scene is refused before any write.",
+      inputSchema: {
+        type: "object", required: ["project", "scene", "prefab"],
+        properties: {
+          project: { type: "string" }, scene: { type: "string" }, prefab: { type: "string" },
+          offset: { type: "array", items: { type: "number" }, description: "[x, y, z] world offset applied to the prefab root (default [0, 0, 0])" },
+          parent_id: { type: "string", format: "uuid", description: "target entity to parent the prefab root under (sets the root's Hierarchy.parent_id)" }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_prefabs",
+      description: "List and validate every prefab under Content/Prefabs for a project (structural diagnostics: format/version/entities without ids, component field checks mirroring scene validation).",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "create_particle_asset",
+      description: "Author a reusable particle emitter asset under Content/Particles/<name>.particle — the emitter fields are EXACTLY the public ParticleEmitter component schema (derived from COMPONENT_SCHEMAS, single source of truth). Unknown fields or wrong types are refused all-or-nothing (nothing written, diagnostics naming the field). dry_run previews the document; update replaces the asset and returns the previous document for rollback.",
+      inputSchema: {
+        type: "object", required: ["project", "name"],
+        properties: {
+          project: { type: "string" }, name: { type: "string" },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: true
+      }
+    },
+    {
+      name: "apply_particle_asset",
+      description: "Apply a particle asset (Content/Particles/<name>.particle) to an entity's ParticleEmitter component in a scene — the component gets every emitter field from the asset (missing fields fall back to the component defaults). The entity must exist; the asset must validate; nothing is written otherwise.",
+      inputSchema: {
+        type: "object", required: ["project", "scene", "entity_id", "asset"],
+        properties: {
+          project: { type: "string" }, scene: { type: "string" }, entity_id: { type: "string", format: "uuid" },
+          asset: { type: "string" }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_particle_assets",
+      description: "List and validate every particle asset under Content/Particles for a project (structural diagnostics mirroring create_particle_asset validation).",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
       name: "validate_game_project",
       description: "Validate the portable project, scenes, entity UUIDs, components, hierarchy, scripts, registry assets, and asset metadata without compiling the engine.",
       inputSchema: {
@@ -1519,6 +1997,16 @@ export function callSemanticTool(engineRoot, name, args = {}) {
     case "inspect_mission_assets": return inspectMissionAssets(engineRoot, args.project);
     case "author_world_profile_asset": return authorWorldProfileAsset(engineRoot, args);
     case "inspect_world_profile_assets": return inspectWorldProfileAssets(engineRoot, args.project);
+    case "author_gait_asset": return authorGaitAsset(engineRoot, args);
+    case "inspect_gait_assets": return inspectGaitAssets(engineRoot, args.project);
+    case "author_simulation_lod_spec": return authorSimulationLodSpec(engineRoot, args);
+    case "inspect_simulation_lod_specs": return inspectSimulationLodSpecs(engineRoot, args.project);
+    case "create_prefab": return createPrefab(engineRoot, args);
+    case "instantiate_prefab": return instantiatePrefab(engineRoot, args);
+    case "inspect_prefabs": return inspectPrefabs(engineRoot, args.project);
+    case "create_particle_asset": return createParticleAsset(engineRoot, args);
+    case "apply_particle_asset": return applyParticleAsset(engineRoot, args);
+    case "inspect_particle_assets": return inspectParticleAssets(engineRoot, args.project);
     case "validate_game_project": return validateProject(engineRoot, args.project);
     default: return undefined;
   }
@@ -1595,6 +2083,10 @@ function inspectProject(engineRoot, projectName) {
     abilities: files(paths.abilities, ".json"),
     missions: files(paths.missions, ".json"),
     world_profiles: files(paths.profiles, ".json"),
+    gaits: files(paths.animations, ".json"),
+    simulation_lod_specs: files(paths.simulationLod, ".json"),
+    prefabs: files(paths.prefabs, ".prefab"),
+    particle_assets: files(paths.particles, ".particle"),
     validation: validateProject(engineRoot, paths.project)
   };
 }
@@ -3420,6 +3912,795 @@ function inspectWorldProfileAssets(engineRoot, projectName) {
   return { project: project.project, world_profiles: assets, count: assets.length };
 }
 
+function buildGaitDocument(kind, args) {
+  if (kind !== "gait") throw new Error(`unsupported gait kind '${kind}'`);
+  const document = {
+    name: String(args.name),
+    version: args.version !== undefined ? Number(args.version) : 1,
+    cycleDuration: args.cycleDuration !== undefined ? Number(args.cycleDuration) : 1.0,
+    stanceFraction: args.stanceFraction !== undefined ? Number(args.stanceFraction) : 0.6,
+    stepHeight: args.stepHeight !== undefined ? Number(args.stepHeight) : 0.25,
+    maxStride: args.maxStride !== undefined ? Number(args.maxStride) : 0.5,
+    legPhases: (args.legPhases ?? []).map((phase) => Number(phase)),
+    legs: (args.legs ?? []).map((leg) => ({
+      name: String(leg.name),
+      hipOffset: (leg.hipOffset ?? [0, 0, 0]).map((v) => Number(v)),
+      upperLength: leg.upperLength !== undefined ? Number(leg.upperLength) : 0.5,
+      lowerLength: leg.lowerLength !== undefined ? Number(leg.lowerLength) : 0.5,
+      restOffset: (leg.restOffset ?? [0, -1, 0]).map((v) => Number(v)),
+      maxReach: leg.maxReach !== undefined ? Number(leg.maxReach) : 0.0,
+      hipBone: leg.hipBone !== undefined ? Number(leg.hipBone) : -1,
+      kneeBone: leg.kneeBone !== undefined ? Number(leg.kneeBone) : -1,
+      footBone: leg.footBone !== undefined ? Number(leg.footBone) : -1
+    }))
+  };
+  return document;
+}
+
+// Structured validation mirroring the public C++ factory (GaitAsset::
+// load_from_json — all-or-nothing, never clamp or guess; the C++ applies
+// documented defaults BEFORE validating, so this mirrors those defaults
+// exactly). Returns { valid, errors }.
+export function validateGaitDocument(kind, document) {
+  const errors = [];
+  const fail = (message) => errors.push(`gait asset ${message}`);
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
+    return { valid: false, errors: ["gait asset must be a JSON object"] };
+  }
+  if (kind !== "gait") return { valid: false, errors: [`unsupported gait kind '${kind}'`] };
+  if (document.version !== undefined && document.version !== 1) fail("'version' must be 1");
+  if (typeof document.name !== "string" || !document.name) fail("'name' is required");
+  if (!finiteNumber(document.cycleDuration ?? 1.0) || (document.cycleDuration ?? 1.0) <= 0) {
+    fail("'cycleDuration' must be finite and > 0");
+  }
+  if (!finiteNumber(document.stanceFraction ?? 0.6) || (document.stanceFraction ?? 0.6) <= 0 || (document.stanceFraction ?? 0.6) >= 1) {
+    fail("'stanceFraction' must be finite and in (0, 1)");
+  }
+  if (!finiteNumber(document.stepHeight ?? 0.25) || (document.stepHeight ?? 0.25) < 0) {
+    fail("'stepHeight' must be finite and >= 0");
+  }
+  if (!finiteNumber(document.maxStride ?? 0.5) || (document.maxStride ?? 0.5) <= 0) {
+    fail("'maxStride' must be finite and > 0");
+  }
+  const phases = document.legPhases ?? [];
+  if (!Array.isArray(document.legPhases)) fail("'legPhases' must be an array");
+  if (!Array.isArray(document.legs) || document.legs.length === 0) {
+    fail("'legs' must be a non-empty array");
+    return { valid: errors.length === 0, errors };
+  }
+  if (!Array.isArray(document.legPhases) || phases.length !== document.legs.length) {
+    fail(`'legPhases' size (${Array.isArray(document.legPhases) ? phases.length : "not an array"}) must match legs (${document.legs.length})`);
+  } else {
+    phases.forEach((phase, index) => {
+      if (!finiteNumber(phase) || phase < 0 || phase >= 1) fail(`'legPhases[${index}]' must be in [0, 1)`);
+    });
+  }
+  document.legs.forEach((leg, index) => {
+    const where = `leg ${index}`;
+    if (!leg || typeof leg !== "object" || Array.isArray(leg)) return fail(`${where} must be an object`);
+    if (typeof leg.name !== "string" || !leg.name) return fail(`${where} 'name' must not be empty`);
+    const hipOffset = leg.hipOffset ?? [0, 0, 0];
+    if (!Array.isArray(hipOffset) || hipOffset.length !== 3 || !hipOffset.every(finiteNumber)) {
+      fail(`${where} 'hipOffset' must be an array of 3 finite numbers`);
+    }
+    if (!finiteNumber(leg.upperLength ?? 0.5) || (leg.upperLength ?? 0.5) <= 0) fail(`${where} 'upperLength' must be finite and > 0`);
+    if (!finiteNumber(leg.lowerLength ?? 0.5) || (leg.lowerLength ?? 0.5) <= 0) fail(`${where} 'lowerLength' must be finite and > 0`);
+    const restOffset = leg.restOffset ?? [0, -1, 0];
+    if (!Array.isArray(restOffset) || restOffset.length !== 3 || !restOffset.every(finiteNumber)) {
+      fail(`${where} 'restOffset' must be an array of 3 finite numbers`);
+    }
+    if (!finiteNumber(leg.maxReach ?? 0.0) || (leg.maxReach ?? 0.0) < 0) fail(`${where} 'maxReach' must be finite and >= 0`);
+    const bones = [leg.hipBone ?? -1, leg.kneeBone ?? -1, leg.footBone ?? -1].map(Number);
+    if (!bones.every(Number.isInteger)) fail(`${where} bone indices must be integers`);
+    const set = bones.filter((bone) => bone >= 0);
+    if (new Set(set).size !== set.length) fail(`${where} bone indices must be distinct when set`);
+  });
+  return { valid: errors.length === 0, errors };
+}
+
+function gaitDiff(previous, document) {
+  const keys = new Set([...Object.keys(previous), ...Object.keys(document)]);
+  const changed = [...keys].filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(document[key])).sort();
+  return { changed_fields: changed };
+}
+
+function authorGaitAsset(engineRoot, args) {
+  const project = requireProject(engineRoot, args.project);
+  const kind = String(args.kind ?? "gait");
+  if (!GAIT_KINDS.includes(kind)) throw new Error(`unsupported gait kind '${kind}' (supported: ${GAIT_KINDS.join(", ")})`);
+  const name = assetName(args.name);
+  const document = buildGaitDocument(kind, args);
+  const validation = validateGaitDocument(kind, document);
+  if (!validation.valid) {
+    return {
+      refused: true,
+      project: project.project,
+      kind,
+      name,
+      diagnostics: validation.errors,
+      reason: "gait fails public-contract validation; nothing was written"
+    };
+  }
+  const file = path.join(project.animations, `${name}.json`);
+  const previous = fs.existsSync(file) ? readJson(file) : null;
+  const diff = previous ? gaitDiff(previous, document) : null;
+  const relative = path.relative(project.root, file).replaceAll(path.sep, "/");
+  if (args.dry_run) {
+    return {
+      dry_run: true,
+      would_write: relative,
+      project: project.project,
+      kind,
+      name,
+      document,
+      diagnostics: [],
+      diff
+    };
+  }
+  if (previous && !args.update) throw new Error(`gait '${name}' already exists (pass update: true to replace, or use dry_run to preview the diff)`);
+  atomicWriteJson(file, document);
+  return {
+    created: !previous,
+    updated: Boolean(previous),
+    project: project.project,
+    kind,
+    name,
+    path: relative,
+    sha256: sha256File(file),
+    diagnostics: [],
+    diff,
+    rollback: previous ? { document: previous, hint: "re-author with update: true and this document to restore" } : undefined
+  };
+}
+
+// Reads every gait asset of a project with its structural diagnostics
+// (mirrors readWorldProfileAssets).
+function readGaitAssets(project) {
+  const assets = [];
+  if (!fs.existsSync(project.animations)) return assets;
+  for (const fileName of fs.readdirSync(project.animations).filter((file) => file.endsWith(".json")).sort()) {
+    const file = path.join(project.animations, fileName);
+    const baseName = fileName.replace(/\.json$/, "");
+    let document = null;
+    const diagnostics = [];
+    try {
+      document = readJson(file);
+    } catch (error) {
+      diagnostics.push(`malformed JSON: ${error.message}`);
+    }
+    if (document && typeof document === "object" && !Array.isArray(document)) {
+      diagnostics.push(...validateGaitDocument("gait", document).errors);
+    } else if (document) {
+      diagnostics.push("gait asset must be a JSON object");
+    }
+    assets.push({
+      kind: "gait",
+      name: baseName,
+      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      document,
+      valid: diagnostics.length === 0,
+      diagnostics
+    });
+  }
+  return assets;
+}
+
+function inspectGaitAssets(engineRoot, projectName) {
+  const project = requireProject(engineRoot, projectName);
+  const assets = readGaitAssets(project);
+  return { project: project.project, gaits: assets, count: assets.length };
+}
+
+function buildSimulationLodDocument(kind, args) {
+  if (kind !== "simulation_lod") throw new Error(`unsupported simulation lod kind '${kind}'`);
+  return {
+    name: String(args.name),
+    version: args.version !== undefined ? Number(args.version) : 1,
+    cellSize: args.cellSize !== undefined ? Number(args.cellSize) : 16.0,
+    fullRadius: args.fullRadius !== undefined ? Number(args.fullRadius) : 48.0,
+    falloffRadius: args.falloffRadius !== undefined ? Number(args.falloffRadius) : 320.0,
+    dayLengthSeconds: args.dayLengthSeconds !== undefined ? Number(args.dayLengthSeconds) : 240.0,
+    daysPerSeason: args.daysPerSeason !== undefined ? Number(args.daysPerSeason) : 30,
+    tiers: (args.tiers ?? []).map((tier) => ({
+      name: String(tier.name),
+      mode: String(tier.mode ?? "full"),
+      minRelevance: tier.minRelevance !== undefined ? Number(tier.minRelevance) : 0.0,
+      updateInterval: tier.updateInterval !== undefined ? Number(tier.updateInterval) : 0.0,
+      sleepAfterIdle: tier.sleepAfterIdle !== undefined ? Number(tier.sleepAfterIdle) : 0.0,
+      maxRegions: tier.maxRegions !== undefined ? Number(tier.maxRegions) : 0,
+      aggregateInterval: tier.aggregateInterval !== undefined ? Number(tier.aggregateInterval) : 0.0
+    }))
+  };
+}
+
+// Structured validation mirroring the public C++ factory (SimulationLodSpec::
+// load_from_json — all-or-nothing, never clamp or guess; the C++ applies
+// documented defaults BEFORE validating, so this mirrors those defaults
+// exactly). Returns { valid, errors }.
+export function validateSimulationLodDocument(kind, document) {
+  const errors = [];
+  const fail = (message) => errors.push(`simulation lod spec ${message}`);
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
+    return { valid: false, errors: ["simulation lod spec must be a JSON object"] };
+  }
+  if (kind !== "simulation_lod") return { valid: false, errors: [`unsupported simulation lod kind '${kind}'`] };
+  if (document.version !== undefined && document.version !== 1) fail("'version' must be 1");
+  if (!finiteNumber(document.cellSize ?? 16.0) || (document.cellSize ?? 16.0) <= 0) fail("'cellSize' must be finite and > 0");
+  if (!finiteNumber(document.fullRadius ?? 48.0) || (document.fullRadius ?? 48.0) < 0) fail("'fullRadius' must be finite and >= 0");
+  if (!finiteNumber(document.falloffRadius ?? 320.0) || !((document.falloffRadius ?? 320.0) > (document.fullRadius ?? 48.0))) {
+    fail("'falloffRadius' must be finite and > fullRadius");
+  }
+  if (!finiteNumber(document.dayLengthSeconds ?? 240.0) || (document.dayLengthSeconds ?? 240.0) <= 0) fail("'dayLengthSeconds' must be finite and > 0");
+  if (!Number.isInteger(document.daysPerSeason ?? 30) || (document.daysPerSeason ?? 30) < 1) fail("'daysPerSeason' must be an integer >= 1");
+  if (!Array.isArray(document.tiers) || document.tiers.length === 0) {
+    fail("'tiers' must be a non-empty array");
+    return { valid: errors.length === 0, errors };
+  }
+  const names = new Set();
+  let previous = 2.0;
+  document.tiers.forEach((tier, index) => {
+    const where = `tier ${index}`;
+    if (!tier || typeof tier !== "object" || Array.isArray(tier)) return fail(`${where} must be an object`);
+    if (typeof tier.name !== "string" || !tier.name) return fail(`${where} 'name' must not be empty`);
+    if (names.has(tier.name)) return fail(`duplicate tier name '${tier.name}'`);
+    names.add(tier.name);
+    const mode = String(tier.mode ?? "full");
+    if (!SIMULATION_LOD_MODES.has(mode)) return fail(`${where} 'mode' must be full|coarse|aggregate|sleeping (got '${mode}')`);
+    const minRelevance = Number(tier.minRelevance ?? 0.0);
+    if (!finiteNumber(minRelevance) || minRelevance < 0 || minRelevance > 1) {
+      return fail(`${where} 'minRelevance' must be in [0, 1]`);
+    }
+    if (!(minRelevance < previous)) return fail(`tiers must be sorted by minRelevance descending (tier '${tier.name}')`);
+    previous = minRelevance;
+    if (!finiteNumber(tier.updateInterval ?? 0.0) || (tier.updateInterval ?? 0.0) < 0) fail(`${where} 'updateInterval' must be finite and >= 0`);
+    if (!finiteNumber(tier.sleepAfterIdle ?? 0.0) || (tier.sleepAfterIdle ?? 0.0) < 0) fail(`${where} 'sleepAfterIdle' must be finite and >= 0`);
+    if (!Number.isInteger(tier.maxRegions ?? 0) || (tier.maxRegions ?? 0) < 0) fail(`${where} 'maxRegions' must be an integer >= 0`);
+    if (!finiteNumber(tier.aggregateInterval ?? 0.0) || (tier.aggregateInterval ?? 0.0) < 0) fail(`${where} 'aggregateInterval' must be finite and >= 0`);
+  });
+  return { valid: errors.length === 0, errors };
+}
+
+function simulationLodDiff(previous, document) {
+  const keys = new Set([...Object.keys(previous), ...Object.keys(document)]);
+  const changed = [...keys].filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(document[key])).sort();
+  return { changed_fields: changed };
+}
+
+function authorSimulationLodSpec(engineRoot, args) {
+  const project = requireProject(engineRoot, args.project);
+  const kind = String(args.kind ?? "simulation_lod");
+  if (!SIMULATION_LOD_KINDS.includes(kind)) throw new Error(`unsupported simulation lod kind '${kind}' (supported: ${SIMULATION_LOD_KINDS.join(", ")})`);
+  const name = assetName(args.name);
+  const document = buildSimulationLodDocument(kind, args);
+  const validation = validateSimulationLodDocument(kind, document);
+  if (!validation.valid) {
+    return {
+      refused: true,
+      project: project.project,
+      kind,
+      name,
+      diagnostics: validation.errors,
+      reason: "simulation LOD spec fails public-contract validation; nothing was written"
+    };
+  }
+  const file = path.join(project.simulationLod, `${name}.json`);
+  const previous = fs.existsSync(file) ? readJson(file) : null;
+  const diff = previous ? simulationLodDiff(previous, document) : null;
+  const relative = path.relative(project.root, file).replaceAll(path.sep, "/");
+  if (args.dry_run) {
+    return {
+      dry_run: true,
+      would_write: relative,
+      project: project.project,
+      kind,
+      name,
+      document,
+      diagnostics: [],
+      diff
+    };
+  }
+  if (previous && !args.update) throw new Error(`simulation LOD spec '${name}' already exists (pass update: true to replace, or use dry_run to preview the diff)`);
+  atomicWriteJson(file, document);
+  return {
+    created: !previous,
+    updated: Boolean(previous),
+    project: project.project,
+    kind,
+    name,
+    path: relative,
+    sha256: sha256File(file),
+    diagnostics: [],
+    diff,
+    rollback: previous ? { document: previous, hint: "re-author with update: true and this document to restore" } : undefined
+  };
+}
+
+// Reads every simulation LOD spec of a project with its structural
+// diagnostics (mirrors readGaitAssets).
+function readSimulationLodAssets(project) {
+  const assets = [];
+  if (!fs.existsSync(project.simulationLod)) return assets;
+  for (const fileName of fs.readdirSync(project.simulationLod).filter((file) => file.endsWith(".json")).sort()) {
+    const file = path.join(project.simulationLod, fileName);
+    const baseName = fileName.replace(/\.json$/, "");
+    let document = null;
+    const diagnostics = [];
+    try {
+      document = readJson(file);
+    } catch (error) {
+      diagnostics.push(`malformed JSON: ${error.message}`);
+    }
+    if (document && typeof document === "object" && !Array.isArray(document)) {
+      diagnostics.push(...validateSimulationLodDocument("simulation_lod", document).errors);
+    } else if (document) {
+      diagnostics.push("simulation lod spec must be a JSON object");
+    }
+    assets.push({
+      kind: "simulation_lod",
+      name: baseName,
+      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      document,
+      valid: diagnostics.length === 0,
+      diagnostics
+    });
+  }
+  return assets;
+}
+
+function inspectSimulationLodSpecs(engineRoot, projectName) {
+  const project = requireProject(engineRoot, projectName);
+  const assets = readSimulationLodAssets(project);
+  return { project: project.project, simulation_lod_specs: assets, count: assets.length };
+}
+
+// ---- prefab authoring (FALTANTES item 23 — "cenas, entidades, componentes
+// e prefabs") ---------------------------------------------------------------
+
+// Validates a prefab document: scene-shaped, version 1, entities WITHOUT ids
+// (they are regenerated on instantiation), every component field known and
+// matching the public component schemas. Returns { valid, errors }.
+export function validatePrefabDocument(document) {
+  const errors = [];
+  const fail = (message) => errors.push(`prefab ${message}`);
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
+    return { valid: false, errors: ["prefab must be a JSON object"] };
+  }
+  if (document.format !== "VulkanEngine.Prefab") fail("'format' must be \"VulkanEngine.Prefab\"");
+  if (document.version !== undefined && document.version !== 1) fail("'version' must be 1");
+  if (!Array.isArray(document.entities)) {
+    fail("'entities' must be an array");
+    return { valid: errors.length === 0, errors };
+  }
+  const names = new Set();
+  document.entities.forEach((entity, index) => {
+    const where = `entity ${index}`;
+    if (!entity || typeof entity !== "object" || Array.isArray(entity)) return fail(`${where} must be an object`);
+    if (entity.id !== undefined) return fail(`${where} must NOT carry an 'id' (ids are regenerated on instantiation)`);
+    if (typeof entity.name !== "string" || !entity.name) return fail(`${where} 'name' must not be empty`);
+    if (names.has(entity.name)) return fail(`duplicate entity name '${entity.name}'`);
+    names.add(entity.name);
+    if (!entity.Transform) return fail(`${where} '${entity.name}' has no Transform`);
+    for (const component of Object.keys(entity).filter((key) => !["name", "Transform"].includes(key))) {
+      if (!COMPONENT_SCHEMAS[component]) return fail(`${where} has unknown component '${component}'`);
+      const unknown = Object.keys(entity[component] ?? {}).filter((key) => !(key in COMPONENT_SCHEMAS[component]));
+      if (unknown.length) return fail(`${where} ${component} has unknown fields ${unknown.join(", ")}`);
+    }
+  });
+  if (errors.length === 0 && document.root_entity !== undefined && !names.has(document.root_entity)) {
+    fail(`'root_entity' '${document.root_entity}' does not name any prefab entity`);
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+function prefabDiff(previous, document) {
+  const keys = new Set([...Object.keys(previous), ...Object.keys(document)]);
+  const changed = [...keys].filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(document[key])).sort();
+  return { changed_fields: changed };
+}
+
+// Extracts a reusable entity set from an existing scene into
+// Content/Prefabs/<name>.prefab (entity ids stripped — regenerated on
+// instantiation). All-or-nothing: an entity id missing from the scene or a
+// component failing the prefab contract refuses the WHOLE extraction.
+function createPrefab(engineRoot, args) {
+  const scene = requireScene(engineRoot, args.project, args.scene);
+  const name = assetName(args.name);
+  const requested = Array.isArray(args.entity_ids) ? args.entity_ids : [];
+  if (requested.length === 0) throw new Error("entity_ids must name at least one entity");
+  const byId = new Map(scene.document.entities.map((entity) => [entity.id, entity]));
+  const missing = requested.filter((id) => !byId.has(id));
+  if (missing.length > 0) {
+    return {
+      refused: true,
+      project: scene.project.project,
+      scene: scene.scene,
+      name,
+      diagnostics: [`entity id(s) not found in scene '${scene.scene}': ${missing.join(", ")}`],
+      reason: "prefab extraction refused; nothing was written"
+    };
+  }
+  // Remap INTERNAL Hierarchy.parent_id links (a parent that is part of the
+  // selection) to the parent entity's NAME — entity ids are stripped from the
+  // prefab, so names are the only stable reference. Links to entities OUTSIDE
+  // the selection are preserved as-is (the instantiating scene must provide
+  // them); the prefab contract refuses dangling internal links at validate.
+  const selectedById = new Map(requested.map((id) => [id, byId.get(id)]));
+  const document = {
+    format: "VulkanEngine.Prefab",
+    version: 1,
+    name,
+    source_scene: scene.scene,
+    source_entity_ids: [...requested],
+    entities: requested.map((id) => {
+      const entity = byId.get(id);
+      const stripped = Object.fromEntries(Object.entries(entity).filter(([key]) => key !== "id"));
+      if (stripped.Hierarchy?.parent_id) {
+        const parent = selectedById.get(stripped.Hierarchy.parent_id);
+        if (parent) stripped.Hierarchy = { ...stripped.Hierarchy, parent_id: parent.name };
+      }
+      return stripped;
+    })
+  };
+  if (args.root_entity !== undefined) {
+    if (!document.entities.some((entity) => entity.name === args.root_entity)) {
+      return {
+        refused: true,
+        project: scene.project.project,
+        scene: scene.scene,
+        name,
+        diagnostics: [`root_entity '${args.root_entity}' does not name any selected entity`],
+        reason: "prefab extraction refused; nothing was written"
+      };
+    }
+    document.root_entity = String(args.root_entity);
+  }
+  const validation = validatePrefabDocument(document);
+  if (!validation.valid) {
+    return {
+      refused: true,
+      project: scene.project.project,
+      scene: scene.scene,
+      name,
+      diagnostics: validation.errors,
+      reason: "prefab fails the public prefab contract; nothing was written"
+    };
+  }
+  const file = path.join(scene.project.prefabs, `${name}.prefab`);
+  const previous = fs.existsSync(file) ? readJson(file) : null;
+  const diff = previous ? prefabDiff(previous, document) : null;
+  const relative = path.relative(scene.project.root, file).replaceAll(path.sep, "/");
+  if (args.dry_run) {
+    return {
+      dry_run: true,
+      would_write: relative,
+      project: scene.project.project,
+      scene: scene.scene,
+      name,
+      document,
+      diagnostics: [],
+      diff
+    };
+  }
+  if (previous && !args.update) throw new Error(`prefab '${name}' already exists (pass update: true to replace, or use dry_run to preview the diff)`);
+  atomicWriteJson(file, document);
+  return {
+    created: !previous,
+    updated: Boolean(previous),
+    project: scene.project.project,
+    scene: scene.scene,
+    name,
+    path: relative,
+    sha256: sha256File(file),
+    diagnostics: [],
+    diff,
+    rollback: previous ? { document: previous, hint: "re-author with update: true and this document to restore" } : undefined
+  };
+}
+
+// Inserts a prefab into a target scene with FRESH UUIDs; internal
+// Hierarchy.parent_id links are remapped to the new ids (links to entities
+// outside the prefab are preserved). Optional offset shifts the prefab root's
+// Transform position. Append-only: existing entities are never rewritten.
+function instantiatePrefab(engineRoot, args) {
+  const scene = requireScene(engineRoot, args.project, args.scene);
+  const prefabName = assetName(args.prefab);
+  const file = path.join(scene.project.prefabs, `${prefabName}.prefab`);
+  if (!fs.existsSync(file)) throw new Error(`prefab '${prefabName}' does not exist in project '${scene.project.project}'`);
+  const document = readJson(file);
+  const validation = validatePrefabDocument(document);
+  if (!validation.valid) {
+    return {
+      refused: true,
+      project: scene.project.project,
+      scene: scene.scene,
+      prefab: prefabName,
+      diagnostics: validation.errors,
+      reason: "prefab is invalid; nothing was instantiated"
+    };
+  }
+  const offset = Array.isArray(args.offset) && args.offset.length === 3 && args.offset.every(finiteNumber)
+    ? args.offset.map(Number)
+    : [0, 0, 0];
+  const oldToNew = new Map();
+  const ids = new Set(scene.document.entities.map((entity) => entity.id));
+  const clones = document.entities.map((template) => {
+    const freshId = uuid();
+    oldToNew.set(template.name, freshId);
+    return { ...template, id: freshId };
+  });
+  // Remap internal Hierarchy.parent_id links by the entity NAME captured
+  // before the templates were cloned (names are unique inside a prefab).
+  const templateById = new Map(document.entities.map((template) => [template.name, template]));
+  for (const clone of clones) {
+    const template = templateById.get(clone.name);
+    if (template.Hierarchy?.parent_id) {
+      const internal = templateById.get(template.Hierarchy.parent_id);
+      if (internal) {
+        clone.Hierarchy = { ...template.Hierarchy, parent_id: oldToNew.get(internal.name) };
+      }
+      // links to entities OUTSIDE the prefab are preserved as-is
+    }
+  }
+  // Scene transforms are GLOBAL positions — the offset shifts EVERY prefab
+  // entity so the whole set moves together (spatial relations preserved).
+  // root_entity is the logical origin when the caller attaches a parent or
+  // reasons about the prefab's placement, not an offset anchor.
+  for (const clone of clones) {
+    if (clone.Transform) {
+      clone.Transform = {
+        ...clone.Transform,
+        px: Number(clone.Transform.px ?? 0) + offset[0],
+        py: Number(clone.Transform.py ?? 0) + offset[1],
+        pz: Number(clone.Transform.pz ?? 0) + offset[2]
+      };
+    }
+  }
+  // Optional external parent: attach the prefab root under a target entity.
+  if (args.parent_id !== undefined) {
+    if (!ids.has(args.parent_id)) {
+      return {
+        refused: true,
+        project: scene.project.project,
+        scene: scene.scene,
+        prefab: prefabName,
+        diagnostics: [`parent_id '${args.parent_id}' does not exist in scene '${scene.scene}'`],
+        reason: "nothing was instantiated"
+      };
+    }
+    const root = clones.find((clone) => clone.name === rootName);
+    if (root) root.Hierarchy = { ...(root.Hierarchy ?? {}), parent_id: args.parent_id };
+  }
+  scene.document.entities.push(...clones);
+  atomicWriteJson(scene.file, scene.document);
+  return {
+    instantiated: clones.length,
+    project: scene.project.project,
+    scene: scene.scene,
+    prefab: prefabName,
+    entity_ids: clones.map((clone) => clone.id),
+    offset
+  };
+}
+
+// Reads every prefab of a project with its structural diagnostics.
+function readPrefabAssets(project) {
+  const assets = [];
+  if (!fs.existsSync(project.prefabs)) return assets;
+  for (const fileName of fs.readdirSync(project.prefabs).filter((file) => file.endsWith(".prefab")).sort()) {
+    const file = path.join(project.prefabs, fileName);
+    const baseName = fileName.replace(/\.prefab$/, "");
+    let document = null;
+    const diagnostics = [];
+    try {
+      document = readJson(file);
+    } catch (error) {
+      diagnostics.push(`malformed JSON: ${error.message}`);
+    }
+    if (document && typeof document === "object" && !Array.isArray(document)) {
+      diagnostics.push(...validatePrefabDocument(document).errors);
+    } else if (document) {
+      diagnostics.push("prefab must be a JSON object");
+    }
+    assets.push({
+      kind: "prefab",
+      name: baseName,
+      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      document,
+      valid: diagnostics.length === 0,
+      diagnostics
+    });
+  }
+  return assets;
+}
+
+function inspectPrefabs(engineRoot, projectName) {
+  const project = requireProject(engineRoot, projectName);
+  const assets = readPrefabAssets(project);
+  return { project: project.project, prefabs: assets, count: assets.length };
+}
+
+// ---- particle asset authoring (FALTANTES item 23 — partículas) ---------------
+
+// The emitter field names are the public ParticleEmitter component schema
+// (single source of truth).
+const PARTICLE_EMITTER_FIELDS = Object.keys(COMPONENT_SCHEMAS.ParticleEmitter);
+
+// Validates a particle asset document: format/version/name plus every emitter
+// field type-checked (numbers finite, booleans boolean); UNKNOWN fields are
+// refused (never guessed). Returns { valid, errors }.
+export function validateParticleDocument(document) {
+  const errors = [];
+  const fail = (message) => errors.push(`particle asset ${message}`);
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
+    return { valid: false, errors: ["particle asset must be a JSON object"] };
+  }
+  if (document.format !== "VulkanEngine.Particle") fail("'format' must be \"VulkanEngine.Particle\"");
+  if (document.version !== undefined && document.version !== 1) fail("'version' must be 1");
+  if (typeof document.name !== "string" || !document.name) fail("'name' must not be empty");
+  const unknown = Object.keys(document).filter((key) => !["name", "version", "format"].includes(key) && !PARTICLE_EMITTER_FIELDS.includes(key));
+  for (const field of unknown) fail(`unknown field '${field}' (emitter fields are exactly the ParticleEmitter component schema)`);
+  for (const field of PARTICLE_EMITTER_FIELDS) {
+    if (document[field] === undefined) continue;
+    if (typeof COMPONENT_SCHEMAS.ParticleEmitter[field] === "boolean") {
+      if (typeof document[field] !== "boolean") fail(`'${field}' must be a boolean`);
+    } else {
+      if (typeof document[field] !== "number" || !Number.isFinite(document[field])) fail(`'${field}' must be a finite number`);
+    }
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+function particleDiff(previous, document) {
+  const keys = new Set([...Object.keys(previous), ...Object.keys(document)]);
+  const changed = [...keys].filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(document[key])).sort();
+  return { changed_fields: changed };
+}
+
+function buildParticleDocument(name, args) {
+  const document = { format: "VulkanEngine.Particle", version: 1, name };
+  for (const field of PARTICLE_EMITTER_FIELDS) {
+    if (args[field] !== undefined) document[field] = args[field];
+  }
+  return document;
+}
+
+function createParticleAsset(engineRoot, args) {
+  const project = requireProject(engineRoot, args.project);
+  const name = assetName(args.name);
+  // Never silently drop an argument the author passed: unknown keys are
+  // refused all-or-nothing (the emitter fields are exactly the public
+  // ParticleEmitter component schema).
+  const unknownArgs = Object.keys(args).filter((key) => !["project", "name", "dry_run", "update"].includes(key) && !PARTICLE_EMITTER_FIELDS.includes(key));
+  if (unknownArgs.length > 0) {
+    return {
+      refused: true,
+      project: project.project,
+      kind: "particle",
+      name,
+      diagnostics: unknownArgs.map((field) => `unknown field '${field}' (emitter fields are exactly the ParticleEmitter component schema)`),
+      reason: "particle asset fails the public component schema; nothing was written"
+    };
+  }
+  const document = buildParticleDocument(name, args);
+  const validation = validateParticleDocument(document);
+  if (!validation.valid) {
+    return {
+      refused: true,
+      project: project.project,
+      kind: "particle",
+      name,
+      diagnostics: validation.errors,
+      reason: "particle asset fails the public component schema; nothing was written"
+    };
+  }
+  const file = path.join(project.particles, `${name}.particle`);
+  const previous = fs.existsSync(file) ? readJson(file) : null;
+  const diff = previous ? particleDiff(previous, document) : null;
+  const relative = path.relative(project.root, file).replaceAll(path.sep, "/");
+  if (args.dry_run) {
+    return {
+      dry_run: true,
+      would_write: relative,
+      project: project.project,
+      kind: "particle",
+      name,
+      document,
+      diagnostics: [],
+      diff
+    };
+  }
+  if (previous && !args.update) throw new Error(`particle asset '${name}' already exists (pass update: true to replace, or use dry_run to preview the diff)`);
+  atomicWriteJson(file, document);
+  return {
+    created: !previous,
+    updated: Boolean(previous),
+    project: project.project,
+    kind: "particle",
+    name,
+    path: relative,
+    sha256: sha256File(file),
+    diagnostics: [],
+    diff,
+    rollback: previous ? { document: previous, hint: "re-author with update: true and this document to restore" } : undefined
+  };
+}
+
+// Applies a particle asset to an entity's ParticleEmitter component through
+// the SAME component validation the scene uses (setComponent) — unknown
+// fields would be refused there too; missing fields fall back to component
+// defaults.
+function applyParticleAsset(engineRoot, args) {
+  const scene = requireScene(engineRoot, args.project, args.scene);
+  findEntity(scene, args.entity_id);
+  const assetNameValue = assetName(args.asset);
+  const file = path.join(scene.project.particles, `${assetNameValue}.particle`);
+  if (!fs.existsSync(file)) throw new Error(`particle asset '${assetNameValue}' does not exist in project '${scene.project.project}'`);
+  const document = readJson(file);
+  const validation = validateParticleDocument(document);
+  if (!validation.valid) {
+    return {
+      refused: true,
+      project: scene.project.project,
+      scene: scene.scene,
+      entity_id: args.entity_id,
+      asset: assetNameValue,
+      diagnostics: validation.errors,
+      reason: "particle asset is invalid; nothing was applied"
+    };
+  }
+  const emitter = {};
+  for (const field of PARTICLE_EMITTER_FIELDS) {
+    if (document[field] !== undefined) emitter[field] = document[field];
+  }
+  const updated = setComponent(engineRoot, { project: args.project, scene: args.scene, entity_id: args.entity_id, component: "ParticleEmitter", values: emitter });
+  return {
+    applied: true,
+    project: scene.project.project,
+    scene: scene.scene,
+    entity_id: args.entity_id,
+    asset: assetNameValue,
+    component: "ParticleEmitter",
+    value: updated.value
+  };
+}
+
+// Reads every particle asset of a project with its structural diagnostics.
+function readParticleAssets(project) {
+  const assets = [];
+  if (!fs.existsSync(project.particles)) return assets;
+  for (const fileName of fs.readdirSync(project.particles).filter((file) => file.endsWith(".particle")).sort()) {
+    const file = path.join(project.particles, fileName);
+    const baseName = fileName.replace(/\.particle$/, "");
+    let document = null;
+    const diagnostics = [];
+    try {
+      document = readJson(file);
+    } catch (error) {
+      diagnostics.push(`malformed JSON: ${error.message}`);
+    }
+    if (document && typeof document === "object" && !Array.isArray(document)) {
+      diagnostics.push(...validateParticleDocument(document).errors);
+    } else if (document) {
+      diagnostics.push("particle asset must be a JSON object");
+    }
+    assets.push({
+      kind: "particle",
+      name: baseName,
+      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      document,
+      valid: diagnostics.length === 0,
+      diagnostics
+    });
+  }
+  return assets;
+}
+
+function inspectParticleAssets(engineRoot, projectName) {
+  const project = requireProject(engineRoot, projectName);
+  const assets = readParticleAssets(project);
+  return { project: project.project, particle_assets: assets, count: assets.length };
+}
+
 function registryDiff(previous, document) {
   const keys = new Set([...Object.keys(previous), ...Object.keys(document)]);
   const changed = [...keys].filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(document[key])).sort();
@@ -3670,5 +4951,41 @@ function validateProject(engineRoot, projectName) {
     }
   }
 
-  return { project: project.project, valid: errors.length === 0, errors, warnings, scenes: sceneFiles.length, registry_assets: registryAssets.length, vehicle_assets: vehicleAssets.length, ability_assets: abilityAssets.length, mission_assets: missionAssets.length, world_profiles: worldProfileAssets.length };
+  // Gait assets (FALTANTES item 23 — animações): structural validation
+  // mirroring the public C++ GaitAsset/LegChainAsset factories.
+  const gaitAssets = readGaitAssets(project);
+  for (const asset of gaitAssets) {
+    for (const diagnostic of asset.diagnostics) {
+      errors.push(`Content/Animations/${asset.name}.json: ${diagnostic}`);
+    }
+  }
+
+  // Simulation LOD specs (FALTANTES §20 — SimulationLodSpec): structural
+  // validation mirroring SimulationLodSpec::load_from_json.
+  const simulationLodAssets = readSimulationLodAssets(project);
+  for (const asset of simulationLodAssets) {
+    for (const diagnostic of asset.diagnostics) {
+      errors.push(`Content/SimulationLod/${asset.name}.json: ${diagnostic}`);
+    }
+  }
+
+  // Prefab assets (FALTANTES item 23): reusable entity sets — structural
+  // validation mirroring the scene checks (components known, fields known).
+  const prefabAssets = readPrefabAssets(project);
+  for (const asset of prefabAssets) {
+    for (const diagnostic of asset.diagnostics) {
+      errors.push(`Content/Prefabs/${asset.name}.prefab: ${diagnostic}`);
+    }
+  }
+
+  // Particle assets (FALTANTES item 23 — partículas): reusable emitter
+  // configurations mirroring the ParticleEmitter component schema.
+  const particleAssets = readParticleAssets(project);
+  for (const asset of particleAssets) {
+    for (const diagnostic of asset.diagnostics) {
+      errors.push(`Content/Particles/${asset.name}.particle: ${diagnostic}`);
+    }
+  }
+
+  return { project: project.project, valid: errors.length === 0, errors, warnings, scenes: sceneFiles.length, registry_assets: registryAssets.length, vehicle_assets: vehicleAssets.length, ability_assets: abilityAssets.length, mission_assets: missionAssets.length, world_profiles: worldProfileAssets.length, gait_assets: gaitAssets.length, simulation_lod_specs: simulationLodAssets.length, prefabs: prefabAssets.length, particle_assets: particleAssets.length };
 }

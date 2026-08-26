@@ -12,15 +12,20 @@ foreach(source IN LISTS JOLT_PHYSICS_SRC_FILES)
         list(APPEND JOLT_CPP_SOURCES ${source})
     endif()
 endforeach()
-add_library(jolt STATIC ${JOLT_CPP_SOURCES})
-target_include_directories(jolt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/jolt)
-target_compile_features(jolt PRIVATE cxx_std_17)
-target_compile_definitions(jolt PRIVATE
+# The target is named vulkan_jolt (NOT jolt): the vendored Jolt.cmake above
+# creates add_library(Jolt ...) which on Windows generates third_party/Jolt.vcxproj;
+# a target named jolt would generate third_party/jolt.vcxproj — case-insensitive
+# collision in the .slnx (MSB4025 duplicate item). The engine target is distinct;
+# OUTPUT_NAME stays Jolt so the installed archive remains lib/Jolt.lib.
+add_library(vulkan_jolt STATIC ${JOLT_CPP_SOURCES})
+target_include_directories(vulkan_jolt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/jolt)
+target_compile_features(vulkan_jolt PRIVATE cxx_std_17)
+target_compile_definitions(vulkan_jolt PRIVATE
     $<$<CONFIG:Debug>:JPH_ENABLE_ASSERTS=1>
     $<$<NOT:$<CONFIG:Debug>>:JPH_ENABLE_ASSERTS=0>
 )
 if(MSVC)
-    target_compile_options(jolt PRIVATE /w)
+    target_compile_options(vulkan_jolt PRIVATE /w)
 endif()
 
 # ---- Bullet (amalgamated) ----

@@ -48,6 +48,14 @@ struct LegChainAsset {
     // All-or-nothing: bone lengths > 0, finite offsets/reach (reach >= 0),
     // distinct bone indices when set.
     bool validate(std::string& errorOut) const;
+
+    // Versioned JSON asset round-trip (the AbilityDefinition/MissionDefinition
+    // pattern). All-or-nothing: a malformed document is refused with a
+    // diagnostic (never clamped, never partially applied). `name` must be
+    // non-empty. Implemented by the SDK adapter (src/engine/sdk/GaitPlanner.cpp).
+    bool load_from_json(const std::string& jsonText, std::string& errorOut);
+    // Bit-exact: to_json() round-trips every field (%.9g float emission).
+    std::string to_json() const;
 };
 
 // A data-driven gait: the cycle timing and per-leg phase offsets that define
@@ -71,6 +79,14 @@ struct GaitAsset {
     // maxStride > 0, non-empty legs, phases sized to match and in [0, 1),
     // every leg validates.
     bool validate(std::string& errorOut) const;
+
+    // Versioned JSON asset round-trip (the AbilityDefinition/MissionDefinition
+    // pattern). All-or-nothing: a malformed document is refused with a
+    // diagnostic (never clamped, never partially applied). `name` must be
+    // non-empty. Implemented by the SDK adapter (src/engine/sdk/GaitPlanner.cpp).
+    bool load_from_json(const std::string& jsonText, std::string& errorOut);
+    // Bit-exact: to_json() round-trips every field (%.9g float emission).
+    std::string to_json() const;
 };
 
 // One foot's plan at the current time.
