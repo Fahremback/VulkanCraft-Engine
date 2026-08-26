@@ -697,5 +697,40 @@ std::shared_ptr<IStructurePlacementSystem> create_structure_placement_system_fro
     return system;
 }
 
+bool place_structure(engine::voxel::IVoxelWorld& world,
+                     const StructurePlacement& placement,
+                     std::string& errorOut) {
+    errorOut.clear();
+    const int width = placement.output.width;
+    const int height = placement.output.height;
+    const int depth = placement.output.depth;
+    if (width <= 0 || height <= 0 || depth <= 0 ||
+        placement.output.blocks.size() !=
+            static_cast<std::size_t>(width) * height * depth) {
+        errorOut = "structure placement: invalid structure output dimensions";
+        return false;
+    }
+    auto transaction = world.begin_transaction();
+    if (!transaction) {
+        errorOut = "structure placement: world has no transaction support";
+        return false;
+    }
+    for (int y = 0; y < depth; ++y) {
+        for (int z = 0; z < height; ++z) {
+            for (int x = 0; x < width; ++x) {
+                const std::uint32_t block = placement.output.blocks[
+                    static_cast<std::size_t>(x + z * width + y * width * height)];
+                if (block == 0) continue;  // Air cells are not written.
+                transaction->set_block(placement.origin.x + x,
+                                       placement.origin.y + y,
+                                       placement.origin.z + z, block);
+            }
+        }
+    }
+    // All-or-nothing: the world's commit validates ids/bounds/loaded chunks
+    // and rolls back the entire placement on any failure.
+    return transaction->commit(errorOut);
+}
+
 }  // namespace procgen
 }  // namespace engine

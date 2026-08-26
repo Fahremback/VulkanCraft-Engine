@@ -24,6 +24,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <engine/registry/BlockRegistry.hpp>
+#include <engine/voxel/IVoxelBlockEntity.hpp>
+#include <filesystem>
+#include <cstdio>
 
 #define CHECK(condition) do { if (!(condition)) { \
     std::cerr << "advanced consumer failure: " #condition "\n"; return 1; } } while (false)
@@ -154,9 +158,188 @@ int test_gameplay() {
 
 }  // namespace
 
+// --- Block entities: register, attach, tick, serialize ---
+class SimpleCounterEntity : public engine::voxel::IVoxelBlockEntity {
+public:
+    std::string type_id() const override { return "ext:counter"; }
+    void on_tick(uint64_t) override { ++count_; }
+    uint32_t data_version() const override { return 1; }
+    std::vector<uint8_t> serialize_state() const override {
+        std::vector<uint8_t> blob(4);
+        blob[0] = static_cast<uint8_t>(count_ & 0xFF);
+        blob[1] = static_cast<uint8_t>((count_ >> 8) & 0xFF);
+        blob[2] = static_cast<uint8_t>((count_ >> 16) & 0xFF);
+        blob[3] = static_cast<uint8_t>((count_ >> 24) & 0xFF);
+        return blob;
+    }
+    bool deserialize_state(const std::vector<uint8_t>& data, uint32_t) override {
+        if (data.size() < 4) return false;
+        count_ = static_cast<uint32_t>(data[0])
+               | (static_cast<uint32_t>(data[1]) << 8)
+               | (static_cast<uint32_t>(data[2]) << 16)
+               | (static_cast<uint32_t>(data[3]) << 24);
+        return true;
+    }
+    uint32_t count() const { return count_; }
+private:
+    uint32_t count_ = 0;
+};
+
+int test_block_entities() {
+    using namespace engine::voxel;
+    auto world = create_default_voxel_world();
+    CHECK(world != nullptr);
+    world->register_block_entity_type("ext:counter",
+        [] { return std::make_shared<SimpleCounterEntity>(); });
+
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    world->set_chunk_budget(16);
+    const auto start = std::chrono::steady_clock::now();
+    while (!world->is_chunk_loaded(0, 0)) {
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count() > 20000) {
+            std::cerr << "advanced consumer: block entity boot timed out\n";
+            return 1;
+        }
+        world->update(player, 1.0f / 60.0f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    // Place a block and attach an entity.
+    world->set_block(4, 130, 4, kStone);
+    auto entity = std::make_shared<SimpleCounterEntity>();
+    CHECK(world->attach_block_entity(4, 130, 4, entity));
+    auto retrieved = world->block_entity_at(4, 130, 4);
+    CHECK(retrieved != nullptr);
+    CHECK(retrieved->type_id() == "ext:counter");
+
+    // Tick the entity a few times.
+    for (int i = 0; i < 5; ++i) {
+        world->update(player, 1.0f / 60.0f);
+    }
+    auto afterTick = world->block_entity_at(4, 130, 4);
+    CHECK(afterTick != nullptr);
+    const auto blob = afterTick->serialize_state();
+    CHECK(blob.size() == 4);
+    uint32_t count = static_cast<uint32_t>(blob[0])
+                   | (static_cast<uint32_t>(blob[1]) << 8)
+                   | (static_cast<uint32_t>(blob[2]) << 16)
+                   | (static_cast<uint32_t>(blob[3]) << 24);
+    CHECK(count > 0);
+
+    std::cout << "advanced-consumer-ok block-entities
+";
+    return 0;
+}
+
+// --- Save/load round-trip ---
+int test_save_load_roundtrip() {
+    using namespace engine::voxel;
+    namespace fs = std::filesystem;
+
+    const std::string savePath = (fs::temp_directory_path() / "vc_ext_advanced_save.vcwld").string();
+
+    // Create world A, edit blocks, save.
+    {
+        auto a = create_default_voxel_world();
+        CHECK(a != nullptr);
+        const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+        a->set_chunk_budget(16);
+        const auto start = std::chrono::steady_clock::now();
+        while (!a->is_chunk_loaded(0, 0)) {
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start).count() > 20000) {
+                std::cerr << "advanced consumer: save boot timed out\n";
+                return 1;
+            }
+            a->update(player, 1.0f / 60.0f);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        a->set_block(4, 130, 4, kStone);
+        a->set_block(5, 130, 4, kStone);
+        a->set_block(6, 130, 4, kStone);
+        std::string error;
+        if (!a->save_world(savePath, error)) { std::cerr << "save failed: " << error << "
+"; return 1; }
+    }
+
+    // Create world B, load, verify.
+    {
+        auto b = create_default_voxel_world();
+        CHECK(b != nullptr);
+        const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+        b->set_chunk_budget(16);
+        const auto start = std::chrono::steady_clock::now();
+        while (!b->is_chunk_loaded(0, 0)) {
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start).count() > 20000) {
+                std::cerr << "advanced consumer: load boot timed out\n";
+                return 1;
+            }
+            b->update(player, 1.0f / 60.0f);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        std::string error;
+        if (!b->load_world(savePath, error)) { std::cerr << "load failed: " << error << "
+"; return 1; }
+        CHECK(b->get_block(4, 130, 4) == kStone);
+        CHECK(b->get_block(5, 130, 4) == kStone);
+        CHECK(b->get_block(6, 130, 4) == kStone);
+    }
+
+    fs::remove_all(savePath);
+    std::cout << "advanced-consumer-ok save-load
+";
+    return 0;
+}
+
+// --- Per-voxel state round-trip ---
+int test_per_voxel_state() {
+    using namespace engine::voxel;
+
+    auto world = create_default_voxel_world();
+    CHECK(world != nullptr);
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    world->set_chunk_budget(16);
+    const auto start = std::chrono::steady_clock::now();
+    while (!world->is_chunk_loaded(0, 0)) {
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count() > 20000) {
+            std::cerr << "advanced consumer: state boot timed out\n";
+            return 1;
+        }
+        world->update(player, 1.0f / 60.0f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    // Set block state and verify.
+    CHECK(world->get_block_state(4, 130, 4) == 0);
+    world->set_block_state(4, 130, 4, 3);
+    CHECK(world->get_block_state(4, 130, 4) == 3);
+
+    // State 7 is max (3-bit).
+    world->set_block_state(4, 130, 4, 7);
+    CHECK(world->get_block_state(4, 130, 4) == 7);
+
+    // Out-of-range returns 0.
+    world->set_block_state(4, 130, 4, 8);
+    CHECK(world->get_block_state(4, 130, 4) == 0);
+
+    // Changing block resets state.
+    world->set_block(4, 130, 4, kStone);
+    CHECK(world->get_block_state(4, 130, 4) == 0);
+
+    std::cout << "advanced-consumer-ok per-voxel-state
+";
+    return 0;
+}
+
 int main() {
     if (test_worlds_and_portal() != 0) return 1;
     if (test_gameplay() != 0) return 1;
+    if (test_block_entities() != 0) return 1;
+    if (test_save_load_roundtrip() != 0) return 1;
+    if (test_per_voxel_state() != 0) return 1;
     std::cout << "advanced-consumer-ok all\n";
     return 0;
 }

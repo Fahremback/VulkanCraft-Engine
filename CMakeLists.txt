@@ -403,6 +403,9 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/OriginRebase.cpp
     src/engine/sdk/LocalSpace.cpp
     src/engine/sdk/TimeTravel.cpp
+    src/engine/sdk/TimelineGraph.cpp
+    src/engine/sdk/CausalResolver.cpp
+    src/engine/sdk/MacroMicroReconciler.cpp
     src/engine/sdk/VehicleAsset.cpp
     src/engine/sdk/BeamGraphAsset.cpp
     src/engine/sdk/VehicleReplication.cpp
@@ -1649,6 +1652,47 @@ if(TARGET vc_generate_world_save)
     add_dependencies(timeline_tests vc_generate_world_save)
 endif()
 add_test(NAME timeline_tests COMMAND timeline_tests)
+
+# Differential engines (META §32 / FALTANTES "diferenciais próprios"):
+# TimelineGraph (branches copy-on-write + causal history — the persistent
+# multiverse layer) and CausalResolver (invalidation/recomputation of ONLY
+# the affected descendants). Engine-own code: nothing in external/solutions
+# resolves them. The contract compiles with public SDK headers only; the gate
+# drives both headless + their composition (timeline causality -> resolver
+# invalidation), the ability_system_tests light pattern.
+add_executable(timeline_causal_tests
+    tests/TimelineCausalTests.cpp
+    # Both differential adapters live in vc_sdk_public; this light target
+    # compiles the TUs directly so the gate needs no other SDK module.
+    src/engine/sdk/TimelineGraph.cpp
+    src/engine/sdk/CausalResolver.cpp
+)
+target_include_directories(timeline_causal_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(timeline_causal_tests PRIVATE vc_build_options glm)
+add_test(NAME timeline_causal_tests COMMAND timeline_causal_tests)
+
+# Differential engine (META §32 / FALTANTES "diferenciais próprios"):
+# MacroMicroReconciler — deterministic materialization of aggregate
+# consequences (the Aggregate -> Full/Coarse handoff of ISimulationLod becomes
+# CONCRETE micro effects: spawns, drops, growth, removals), with a budget/
+# continuation cursor, macro-change invalidation of the pending batch (the
+# ICausalResolver semantics) and deterministic conflict resolution. Engine-own
+# code. The contract compiles with public SDK headers only; the gate drives it
+# headless (the ability_system_tests light pattern — RegistryJson + this TU).
+add_executable(macro_micro_reconciler_tests
+    tests/MacroMicroReconcilerTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/MacroMicroReconciler.cpp
+)
+target_include_directories(macro_micro_reconciler_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(macro_micro_reconciler_tests PRIVATE vc_build_options glm)
+add_test(NAME macro_micro_reconciler_tests COMMAND macro_micro_reconciler_tests)
 
 # Multi-scale streaming (META §19 / FALTANTES §15 vision "streaming
 # multi-escala", Fase 5 checkbox): the world function streamed at several

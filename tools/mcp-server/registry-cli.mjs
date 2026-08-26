@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Registry/vehicle/ability asset CLI (FALTANTES item 10 + §17 item 12 + §19):
-// expose the complete registry, vehicle-assembly AND ability schemas and
-// validate/author assets WITHOUT a running MCP server. Every command goes
+// Registry/vehicle/ability/mission asset CLI (FALTANTES item 10 + §17 item 12
+// + §19 + item 23): expose the complete registry, vehicle-assembly, ability
+// AND mission schemas and validate/author assets WITHOUT a running MCP
+// server. Every command goes
 // through the SAME factories the MCP server uses (game-authoring.mjs), so the
 // CLI can never drift from what the mirror validation accepts — and the
 // exported JSON Schemas are generated from the same FIELD_SCHEMAS contracts.
@@ -21,19 +22,27 @@ import {
   REGISTRY_KINDS,
   VEHICLE_KINDS,
   ABILITY_KINDS,
+  MISSION_KINDS,
+  WORLD_PROFILE_KINDS,
   buildRegistryJsonSchema,
   buildVehicleJsonSchema,
   buildAbilityJsonSchema,
+  buildMissionJsonSchema,
+  buildWorldProfileJsonSchema,
   validateRegistryDocument,
   validateVehicleDocument,
-  validateAbilityDocument
+  validateAbilityDocument,
+  validateMissionDocument,
+  validateWorldProfileDocument
 } from "./game-authoring.mjs";
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ENGINE_ROOT = path.resolve(SERVER_DIR, "..", "..");
-const ALL_KINDS = [...REGISTRY_KINDS, ...VEHICLE_KINDS, ...ABILITY_KINDS];
+const ALL_KINDS = [...REGISTRY_KINDS, ...VEHICLE_KINDS, ...ABILITY_KINDS, ...MISSION_KINDS, ...WORLD_PROFILE_KINDS];
 const VEHICLE_KIND_SET = new Set(VEHICLE_KINDS);
 const ABILITY_KIND_SET = new Set(ABILITY_KINDS);
+const MISSION_KIND_SET = new Set(MISSION_KINDS);
+const WORLD_PROFILE_KIND_SET = new Set(WORLD_PROFILE_KINDS);
 
 function fail(message, code = 1) {
   console.error(`registry-cli: ${message}`);
@@ -69,7 +78,11 @@ function cmdSchema(kind) {
     ? buildVehicleJsonSchema(kind)
     : ABILITY_KIND_SET.has(kind)
       ? buildAbilityJsonSchema(kind)
-      : buildRegistryJsonSchema(kind);
+      : MISSION_KIND_SET.has(kind)
+        ? buildMissionJsonSchema(kind)
+        : WORLD_PROFILE_KIND_SET.has(kind)
+          ? buildWorldProfileJsonSchema(kind)
+          : buildRegistryJsonSchema(kind);
   console.log(JSON.stringify(schema, null, 2));
 }
 
@@ -83,7 +96,11 @@ function cmdExportSchemas(outDir) {
       ? buildVehicleJsonSchema(kind)
       : ABILITY_KIND_SET.has(kind)
         ? buildAbilityJsonSchema(kind)
-        : buildRegistryJsonSchema(kind);
+        : MISSION_KIND_SET.has(kind)
+          ? buildMissionJsonSchema(kind)
+          : WORLD_PROFILE_KIND_SET.has(kind)
+            ? buildWorldProfileJsonSchema(kind)
+            : buildRegistryJsonSchema(kind);
     atomicWriteJson(file, schema);
     written.push(file);
   }
@@ -103,7 +120,11 @@ function cmdValidate(kind, file) {
     ? validateVehicleDocument(kind, document)
     : ABILITY_KIND_SET.has(kind)
       ? validateAbilityDocument(kind, document)
-      : validateRegistryDocument(kind, document);
+      : MISSION_KIND_SET.has(kind)
+        ? validateMissionDocument(kind, document)
+        : WORLD_PROFILE_KIND_SET.has(kind)
+          ? validateWorldProfileDocument(kind, document)
+          : validateRegistryDocument(kind, document);
   if (!result.valid) {
     for (const diagnostic of result.errors) console.error(`- ${diagnostic}`);
     console.error(`registry-cli: '${file}' is INVALID (${result.errors.length} diagnostic(s))`);
@@ -134,7 +155,11 @@ function cmdAuthor(args) {
     ? validateVehicleDocument(kind, document)
     : ABILITY_KIND_SET.has(kind)
       ? validateAbilityDocument(kind, document)
-      : validateRegistryDocument(kind, document);
+      : MISSION_KIND_SET.has(kind)
+        ? validateMissionDocument(kind, document)
+        : WORLD_PROFILE_KIND_SET.has(kind)
+          ? validateWorldProfileDocument(kind, document)
+          : validateRegistryDocument(kind, document);
   if (!validation.valid) {
     for (const diagnostic of validation.errors) console.error(`- ${diagnostic}`);
     fail(`asset '${kind}/${name}' fails public-contract validation; nothing was written`);
@@ -143,7 +168,11 @@ function cmdAuthor(args) {
     ? path.join(engine, "Projects", project, "Content", "Vehicles", `${name}.json`)
     : ABILITY_KIND_SET.has(kind)
       ? path.join(engine, "Projects", project, "Content", "Abilities", `${name}.json`)
-      : path.join(engine, "Projects", project, "Content", "Registry", kind, `${name}.json`);
+      : MISSION_KIND_SET.has(kind)
+        ? path.join(engine, "Projects", project, "Content", "Missions", `${name}.json`)
+        : WORLD_PROFILE_KIND_SET.has(kind)
+          ? path.join(engine, "Projects", project, "Content", "Profiles", `${name}.json`)
+          : path.join(engine, "Projects", project, "Content", "Registry", kind, `${name}.json`);
   const relative = path.relative(path.join(engine, "Projects", project), target).replaceAll(path.sep, "/");
   const previous = fs.existsSync(target) ? readJson(target) : null;
   if (dryRun) {
@@ -179,7 +208,7 @@ function main() {
     default:
       console.error(
         "Usage: node registry-cli.mjs <kinds|schema|export-schemas|validate|author> ...\n" +
-        "  kinds                     list supported registry + vehicle + ability kinds\n" +
+        "  kinds                     list supported registry + vehicle + ability + mission kinds\n" +
         "  schema <kind>             print the JSON Schema (draft-07) for a kind\n" +
         "  export-schemas [outDir]   write <kind>.json for every kind\n" +
         "  validate <kind> <file>    validate an asset document (exit 1 on invalid)\n" +

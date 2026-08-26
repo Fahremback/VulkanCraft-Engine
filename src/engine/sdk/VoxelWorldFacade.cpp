@@ -266,6 +266,7 @@ constexpr char kRegionMagicV2[5] = "VCW2";
 // Region page chunk flags (layout v2).
 constexpr uint8_t kRegionFlagPalette = 0x01;
 constexpr uint8_t kRegionFlagCompressed = 0x02;
+constexpr uint8_t kRegionFlagState = 0x04;
 
 // Page id for a region tile ("r.<x>.<z>") — the id the region backend stores.
 std::string region_page_id(int regionX, int regionZ) {
@@ -3079,9 +3080,20 @@ private:
                 for (const RuntimeBlockId id : distinct) indexOf[id] = next++;
             }
 
+            // Per-voxel state (FALTANTES item 2): appended after the fluid
+            // bytes only when the chunk has at least one non-default state.
+            // A chunk without state writes a payload byte-identical to before
+            // (flag off), so pages stay backward compatible with readers that
+            // predate the state bytes.
+            bool hasState = false;
+            if (snap->stateIndices.size() == voxelBytes) {
+                for (const uint8_t s : snap->stateIndices) {
+                    if (s != 0) { hasState = true; break; }
+                }
+            }
             std::string inner;
             inner.reserve((usePalette ? voxelBytes : voxelBytes * 2) +
-                          voxelBytes);
+                          voxelBytes + (hasState ? voxelBytes : 0));
             if (usePalette) {
                 for (const RuntimeBlockId id : snap->blocks) {
                     inner.push_back(static_cast<char>(
@@ -3094,6 +3106,11 @@ private:
             }
             inner.append(reinterpret_cast<const char*>(snap->fluid.data()),
                          snap->fluid.size());
+            if (hasState) {
+                inner.append(
+                    reinterpret_cast<const char*>(snap->stateIndices.data()),
+                    snap->stateIndices.size());
+            }
             const std::string compressed =
                 compression_ ? compression_->compress(inner) : std::string();
             const bool useCompression =
@@ -3106,6 +3123,7 @@ private:
             uint8_t flags = 0;
             if (usePalette) flags |= kRegionFlagPalette;
             if (useCompression) flags |= kRegionFlagCompressed;
+            if (hasState) flags |= kRegionFlagState;
             payload.push_back(static_cast<char>(flags));
             if (usePalette) {
                 append_u16(payload, static_cast<uint16_t>(distinct.size()));
@@ -3174,8 +3192,10 @@ private:
             offset += voxelBytes * 2;
             std::string water(payload.data() + offset, voxelBytes);
             offset += voxelBytes;
+            // v1 pages predate per-voxel state: restore with state 0 everywhere.
+            const std::vector<uint8_t> noState;
             if (!restore_decoded_chunk(cx, cz, static_cast<int>(extent),
-                                       blockIds, water, errorOut)) {
+                                       blockIds, water, noState, errorOut)) {
                 return false;
             }
         }
@@ -3209,6 +3229,8 @@ private:
                 (flags & kRegionFlagPalette) != 0;
             const bool hasCompression =
                 (flags & kRegionFlagCompressed) != 0;
+            const bool hasState =
+                (flags & kRegionFlagState) != 0;
 
             // Palette: u16 count + count runtime ids, each validated.
             std::vector<RuntimeBlockId> palette;
@@ -3276,7 +3298,8 @@ private:
                 inner = blob;
             }
             const std::size_t expected =
-                (hasPalette ? voxelBytes : voxelBytes * 2) + voxelBytes;
+                (hasPalette ? voxelBytes : voxelBytes * 2) + voxelBytes +
+                (hasState ? voxelBytes : 0);
             if (inner.size() != expected) {
                 errorOut = "region page: chunk (" + std::to_string(cx) +
                            ',' + std::to_string(cz) +
@@ -3319,8 +3342,17 @@ private:
             std::string water(inner.data() +
                                   (hasPalette ? voxelBytes : voxelBytes * 2),
                               voxelBytes);
+            std::vector<uint8_t> stateIndices;
+            if (hasState) {
+                const std::size_t stateOffset =
+                    (hasPalette ? voxelBytes : voxelBytes * 2) + voxelBytes;
+                stateIndices.assign(
+                    reinterpret_cast<const uint8_t*>(inner.data() + stateOffset),
+                    reinterpret_cast<const uint8_t*>(inner.data() + stateOffset) +
+                        voxelBytes);
+            }
             if (!restore_decoded_chunk(cx, cz, static_cast<int>(extent),
-                                       blockIds, water, errorOut)) {
+                                       blockIds, water, stateIndices, errorOut)) {
                 return false;
             }
         }
@@ -3331,9 +3363,9 @@ private:
     bool restore_decoded_chunk(int cx, int cz, int extent,
                                std::vector<RuntimeBlockId>& blockIds,
                                const std::string& water,
+                               const std::vector<uint8_t>& stateIndices,
                                std::string& errorOut) {
-        std::vector<uint8_t> stateIndicesRegion;
-        if (!apply_saved_chunk(cx, cz, extent, blockIds, water, stateIndicesRegion)) {
+        if (!apply_saved_chunk(cx, cz, extent, blockIds, water, stateIndices)) {
             errorOut = "region page: chunk (" + std::to_string(cx) +
                        ',' + std::to_string(cz) + ") could not be loaded";
             return false;

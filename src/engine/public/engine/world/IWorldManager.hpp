@@ -10,6 +10,7 @@
 // implementation lives in src/engine/sdk/WorldManager.cpp.
 
 #include "engine/entity/IEntityWorld.hpp"
+#include "engine/procgen/IWorldProfile.hpp"
 #include "engine/voxel/IVoxelWorld.hpp"
 
 #include <cstdint>
@@ -23,12 +24,19 @@ namespace world {
 // Per-world configuration. `name` must be unique; `seed` is the per-world
 // seed (the project's generator/behavior RNG); `rulesJson` is an optional
 // opaque JSON document whose semantics belong to the project (validated as
-// well-formed JSON at create time, never guessed); `savePath` is the default
-// persistence location for load_world/save_world.
+// well-formed JSON at create time, never guessed); `profileJson` is an
+// OPTIONAL world profile (engine/procgen/IWorldProfile.hpp): when set, the
+// manager composes the world's generator from it (height + climate + biomes +
+// caves/ores + carver + decorators + structures) and registers it — the
+// project authors world generation entirely as JSON, no engine recompile. An
+// invalid profile REFUSES the world creation (all-or-nothing, nothing
+// registered). `savePath` is the default persistence location for
+// load_world/save_world.
 struct WorldSpec {
     std::string name;
     uint64_t seed{ 0 };
     std::string rulesJson;
+    std::string profileJson;
     std::string savePath;
 };
 
@@ -156,6 +164,15 @@ public:
     virtual engine::entity::EntityId resolve_entity_ref(
         const std::string& fromWorld, engine::entity::EntityId fromEntity,
         std::string& errorOut) = 0;
+
+    // ---- World profile (data-driven generation) ----------------------------
+    // The world profile the world was created with (WorldSpec.profileJson);
+    // nullptr when the world has none. The composed generator is already
+    // registered on the world (world(name)->generator is driven by it); the
+    // profile also exposes the structure-placement system (definitions + spawn
+    // rules) for the project to plan and place structures.
+    virtual std::shared_ptr<const engine::procgen::IWorldProfile> world_profile(
+        const std::string& name) const = 0;
 };
 
 // The only implementation of IWorldManager (src/engine/sdk/WorldManager.cpp).

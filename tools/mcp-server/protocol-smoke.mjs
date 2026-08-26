@@ -492,8 +492,8 @@ try {
   const runCli = (args) => spawnSync(process.execPath, [cliPath, ...args], { encoding: "utf8" });
   const cliKinds = runCli(["kinds"]);
   assert.equal(cliKinds.status, 0, cliKinds.stderr);
-  // 2 vehicle kinds (§17 item 12) + 1 ability kind (§19).
-  assert.equal(cliKinds.stdout.split(/\n/).filter(Boolean).length, schemaKinds.length + 3, cliKinds.stdout);
+  // 2 vehicle kinds (§17 item 12) + 1 ability kind (§19) + 1 mission kind (item 23).
+  assert.equal(cliKinds.stdout.split(/\n/).filter(Boolean).length, schemaKinds.length + 4, cliKinds.stdout);
   const cliSchema = runCli(["schema", "block"]);
   assert.equal(cliSchema.status, 0, cliSchema.stderr);
   assert.deepEqual(JSON.parse(cliSchema.stdout).properties.collisionShape.enum, ["full", "cross", "none"]);
@@ -735,6 +735,85 @@ try {
   const cliAbilitySchema = runCli(["schema", "ability"]);
   assert.equal(cliAbilitySchema.status, 0, cliAbilitySchema.stderr);
   assert.ok(JSON.parse(cliAbilitySchema.stdout).properties.effects, "CLI ability schema declares effects");
+
+  // Item 23 — missions and dialogues: author a mission through the same MCP
+  // surface, mirroring MissionDefinition::load_from_json (all-or-nothing).
+  const missionAsset = await request("tools/call", {
+    name: "author_mission_asset",
+    arguments: {
+      project: smokeProject, name: "First Steps",
+      objectives: [
+        { id: "reach_hill", kind: "reach", x: 10, z: -5, radius: 3 },
+        { id: "collect_wood", kind: "collect", target: "vulkancraft:oak_log", count: 2 }
+      ],
+      dialogue: [
+        { id: "start", speaker: "Elder", text: "Welcome, adventurer.", choices: [
+          { text: "Tell me the task.", next: "task" },
+          { text: "Goodbye.", next: "" }
+        ]},
+        { id: "task", speaker: "Elder", text: "Gather wood." }
+      ],
+      unlockConditions: [{ kind: "flag", key: "met_elder" }],
+      reward: { itemId: "vulkancraft:torch", count: 3, xp: 50, setFlag: "first_steps_done" },
+      repeatable: false
+    }
+  });
+  assert.equal(missionAsset.result.isError, undefined, JSON.stringify(missionAsset));
+  const missionPayload = JSON.parse(missionAsset.result.content[0].text);
+  assert.equal(missionPayload.created, true);
+  assert.equal(missionPayload.diagnostics.length, 0, JSON.stringify(missionPayload));
+  assert.ok(fs.existsSync(path.join(smokeProjectPath, "Content", "Missions", "First_Steps.json")));
+  const missionDocument = JSON.parse(fs.readFileSync(path.join(smokeProjectPath, "Content", "Missions", "First_Steps.json"), "utf8"));
+  assert.equal(missionDocument.objectives.length, 2);
+  assert.equal(missionDocument.dialogue.length, 2);
+  assert.equal(missionDocument.dialogue[0].choices[0].next, "task");
+  assert.equal(missionDocument.reward.itemId, "vulkancraft:torch");
+
+  // The exported JSON Schema covers the mission kind and accepts the emitted document.
+  assert.ok(capabilitiesPayload.mission_schemas, "game_capabilities exposes mission_schemas");
+  assert.ok(capabilitiesPayload.mission_asset_kinds, "game_capabilities exposes mission_asset_kinds");
+  const missionSchema = capabilitiesPayload.mission_schemas.mission;
+  assert.equal(missionSchema.$schema, "http://json-schema.org/draft-07/schema#");
+  assert.equal(missionSchema.type, "object");
+  assert.ok(missionSchema.properties.objectives, "mission schema declares objectives");
+  const missionSchemaErrors = validateJsonSchema(missionDocument, missionSchema);
+  assert.equal(missionSchemaErrors.length, 0, missionSchemaErrors.join("; "));
+
+  // Item 23 all-or-nothing: a dialogue without a 'start' node is refused.
+  const badMission = await request("tools/call", {
+    name: "author_mission_asset",
+    arguments: {
+      project: smokeProject, name: "BrokenQuest",
+      objectives: [{ id: "o1", kind: "reach", x: 0, z: 0, radius: 1 }],
+      dialogue: [{ id: "a", speaker: "X", text: "hi" }]
+    }
+  });
+  assert.equal(badMission.result.isError, undefined, JSON.stringify(badMission));
+  const badMissionPayload = JSON.parse(badMission.result.content[0].text);
+  assert.equal(badMissionPayload.refused, true, JSON.stringify(badMissionPayload));
+  assert.ok(badMissionPayload.diagnostics.some((d) => String(d).includes("start")), JSON.stringify(badMissionPayload));
+  assert.ok(!fs.existsSync(path.join(smokeProjectPath, "Content", "Missions", "BrokenQuest.json")));
+
+  // Missions are listed by inspect and counted by validate_game_project.
+  const inspectMissions = await request("tools/call", {
+    name: "inspect_mission_assets",
+    arguments: { project: smokeProject }
+  });
+  const inspectMissionsPayload = JSON.parse(inspectMissions.result.content[0].text);
+  assert.equal(inspectMissionsPayload.count, 1);
+  assert.ok(inspectMissionsPayload.mission_assets.every((asset) => asset.valid), JSON.stringify(inspectMissionsPayload));
+  const missionsValidation = await request("tools/call", {
+    name: "validate_game_project",
+    arguments: { project: smokeProject }
+  });
+  const missionsValidationPayload = JSON.parse(missionsValidation.result.content[0].text);
+  assert.equal(missionsValidationPayload.valid, true, JSON.stringify(missionsValidationPayload));
+  assert.ok(missionsValidationPayload.mission_assets >= 1);
+
+  // The CLI exposes the mission schema too.
+  const cliMissionSchema = runCli(["schema", "mission"]);
+  assert.equal(cliMissionSchema.status, 0, cliMissionSchema.stderr);
+  assert.ok(JSON.parse(cliMissionSchema.stdout).properties.objectives, "CLI mission schema declares objectives");
 
   // ---- Control API (editor_*): drive the RUNNING editor via :8321 ----
 

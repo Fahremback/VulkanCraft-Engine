@@ -125,6 +125,11 @@ uint8_t Chunk::get_block_light(int x, int y, int z) const {
     return found == blockLight.end() ? 0 : found->second;
 }
 
+uint16_t Chunk::get_sky_occlusion(int x, int z) const {
+    if (x < 0 || x >= CHUNK_SIZE_X || z < 0 || z >= CHUNK_SIZE_Z) return 0;
+    return skyOcclusionTop[x][z];
+}
+
 uint8_t Chunk::get_water_level(int x, int y, int z) const {
     const RuntimeBlockId waterId = runtime_id(BlockType::Water);
     if (x < 0 || x >= CHUNK_SIZE_X || y < 0 || y >= CHUNK_SIZE_Y || z < 0 || z >= CHUNK_SIZE_Z) return WATER_LEVEL_NONE;

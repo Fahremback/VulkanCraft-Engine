@@ -23,6 +23,7 @@
 // the public IStructureGenerator.
 
 #include "engine/procgen/IStructureGenerator.hpp"
+#include "engine/voxel/IVoxelWorld.hpp"
 
 #include <glm/glm.hpp>
 
@@ -180,6 +181,18 @@ std::shared_ptr<IStructurePlacementSystem> create_structure_placement_system();
 // nullptr + diagnostic on malformed/unknown-version documents.
 std::shared_ptr<IStructurePlacementSystem> create_structure_placement_system_from_json(
     const std::string& json, std::string& errorOut);
+
+// Writes a placed structure into a voxel world through the world's
+// TRANSACTIONAL path (the single mutation authority — META §11 / FALTANTES
+// §7): every non-air block of `placement.output.blocks` (index
+// x + z*width + y*width*height) is written at `origin + (x, y, z)` inside ONE
+// transaction. The commit is all-or-nothing: an unregistered block id, an
+// out-of-bounds cell or an unloaded chunk fails the WHOLE placement with a
+// diagnostic (nothing partial is ever observable). Returns false with a
+// diagnostic on a malformed output or a failed commit. Deterministic.
+bool place_structure(engine::voxel::IVoxelWorld& world,
+                     const StructurePlacement& placement,
+                     std::string& errorOut);
 
 }  // namespace procgen
 }  // namespace engine

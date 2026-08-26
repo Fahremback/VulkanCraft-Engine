@@ -71,6 +71,16 @@ ColumnKey column_key(const VoxelColumn& column, float cellSize) {
              static_cast<int>(std::llround(column.z / cellSize)) };
 }
 
+// Grid-equality of two columns (same quantized cell, same span and solid
+// flag) — the comparison used to detect that an obstacle toggle changed a
+// footprint column vs. the current effective set.
+bool same_grid_column(const VoxelColumn& a, const VoxelColumn& b,
+                      float cellSize) {
+    return column_key(a, cellSize) == column_key(b, cellSize) &&
+           a.solid == b.solid && a.solidMinY == b.solidMinY &&
+           a.solidMaxY == b.solidMaxY;
+}
+
 // Tile grid key (tile indices on the tiled navmesh).
 struct TileKey {
     int x{ 0 };
@@ -349,6 +359,189 @@ public:
             return false;
         }
 
+        // The caller changed the TERRAIN: apply to the base set, then
+        // recompute the effective set over the touched keys (active
+        // obstacles still override their footprint) and re-bake only what
+        // actually changed. All-or-nothing: the base set rolls back if the
+        // bake fails.
+        struct OldBase {
+            bool present{ false };
+            VoxelColumn value;
+        };
+        std::unordered_map<ColumnKey, OldBase, ColumnKeyHash> oldBase;
+        oldBase.reserve(changedColumns.size());
+        for (const VoxelColumn& column : changedColumns) {
+            const ColumnKey key = column_key(column, config_.cellSize);
+            const auto it = baseColumnsByKey_.find(key);
+            OldBase old;
+            old.present = it != baseColumnsByKey_.end();
+            if (old.present) old.value = it->second;
+            oldBase.emplace(key, old);
+            baseColumnsByKey_[key] = column;
+        }
+        std::vector<VoxelColumn> delta;
+        std::string diffError;
+        if (!effective_diff(changedColumns, delta, diffError)) {
+            errorOut = diffError;
+            return false;
+        }
+        if (delta.empty()) {
+            errorOut.clear();
+            return true;  // every touched key is still overridden — no re-bake
+        }
+        if (!apply_column_delta(delta, errorOut)) {
+            for (const auto& entry : oldBase) {
+                if (entry.second.present) {
+                    baseColumnsByKey_[entry.first] = entry.second.value;
+                } else {
+                    baseColumnsByKey_.erase(entry.first);
+                }
+            }
+            return false;
+        }
+        return true;
+    }
+
+    bool set_dynamic_obstacle(uint64_t id, const DynamicObstacle& obstacle,
+                              std::string& errorOut) override {
+        if (tileSize_ <= 0.0f) {
+            errorOut = "navigation: dynamic obstacles require tiled mode "
+                       "(NavmeshConfig::tileSize > 0)";
+            return false;
+        }
+        if (columnsByKey_.empty()) {
+            errorOut = "navigation: set_dynamic_obstacle before build()";
+            return false;
+        }
+        if (obstacle.columns.empty()) {
+            errorOut = "navigation: dynamic obstacle has no columns";
+            return false;
+        }
+        // Save the previous registration so a failed bake restores it
+        // (all-or-nothing).
+        const bool hadPrevious = obstacles_.count(id) != 0;
+        const ObstacleState previous = hadPrevious ? obstacles_.at(id)
+                                                   : ObstacleState{};
+        obstacles_[id] = ObstacleState{ obstacle, true };
+        if (!reapply_obstacle(id, errorOut)) {
+            if (hadPrevious) {
+                obstacles_[id] = previous;
+            } else {
+                obstacles_.erase(id);
+            }
+            return false;
+        }
+        return true;
+    }
+
+    bool set_obstacle_active(uint64_t id, bool active,
+                             std::string& errorOut) override {
+        if (tileSize_ <= 0.0f) {
+            errorOut = "navigation: dynamic obstacles require tiled mode "
+                       "(NavmeshConfig::tileSize > 0)";
+            return false;
+        }
+        const auto it = obstacles_.find(id);
+        if (it == obstacles_.end()) {
+            errorOut = "navigation: unknown dynamic obstacle id";
+            return false;
+        }
+        if (it->second.active == active) {
+            errorOut.clear();
+            return true;  // no-op toggle
+        }
+        it->second.active = active;
+        if (!reapply_obstacle(id, errorOut)) {
+            it->second.active = !active;  // restore the previous state
+            return false;
+        }
+        return true;
+    }
+
+    // Computes the effective columns (base terrain overlaid by every ACTIVE
+    // obstacle, highest registered id winning on overlap) for the grid keys
+    // of `columns`, diffs them against the current effective set and appends
+    // the columns that changed (a non-solid column removes its key). Pure:
+    // does not mutate the stored sets.
+    bool effective_diff(const std::vector<VoxelColumn>& columns,
+                        std::vector<VoxelColumn>& deltaOut,
+                        std::string& errorOut) {
+        deltaOut.clear();
+        // Active obstacles sorted by id (ascending): the highest id wins on
+        // overlapping footprints (deterministic).
+        std::vector<std::uint64_t> activeIds;
+        for (const auto& entry : obstacles_) {
+            if (entry.second.active) activeIds.push_back(entry.first);
+        }
+        std::sort(activeIds.begin(), activeIds.end());
+        for (const VoxelColumn& column : columns) {
+            const ColumnKey key = column_key(column, config_.cellSize);
+            bool hasEffective = false;
+            VoxelColumn effective;
+            for (const std::uint64_t id : activeIds) {
+                for (const VoxelColumn& ob : obstacles_.at(id).obstacle.columns) {
+                    if (column_key(ob, config_.cellSize) == key) {
+                        effective = ob;
+                        hasEffective = true;
+                        break;
+                    }
+                }
+            }
+            if (!hasEffective) {
+                const auto baseIt = baseColumnsByKey_.find(key);
+                if (baseIt != baseColumnsByKey_.end()) {
+                    effective = baseIt->second;
+                    hasEffective = true;
+                }
+            }
+            const auto curIt = columnsByKey_.find(key);
+            const bool hasCurrent = curIt != columnsByKey_.end();
+            const bool same = hasCurrent == hasEffective &&
+                              (!hasEffective ||
+                               same_grid_column(curIt->second, effective,
+                                                config_.cellSize));
+            if (same) continue;
+            if (hasEffective) {
+                deltaOut.push_back(effective);
+            } else {
+                // Removing the key: a non-solid column is ignored by the
+                // baker and drops any previous column at the key.
+                VoxelColumn empty;
+                empty.x = column.x;
+                empty.z = column.z;
+                empty.solid = false;
+                deltaOut.push_back(empty);
+            }
+        }
+        errorOut.clear();
+        return true;
+    }
+
+    // Re-bakes the tiles overlapping ONE obstacle's footprint from its
+    // current active state (called by set_dynamic_obstacle /
+    // set_obstacle_active).
+    bool reapply_obstacle(std::uint64_t id, std::string& errorOut) {
+        std::vector<VoxelColumn> delta;
+        std::string diffError;
+        if (!effective_diff(obstacles_.at(id).obstacle.columns, delta,
+                            diffError)) {
+            errorOut = diffError;
+            return false;
+        }
+        if (delta.empty()) {
+            errorOut.clear();
+            return true;  // no effective change (e.g. obstacle over same terrain)
+        }
+        return apply_column_delta(delta, errorOut);
+    }
+
+    // Applies a set of changed columns to the effective column set and
+    // re-bakes ONLY the tiles overlapping them (all-or-nothing: the stored
+    // sets and the navmesh are rolled back when any affected tile fails to
+    // bake). Shared by update() (terrain edits) and the dynamic-obstacle
+    // toggle (which computes the footprint diff and feeds it here).
+    bool apply_column_delta(const std::vector<VoxelColumn>& changedColumns,
+                            std::string& errorOut) {
         // Apply the delta to the stored column set, remembering the previous
         // values so a bake failure can roll the stored set back (all-or-nothing).
         struct OldColumn {
@@ -557,6 +750,11 @@ private:
         uint64_t revision{ 0 };
     };
 
+    struct ObstacleState {
+        DynamicObstacle obstacle;
+        bool active{ false };
+    };
+
     // ---- legacy single-navmesh mode (tileSize == 0) ----
     bool build_single(const NavmeshConfig& config,
                       const std::vector<VoxelColumn>& columns,
@@ -596,6 +794,8 @@ private:
         borderCells_ = 0;
         tiles_.clear();
         columnsByKey_.clear();
+        baseColumnsByKey_.clear();
+        obstacles_.clear();
         ++revision_;
         errorOut.clear();
         return true;
@@ -690,12 +890,19 @@ private:
         borderCells_ = borderCells;
         ++revision_;
         for (auto& entry : tiles_) entry.second.revision = revision_;
-        // Store the full column set for incremental updates.
+        // Store the full column set for incremental updates. The base set is
+        // the terrain as baked; active dynamic obstacles overlay it and the
+        // effective set (columnsByKey_) is what tiles are baked from.
         columnsByKey_.clear();
         columnsByKey_.reserve(columns.size());
+        baseColumnsByKey_.clear();
+        baseColumnsByKey_.reserve(columns.size());
         for (const VoxelColumn& column : columns) {
-            columnsByKey_[column_key(column, config.cellSize)] = column;
+            const ColumnKey key = column_key(column, config.cellSize);
+            columnsByKey_[key] = column;
+            baseColumnsByKey_[key] = column;
         }
+        obstacles_.clear();
         errorOut.clear();
         return true;
     }
@@ -724,7 +931,13 @@ private:
     int borderCells_{ 0 };
     std::vector<std::byte> singleData_;  // owned buffer in single mode
     std::unordered_map<TileKey, TileState, TileKeyHash> tiles_;
+    // Effective column set (base terrain overlaid by active obstacles); this
+    // is what tiles are baked from and what apply_column_delta mutates.
     std::unordered_map<ColumnKey, VoxelColumn, ColumnKeyHash> columnsByKey_;
+    // Base terrain columns (from build(); update() mutates these, obstacle
+    // toggles never do) — the fallback when no active obstacle covers a key.
+    std::unordered_map<ColumnKey, VoxelColumn, ColumnKeyHash> baseColumnsByKey_;
+    std::unordered_map<std::uint64_t, ObstacleState> obstacles_;
 };
 
 std::unique_ptr<INavigationProvider> create_recast_navigation_provider() {

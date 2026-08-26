@@ -47,6 +47,8 @@
 #include "Voxel.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <utility>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -1545,6 +1547,114 @@ void test_region_palette_compression() {
 
     std::cout << "[sdk] region palette+compression: v2 page smaller than raw, "
                  "round-trip identical, corruption refused OK\n";
+}
+
+// Per-voxel state in region pages (FALTANTES item 2): a paged (region) save
+// must persist block states exactly like the monolithic v5 save does. The v2
+// page appends a state section gated by flag 0x04, only when the chunk holds
+// non-default state; loading restores it, and pages without the flag load
+// with state 0 everywhere (backward compatible with pre-state readers).
+void test_region_state_persistence() {
+    // --- Phase A: world with a stateful lamp, paged save. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    auto registryA = std::make_shared<engine::registry::BlockRegistry>();
+    std::string error;
+    CHECK(registryA->load_from_json(
+        R"({"name":"lamp","namespace":"test","states":[)"
+        R"({"name":"base","color":[0.4,0.4,0.4]},)"
+        R"({"name":"lit","color":[1.0,0.6,0.1],"lightEmission":0.8}]})",
+        error));
+    a->set_block_registry(registryA);
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    uint32_t lampId = 0;
+    CHECK(a->resolve_block_id("test:lamp", lampId, error));
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(3, 130, 3, lampId);
+        tx->set_block(5, 130, 5, lampId);
+        tx->set_block(7, 130, 7, lampId);
+        std::string txErr;
+        CHECK(tx->commit(txErr));
+        CHECK(txErr.empty());
+    }
+    a->set_block_state(5, 130, 5, 1);
+    a->set_block_state(7, 130, 7, 0);
+    CHECK(a->get_block_state(3, 130, 3) == 0);
+    CHECK(a->get_block_state(5, 130, 5) == 1);
+    CHECK(a->get_block_state(7, 130, 7) == 0);
+
+    a->register_storage(engine::storage::create_region_chunk_storage(8));
+    const std::string dir = scratch_dir() + "/vc_test_regions_state";
+    std::string errorA;
+    CHECK(a->save_world(dir, errorA));
+    CHECK(errorA.empty());
+
+    // --- Phase B: the page carries the state flag (0x04) for the edited
+    // chunk and parses with no trailing garbage. ---
+    const std::string pagePath = dir + "/pages/r_0_0.dat";
+    std::ifstream in(pagePath, std::ios::binary);
+    CHECK(in.good());
+    std::string page((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+    CHECK(page.size() > 8);
+    CHECK(page.compare(0, 4, "VCW2") == 0);
+    const auto u32at = [&page](std::size_t at) {
+        return static_cast<uint32_t>(static_cast<uint8_t>(page[at])) |
+               (static_cast<uint32_t>(static_cast<uint8_t>(page[at + 1])) << 8) |
+               (static_cast<uint32_t>(static_cast<uint8_t>(page[at + 2])) << 16) |
+               (static_cast<uint32_t>(static_cast<uint8_t>(page[at + 3])) << 24);
+    };
+    const uint32_t count = u32at(4);
+    CHECK(count >= 1);
+    bool sawStateFlag = false;
+    std::size_t cursor = 8;
+    for (uint32_t i = 0; i < count; ++i) {
+        CHECK(cursor + 13 <= page.size());
+        const uint8_t flags = static_cast<uint8_t>(page[cursor + 12]);
+        if ((flags & 0x04) != 0) sawStateFlag = true;
+        cursor += 13;
+        if ((flags & 0x01) != 0) {  // palette present
+            CHECK(cursor + 2 <= page.size());
+            const uint16_t paletteCount =
+                static_cast<uint16_t>(static_cast<uint8_t>(page[cursor])) |
+                (static_cast<uint16_t>(static_cast<uint8_t>(page[cursor + 1])) << 8);
+            cursor += 2 + static_cast<std::size_t>(paletteCount) * 2;
+        }
+        CHECK(cursor + 4 <= page.size());
+        const uint32_t payloadBytes = u32at(cursor);
+        cursor += 4 + payloadBytes;
+    }
+    CHECK(cursor == page.size());  // no trailing garbage
+    CHECK(sawStateFlag);
+
+    // --- Phase C: fresh world loads the page and restores states. ---
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    auto registryB = std::make_shared<engine::registry::BlockRegistry>();
+    CHECK(registryB->load_from_json(
+        R"({"name":"lamp","namespace":"test","states":[)"
+        R"({"name":"base","color":[0.4,0.4,0.4]},)"
+        R"({"name":"lit","color":[1.0,0.6,0.1],"lightEmission":0.8}]})",
+        error));
+    b->set_block_registry(registryB);
+    CHECK(boot_world(*b, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    b->register_storage(engine::storage::create_region_chunk_storage(8));
+    std::string errorB;
+    CHECK(b->load_world(dir, errorB));
+    CHECK(errorB.empty());
+    CHECK(b->get_block(3, 130, 3) == static_cast<uint32_t>(lampId));
+    CHECK(b->get_block(5, 130, 5) == static_cast<uint32_t>(lampId));
+    CHECK(b->get_block(7, 130, 7) == static_cast<uint32_t>(lampId));
+    CHECK(b->get_block_state(3, 130, 3) == 0);
+    CHECK(b->get_block_state(5, 130, 5) == 1);
+    CHECK(b->get_block_state(7, 130, 7) == 0);
+    // Chunks without state (the flat terrain) load with state 0 — their pages
+    // have the flag off, exactly like a pre-state page (backward compatible).
+    CHECK(b->get_block_state(1, 50, 1) == 0);
+
+    std::cout << "[sdk] region pages: per-voxel state persisted (flag 0x04), "
+                 "round-trip OK\n";
 }
 
 // A region backend whose FIRST save_page call blocks on a gate — used to pin
@@ -6723,6 +6833,159 @@ void test_navigation_local_update_world() {
                  "tile of the change re-baked OK\n";
 }
 
+// FALTANTES item 12 — doors, platforms and moving obstacles: a dynamic
+// obstacle (a named set of solid columns) toggles on/off over the terrain.
+// While ACTIVE its columns block the navmesh (detour); while INACTIVE the
+// terrain columns are restored (straight path again). Toggling re-bakes ONLY
+// the tiles overlapping the footprint and is bit-exact equivalent to a full
+// rebuild over the effective column set — a door opening/closing never
+// triggers a full rebake.
+void test_navigation_dynamic_obstacle() {
+    using engine::navigation::DynamicObstacle;
+    using engine::navigation::NavmeshConfig;
+    using engine::navigation::PathResult;
+    using engine::navigation::VoxelColumn;
+
+    const float step = 0.5f;
+    const auto ground_columns = [&]() {
+        std::vector<VoxelColumn> columns;
+        for (float x = 0.25f; x <= 31.75f; x += step) {
+            for (float z = 0.25f; z <= 31.75f; z += step) {
+                VoxelColumn column;
+                column.x = x;
+                column.z = z;
+                column.solidMinY = 0.0f;
+                column.solidMaxY = 1.0f;
+                column.solid = true;
+                columns.push_back(column);
+            }
+        }
+        return columns;
+    };
+    const auto wall_obstacle = [&](float z0, float z1) {
+        DynamicObstacle obstacle;
+        for (float z = z0; z <= z1; z += step) {
+            VoxelColumn column;
+            column.x = 16.0f;  // tile boundary between x-tiles 1 and 2
+            column.z = z;
+            column.solidMinY = 0.0f;
+            column.solidMaxY = 4.0f;
+            column.solid = true;
+            obstacle.columns.push_back(column);
+        }
+        return obstacle;
+    };
+
+    NavmeshConfig config;
+    config.boundsMinX = 0.0f;
+    config.boundsMaxX = 32.0f;
+    config.boundsMinZ = 0.0f;
+    config.boundsMaxZ = 32.0f;
+    config.cellSize = step;
+    config.tileSize = 8.0f;  // tiled mode: 4x4 tiles of 8 world units
+
+    std::string error;
+    std::unique_ptr<engine::navigation::INavigationProvider> nav =
+        engine::navigation::create_recast_navigation_provider();
+    const auto flatColumns = ground_columns();
+    CHECK(nav->build(config, flatColumns, error));
+    CHECK(error.empty());
+    CHECK(nav->valid());
+
+    // Baseline straight path along z=12, from x=2 to x=30 (the door at x=16
+    // spanning z in [8,24] crosses this line).
+    PathResult base;
+    CHECK(nav->find_path(2.0f, 0.5f, 12.0f, 30.0f, 0.5f, 12.0f, base));
+    CHECK(base.found);
+    const float baseLen = base.totalLength;
+    const uint64_t r0 = nav->tile_revision(4.0f, 4.0f);
+    CHECK(r0 > 0);
+    CHECK(nav->tile_revision(20.0f, 20.0f) == r0);
+    CHECK(nav->tile_revision(28.0f, 4.0f) == r0);
+
+    // ---- Door CLOSED: the wall detours the path ----
+    const DynamicObstacle door = wall_obstacle(8.0f, 24.0f);
+    CHECK(nav->set_dynamic_obstacle(1, door, error));
+    CHECK(error.empty());
+    PathResult closed;
+    CHECK(nav->find_path(2.0f, 0.5f, 12.0f, 30.0f, 0.5f, 12.0f, closed));
+    CHECK(closed.found);
+    CHECK(closed.totalLength > baseLen + 2.0f);  // real detour (~30.1 vs 28.0)
+    // Locality: the wall touches tiles (1,1),(1,2),(2,1),(2,2) only — corner
+    // tiles (0,0) and (3,0) are NOT re-baked.
+    CHECK(nav->tile_revision(4.0f, 4.0f) == r0);           // tile (0,0) untouched
+    CHECK(nav->tile_revision(28.0f, 4.0f) == r0);          // tile (3,0) untouched
+    CHECK(nav->tile_revision(20.0f, 20.0f) > r0);          // tile (2,2) re-baked
+
+    // ---- Door OPEN: path restored (straight again, ~= base) ----
+    CHECK(nav->set_obstacle_active(1, false, error));
+    CHECK(error.empty());
+    PathResult open;
+    CHECK(nav->find_path(2.0f, 0.5f, 12.0f, 30.0f, 0.5f, 12.0f, open));
+    CHECK(open.found);
+    CHECK(std::fabs(open.totalLength - baseLen) < 0.001f);
+
+    // ---- Door re-closed: same detour returns ----
+    CHECK(nav->set_obstacle_active(1, true, error));
+    CHECK(error.empty());
+    PathResult closed2;
+    CHECK(nav->find_path(2.0f, 0.5f, 12.0f, 30.0f, 0.5f, 12.0f, closed2));
+    CHECK(closed2.found);
+    CHECK(std::fabs(closed2.totalLength - closed.totalLength) < 0.001f);
+
+    // ---- Equivalence: obstacle active == full rebuild over the effective
+    // column set (ground minus replaced keys + wall), bit-exact ----
+    std::unique_ptr<engine::navigation::INavigationProvider> fresh =
+        engine::navigation::create_recast_navigation_provider();
+    std::vector<VoxelColumn> effective;
+    {
+        auto wallKey = [&](const VoxelColumn& c) {
+            return std::make_pair(static_cast<int>(std::llround(c.x / step)),
+                                  static_cast<int>(std::llround(c.z / step)));
+        };
+        std::vector<std::pair<int, int>> wallKeys;
+        for (const VoxelColumn& wc : door.columns) wallKeys.push_back(wallKey(wc));
+        for (const VoxelColumn& g : flatColumns) {
+            const auto k = wallKey(g);
+            if (std::find(wallKeys.begin(), wallKeys.end(), k) != wallKeys.end()) {
+                continue;  // this ground column is replaced by the wall
+            }
+            effective.push_back(g);
+        }
+        for (const VoxelColumn& c : door.columns) effective.push_back(c);
+    }
+    CHECK(fresh->build(config, effective, error));
+    CHECK(error.empty());
+    PathResult baked;
+    CHECK(fresh->find_path(2.0f, 0.5f, 12.0f, 30.0f, 0.5f, 12.0f, baked));
+    CHECK(baked.found);
+    CHECK(baked.totalLength == closed.totalLength);  // bit-exact
+    CHECK(baked.waypoints == closed.waypoints);
+
+    // ---- Refusals (all-or-nothing / mode guards) ----
+    std::string refused;
+    CHECK(!nav->set_obstacle_active(999, true, refused));  // unknown id
+    CHECK(!refused.empty());
+    CHECK(!nav->set_dynamic_obstacle(2, DynamicObstacle{}, refused));  // empty
+    CHECK(!refused.empty());
+    NavmeshConfig legacyConfig = config;
+    legacyConfig.tileSize = 0.0f;  // single-navmesh mode
+    std::unique_ptr<engine::navigation::INavigationProvider> legacy =
+        engine::navigation::create_recast_navigation_provider();
+    CHECK(legacy->build(legacyConfig, flatColumns, error));
+    CHECK(error.empty());
+    CHECK(!legacy->set_dynamic_obstacle(1, door, refused));  // refused
+    CHECK(!refused.empty());
+    std::unique_ptr<engine::navigation::INavigationProvider> freshNav =
+        engine::navigation::create_recast_navigation_provider();
+    CHECK(!freshNav->set_dynamic_obstacle(1, door, refused));  // before build
+    CHECK(!refused.empty());
+
+    std::cout << "[sdk] navigation dynamic obstacle: door toggles locally "
+                 "(only its tiles re-bake), open restores the path, active "
+                 "== full rebuild bit-exact, refusals OK\n";
+}
+
 // ---- META section 17 / FALTANTES item 13: authoritative voxel replication ----
 // Server validates and applies client edits (cooldown, bounds, loaded chunk,
 // block registry), broadcasts ordered deltas over the generic networking
@@ -9565,6 +9828,118 @@ void test_structure_placement() {
                  "spawn rules, determinism, JSON all-or-nothing) OK\n";
 }
 
+// ---- Item 14 resto: structure placement WRITTEN into the world (the
+// placement system decides WHERE; this consumer writes the generated blocks
+// through the world's transactional path — all-or-nothing) ----
+
+void test_structure_placer() {
+    std::string error;
+    auto system = engine::procgen::create_structure_placement_system();
+    CHECK(system != nullptr);
+    engine::procgen::StructureDefinition room;
+    room.id = "test:room";
+    room.spec = make_room_spec(7);
+    room.outputWidth = 12;
+    room.outputHeight = 8;
+    CHECK(system->add_definition(room, error) && error.empty());
+    engine::procgen::StructureSpawnRule rule;
+    rule.structureId = "test:room";
+    rule.density = 1.0f;
+    rule.spacing = 8;
+    rule.yOffset = 1;
+
+    // Flat DRY world (130 — the fluid-test convention) so the structure lands
+    // on land, inside the loaded region around the boot focus.
+    std::unique_ptr<engine::voxel::IVoxelWorld> world =
+        engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(130));
+    CHECK(boot_world(*world, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    // boot_world only guarantees chunk (0,0); the room spans chunks (0,0) and
+    // (1,0) (x 8..19), and place_structure legitimately rolls back on an
+    // unloaded chunk — settle until the stream loads the second chunk.
+    CHECK(settle(*world, glm::vec3(16.0f, 200.0f, 16.0f),
+                 [&]() { return world->is_chunk_loaded(1, 0); }));
+
+    const std::uint32_t worldSeed = 42u;
+    engine::procgen::StructurePlacement placed;
+    CHECK(system->try_place({ rule }, 8, 8, 130, "", worldSeed, placed, error));
+    CHECK(placed.origin == glm::ivec3(8, 131, 8));
+    CHECK(engine::procgen::place_structure(*world, placed, error) && error.empty());
+
+    // The room is in the world: a wall column is 3/3/3/air and a floor column
+    // is 5/air at the placement origin (extrusion profiles of the asset).
+    bool sawWall = false, sawFloor = false;
+    for (int z = 0; z < placed.output.height && !(sawWall && sawFloor); ++z) {
+        for (int x = 0; x < placed.output.width; ++x) {
+            const std::uint32_t id =
+                placed.output.plan[x + z * placed.output.width];
+            const int wx = placed.origin.x + x;
+            const int wz = placed.origin.z + z;
+            if (id == 1 && !sawWall) {
+                sawWall = true;
+                CHECK(world->get_block(wx, placed.origin.y, wz) == 3);
+                CHECK(world->get_block(wx, placed.origin.y + 1, wz) == 3);
+                CHECK(world->get_block(wx, placed.origin.y + 2, wz) == 3);
+                CHECK(world->get_block(wx, placed.origin.y + 3, wz) == 0);
+            } else if (id == 2 && !sawFloor) {
+                sawFloor = true;
+                CHECK(world->get_block(wx, placed.origin.y, wz) == 5);
+                CHECK(world->get_block(wx, placed.origin.y + 1, wz) == 0);
+            }
+        }
+    }
+    CHECK(sawWall && sawFloor);
+
+    // Determinism: a second world receives the identical structure.
+    std::unique_ptr<engine::voxel::IVoxelWorld> worldB =
+        engine::voxel::create_default_voxel_world();
+    worldB->register_generator(std::make_shared<FlatGenerator>(130));
+    CHECK(boot_world(*worldB, glm::vec3(16.0f, 200.0f, 16.0f), 16));
+    CHECK(settle(*worldB, glm::vec3(16.0f, 200.0f, 16.0f),
+                 [&]() { return worldB->is_chunk_loaded(1, 0); }));
+    CHECK(engine::procgen::place_structure(*worldB, placed, error) && error.empty());
+    bool same = true;
+    for (int x = 8; x <= 19; ++x) {
+        for (int z = 8; z <= 15; ++z) {
+            for (int y = 128; y <= 136; ++y) {
+                if (world->get_block(x, y, z) != worldB->get_block(x, y, z)) {
+                    same = false;
+                }
+            }
+        }
+    }
+    CHECK(same);
+
+    // All-or-nothing 1: an unregistered block id fails the WHOLE placement
+    // (id validation runs before apply) and nothing is observable.
+    engine::procgen::StructurePlacement bad;
+    bad.structureId = "test:room";
+    bad.origin = glm::ivec3(30, 131, 8);
+    bad.output.width = 2;
+    bad.output.height = 1;
+    bad.output.depth = 1;
+    bad.output.blocks = { 999, 0 };
+    CHECK(!engine::procgen::place_structure(*world, bad, error) && !error.empty());
+    CHECK(world->get_block(30, 131, 8) == 0);
+    CHECK(world->get_block(31, 131, 8) == 0);
+
+    // All-or-nothing 2: a placement over an UNLOADED chunk rolls back
+    // entirely (no partial edits).
+    engine::procgen::StructurePlacement far = placed;
+    far.origin = glm::ivec3(1000, 131, 1000);
+    CHECK(!engine::procgen::place_structure(*world, far, error) && !error.empty());
+    CHECK(world->get_block(1000, 131, 1000) == 0);
+
+    // Malformed output refused with a diagnostic.
+    engine::procgen::StructurePlacement malformed;
+    malformed.output.width = 0;
+    CHECK(!engine::procgen::place_structure(*world, malformed, error) &&
+          !error.empty());
+
+    std::cout << "[sdk] procgen: structure placer (placement written into the "
+                 "world, transactional all-or-nothing, determinism) OK\n";
+}
+
 // ---- Item 14/16: world profile — ONE JSON document composes every
 // generation domain (noise + climate + biomes + surface + caves/ores +
 // carver + decorators + structures) without per-world C++ assembly ----
@@ -9720,6 +10095,115 @@ void test_world_profile() {
     std::cout << "[sdk] procgen: world profile (one JSON composes noise+"
                  "climate+biomes+ores+carver+decorators+structures, "
                  "round-trip, all-or-nothing) OK\n";
+}
+
+// ---- Item 16 resto: the WorldManager consumes a world profile end-to-end
+// (WorldSpec.profileJson -> composed generator registered on the world) ----
+
+void test_world_manager_profile() {
+    std::string error;
+    auto manager = engine::world::create_world_manager();
+    CHECK(manager != nullptr);
+
+    engine::world::WorldSpec spec;
+    spec.name = "profile_world";
+    spec.seed = 42;
+    spec.profileJson = kProfileAsset;
+    CHECK(manager->create_world(spec, error) && error.empty());
+    CHECK(manager->has_world("profile_world"));
+    engine::voxel::IVoxelWorld* w = manager->world("profile_world");
+    CHECK(w != nullptr);
+    auto profile = manager->world_profile("profile_world");
+    CHECK(profile != nullptr);
+    CHECK(profile->structure_placement() != nullptr);
+    CHECK(profile->structure_placement()->definition("p:room") != nullptr);
+    CHECK(profile->structure_placement()->rules().size() == 1);
+    // A world without a profile has none.
+    engine::world::WorldSpec plain;
+    plain.name = "plain_world";
+    CHECK(manager->create_world(plain, error) && error.empty());
+    CHECK(manager->world_profile("plain_world") == nullptr);
+
+    // Settle chunk (0,0) through the manager's update loop.
+    const glm::vec3 focus(16.0f, 200.0f, 16.0f);
+    const auto start = std::chrono::steady_clock::now();
+    bool loaded = false;
+    for (int step = 0; step < 60 * 30 && !loaded; ++step) {
+        if (w->is_chunk_loaded(0, 0)) {
+            loaded = true;
+            break;
+        }
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count() > 8000) {
+            break;
+        }
+        manager->update_world("profile_world", focus, 1.0f / 60.0f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(loaded);
+
+    // The profile's data-driven generator drives the world's voxels.
+    CHECK(w->get_block(4, 60, 4) == 18);    // ore rule over builtin GoldOre
+    CHECK(w->get_block(4, 100, 4) == 18);   // ore rule over builtin IronOre
+    CHECK(w->get_block(4, 5, 4) == 17);     // y-gate: builtin GoldOre stays
+    // Biome surface rule + decorator column at a land column.
+    const int surface = profile->generator()->sample(8.0f, 8.0f).height;
+    if (surface > 129) {
+        CHECK(w->get_block(8, surface, 8) == 50);
+        CHECK(w->get_block(8, surface + 1, 8) == 50);
+        CHECK(w->get_block(8, surface + 2, 8) == 50);
+        CHECK(w->get_block(8, surface + 3, 8) == 0);
+    }
+
+    // All-or-nothing: an invalid profile refuses world creation (nothing
+    // registered, nothing partial).
+    engine::world::WorldSpec bad;
+    bad.name = "bad_world";
+    bad.profileJson = "{\"version\":99}";
+    CHECK(!manager->create_world(bad, error) && !error.empty());
+    CHECK(!manager->has_world("bad_world"));
+    bad.profileJson = "{nope";
+    CHECK(!manager->create_world(bad, error) && !error.empty());
+    CHECK(!manager->has_world("bad_world"));
+
+    // Determinism: a second manager + world with the same profile is
+    // identical to the first.
+    auto managerB = engine::world::create_world_manager();
+    engine::world::WorldSpec specB = spec;
+    specB.name = "profile_world_b";
+    CHECK(managerB->create_world(specB, error) && error.empty());
+    engine::voxel::IVoxelWorld* wB = managerB->world("profile_world_b");
+    CHECK(wB != nullptr);
+    const auto startB = std::chrono::steady_clock::now();
+    bool loadedB = false;
+    for (int step = 0; step < 60 * 30 && !loadedB; ++step) {
+        if (wB->is_chunk_loaded(0, 0)) {
+            loadedB = true;
+            break;
+        }
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - startB).count() > 8000) {
+            break;
+        }
+        managerB->update_world("profile_world_b", focus, 1.0f / 60.0f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(loadedB);
+    bool same = true;
+    for (int x = 4; x <= 12; x += 2) {
+        for (int z = 4; z <= 12; z += 2) {
+            for (int y = 100; y <= 140; ++y) {
+                if (w->get_block(x, y, z) != wB->get_block(x, y, z)) {
+                    same = false;
+                }
+            }
+        }
+    }
+    CHECK(same);
+
+    std::cout << "[sdk] world manager: world profile end-to-end (generator "
+                 "registered, voxels data-driven, all-or-nothing, "
+                 "determinism) OK\n";
 }
 
 void test_road_network() {
@@ -10919,6 +11403,7 @@ int main(int argc, char** argv) {
         test_storage_service();
         test_region_chunk_storage();
         test_region_palette_compression();
+        test_region_state_persistence();
         test_region_delta_saves();
         test_region_snapshot_concurrent_edit();
         test_region_async_save_load();
@@ -10977,6 +11462,7 @@ int main(int argc, char** argv) {
         test_navigation_voxel_world();
         test_navigation_local_update();
         test_navigation_local_update_world();
+        test_navigation_dynamic_obstacle();
         test_replication_authority();
         test_replication_deltas_reorder();
         test_commit_replication_persistence();
@@ -11005,7 +11491,9 @@ int main(int argc, char** argv) {
         test_world_features();
         test_structure_generator();
         test_structure_placement();
+        test_structure_placer();
         test_world_profile();
+        test_world_manager_profile();
         test_road_network();
         test_parcellation();
         test_parcel_triangulation();

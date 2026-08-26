@@ -62,20 +62,27 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
 
     auto add_face = [&](const glm::vec3& p0, const glm::vec3& p1, const glm::vec3& p2, const glm::vec3& p3,
                         const glm::vec3& normal, RuntimeBlockId type,
-                        uint8_t stateIndex = 0) {
+                        uint8_t stateIndex, float brightness) {
         const auto [col, layer] = material_for(type, normal, stateIndex);
+        // Block-light shading (FALTANTES item 8/9): the vertex color is the
+        // material color scaled by light/15. Only RGB is scaled — alpha (water
+        // transparency) is brightness-independent.
+        glm::vec4 lit = col;
+        lit.r *= brightness;
+        lit.g *= brightness;
+        lit.b *= brightness;
 
         glm::vec3 uv0(0.0f, 0.0f, layer);
         glm::vec3 uv1(1.0f, 0.0f, layer);
         glm::vec3 uv2(1.0f, 1.0f, layer);
         glm::vec3 uv3(0.0f, 1.0f, layer);
         auto& vertices = is_fluid_mesh(type) ? mesh.waterMeshVertices : mesh.meshVertices;
-        vertices.push_back({ p0, normal, col, uv0 });
-        vertices.push_back({ p1, normal, col, uv1 });
-        vertices.push_back({ p2, normal, col, uv2 });
-        vertices.push_back({ p0, normal, col, uv0 });
-        vertices.push_back({ p2, normal, col, uv2 });
-        vertices.push_back({ p3, normal, col, uv3 });
+        vertices.push_back({ p0, normal, lit, uv0 });
+        vertices.push_back({ p1, normal, lit, uv1 });
+        vertices.push_back({ p2, normal, lit, uv2 });
+        vertices.push_back({ p0, normal, lit, uv0 });
+        vertices.push_back({ p2, normal, lit, uv2 });
+        vertices.push_back({ p3, normal, lit, uv3 });
     };
 
     auto should_draw_face = [&](RuntimeBlockId current, RuntimeBlockId neighbor) {
@@ -144,6 +151,37 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
                 RuntimeBlockId northNeighbor = neighbor_block(0, 0, 1);
                 RuntimeBlockId southNeighbor = neighbor_block(0, 0, -1);
 
+                // Block/sky light shading (FALTANTES item 8/9): a face is
+                // shaded by the light of the cell it EXPOSES (the adjacent
+                // cell), so an opaque block next to a lamp reads the lamp's
+                // pool instead of its own always-dark cell. Snapshots without
+                // a light capture (tests/tooling) stay full-bright (1.0f).
+                auto neighbor_light = [&](int dx, int dy, int dz) -> uint8_t {
+                    const int nx = x + dx, ny = y + dy, nz = z + dz;
+                    if (nx >= 0 && nx < CHUNK_SIZE_X && ny >= 0 && ny < CHUNK_SIZE_Y &&
+                        nz >= 0 && nz < CHUNK_SIZE_Z) {
+                        return snapshot.light(nx, ny, nz);
+                    }
+                    if (dy == 0 && (nx < 0 || nx >= CHUNK_SIZE_X || nz < 0 || nz >= CHUNK_SIZE_Z)) {
+                        bool known = false;
+                        const uint8_t neighborLight = snapshot.halo_light(nx, ny, nz, known);
+                        return known ? neighborLight : uint8_t(0);
+                    }
+                    return 0;  // above/below the logical column: no light
+                };
+                const float bTop = snapshot.hasLightData
+                    ? static_cast<float>(neighbor_light(0, 1, 0)) / 15.0f : 1.0f;
+                const float bBottom = snapshot.hasLightData
+                    ? static_cast<float>(neighbor_light(0, -1, 0)) / 15.0f : 1.0f;
+                const float bEast = snapshot.hasLightData
+                    ? static_cast<float>(neighbor_light(1, 0, 0)) / 15.0f : 1.0f;
+                const float bWest = snapshot.hasLightData
+                    ? static_cast<float>(neighbor_light(-1, 0, 0)) / 15.0f : 1.0f;
+                const float bNorth = snapshot.hasLightData
+                    ? static_cast<float>(neighbor_light(0, 0, 1)) / 15.0f : 1.0f;
+                const float bSouth = snapshot.hasLightData
+                    ? static_cast<float>(neighbor_light(0, 0, -1)) / 15.0f : 1.0f;
+
                 if (is_leaf_block(as_builtin_block(type))) {
                     const bool exposed = topNeighbor == kRuntimeAirId || bottomNeighbor == kRuntimeAirId ||
                                          eastNeighbor == kRuntimeAirId || westNeighbor == kRuntimeAirId ||
@@ -195,28 +233,28 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
                     if (topNeighbor != type) {  // same fluid above: no top face
                         add_face(pos + glm::vec3(0, hNW, 1), pos + glm::vec3(1, hNE, 1),
                                  pos + glm::vec3(1, hSE, 0), pos + glm::vec3(0, hSW, 0),
-                                 glm::vec3(0, 1, 0), type, voxelState);
+                                 glm::vec3(0, 1, 0), type, voxelState, bTop);
                     }
                     if (bottomNeighbor == kRuntimeAirId) {
                         add_face(pos + glm::vec3(0, 0, 0), pos + glm::vec3(1, 0, 0),
                                  pos + glm::vec3(1, 0, 1), pos + glm::vec3(0, 0, 1),
-                                 glm::vec3(0, -1, 0), type, voxelState);
+                                 glm::vec3(0, -1, 0), type, voxelState, bBottom);
                     }
                     if (eastNeighbor == kRuntimeAirId) {
                         add_face(pos + glm::vec3(1, 0, 0), pos + glm::vec3(1, hSE, 0),
-                                 pos + glm::vec3(1, hNE, 1), pos + glm::vec3(1, 0, 1), glm::vec3(1, 0, 0), type, voxelState);
+                                 pos + glm::vec3(1, hNE, 1), pos + glm::vec3(1, 0, 1), glm::vec3(1, 0, 0), type, voxelState, bEast);
                     }
                     if (westNeighbor == kRuntimeAirId) {
                         add_face(pos + glm::vec3(0, 0, 1), pos + glm::vec3(0, hNW, 1),
-                                 pos + glm::vec3(0, hSW, 0), pos + glm::vec3(0, 0, 0), glm::vec3(-1, 0, 0), type, voxelState);
+                                 pos + glm::vec3(0, hSW, 0), pos + glm::vec3(0, 0, 0), glm::vec3(-1, 0, 0), type, voxelState, bWest);
                     }
                     if (northNeighbor == kRuntimeAirId) {
                         add_face(pos + glm::vec3(1, 0, 1), pos + glm::vec3(1, hNE, 1),
-                                 pos + glm::vec3(0, hNW, 1), pos + glm::vec3(0, 0, 1), glm::vec3(0, 0, 1), type, voxelState);
+                                 pos + glm::vec3(0, hNW, 1), pos + glm::vec3(0, 0, 1), glm::vec3(0, 0, 1), type, voxelState, bNorth);
                     }
                     if (southNeighbor == kRuntimeAirId) {
                         add_face(pos + glm::vec3(0, 0, 0), pos + glm::vec3(0, hSW, 0),
-                                 pos + glm::vec3(1, hSE, 0), pos + glm::vec3(1, 0, 0), glm::vec3(0, 0, -1), type, voxelState);
+                                 pos + glm::vec3(1, hSE, 0), pos + glm::vec3(1, 0, 0), glm::vec3(0, 0, -1), type, voxelState, bSouth);
                     }
                     continue;
                 }
@@ -224,7 +262,7 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
                 // Top (+Y)
                 if (should_draw_face(type, topNeighbor)) {
                     add_face(pos + glm::vec3(0, 1, 1), pos + glm::vec3(1, 1, 1), pos + glm::vec3(1, 1, 0), pos + glm::vec3(0, 1, 0),
-                             glm::vec3(0, 1, 0), type, voxelState);
+                             glm::vec3(0, 1, 0), type, voxelState, bTop);
 
                     if (type == grassId && topNeighbor == kRuntimeAirId) {
                         uint32_t edgeMask = 0;
@@ -251,27 +289,27 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
                 // Bottom (-Y)
                 if (should_draw_face(type, bottomNeighbor)) {
                     add_face(pos + glm::vec3(0, 0, 0), pos + glm::vec3(1, 0, 0), pos + glm::vec3(1, 0, 1), pos + glm::vec3(0, 0, 1),
-                             glm::vec3(0, -1, 0), type, voxelState);
+                             glm::vec3(0, -1, 0), type, voxelState, bBottom);
                 }
                 // East (+X)
                 if (should_draw_face(type, eastNeighbor)) {
                     add_face(pos + glm::vec3(1, 0, 0), pos + glm::vec3(1, 1, 0), pos + glm::vec3(1, 1, 1), pos + glm::vec3(1, 0, 1),
-                             glm::vec3(1, 0, 0), type, voxelState);
+                             glm::vec3(1, 0, 0), type, voxelState, bEast);
                 }
                 // West (-X)
                 if (should_draw_face(type, westNeighbor)) {
                     add_face(pos + glm::vec3(0, 0, 1), pos + glm::vec3(0, 1, 1), pos + glm::vec3(0, 1, 0), pos + glm::vec3(0, 0, 0),
-                             glm::vec3(-1, 0, 0), type, voxelState);
+                             glm::vec3(-1, 0, 0), type, voxelState, bWest);
                 }
                 // North (+Z)
                 if (should_draw_face(type, northNeighbor)) {
                     add_face(pos + glm::vec3(1, 0, 1), pos + glm::vec3(1, 1, 1), pos + glm::vec3(0, 1, 1), pos + glm::vec3(0, 0, 1),
-                             glm::vec3(0, 0, 1), type, voxelState);
+                             glm::vec3(0, 0, 1), type, voxelState, bNorth);
                 }
                 // South (-Z)
                 if (should_draw_face(type, southNeighbor)) {
                     add_face(pos + glm::vec3(0, 0, 0), pos + glm::vec3(0, 1, 0), pos + glm::vec3(1, 1, 0), pos + glm::vec3(1, 0, 0),
-                             glm::vec3(0, 0, -1), type, voxelState);
+                             glm::vec3(0, 0, -1), type, voxelState, bSouth);
                 }
             }
         }

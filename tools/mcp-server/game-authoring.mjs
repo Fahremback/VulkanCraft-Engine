@@ -190,6 +190,41 @@ const MISSION_CONDITION_FIELDS = [
   { name: "flagValue", type: "boolean", required: false, default: true }
 ];
 
+// World-profile asset kind (FALTANTES item 23 "editar geração procedural" —
+// the C++ contract is engine/procgen/IWorldProfile.hpp by AGENT-3, findings
+// #120-worldprofile): ONE versioned JSON document that composes the whole
+// generation pipeline — height (noise graph) + baseHeight/amplitude, climate
+// axes (each an optional noise graph), biomes, caves/ores (density + scale/
+// offset + ore table), carver, decorators and structures (definitions +
+// spawn rules) — into the generator the world registers. The MCP validates
+// the TOP-LEVEL structure only (version, section types, amplitude >= 0,
+// finite scale/offset); every present section is validated all-or-nothing by
+// its OWN subsystem parser when the C++ factory loads the document
+// (create_world_profile_from_json) — the MCP never re-implements the
+// subsystem parsers (the same "MCP validates structure only" rule as
+// registry/vehicle/ability/mission assets). File: Content/Profiles/<name>.json.
+export const WORLD_PROFILE_KINDS = Object.freeze(["world_profile"]);
+const WORLD_PROFILE_CLIMATE_AXES = ["temperature", "moisture", "continentalness", "erosion", "weirdness", "river"];
+
+// Compact field contracts surfaced by game_capabilities so an agent can author
+// a world profile without reading the engine source.
+export const WORLD_PROFILE_FIELD_SCHEMAS = Object.freeze({
+  world_profile: [
+    { name: "name", type: "string", required: true, description: "profile name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "height", type: "object", required: false, description: "2D height field: a noise graph JSON document" },
+    { name: "baseHeight", type: "integer", required: false, default: 0, description: "height = baseHeight + round(h * amplitude); only read when 'height' is present" },
+    { name: "amplitude", type: "integer", required: false, default: 1, description: ">= 0; only read when 'height' is present" },
+    { name: "climate", type: "object", required: false, description: "optional axes, each a noise graph JSON document: { temperature?, moisture?, continentalness?, erosion?, weirdness?, river? }" },
+    { name: "biomes", type: "object", required: false, description: "biome registry JSON document (surface + climate per biome)" },
+    { name: "caves", type: "object", required: false, description: "{ density?: noise graph JSON, scale?: number, offset?: number }" },
+    { name: "ores", type: "object", required: false, description: "{ density?: noise graph JSON, scale?: number, offset?: number, table?: ore table JSON }" },
+    { name: "carver", type: "object", required: false, description: "carver JSON document" },
+    { name: "decorators", type: "object", required: false, description: "decorator set JSON document" },
+    { name: "structures", type: "object", required: false, description: "structure placement document (definitions + spawn rules)" }
+  ]
+});
+
 // Compact field contracts surfaced by game_capabilities so an agent can author
 // a vehicle assembly without reading the engine source. Single source for the
 // exported JSON Schema (buildVehicleJsonSchema) and the author tool.
@@ -544,6 +579,74 @@ export function buildAbilityJsonSchema(kind) {
   };
 }
 
+export function buildMissionJsonSchema(kind) {
+  const fields = MISSION_FIELD_SCHEMAS[kind];
+  if (!fields) throw new Error(`unsupported mission kind '${kind}'`);
+  const properties = {};
+  const required = [];
+  for (const field of fields) {
+    let schema = { description: field.description ?? `\"${field.name}\" mission field` };
+    if (field.default !== undefined) schema.default = field.default;
+    switch (field.type) {
+      case "string": schema.type = "string"; break;
+      case "boolean": schema.type = "boolean"; break;
+      case "number": schema.type = "number"; break;
+      case "integer": schema.type = "integer"; break;
+      case "enum": schema.enum = [...field.values]; break;
+      case "object": schema.type = "object"; break;
+      case "array": schema.type = "array"; break;
+      case "array[object]": schema.type = "array"; schema.items = { type: "object" }; break;
+      case "array[string]": schema.type = "array"; schema.items = { type: "string" }; break;
+      default: throw new Error(`unknown mission field type '${field.type}' in ${kind} schema`);
+    }
+    properties[field.name] = schema;
+    if (field.required) required.push(field.name);
+  }
+  return {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    $id: `https://vulkancraft.engine/schema/missions/${kind}.json`,
+    title: `${kind} mission asset`,
+    type: "object",
+    additionalProperties: true,
+    properties,
+    ...(required.length > 0 ? { required } : {})
+  };
+}
+
+export function buildWorldProfileJsonSchema(kind) {
+  const fields = WORLD_PROFILE_FIELD_SCHEMAS[kind];
+  if (!fields) throw new Error(`unsupported world profile kind '${kind}'`);
+  const properties = {};
+  const required = [];
+  for (const field of fields) {
+    let schema = { description: field.description ?? `\"${field.name}\" world profile field` };
+    if (field.default !== undefined) schema.default = field.default;
+    switch (field.type) {
+      case "string": schema.type = "string"; break;
+      case "boolean": schema.type = "boolean"; break;
+      case "number": schema.type = "number"; break;
+      case "integer": schema.type = "integer"; break;
+      case "enum": schema.enum = [...field.values]; break;
+      case "object": schema.type = "object"; break;
+      case "array": schema.type = "array"; break;
+      case "array[object]": schema.type = "array"; schema.items = { type: "object" }; break;
+      case "array[string]": schema.type = "array"; schema.items = { type: "string" }; break;
+      default: throw new Error(`unknown world profile field type '${field.type}' in ${kind} schema`);
+    }
+    properties[field.name] = schema;
+    if (field.required) required.push(field.name);
+  }
+  return {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    $id: `https://vulkancraft.engine/schema/profiles/${kind}.json`,
+    title: `${kind} world profile`,
+    type: "object",
+    additionalProperties: true,
+    properties,
+    ...(required.length > 0 ? { required } : {})
+  };
+}
+
 const PROJECT_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const PROFILE_NAMES = new Set(["Debug", "Development", "Shipping", "Server", "Editor"]);
 const PLATFORM_NAMES = new Set(["windows-x64", "linux-x64", "macos-universal", "dedicated-server"]);
@@ -607,7 +710,9 @@ function projectPaths(engineRoot, projectName) {
     physicsMaterials: path.join(root, "Content", "PhysicsMaterials"),
     registry: path.join(root, "Content", "Registry"),
     vehicles: path.join(root, "Content", "Vehicles"),
-    abilities: path.join(root, "Content", "Abilities")
+    abilities: path.join(root, "Content", "Abilities"),
+    missions: path.join(root, "Content", "Missions"),
+    profiles: path.join(root, "Content", "Profiles")
   };
 }
 
@@ -689,7 +794,11 @@ function capabilityDocument() {
       "author vehicle assemblies (rigid VehicleAsset / beam BeamGraphAsset)",
       "inspect vehicle assemblies", "dry-run vehicle assembly updates",
       "author ability assets (data-driven abilities: attributes/tags/cost/cooldown/conditions, composable effects)",
-      "inspect ability assets", "dry-run ability asset updates"
+      "inspect ability assets", "dry-run ability asset updates",
+      "author mission assets (data-driven missions: reach/collect/kill/interact objectives, dialogue graph with condition-gated choices, unlock conditions, rewards)",
+      "inspect mission assets", "dry-run mission asset updates",
+      "author world profiles (ONE JSON composing height/climate/biomes/caves/ores/carver/decorators/structures into the world generator — IWorldProfile)",
+      "inspect world profiles", "dry-run world profile updates"
     ],
     components: COMPONENT_SCHEMAS,
     light_types: { Directional: 0, Point: 1, Spot: 2, Area: 3 },
@@ -730,6 +839,43 @@ function capabilityDocument() {
     ability_validation: {
       note: "Each document mirrors exactly the versioned JSON the public C++ factory parses (AbilityDefinition::load_from_json, implemented by src/engine/sdk/AbilitySystem.cpp); the MCP validates structure only — the runtime validates the same document again on load (all-or-nothing).",
       dry_run: "author_ability_asset accepts dry_run: true to validate and preview the document/diff without writing.",
+      rollback: "Updates return the previous document; re-authoring it with update: true restores the prior state."
+    },
+    // Mission assets (FALTANTES item 23 — missões e diálogos): data-driven
+    // missions (reach/collect/kill/interact objectives, unlock conditions,
+    // rewards) with a dialogue graph (condition-gated choices) under
+    // Content/Missions/<name>.json.
+    mission_asset_kinds: MISSION_KINDS.map((kind) => ({
+      kind,
+      file: `Content/Missions/<name>.json`,
+      fields: MISSION_FIELD_SCHEMAS[kind],
+      objective_fields: MISSION_OBJECTIVE_FIELDS,
+      condition_fields: MISSION_CONDITION_FIELDS
+    })),
+    mission_schemas: Object.fromEntries(
+      MISSION_KINDS.map((kind) => [kind, buildMissionJsonSchema(kind)])
+    ),
+    mission_validation: {
+      note: "Each document mirrors exactly the versioned JSON the public C++ factory parses (MissionDefinition::load_from_json, implemented by src/engine/sdk/MissionAsset.cpp); the MCP validates structure only — the runtime validates the same document again on load (all-or-nothing).",
+      dry_run: "author_mission_asset accepts dry_run: true to validate and preview the document/diff without writing.",
+      rollback: "Updates return the previous document; re-authoring it with update: true restores the prior state."
+    },
+    // World profiles (FALTANTES item 23 "editar geração procedural"): ONE
+    // versioned JSON composing the whole generation pipeline into the world
+    // generator (IWorldProfile, engine/procgen/IWorldProfile.hpp by AGENT-3
+    // — findings #120-worldprofile) under Content/Profiles/<name>.json.
+    world_profile_asset_kinds: WORLD_PROFILE_KINDS.map((kind) => ({
+      kind,
+      file: `Content/Profiles/<name>.json`,
+      fields: WORLD_PROFILE_FIELD_SCHEMAS[kind],
+      climate_axes: WORLD_PROFILE_CLIMATE_AXES
+    })),
+    world_profile_schemas: Object.fromEntries(
+      WORLD_PROFILE_KINDS.map((kind) => [kind, buildWorldProfileJsonSchema(kind)])
+    ),
+    world_profile_validation: {
+      note: "The MCP validates the TOP-LEVEL structure (version, section types, amplitude >= 0, finite scale/offset); every present section is validated all-or-nothing by its OWN subsystem parser when the C++ factory loads the document (create_world_profile_from_json, src/engine/sdk/WorldProfile.cpp) — the MCP never re-implements the subsystem parsers.",
+      dry_run: "author_world_profile_asset accepts dry_run: true to validate and preview the document/diff without writing.",
       rollback: "Updates return the previous document; re-authoring it with update: true restores the prior state."
     },
     // Full JSON Schema (draft-07) per registry kind (FALTANTES item 10): the
@@ -1204,6 +1350,139 @@ export function semanticToolDefinitions() {
       }
     },
     {
+      name: "author_mission_asset",
+      description: "Author a data-driven mission (FALTANTES item 23) as a versioned JSON document in Content/Missions/, mirroring exactly the public C++ mission JSON schema (MissionDefinition::load_from_json). Objectives (reach/collect/kill/interact) all must complete; unlockConditions gate acceptance; a dialogue graph (nodes with condition-gated choices) must declare a 'start' node; reward (itemId/count/xp/setFlag) applies on completion; repeatable missions can be accepted again. Validates structure against the public contract; dry_run previews the document/diff without writing; update replaces an existing asset and returns the previous document for rollback.",
+      inputSchema: {
+        type: "object",
+        required: ["project", "name", "objectives"],
+        properties: {
+          project: { type: "string" },
+          name: { type: "string", minLength: 1, description: "mission name (becomes the file name)" },
+          dry_run: { type: "boolean", default: false },
+          update: { type: "boolean", default: false },
+          id: { type: "string" },
+          version: { type: "integer", default: 1 },
+          objectives: {
+            type: "array", minItems: 1, items: {
+              type: "object", properties: {
+                id: { type: "string" },
+                kind: { type: "string", enum: [...MISSION_OBJECTIVE_KINDS] },
+                target: { type: "string", description: "item/entity/interaction id (required for collect/kill/interact)" },
+                count: { type: "integer", default: 1, description: ">= 1" },
+                x: { type: "number", default: 0 },
+                z: { type: "number", default: 0 },
+                radius: { type: "number", default: 0, description: ">= 0" },
+                conditions: {
+                  type: "array", items: {
+                    type: "object", properties: {
+                      kind: { type: "string", enum: [...MISSION_CONDITION_KINDS] },
+                      key: { type: "string" },
+                      op: { type: "string", enum: [...MISSION_OPS] },
+                      value: { type: "number" },
+                      flagValue: { type: "boolean" }
+                    }, additionalProperties: false
+                  }
+                }
+              }, additionalProperties: false
+            }
+          },
+          dialogue: {
+            type: "array", items: {
+              type: "object", properties: {
+                id: { type: "string", description: "must include 'start'" },
+                speaker: { type: "string" },
+                text: { type: "string" },
+                choices: {
+                  type: "array", items: {
+                    type: "object", properties: {
+                      text: { type: "string" },
+                      next: { type: "string", description: "target node id or empty to end" },
+                      conditions: {
+                        type: "array", items: {
+                          type: "object", properties: {
+                            kind: { type: "string", enum: [...MISSION_CONDITION_KINDS] },
+                            key: { type: "string" },
+                            op: { type: "string", enum: [...MISSION_OPS] },
+                            value: { type: "number" },
+                            flagValue: { type: "boolean" }
+                          }, additionalProperties: false
+                        }
+                      }
+                    }, additionalProperties: false
+                  }
+                }
+              }, additionalProperties: false
+            }
+          },
+          unlockConditions: {
+            type: "array", items: {
+              type: "object", properties: {
+                kind: { type: "string", enum: [...MISSION_CONDITION_KINDS] },
+                key: { type: "string" },
+                op: { type: "string", enum: [...MISSION_OPS] },
+                value: { type: "number" },
+                flagValue: { type: "boolean" }
+              }, additionalProperties: false
+            }
+          },
+          reward: {
+            type: "object", properties: {
+              itemId: { type: "string" },
+              count: { type: "integer", default: 0, description: ">= 0" },
+              xp: { type: "integer", default: 0, description: ">= 0" },
+              setFlag: { type: "string" }
+            }, additionalProperties: false
+          },
+          repeatable: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_mission_assets",
+      description: "List and validate every mission asset under Content/Missions for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "author_world_profile_asset",
+      description: "Author a data-driven world profile (FALTANTES item 23 — geração procedural) as a versioned JSON document in Content/Profiles/, mirroring the public C++ world-profile document (create_world_profile_from_json, IWorldProfile). ONE document composes the whole generation pipeline: height (noise graph) + baseHeight/amplitude, climate axes (each an optional noise graph), biomes, caves/ores (density + scale/offset + ore table), carver, decorators and structures (definitions + spawn rules). The MCP validates the top-level structure only; every present section is validated all-or-nothing by its OWN subsystem parser when the C++ factory loads the document. dry_run previews the document/diff without writing; update replaces an existing asset and returns the previous document for rollback.",
+      inputSchema: {
+        type: "object",
+        required: ["project", "name"],
+        properties: {
+          project: { type: "string" },
+          name: { type: "string", minLength: 1, description: "profile name (becomes the file name)" },
+          dry_run: { type: "boolean", default: false },
+          update: { type: "boolean", default: false },
+          version: { type: "integer", default: 1 },
+          height: { type: "object", description: "noise graph JSON document (2D height field)" },
+          baseHeight: { type: "integer", default: 0 },
+          amplitude: { type: "integer", default: 1, description: ">= 0" },
+          climate: {
+            type: "object", description: "optional axes, each a noise graph JSON document",
+            properties: Object.fromEntries(WORLD_PROFILE_CLIMATE_AXES.map((axis) => [axis, { type: "object" }])),
+            additionalProperties: false
+          },
+          biomes: { type: "object", description: "biome registry JSON document" },
+          caves: { type: "object", description: "{ density?: noise graph JSON, scale?: number, offset?: number }" },
+          ores: { type: "object", description: "{ density?: noise graph JSON, scale?: number, offset?: number, table?: ore table JSON }" },
+          carver: { type: "object", description: "carver JSON document" },
+          decorators: { type: "object", description: "decorator set JSON document" },
+          structures: { type: "object", description: "structure placement document (definitions + spawn rules)" }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_world_profile_assets",
+      description: "List and validate every world profile under Content/Profiles for a project (top-level structural diagnostics).",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
       name: "validate_game_project",
       description: "Validate the portable project, scenes, entity UUIDs, components, hierarchy, scripts, registry assets, and asset metadata without compiling the engine.",
       inputSchema: {
@@ -1236,6 +1515,10 @@ export function callSemanticTool(engineRoot, name, args = {}) {
     case "inspect_vehicle_assets": return inspectVehicleAssets(engineRoot, args.project);
     case "author_ability_asset": return authorAbilityAsset(engineRoot, args);
     case "inspect_ability_assets": return inspectAbilityAssets(engineRoot, args.project);
+    case "author_mission_asset": return authorMissionAsset(engineRoot, args);
+    case "inspect_mission_assets": return inspectMissionAssets(engineRoot, args.project);
+    case "author_world_profile_asset": return authorWorldProfileAsset(engineRoot, args);
+    case "inspect_world_profile_assets": return inspectWorldProfileAssets(engineRoot, args.project);
     case "validate_game_project": return validateProject(engineRoot, args.project);
     default: return undefined;
   }
@@ -1309,6 +1592,9 @@ function inspectProject(engineRoot, projectName) {
     scripts: [...files(paths.scripts, ".script"), ...files(paths.scenes, ".script")],
     assets: fs.existsSync(paths.assets) ? fs.readdirSync(paths.assets, { withFileTypes: true }).filter((entry) => entry.isFile() && !entry.name.endsWith(".import.json")).map((entry) => entry.name).sort() : [],
     vehicles: files(paths.vehicles, ".json"),
+    abilities: files(paths.abilities, ".json"),
+    missions: files(paths.missions, ".json"),
+    world_profiles: files(paths.profiles, ".json"),
     validation: validateProject(engineRoot, paths.project)
   };
 }
@@ -2697,6 +2983,443 @@ function inspectAbilityAssets(engineRoot, projectName) {
   return { project: project.project, ability_assets: assets, count: assets.length };
 }
 
+// ---- mission assets (FALTANTES item 23 — missões e diálogos) -----------------
+
+function buildMissionObjective(objective, index) {
+  const prefix = `objective ${index}`;
+  const target = String(objective.target ?? "");
+  return {
+    id: String(objective.id ?? `${prefix}`),
+    kind: String(objective.kind ?? "reach"),
+    target,
+    count: objective.count !== undefined ? Number(objective.count) : 1,
+    x: objective.x !== undefined ? Number(objective.x) : 0,
+    z: objective.z !== undefined ? Number(objective.z) : 0,
+    radius: objective.radius !== undefined ? Number(objective.radius) : 0,
+    conditions: buildMissionConditions(objective.conditions)
+  };
+}
+
+function buildMissionConditions(conditions) {
+  return (conditions ?? []).map((condition) => ({
+    kind: String(condition.kind ?? "flag"),
+    key: String(condition.key ?? ""),
+    op: String(condition.op ?? ">="),
+    value: condition.value !== undefined ? Number(condition.value) : 0,
+    flagValue: condition.flagValue !== undefined ? Boolean(condition.flagValue) : true
+  }));
+}
+
+function buildMissionDocument(kind, args) {
+  if (kind !== "mission") throw new Error(`unsupported mission kind '${kind}'`);
+  const document = {
+    name: String(args.name),
+    version: args.version !== undefined ? Number(args.version) : 1,
+    objectives: (args.objectives ?? []).map(buildMissionObjective),
+    dialogue: (args.dialogue ?? []).map((node, index) => ({
+      id: String(node.id ?? `node${index}`),
+      speaker: String(node.speaker ?? ""),
+      text: String(node.text ?? ""),
+      choices: (node.choices ?? []).map((choice) => ({
+        text: String(choice.text ?? ""),
+        next: String(choice.next ?? ""),
+        conditions: buildMissionConditions(choice.conditions)
+      }))
+    })),
+    unlockConditions: buildMissionConditions(args.unlockConditions),
+    reward: {
+      itemId: String(args.reward?.itemId ?? ""),
+      count: args.reward?.count !== undefined ? Number(args.reward.count) : 0,
+      xp: args.reward?.xp !== undefined ? Number(args.reward.xp) : 0,
+      setFlag: String(args.reward?.setFlag ?? "")
+    },
+    repeatable: args.repeatable !== undefined ? Boolean(args.repeatable) : false
+  };
+  if (args.id !== undefined) document.id = String(args.id);
+  return document;
+}
+
+// Structured validation mirroring the public C++ factory (MissionDefinition::
+// load_from_json — all-or-nothing, never clamp or guess). Returns { valid, errors }.
+function validateMissionCondition(condition, objectiveIds, errors, where) {
+  const fail = (message) => errors.push(`${where}: ${message}`);
+  if (!condition || typeof condition !== "object" || Array.isArray(condition)) return fail("must be an object");
+  const kind = String(condition.kind ?? "");
+  if (!MISSION_CONDITION_KINDS.has(kind)) return fail(`'kind' must be flag|counter|objectiveDone|attribute (got '${kind}')`);
+  if (typeof condition.key !== "string" || !condition.key) return fail("'key' must not be empty");
+  if (kind === "counter" || kind === "attribute") {
+    // The C++ factory defaults 'op' to ">=" and 'value' to 0 before
+    // validating; mirror those defaults exactly.
+    const op = String(condition.op ?? ">=");
+    if (!MISSION_OPS.has(op)) fail(`'op' must be ==|!=|>=|<=|>|< (got '${op}')`);
+    if (!finiteNumber(condition.value ?? 0)) fail("'value' must be finite");
+  }
+  if (kind === "objectiveDone" && objectiveIds && !objectiveIds.has(condition.key)) {
+    fail(`objectiveDone references unknown objective '${condition.key}'`);
+  }
+}
+
+export function validateMissionDocument(kind, document) {
+  const errors = [];
+  const fail = (message) => errors.push(`mission asset ${message}`);
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
+    return { valid: false, errors: ["mission asset must be a JSON object"] };
+  }
+  if (kind !== "mission") return { valid: false, errors: [`unsupported mission kind '${kind}'`] };
+  if (document.version !== undefined && document.version !== 1) fail("'version' must be 1");
+  if (typeof document.name !== "string" || !document.name) fail("'name' is required");
+  if (!Array.isArray(document.objectives) || document.objectives.length === 0) {
+    fail("'objectives' must be a non-empty array");
+  } else {
+    const objectiveIds = new Set();
+    document.objectives.forEach((objective, index) => {
+      const where = `objective ${index}`;
+      if (!objective || typeof objective !== "object" || Array.isArray(objective)) return fail(`${where} must be an object`);
+      if (typeof objective.id !== "string" || !objective.id) return fail(`${where} 'id' must not be empty`);
+      if (objectiveIds.has(objective.id)) return fail(`duplicate objective id '${objective.id}'`);
+      objectiveIds.add(objective.id);
+      // The C++ factory defaults kind->"collect", count->1, x/z/radius->0
+      // before validating; mirror those defaults exactly.
+      const kind = String(objective.kind ?? "collect");
+      if (!MISSION_OBJECTIVE_KINDS.has(kind)) return fail(`${where} 'kind' must be reach|collect|kill|interact (got '${kind}')`);
+      if (kind !== "reach" && (typeof objective.target !== "string" || !objective.target)) fail(`${where} needs a target`);
+      if (!Number.isInteger(objective.count ?? 1) || (objective.count ?? 1) < 1) fail(`${where} 'count' must be an integer >= 1`);
+      if (!finiteNumber(objective.x ?? 0) || !finiteNumber(objective.z ?? 0)) fail(`${where} position must be finite`);
+      if (!finiteNumber(objective.radius ?? 0) || (objective.radius ?? 0) < 0) fail(`${where} 'radius' must be finite and >= 0`);
+      if (objective.conditions !== undefined) {
+        if (!Array.isArray(objective.conditions)) fail(`${where} 'conditions' must be an array`);
+        else objective.conditions.forEach((condition) => validateMissionCondition(condition, objectiveIds, errors, `${where} condition`));
+      }
+    });
+  }
+  const nodeIds = new Set();
+  if (document.dialogue !== undefined) {
+    if (!Array.isArray(document.dialogue)) {
+      fail("'dialogue' must be an array");
+    } else {
+      document.dialogue.forEach((node, index) => {
+        const where = `dialogue node ${index}`;
+        if (!node || typeof node !== "object" || Array.isArray(node)) return fail(`${where} must be an object`);
+        if (typeof node.id !== "string" || !node.id) return fail(`${where} 'id' must not be empty`);
+        if (nodeIds.has(node.id)) return fail(`duplicate dialogue node id '${node.id}'`);
+        nodeIds.add(node.id);
+        if (node.choices !== undefined) {
+          if (!Array.isArray(node.choices)) return fail(`${where} 'choices' must be an array`);
+          node.choices.forEach((choice, choiceIndex) => {
+            const choiceWhere = `${where} choice ${choiceIndex}`;
+            if (!choice || typeof choice !== "object" || Array.isArray(choice)) return fail(`${choiceWhere} must be an object`);
+            if (typeof choice.text !== "string" || !choice.text) fail(`${choiceWhere} 'text' must not be empty`);
+            if (typeof choice.next !== "string") fail(`${choiceWhere} 'next' must be a string`);
+            if (choice.conditions !== undefined) {
+              if (!Array.isArray(choice.conditions)) fail(`${choiceWhere} 'conditions' must be an array`);
+              else choice.conditions.forEach((condition) => validateMissionCondition(condition, null, errors, `${choiceWhere} condition`));
+            }
+          });
+        }
+      });
+    }
+  }
+  if (document.dialogue && document.dialogue.length > 0 && !nodeIds.has("start")) {
+    fail("dialogue must declare a 'start' node");
+  }
+  if (document.dialogue && Array.isArray(document.dialogue)) {
+    for (const node of document.dialogue) {
+      for (const choice of node.choices ?? []) {
+        if (choice.next && !nodeIds.has(choice.next)) fail(`dialogue choice 'next' references unknown node '${choice.next}'`);
+      }
+    }
+  }
+  if (document.unlockConditions !== undefined) {
+    if (!Array.isArray(document.unlockConditions)) fail("'unlockConditions' must be an array");
+    else document.unlockConditions.forEach((condition) => validateMissionCondition(condition, null, errors, "unlock condition"));
+  }
+  if (document.reward !== undefined) {
+    if (!document.reward || typeof document.reward !== "object" || Array.isArray(document.reward)) fail("'reward' must be an object");
+    else {
+      // The C++ factory defaults reward count/xp to 0 before validating.
+      if (!Number.isInteger(document.reward.count ?? 0) || (document.reward.count ?? 0) < 0) fail("reward 'count' must be an integer >= 0");
+      if (!Number.isInteger(document.reward.xp ?? 0) || (document.reward.xp ?? 0) < 0) fail("reward 'xp' must be an integer >= 0");
+    }
+  }
+  if (document.repeatable !== undefined && typeof document.repeatable !== "boolean") fail("'repeatable' must be a boolean");
+  return { valid: errors.length === 0, errors };
+}
+
+function missionDiff(previous, document) {
+  const keys = new Set([...Object.keys(previous), ...Object.keys(document)]);
+  const changed = [...keys].filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(document[key])).sort();
+  return { changed_fields: changed };
+}
+
+function authorMissionAsset(engineRoot, args) {
+  const project = requireProject(engineRoot, args.project);
+  const kind = String(args.kind ?? "mission");
+  if (!MISSION_KINDS.includes(kind)) throw new Error(`unsupported mission kind '${kind}' (supported: ${MISSION_KINDS.join(", ")})`);
+  const name = assetName(args.name);
+  const document = buildMissionDocument(kind, args);
+  const validation = validateMissionDocument(kind, document);
+  if (!validation.valid) {
+    return {
+      refused: true,
+      project: project.project,
+      kind,
+      name,
+      diagnostics: validation.errors,
+      reason: "mission asset fails public-contract validation; nothing was written"
+    };
+  }
+  const file = path.join(project.missions, `${name}.json`);
+  const previous = fs.existsSync(file) ? readJson(file) : null;
+  const diff = previous ? missionDiff(previous, document) : null;
+  const relative = path.relative(project.root, file).replaceAll(path.sep, "/");
+  if (args.dry_run) {
+    return {
+      dry_run: true,
+      would_write: relative,
+      project: project.project,
+      kind,
+      name,
+      document,
+      diagnostics: [],
+      diff
+    };
+  }
+  if (previous && !args.update) throw new Error(`mission asset '${name}' already exists (pass update: true to replace, or use dry_run to preview the diff)`);
+  atomicWriteJson(file, document);
+  return {
+    created: !previous,
+    updated: Boolean(previous),
+    project: project.project,
+    kind,
+    name,
+    path: relative,
+    sha256: sha256File(file),
+    diagnostics: [],
+    diff,
+    rollback: previous ? { document: previous, hint: "re-author with update: true and this document to restore" } : undefined
+  };
+}
+
+// Reads every mission asset of a project with its structural diagnostics
+// (mirrors readAbilityAssets).
+function readMissionAssets(project) {
+  const assets = [];
+  if (!fs.existsSync(project.missions)) return assets;
+  for (const fileName of fs.readdirSync(project.missions).filter((file) => file.endsWith(".json")).sort()) {
+    const file = path.join(project.missions, fileName);
+    const baseName = fileName.replace(/\.json$/, "");
+    let document = null;
+    const diagnostics = [];
+    try {
+      document = readJson(file);
+    } catch (error) {
+      diagnostics.push(`malformed JSON: ${error.message}`);
+    }
+    if (document && typeof document === "object" && !Array.isArray(document)) {
+      diagnostics.push(...validateMissionDocument("mission", document).errors);
+    } else if (document) {
+      diagnostics.push("mission asset must be a JSON object");
+    }
+    assets.push({
+      kind: "mission",
+      name: baseName,
+      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      document,
+      valid: diagnostics.length === 0,
+      diagnostics
+    });
+  }
+  return assets;
+}
+
+function inspectMissionAssets(engineRoot, projectName) {
+  const project = requireProject(engineRoot, projectName);
+  const assets = readMissionAssets(project);
+  return { project: project.project, mission_assets: assets, count: assets.length };
+}
+
+// ---- world profiles (FALTANTES item 23 "editar geração procedural") --------
+
+function buildWorldProfileDocument(kind, args) {
+  if (kind !== "world_profile") throw new Error(`unsupported world profile kind '${kind}'`);
+  const document = { version: args.version !== undefined ? Number(args.version) : 1 };
+  if (args.height !== undefined) {
+    document.height = args.height;
+    document.baseHeight = args.baseHeight !== undefined ? Number(args.baseHeight) : 0;
+    document.amplitude = args.amplitude !== undefined ? Number(args.amplitude) : 1;
+  }
+  if (args.climate !== undefined) {
+    const climate = {};
+    for (const axis of WORLD_PROFILE_CLIMATE_AXES) {
+      if (args.climate[axis] !== undefined) climate[axis] = args.climate[axis];
+    }
+    document.climate = climate;
+  }
+  if (args.biomes !== undefined) document.biomes = args.biomes;
+  if (args.caves !== undefined) {
+    document.caves = {};
+    if (args.caves.density !== undefined) document.caves.density = args.caves.density;
+    if (args.caves.scale !== undefined) document.caves.scale = Number(args.caves.scale);
+    if (args.caves.offset !== undefined) document.caves.offset = Number(args.caves.offset);
+  }
+  if (args.ores !== undefined) {
+    document.ores = {};
+    if (args.ores.density !== undefined) document.ores.density = args.ores.density;
+    if (args.ores.scale !== undefined) document.ores.scale = Number(args.ores.scale);
+    if (args.ores.offset !== undefined) document.ores.offset = Number(args.ores.offset);
+    if (args.ores.table !== undefined) document.ores.table = args.ores.table;
+  }
+  if (args.carver !== undefined) document.carver = args.carver;
+  if (args.decorators !== undefined) document.decorators = args.decorators;
+  if (args.structures !== undefined) document.structures = args.structures;
+  return document;
+}
+
+// Top-level structural validation mirroring the public C++ factory
+// (create_world_profile_from_json — version, section types, amplitude >= 0,
+// finite scale/offset). The MCP never re-implements the subsystem parsers:
+// every present section is validated all-or-nothing by its own parser on
+// load. Returns { valid, errors }.
+export function validateWorldProfileDocument(kind, document) {
+  const errors = [];
+  const fail = (message) => errors.push(`world profile ${message}`);
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
+    return { valid: false, errors: ["world profile must be a JSON object"] };
+  }
+  if (kind !== "world_profile") return { valid: false, errors: [`unsupported world profile kind '${kind}'`] };
+  if (document.version !== 1) fail("'version' must be 1");
+  if (document.height !== undefined) {
+    if (!document.height || typeof document.height !== "object" || Array.isArray(document.height)) fail("'height' must be an object (noise graph JSON)");
+    if (!Number.isInteger(document.baseHeight ?? 0)) fail("'baseHeight' must be an integer");
+    if (!Number.isInteger(document.amplitude ?? 1) || (document.amplitude ?? 1) < 0) fail("'amplitude' must be an integer >= 0");
+  }
+  if (document.climate !== undefined) {
+    if (!document.climate || typeof document.climate !== "object" || Array.isArray(document.climate)) {
+      fail("'climate' must be an object");
+    } else {
+      for (const axis of WORLD_PROFILE_CLIMATE_AXES) {
+        if (document.climate[axis] !== undefined &&
+            (!document.climate[axis] || typeof document.climate[axis] !== "object" || Array.isArray(document.climate[axis]))) {
+          fail(`'climate.${axis}' must be an object (noise graph JSON)`);
+        }
+      }
+    }
+  }
+  for (const section of ["biomes", "carver", "decorators", "structures"]) {
+    if (document[section] !== undefined &&
+        (!document[section] || typeof document[section] !== "object" || Array.isArray(document[section]))) {
+      fail(`'${section}' must be an object`);
+    }
+  }
+  for (const section of ["caves", "ores"]) {
+    if (document[section] === undefined) continue;
+    if (!document[section] || typeof document[section] !== "object" || Array.isArray(document[section])) {
+      fail(`'${section}' must be an object`);
+      continue;
+    }
+    if (document[section].density !== undefined &&
+        (!document[section].density || typeof document[section].density !== "object" || Array.isArray(document[section].density))) {
+      fail(`'${section}.density' must be an object (noise graph JSON)`);
+    }
+    if (document[section].scale !== undefined && !finiteNumber(document[section].scale)) fail(`'${section}.scale' must be finite`);
+    if (document[section].offset !== undefined && !finiteNumber(document[section].offset)) fail(`'${section}.offset' must be finite`);
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+function worldProfileDiff(previous, document) {
+  const keys = new Set([...Object.keys(previous), ...Object.keys(document)]);
+  const changed = [...keys].filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(document[key])).sort();
+  return { changed_fields: changed };
+}
+
+function authorWorldProfileAsset(engineRoot, args) {
+  const project = requireProject(engineRoot, args.project);
+  const kind = String(args.kind ?? "world_profile");
+  if (!WORLD_PROFILE_KINDS.includes(kind)) throw new Error(`unsupported world profile kind '${kind}' (supported: ${WORLD_PROFILE_KINDS.join(", ")})`);
+  const name = assetName(args.name);
+  const document = buildWorldProfileDocument(kind, args);
+  const validation = validateWorldProfileDocument(kind, document);
+  if (!validation.valid) {
+    return {
+      refused: true,
+      project: project.project,
+      kind,
+      name,
+      diagnostics: validation.errors,
+      reason: "world profile fails top-level public-contract validation; nothing was written"
+    };
+  }
+  const file = path.join(project.profiles, `${name}.json`);
+  const previous = fs.existsSync(file) ? readJson(file) : null;
+  const diff = previous ? worldProfileDiff(previous, document) : null;
+  const relative = path.relative(project.root, file).replaceAll(path.sep, "/");
+  if (args.dry_run) {
+    return {
+      dry_run: true,
+      would_write: relative,
+      project: project.project,
+      kind,
+      name,
+      document,
+      diagnostics: [],
+      diff
+    };
+  }
+  if (previous && !args.update) throw new Error(`world profile '${name}' already exists (pass update: true to replace, or use dry_run to preview the diff)`);
+  atomicWriteJson(file, document);
+  return {
+    created: !previous,
+    updated: Boolean(previous),
+    project: project.project,
+    kind,
+    name,
+    path: relative,
+    sha256: sha256File(file),
+    diagnostics: [],
+    diff,
+    rollback: previous ? { document: previous, hint: "re-author with update: true and this document to restore" } : undefined
+  };
+}
+
+// Reads every world profile of a project with its top-level structural
+// diagnostics (mirrors readMissionAssets).
+function readWorldProfileAssets(project) {
+  const assets = [];
+  if (!fs.existsSync(project.profiles)) return assets;
+  for (const fileName of fs.readdirSync(project.profiles).filter((file) => file.endsWith(".json")).sort()) {
+    const file = path.join(project.profiles, fileName);
+    const baseName = fileName.replace(/\.json$/, "");
+    let document = null;
+    const diagnostics = [];
+    try {
+      document = readJson(file);
+    } catch (error) {
+      diagnostics.push(`malformed JSON: ${error.message}`);
+    }
+    if (document && typeof document === "object" && !Array.isArray(document)) {
+      diagnostics.push(...validateWorldProfileDocument("world_profile", document).errors);
+    } else if (document) {
+      diagnostics.push("world profile must be a JSON object");
+    }
+    assets.push({
+      kind: "world_profile",
+      name: baseName,
+      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      document,
+      valid: diagnostics.length === 0,
+      diagnostics
+    });
+  }
+  return assets;
+}
+
+function inspectWorldProfileAssets(engineRoot, projectName) {
+  const project = requireProject(engineRoot, projectName);
+  const assets = readWorldProfileAssets(project);
+  return { project: project.project, world_profiles: assets, count: assets.length };
+}
+
 function registryDiff(previous, document) {
   const keys = new Set([...Object.keys(previous), ...Object.keys(document)]);
   const changed = [...keys].filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(document[key])).sort();
@@ -2929,5 +3652,23 @@ function validateProject(engineRoot, projectName) {
     }
   }
 
-  return { project: project.project, valid: errors.length === 0, errors, warnings, scenes: sceneFiles.length, registry_assets: registryAssets.length, vehicle_assets: vehicleAssets.length, ability_assets: abilityAssets.length };
+  // Mission assets (FALTANTES item 23 — missões e diálogos): structural
+  // validation mirroring the public C++ MissionDefinition factory.
+  const missionAssets = readMissionAssets(project);
+  for (const asset of missionAssets) {
+    for (const diagnostic of asset.diagnostics) {
+      errors.push(`Content/Missions/${asset.name}.json: ${diagnostic}`);
+    }
+  }
+
+  // World profiles (FALTANTES item 23 — editar geração procedural): top-level
+  // structural validation; sections validated by their own C++ parsers on load.
+  const worldProfileAssets = readWorldProfileAssets(project);
+  for (const asset of worldProfileAssets) {
+    for (const diagnostic of asset.diagnostics) {
+      errors.push(`Content/Profiles/${asset.name}.json: ${diagnostic}`);
+    }
+  }
+
+  return { project: project.project, valid: errors.length === 0, errors, warnings, scenes: sceneFiles.length, registry_assets: registryAssets.length, vehicle_assets: vehicleAssets.length, ability_assets: abilityAssets.length, mission_assets: missionAssets.length, world_profiles: worldProfileAssets.length };
 }

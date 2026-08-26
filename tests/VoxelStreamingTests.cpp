@@ -65,7 +65,13 @@ struct MockBridge final : WorldRenderBridge {
     void upload_chunk(ChunkMeshResult result) override {
         uploaded.push_back(result.chunk);
         ++uploadsPerChunk[key(result.chunk.coord.x, result.chunk.coord.z)];
+        lastMesh[key(result.chunk.coord.x, result.chunk.coord.z)] = std::move(result);
     }
+
+    // Latest mesh per chunk (additive: existing members unchanged). Lets
+    // scenarios assert vertex content produced through the REAL dispatch path
+    // (world -> snapshot -> mesher), e.g. block-light shading.
+    std::unordered_map<uint64_t, ChunkMeshResult> lastMesh;
 
     int uploads_for(int cx, int cz) const {
         const auto found = uploadsPerChunk.find(key(cx, cz));
@@ -287,6 +293,163 @@ bool scenario_dynamic_block_meshes() {
 
     std::cout << "[test] dynamic block meshes with data-driven color ("
               << result.mesh.meshVertices.size() << " vertices)\n";
+    return g_failures == 0;
+}
+
+// FALTANTES item 8/9: the mesher shades vertex colors by the captured block
+// light (0..15). A snapshot with hasLightData scales RGB by light/15 (alpha
+// untouched); a snapshot WITHOUT light data keeps the legacy full-bright
+// material color.
+bool scenario_mesher_consumes_light() {
+    const RuntimeBlockId stoneId = runtime_id(BlockType::Stone);
+
+    auto make_snapshot = [&](bool hasLight, uint8_t lightLevel, uint32_t id) {
+        ChunkSnapshot snapshot;
+        snapshot.id = { { 0, 0 }, id };
+        snapshot.revision = 1;
+        snapshot.verticalExtent = 1;
+        snapshot.layers = { 130 };
+        snapshot.hasLightData = hasLight;
+        auto& layer = snapshot.center[130];
+        layer.blocks.fill(kRuntimeAirId);
+        layer.blocks[8 * CHUNK_SIZE_X + 8] = stoneId;
+        if (hasLight) layer.light.fill(lightLevel);
+        return snapshot;
+    };
+
+    const ChunkMeshResult full = VoxelMesher::build(make_snapshot(true, 15, 1));
+    const ChunkMeshResult half = VoxelMesher::build(make_snapshot(true, 8, 2));
+    const ChunkMeshResult dark = VoxelMesher::build(make_snapshot(true, 0, 3));
+    // No light capture: legacy full-bright material color (brightness 1.0).
+    const ChunkMeshResult unlit = VoxelMesher::build(make_snapshot(false, 0, 4));
+    CHECK(full.valid);
+    CHECK(half.valid);
+    CHECK(dark.valid);
+    CHECK(unlit.valid);
+    CHECK(!full.mesh.meshVertices.empty());
+    CHECK(!half.mesh.meshVertices.empty());
+    CHECK(!dark.mesh.meshVertices.empty());
+    CHECK(!unlit.mesh.meshVertices.empty());
+
+    const glm::vec4 fullColor = full.mesh.meshVertices.front().color;
+    const glm::vec4 halfColor = half.mesh.meshVertices.front().color;
+    const glm::vec4 darkColor = dark.mesh.meshVertices.front().color;
+    const glm::vec4 baseColor = unlit.mesh.meshVertices.front().color;
+
+    // light=15 == the unlit material color exactly (and alpha untouched).
+    for (int c = 0; c < 3; ++c) {
+        CHECK(std::abs(fullColor[c] - baseColor[c]) < 1e-3f);
+        CHECK(std::abs(halfColor[c] - baseColor[c] * (8.0f / 15.0f)) < 1e-3f);
+        CHECK(std::abs(darkColor[c]) < 1e-3f);
+    }
+    CHECK(fullColor.a == baseColor.a);
+    CHECK(halfColor.a == baseColor.a);
+    CHECK(darkColor.a == baseColor.a);
+    // Ordering: full > half > dark.
+    CHECK(fullColor.r > halfColor.r);
+    CHECK(halfColor.r > darkColor.r);
+
+    // Sky fallback for cells with no occupied layer (open air above the
+    // surface): the accessor uses the column's occlusion height.
+    const ChunkSnapshot& skySnapshot = make_snapshot(true, 0, 5);
+    CHECK(skySnapshot.light(8, 131, 8) == 0);  // layer 131 missing, no sky data
+    auto skyVisible = skySnapshot;
+    skyVisible.skyOcclusionTop[8 * CHUNK_SIZE_X + 8] = 130;
+    CHECK(skyVisible.light(8, 131, 8) == 15);  // above the occluding column
+    auto skyBlocked = skyVisible;
+    skyBlocked.skyOcclusionTop[8 * CHUNK_SIZE_X + 8] = 255;
+    CHECK(skyBlocked.light(8, 131, 8) == 0);  // column occluded above the cell
+
+    std::cout << "[test] mesher shades vertex colors by block light ("
+              << fullColor.r << " > " << halfColor.r << " > " << darkColor.r
+              << ", alpha preserved, no-light = full bright)\n";
+    return g_failures == 0;
+}
+
+// FALTANTES item 8/9, real dispatch path: a Glowstone emitter (builtin
+// emission 15) inside an underground air tunnel lights the tunnel; the
+// snapshot captured at meshing carries the light, and the uploaded mesh
+// shades a stone block facing the emitter at full brightness while a stone
+// block at the far end of the tunnel is notably darker (light decay).
+bool scenario_mesher_light_capture() {
+    TestWorld test;
+    CHECK(test.boot_world());
+
+    // Underground (below the terrain occlusion line, so sky light = 0): an
+    // air tunnel along +x inside chunk (0,0). Glowstone emits 15 by default
+    // (builtin light table); stone probes border the tunnel.
+    const RuntimeBlockId airId = kRuntimeAirId;
+    const RuntimeBlockId stoneId = runtime_id(BlockType::Stone);
+    const RuntimeBlockId emitterId = runtime_id(BlockType::Glowstone);
+    const int y = 40;
+    const glm::vec3 emitter(8.0f, static_cast<float>(y), 8.0f);
+    const glm::vec3 nearBlock(9.0f, static_cast<float>(y), 8.0f);
+    const glm::vec3 farBlock(0.0f, static_cast<float>(y), 8.0f);
+    for (int x = 2; x <= 7; ++x) {
+        test.world.set_block_at(
+            glm::vec3(static_cast<float>(x), static_cast<float>(y), 8.0f), airId);
+    }
+    test.world.set_block_at(emitter, emitterId);
+    test.world.set_block_at(nearBlock, stoneId);
+    test.world.set_block_at(farBlock, stoneId);
+    CHECK(test.world.get_block_at(emitter) == emitterId);
+
+    // Wait until the light field settles: the emitter cell is 15, the far
+    // tunnel air cell (1,y,8) has decayed to 8 (7 steps through air).
+    const glm::vec3 farAir(1.0f, static_cast<float>(y), 8.0f);
+    const bool lit = test.run_until([&] {
+        const uint8_t far = test.world.get_block_light(farAir);
+        return test.world.get_block_light(emitter) == 15 && far >= 8 && far <= 10;
+    });
+    std::cout << "[dbg] light emitter="
+              << static_cast<int>(test.world.get_block_light(emitter))
+              << " farAir=" << static_cast<int>(test.world.get_block_light(farAir))
+              << " lit=" << lit << "\n";
+    CHECK(lit);
+
+    // Meshing runs one frame BEFORE the light pass in update(), so the last
+    // uploaded mesh may predate the settled light. Force one more remesh now
+    // that the light is final, then wait for a newer mesh revision.
+    const auto key = MockBridge::key_of(emitter);
+    const uint64_t before = test.bridge.lastMesh.count(key)
+        ? test.bridge.lastMesh.at(key).sourceRevision : 0;
+    test.world.set_block_at(farBlock, stoneId);  // same value: bump + remesh
+    const bool remeshed = test.run_until([&] {
+        const auto found = test.bridge.lastMesh.find(key);
+        return found != test.bridge.lastMesh.end() &&
+               found->second.sourceRevision > before;
+    });
+    CHECK(remeshed);
+
+    const ChunkMeshResult& mesh = test.bridge.lastMesh.at(key);
+    CHECK(mesh.valid);
+    const auto face_color_at = [&](const glm::vec3& blockPos) {
+        // Average the vertices of the ONE drawn face (the one looking into
+        // the tunnel); world positions, block occupies [blockPos, +1).
+        float r = 0.0f, g = 0.0f, b = 0.0f;
+        int n = 0;
+        for (const VoxelVertex& v : mesh.mesh.meshVertices) {
+            if (v.position.x >= blockPos.x && v.position.x <= blockPos.x + 1.0f &&
+                v.position.y >= blockPos.y && v.position.y <= blockPos.y + 1.0f &&
+                v.position.z >= blockPos.z && v.position.z <= blockPos.z + 1.0f) {
+                r += v.color.r; g += v.color.g; b += v.color.b; ++n;
+            }
+        }
+        return std::make_tuple(n, r, g, b);
+    };
+    const auto [nNear, rN, gN, bN] = face_color_at(nearBlock);
+    const auto [nFar, rF, gF, bF] = face_color_at(farBlock);
+    CHECK(nNear > 0);
+    CHECK(nFar > 0);
+    // near faces the emitter cell (light 15); far faces tunnel air at ~8
+    // (8/15 = 0.53, so far < 0.7 * near is a safe margin).
+    CHECK(rF < rN * 0.7f);
+    CHECK(gF < gN * 0.7f);
+    CHECK(bF < bN * 0.7f);
+
+    std::cout << "[test] real dispatch: near-emitter stone lit (" << rN
+              << ',' << gN << ',' << bN << ") vs far stone dark (" << rF
+              << ',' << gF << ',' << bF << ") OK\n";
     return g_failures == 0;
 }
 
@@ -543,6 +706,8 @@ int main() {
     // Mesher-level checks (no world needed): dynamic ids resolve through the
     // snapshot's runtime table; per-face materials and occlusion follow §14.
     scenario_dynamic_block_meshes();
+    scenario_mesher_consumes_light();
+    scenario_mesher_light_capture();
     scenario_face_materials_and_occlusion();
     scenario_dynamic_fluid_meshes_as_fluid();
     scenario_state_materials();

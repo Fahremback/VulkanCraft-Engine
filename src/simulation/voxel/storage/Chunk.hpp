@@ -44,6 +44,9 @@ public:
     // occlusion height; block light from the sparse map (0 when unlit).
     uint8_t get_sky_light(int x, int y, int z) const;
     uint8_t get_block_light(int x, int y, int z) const;
+    // Top of the occluding column (sky is visible strictly above it). Used by
+    // the mesher snapshot to shade open-sky cells with no occupied layer.
+    uint16_t get_sky_occlusion(int x, int z) const;
     static uint32_t light_key(int x, int y, int z) {
         return (static_cast<uint32_t>(y) << 8) | (static_cast<uint32_t>(z) << 4) |
                static_cast<uint32_t>(x);

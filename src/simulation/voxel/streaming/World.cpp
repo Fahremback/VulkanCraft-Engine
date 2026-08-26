@@ -234,6 +234,10 @@ ChunkSnapshot World::create_chunk_snapshot(const Chunk& chunk) const {
     snapshot.id = chunk.id();
     snapshot.revision = chunk.revision();
     snapshot.verticalExtent = chunk.vertical_render_extent();
+    // The mesh snapshot carries the discrete block light (0..15) so the
+    // mesher can shade vertex colors (FALTANTES item 8/9). Always captured
+    // from a lit world; consumers gate on hasLightData.
+    snapshot.hasLightData = true;
 
     const int denseHeight = std::clamp(chunk.highestOccupiedY + 1, 1, GENERATED_TERRAIN_HEIGHT);
     snapshot.layers.reserve(static_cast<std::size_t>(denseHeight) +
@@ -248,6 +252,13 @@ ChunkSnapshot World::create_chunk_snapshot(const Chunk& chunk) const {
     std::sort(snapshot.layers.begin(), snapshot.layers.end());
     snapshot.layers.erase(std::unique(snapshot.layers.begin(), snapshot.layers.end()), snapshot.layers.end());
 
+    for (int z = 0; z < CHUNK_SIZE_Z; ++z) {
+        for (int x = 0; x < CHUNK_SIZE_X; ++x) {
+            snapshot.skyOcclusionTop[static_cast<std::size_t>(z * CHUNK_SIZE_X + x)] =
+                chunk.get_sky_occlusion(x, z);
+        }
+    }
+
     for (const int y : snapshot.layers) {
         auto& center = snapshot.center[y];
         auto& halo = snapshot.halo[y];
@@ -257,6 +268,10 @@ ChunkSnapshot World::create_chunk_snapshot(const Chunk& chunk) const {
                 center.blocks[index] = chunk.get_block(x, y, z);
                 center.water[index] = chunk.get_water_level(x, y, z);
                 center.stateIndices[index] = chunk.get_state(x, y, z);
+                // Combined light (max of sky and block) per cell; the mesher
+                // shades faces by the adjacent cell's value (item 8/9).
+                center.light[index] = std::max<uint8_t>(
+                    chunk.get_sky_light(x, y, z), chunk.get_block_light(x, y, z));
             }
         }
         for (int localZ = -1; localZ <= CHUNK_SIZE_Z; ++localZ) {
@@ -267,6 +282,9 @@ ChunkSnapshot World::create_chunk_snapshot(const Chunk& chunk) const {
                     localZ >= 0 && localZ < CHUNK_SIZE_Z) {
                     halo.blocks[haloIndex] = chunk.get_block(localX, y, localZ);
                     halo.water[haloIndex] = chunk.get_water_level(localX, y, localZ);
+                    halo.light[haloIndex] = std::max<uint8_t>(
+                        chunk.get_sky_light(localX, y, localZ),
+                        chunk.get_block_light(localX, y, localZ));
                     halo.known[haloIndex] = 1;
                     continue;
                 }
@@ -288,6 +306,9 @@ ChunkSnapshot World::create_chunk_snapshot(const Chunk& chunk) const {
                     (localZ >= CHUNK_SIZE_Z ? 0 : localZ);
                 halo.blocks[haloIndex] = found->second->get_block(nx, y, nz);
                 halo.water[haloIndex] = found->second->get_water_level(nx, y, nz);
+                halo.light[haloIndex] = std::max<uint8_t>(
+                    found->second->get_sky_light(nx, y, nz),
+                    found->second->get_block_light(nx, y, nz));
                 halo.known[haloIndex] = 1;
             }
         }

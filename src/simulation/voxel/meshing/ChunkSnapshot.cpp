@@ -34,6 +34,16 @@ uint8_t ChunkSnapshot::state(int x, int y, int z) const {
     return layer == center.end() ? 0 : layer->second.stateIndices[center_index(x, z)];
 }
 
+uint8_t ChunkSnapshot::light(int x, int y, int z) const {
+    if (x < 0 || x >= CHUNK_SIZE_X || z < 0 || z >= CHUNK_SIZE_Z) return 0;
+    const auto layer = center.find(y);
+    if (layer != center.end()) return layer->second.light[center_index(x, z)];
+    // No occupied layer at this cell (open air above the surface): the light
+    // is the column's sky term (block light there is 0 by construction).
+    return static_cast<uint8_t>(
+        y > skyOcclusionTop[center_index(x, z)] ? 15 : 0);
+}
+
 RuntimeBlockId ChunkSnapshot::halo_block(int x, int y, int z, bool& isKnown) const {
     const auto layer = halo.find(y);
     if (layer == halo.end() || x < -1 || x > CHUNK_SIZE_X || z < -1 || z > CHUNK_SIZE_Z) {
@@ -54,4 +64,15 @@ uint8_t ChunkSnapshot::halo_water(int x, int y, int z, bool& isKnown) const {
     const auto index = halo_index(x, z);
     isKnown = layer->second.known[index] != 0;
     return layer->second.water[index];
+}
+
+uint8_t ChunkSnapshot::halo_light(int x, int y, int z, bool& isKnown) const {
+    const auto layer = halo.find(y);
+    if (layer == halo.end() || x < -1 || x > CHUNK_SIZE_X || z < -1 || z > CHUNK_SIZE_Z) {
+        isKnown = false;
+        return 0;
+    }
+    const auto index = halo_index(x, z);
+    isKnown = layer->second.known[index] != 0;
+    return layer->second.light[index];
 }

@@ -4,10 +4,8 @@
 // transfer is transactional (all-or-nothing: the source is only mutated after
 // the destination accepts the rebuild); portals are generic position mappings
 // between two world spaces. Pure composition of the public voxel/entity layers
-// — no backend of its own.
-
-#include "engine/world/IWorldManager.hpp"
-
+// — no backend of its own.#include "engine/world/IWorldManager.hpp"
+#include "engine/procgen/IWorldProfile.hpp"
 #include "RegistryJson.hpp"
 
 #include <cmath>
@@ -431,6 +429,7 @@ private:
     struct WorldEntry {
         WorldSpec spec;
         std::unique_ptr<engine::voxel::IVoxelWorld> voxel;
+        std::shared_ptr<const engine::procgen::IWorldProfile> profile;
         double elapsed{ 0.0 };
     };
 
@@ -467,6 +466,23 @@ private:
         meta.worldName = spec.name;
         meta.rulesJson = spec.rulesJson;
         voxel->set_world_metadata(meta);
+        // World profile (data-driven generation): compose the generator from
+        // the profile and register it BEFORE any load so chunks generated
+        // during load follow the profile. An invalid profile refuses the
+        // world creation (all-or-nothing — nothing is registered).
+        std::shared_ptr<const engine::procgen::IWorldProfile> profile;
+        if (!spec.profileJson.empty()) {
+            std::string profileError;
+            profile = engine::procgen::create_world_profile_from_json(
+                spec.profileJson, profileError);
+            if (!profile) {
+                errorOut = "world: '" + spec.name +
+                           "' profile is not a valid world profile: " +
+                           profileError;
+                return false;
+            }
+            voxel->register_generator(profile->generator());
+        }
         if (loadFromSave) {
             if (spec.savePath.empty()) {
                 errorOut = "world: '" + spec.name +
@@ -485,10 +501,17 @@ private:
         WorldEntry entry;
         entry.spec = spec;
         entry.voxel = std::move(voxel);
+        entry.profile = std::move(profile);
         entry.elapsed = 0.0;
         worlds_.emplace(spec.name, std::move(entry));
         errorOut.clear();
         return true;
+    }
+
+    std::shared_ptr<const engine::procgen::IWorldProfile> world_profile(
+        const std::string& name) const override {
+        const auto it = worlds_.find(name);
+        return it == worlds_.end() ? nullptr : it->second.profile;
     }
 
     std::map<std::string, WorldEntry> worlds_;  // sorted: deterministic names

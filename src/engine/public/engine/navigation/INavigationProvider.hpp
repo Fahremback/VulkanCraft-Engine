@@ -66,6 +66,21 @@ struct PathResult {
     uint64_t revision{ 0 };        // navmesh revision that produced the path
 };
 
+// A dynamic obstacle (FALTANTES item 12 — doors, platforms, moving
+// obstacles): a named set of solid voxel columns whose footprint blocks the
+// navmesh while ACTIVE and is passable while INACTIVE. Toggling an obstacle
+// re-bakes ONLY the navmesh tiles overlapping its columns (tiled mode), so a
+// door opening/closing or a platform appearing/disappearing never triggers a
+// full rebake; the resulting navmesh is equivalent to build() over the full
+// column set with the obstacle's columns applied (active) or not (inactive).
+// The id is caller-chosen and must be unique per provider.
+struct DynamicObstacle {
+    // Solid footprint columns. While ACTIVE these columns override the
+    // terrain columns at the same grid positions (blocking); while INACTIVE
+    // the terrain columns are restored (passable).
+    std::vector<VoxelColumn> columns;
+};
+
 class INavigationProvider {
 public:
     virtual ~INavigationProvider() = default;
@@ -111,6 +126,24 @@ public:
     // cached path invalidation.
     virtual uint64_t tile_revision(float x, float z) const = 0;
     virtual bool valid() const = 0;
+
+    // Registers (or replaces) a dynamic obstacle and activates it: the
+    // obstacle's columns override the terrain in their footprint and ONLY
+    // the overlapping tiles are re-baked (tiled mode). Refused with a
+    // diagnostic in single-navmesh mode, before build(), for an empty
+    // footprint, or when a tile bake fails (all-or-nothing: the previous
+    // obstacle state is preserved). A registered id can be toggled with
+    // set_obstacle_active.
+    virtual bool set_dynamic_obstacle(uint64_t id,
+                                      const DynamicObstacle& obstacle,
+                                      std::string& errorOut) = 0;
+
+    // Toggles a registered obstacle: active re-applies its columns over the
+    // terrain (re-baking only the overlapping tiles), inactive restores the
+    // terrain columns underneath. Refused with a diagnostic for an unknown
+    // id or in single-navmesh mode.
+    virtual bool set_obstacle_active(uint64_t id, bool active,
+                                     std::string& errorOut) = 0;
 };
 
 // Recast + Detour-backed implementation (the only TU with Recast headers).
