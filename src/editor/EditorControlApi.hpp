@@ -10,6 +10,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Engine {
 
@@ -57,6 +58,12 @@ struct EditorApiState {
     // Dev telemetry: last headless self-test result, script VM state.
     std::string lastSelfTest;
     std::string scriptState;
+    // Registered editor panels (EditorPluginRegistry), insertion order — the
+    // shell's menu/palette/layout surface, exposed for CLI/MCP observability.
+    std::vector<std::string> panels;
+    // Project templates (ProjectTemplateRegistry), insertion order — the
+    // project wizard's catalog, exposed for CLI/MCP observability.
+    std::vector<std::string> templates;
 };
 
 class EditorControlApi {

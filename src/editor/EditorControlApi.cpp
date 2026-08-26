@@ -227,6 +227,56 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
     in >> method >> path;
     if (path.empty()) path = "/";
 
+    if (method == "GET" && path == "/panels") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        const auto esc = [](const std::string& in) {
+            std::string out;
+            out.reserve(in.size() + 8);
+            for (const char ch : in) {
+                if (ch == '\\' || ch == '"') out.push_back('\\');
+                out.push_back(ch);
+            }
+            return out;
+        };
+        std::ostringstream out;
+        out << "{\"count\":" << snapshot.panels.size() << ",\"panels\":[";
+        for (std::size_t i = 0; i < snapshot.panels.size(); ++i) {
+            if (i) out << ",";
+            out << "\"" << esc(snapshot.panels[i]) << "\"";
+        }
+        out << "]}";
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/templates") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        const auto esc = [](const std::string& in) {
+            std::string out;
+            out.reserve(in.size() + 8);
+            for (const char ch : in) {
+                if (ch == '\\' || ch == '"') out.push_back('\\');
+                out.push_back(ch);
+            }
+            return out;
+        };
+        std::ostringstream out;
+        out << "{\"count\":" << snapshot.templates.size() << ",\"templates\":[";
+        for (std::size_t i = 0; i < snapshot.templates.size(); ++i) {
+            if (i) out << ",";
+            out << "\"" << esc(snapshot.templates[i]) << "\"";
+        }
+        out << "]}";
+        send_response(conn, out.str());
+        return;
+    }
     if (method == "GET" && path == "/health") {
         send_response(conn, "ok", "text/plain");
         return;

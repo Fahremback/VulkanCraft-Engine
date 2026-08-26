@@ -18,6 +18,12 @@ namespace {
 // the loader rejects unknown versions instead of guessing.
 constexpr int kSerializedVersion = 1;
 
+// Undo history depth: a bounded ring of pre-mutation slot snapshots. The
+// oldest entry is dropped once the cap is reached, so a hot inventory loop
+// cannot grow memory without bound. Redo depth is implicitly bounded by the
+// number of undos performed (<= cap).
+constexpr std::size_t kMaxUndoDepth = 128;
+
 // Minimal JSON string escaping for the emitter.
 std::string json_escape(const std::string& text) {
     std::string out;
@@ -88,6 +94,37 @@ void Inventory::bump() {
     if (onChange_) onChange_(*this);
 }
 
+void Inventory::push_undo(std::vector<ItemStack>&& before) {
+    undoStack_.push_back(std::move(before));
+    if (undoStack_.size() > kMaxUndoDepth) {
+        undoStack_.erase(undoStack_.begin());
+    }
+    redoStack_.clear();
+}
+
+bool Inventory::undo() {
+    if (undoStack_.empty()) return false;
+    redoStack_.push_back(std::move(slots_));
+    slots_ = std::move(undoStack_.back());
+    undoStack_.pop_back();
+    bump();
+    return true;
+}
+
+bool Inventory::redo() {
+    if (redoStack_.empty()) return false;
+    undoStack_.push_back(std::move(slots_));
+    slots_ = std::move(redoStack_.back());
+    redoStack_.pop_back();
+    bump();
+    return true;
+}
+
+void Inventory::clear_history() noexcept {
+    undoStack_.clear();
+    redoStack_.clear();
+}
+
 bool Inventory::set(int slot, const ItemStack& stack, const ItemRegistry& items,
                     std::string& errorOut) {
     if (slot < 0 || slot >= slot_count()) {
@@ -95,6 +132,7 @@ bool Inventory::set(int slot, const ItemStack& stack, const ItemRegistry& items,
         return false;
     }
     if (!slot_accepts(slot, stack, items, errorOut)) return false;
+    std::vector<ItemStack> before = slots_;
     if (stack.empty()) {
         slots_[static_cast<std::size_t>(slot)].clear();
     } else {
@@ -103,6 +141,7 @@ bool Inventory::set(int slot, const ItemStack& stack, const ItemRegistry& items,
         if (clamped.count <= 0) clamped.clear();
         slots_[static_cast<std::size_t>(slot)] = clamped;
     }
+    push_undo(std::move(before));
     bump();
     errorOut.clear();
     return true;
@@ -121,6 +160,7 @@ ItemStack Inventory::add(const ItemStack& stack, const ItemRegistry& items,
     }
     const int maxStack = def->maxStack;
 
+    std::vector<ItemStack> before = slots_;
     ItemStack remainder = stack;
     bool changed = false;
     // Pass 1: merge into matching stacks that still have room.
@@ -144,7 +184,10 @@ ItemStack Inventory::add(const ItemStack& stack, const ItemRegistry& items,
         changed = true;
         if (remainder.count <= 0) remainder.clear();
     }
-    if (changed) bump();
+    if (changed) {
+        push_undo(std::move(before));
+        bump();
+    }
     errorOut.clear();
     return remainder;
 }
@@ -155,6 +198,7 @@ int Inventory::remove(const std::string& item, int count, const ItemRegistry&,
         errorOut.clear();
         return 0;
     }
+    std::vector<ItemStack> before = slots_;
     int removed = 0;
     for (int s = 0; s < slot_count() && removed < count; ++s) {
         ItemStack& slot = slots_[static_cast<std::size_t>(s)];
@@ -164,7 +208,10 @@ int Inventory::remove(const std::string& item, int count, const ItemRegistry&,
         removed += take;
         if (slot.count <= 0) slot.clear();
     }
-    if (removed > 0) bump();
+    if (removed > 0) {
+        push_undo(std::move(before));
+        bump();
+    }
     errorOut.clear();
     return removed;
 }
@@ -173,9 +220,11 @@ int Inventory::consume(int slot, int amount) {
     if (slot < 0 || slot >= slot_count() || amount <= 0) return 0;
     ItemStack& stack = slots_[static_cast<std::size_t>(slot)];
     if (stack.empty()) return 0;
+    std::vector<ItemStack> before = slots_;
     const int taken = std::min(amount, stack.count);
     stack.count -= taken;
     if (stack.count <= 0) stack.clear();
+    push_undo(std::move(before));
     bump();
     return taken;
 }
@@ -233,9 +282,13 @@ int Inventory::transfer(Inventory& src, int srcSlot, Inventory& dst, int dstSlot
         errorOut.clear();
         return 0;
     }
+    std::vector<ItemStack> srcBefore = src.slots_;
+    std::vector<ItemStack> dstBefore = dst.slots_;
     source.count -= moved;
     if (source.count <= 0) source.clear();
     target.count += moved;
+    src.push_undo(std::move(srcBefore));
+    dst.push_undo(std::move(dstBefore));
     src.bump();
     dst.bump();
     errorOut.clear();
@@ -257,7 +310,9 @@ bool Inventory::swap(Inventory& inv, int a, int b, const ItemRegistry& items,
     // The destination of each side must accept the incoming item.
     if (!inv.slot_accepts(b, stackA, items, errorOut)) return false;
     if (!inv.slot_accepts(a, stackB, items, errorOut)) return false;
+    std::vector<ItemStack> before = inv.slots_;
     std::swap(stackA, stackB);
+    inv.push_undo(std::move(before));
     inv.bump();
     errorOut.clear();
     return true;
@@ -343,8 +398,10 @@ bool Inventory::deserialize_json(const std::string& jsonText,
         }
         next[i] = stack;
     }
+    std::vector<ItemStack> before = slots_;
     slots_ = std::move(next);
     filters_ = std::move(nextFilters);
+    push_undo(std::move(before));
     bump();
     errorOut.clear();
     return true;

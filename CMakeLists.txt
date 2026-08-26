@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(vulkan_craft_1_5 LANGUAGES C CXX)
+# Guard against in-source builds (Agent 6 §1.31)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
+    message(FATAL_ERROR "In-source builds are not allowed. Use cmake --preset <name> or cmake -B build.")
+endif()
 
 enable_testing()
 set(CMAKE_CXX_STANDARD 20)
@@ -302,6 +306,10 @@ set(VC_SOURCE_DIRS
 )
 
 add_library(vc_build_options INTERFACE)
+# MSVC parallel compilation (/MP) — uses all available cores
+if(MSVC)
+    target_compile_options(vc_build_options INTERFACE /MP)
+endif()
 target_include_directories(vc_build_options INTERFACE
     ${VC_SOURCE_DIRS}
     ${Vulkan_INCLUDE_DIRS}
@@ -427,6 +435,8 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/AnimationLod.cpp
     src/engine/sdk/AiGraphValidation.cpp
     src/engine/sdk/StrandHair.cpp
+    src/engine/sdk/BehaviorTree.cpp
+    src/engine/sdk/ActionMap.cpp
     src/engine/sdk/RegistryJson.cpp
 
     src/engine/core/compression/ZstdCompression.cpp
@@ -671,6 +681,10 @@ add_executable(VulkanEngineEditor
     src/editor/EditorApplication.cpp
     # Loopback HTTP control API (curl 127.0.0.1:8321/{play,pause,resume,stop,step,state})
     src/editor/EditorControlApi.cpp
+    # Editor plugin API (ezEngine-style swappable tools; headless registry).
+    src/editor/EditorPlugin.cpp
+    # Project templates (ezEngine "project templates" pillar; headless scaffold).
+    src/editor/ProjectTemplate.cpp
     src/engine/editor/ui/EditorGUI.cpp
     src/editor/tools/SpecializedEditorsPanel.cpp
     # Wicked-port tool panels (frontend; PORTS.md): windows wired to the
@@ -786,6 +800,76 @@ target_include_directories(global_illumination_tests PRIVATE
 )
 target_link_libraries(global_illumination_tests PRIVATE vc_build_options glm)
 add_test(NAME global_illumination_tests COMMAND global_illumination_tests)
+
+# Public Lumen-style surface cache (Agente 1, task_plan A.3): the headless
+# ILumenScene gate — deterministic surface cards, incremental dirty-chunk
+# updates, coplanar carding, LRU budget, hierarchical distance cascades.
+add_executable(lumen_scene_tests
+    tests/LumenSceneTests.cpp
+    src/engine/sdk/LumenScene.cpp
+)
+target_include_directories(lumen_scene_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(lumen_scene_tests PRIVATE vc_build_options glm)
+add_test(NAME lumen_scene_tests COMMAND lumen_scene_tests)
+
+# Public material-card capture (Agente 1, task_plan A.4): the headless
+# ISurfaceCacheCapture gate — capture budget, nearest-camera-first, LOCALIZED
+# invalidation, revision-bump re-capture, self-luminous, exact vram.
+add_executable(surface_cache_capture_tests
+    tests/SurfaceCacheCaptureTests.cpp
+    src/engine/sdk/SurfaceCacheCapture.cpp
+    src/engine/sdk/LumenScene.cpp
+)
+target_include_directories(surface_cache_capture_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(surface_cache_capture_tests PRIVATE vc_build_options glm)
+add_test(NAME surface_cache_capture_tests COMMAND surface_cache_capture_tests)
+
+# Public multi-bounce diffuse GI (Agente 1, task_plan A.5): the headless
+# IDiffuseGlobalIllumination gate — radiosity, color bleeding, shadowed
+# skylight, energy tracking, determinism.
+add_executable(diffuse_global_illumination_tests
+    tests/DiffuseGlobalIlluminationTests.cpp
+    src/engine/sdk/DiffuseGlobalIllumination.cpp
+)
+target_include_directories(diffuse_global_illumination_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(diffuse_global_illumination_tests PRIVATE vc_build_options glm)
+add_test(NAME diffuse_global_illumination_tests COMMAND diffuse_global_illumination_tests)
+
+# Public software ray tracer (Agente 1, task_plan A.7): the headless
+# ISoftwareTracer gate — sphere tracing against SDFs (hit/miss/occlusion/normal).
+add_executable(software_tracer_tests
+    tests/SoftwareTracerTests.cpp
+    src/engine/sdk/SoftwareTracer.cpp
+)
+target_include_directories(software_tracer_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(software_tracer_tests PRIVATE vc_build_options glm)
+add_test(NAME software_tracer_tests COMMAND software_tracer_tests)
+
+# Public quality presets (Agente 1, task_plan A.16): the headless
+# IRenderingPresets gate — deterministic per-level budgets + all-or-nothing
+# validation across all rendering contracts.
+add_executable(rendering_presets_tests
+    tests/RenderingPresetsTests.cpp
+    src/engine/sdk/RenderingPresets.cpp
+)
+target_include_directories(rendering_presets_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(rendering_presets_tests PRIVATE vc_build_options glm)
+add_test(NAME rendering_presets_tests COMMAND rendering_presets_tests)
 
 add_executable(voxel_box_merger_tests
     tests/VoxelBoxMergerTests.cpp
@@ -1076,6 +1160,39 @@ target_include_directories(simulation_lod_tests PRIVATE
 target_link_libraries(simulation_lod_tests PRIVATE vc_build_options glm)
 add_test(NAME simulation_lod_tests COMMAND simulation_lod_tests)
 
+# Reusable AI (agente 4 §3): blackboard tipado + behavior tree data-driven
+# determinístico — composites/decorators/leaves/abort/service/cooldown/wait,
+# JSON versionado all-or-nothing, round-trip bit-exact, headless. O contrato
+# compila só com headers públicos; o gate dirige o runtime puro (o padrão
+# simulation_lod_tests) — compila os TUs direto, sem outro módulo do SDK.
+add_executable(behavior_tree_tests
+    tests/BehaviorTreeTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/BehaviorTree.cpp
+)
+target_include_directories(behavior_tree_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(behavior_tree_tests PRIVATE vc_build_options glm)
+add_test(NAME behavior_tree_tests COMMAND behavior_tree_tests)
+
+# Input mapping (agente 4 §1 item 8): action map + rebinding + conflito +
+# persistência + multi-dispositivo — contrato puro/determinístico, JSON
+# versionado all-or-nothing, round-trip bit-exact, headless (o padrão
+# behavior_tree_tests/simulation_lod_tests).
+add_executable(action_map_tests
+    tests/ActionMapTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/ActionMap.cpp
+)
+target_include_directories(action_map_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(action_map_tests PRIVATE vc_build_options glm)
+add_test(NAME action_map_tests COMMAND action_map_tests)
+
 # Mission/dialogue assets (FALTANTES item 23 "missões e diálogos"): a mission
 # is a data-driven JSON asset (objectives, dialogue graph, unlock conditions,
 # reward) applied through the public IMissionWorld seam — deterministic,
@@ -1108,6 +1225,31 @@ add_executable(visual_authoring_tests
 )
 target_link_libraries(visual_authoring_tests PRIVATE vc_build_options glm)
 add_test(NAME visual_authoring_tests COMMAND visual_authoring_tests)
+
+# Editor panel plugin registry (ezEngine "tools as replaceable plugins" pillar):
+# panels register stable metadata; the shell derives menus/palette/layout from
+# the registry. Model-only (no UI/GPU) — headless test below.
+add_executable(editor_plugin_tests
+    tests/EditorPluginTests.cpp
+    src/editor/EditorPlugin.cpp
+)
+target_include_directories(editor_plugin_tests PRIVATE
+    src
+)
+target_link_libraries(editor_plugin_tests PRIVATE vc_build_options)
+add_test(NAME editor_plugin_tests COMMAND editor_plugin_tests)
+
+# Editor project templates (ezEngine "project templates" pillar): data-driven
+# scaffold generation, all-or-nothing materialization — model-only headless gate.
+add_executable(project_template_tests
+    tests/ProjectTemplateTests.cpp
+    src/editor/ProjectTemplate.cpp
+)
+target_include_directories(project_template_tests PRIVATE
+    src
+)
+target_link_libraries(project_template_tests PRIVATE vc_build_options)
+add_test(NAME project_template_tests COMMAND project_template_tests)
 
 add_executable(script_debugger_tests
     tests/ScriptDebuggerTests.cpp
@@ -2588,7 +2730,7 @@ install(DIRECTORY assets/ DESTINATION assets OPTIONAL)
 install(DIRECTORY src/engine/public/ DESTINATION include FILES_MATCHING PATTERN "*.hpp")
 install(DIRECTORY tools/mcp-server DESTINATION tools
     FILES_MATCHING PATTERN "*.mjs" PATTERN "package.json" PATTERN "README.md")
-install(FILES SDK.md DESTINATION .)
+install(FILES docs/SDK_MANIFEST.md DESTINATION . RENAME SDK.md)
 if(WIN32)
     install(DIRECTORY "${CMAKE_BINARY_DIR}/Release/" DESTINATION bin OPTIONAL
         FILES_MATCHING PATTERN "*.dll")

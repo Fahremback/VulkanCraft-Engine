@@ -91,7 +91,25 @@ function request(method, params = {}) {
 try {
   const initialized = await request("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "smoke", version: "1" } });
   assert.equal(initialized.result.serverInfo.name, "vulkancraft-engine");
+  assert.equal(initialized.result.protocolVersion, "2025-03-26", "initialize negotiates the supported version");
   assert.ok(initialized.result.capabilities.prompts, "initialize advertises the prompts capability");
+
+  // ---- semantic versioning: serverInfo exposes engine semver + ABI from the
+  // single source of truth (version.hpp), never a duplicated literal.
+  assert.match(initialized.result.serverInfo.engineVersion, /^\d+\.\d+\.\d+$/, "serverInfo.engineVersion is semver");
+  assert.ok(initialized.result.serverInfo.engineAbi, "serverInfo.engineAbi is present");
+  const version = await request("tools/call", { name: "engine_version", arguments: {} });
+  const versionPayload = JSON.parse(version.result.content[0].text);
+  assert.match(versionPayload.engine, /^\d+\.\d+\.\d+$/, "engine_version.engine is semver");
+  assert.equal(versionPayload.engine, initialized.result.serverInfo.engineVersion, "tool and serverInfo agree");
+  assert.equal(versionPayload.engine_abi, initialized.result.serverInfo.engineAbi, "ABI agrees between tool and serverInfo");
+  assert.equal(versionPayload.protocol, "2025-03-26", "engine_version exposes the protocol version");
+
+  // ---- handshake version negotiation: unsupported versions refused ----
+  const badVersion = await request("initialize", { protocolVersion: "2099-01-01", capabilities: {}, clientInfo: { name: "smoke", version: "1" } });
+  assert.equal(badVersion.error.code, -32602);
+  assert.match(badVersion.error.message, /unsupported protocol version/);
+  assert.deepEqual(badVersion.error.data.supportedProtocolVersions, ["2025-03-26"]);
 
   // ---- prompts: game-creation recipes (FALTANTES item 5) ----
   const promptsListed = await request("prompts/list");
@@ -126,11 +144,39 @@ try {
   assert.equal(unknownPrompt.error.code, -32602);
   assert.match(unknownPrompt.error.message, /unknown prompt/);
 
+  // ---- resources: documentation surface covers docs + SDK manifest ----
+  const resources = await request("resources/list");
+  const resourceUris = resources.result.resources.map((r) => r.uri);
+  assert.ok(resourceUris.includes("engine://readme"), "resources expose readme");
+  assert.ok(resourceUris.includes("engine://sdk-manifest"), "resources expose the SDK manifest");
+  assert.ok(resourceUris.includes("engine://pending-work"), "resources expose pending work");
+  const manifestRead = await request("resources/read", { uri: "engine://sdk-manifest" });
+  assert.match(manifestRead.result.contents[0].text, /SDK/);
+
   const listed = await request("tools/list");
   assert.ok(listed.result.tools.some((tool) => tool.name === "apply_text_edits"));
   assert.ok(listed.result.tools.some((tool) => tool.name === "engine_overview"));
   assert.ok(listed.result.tools.some((tool) => tool.name === "create_game_project"));
   assert.ok(listed.result.tools.some((tool) => tool.name === "set_component"));
+
+  // ---- long operations: async build jobs (start_build / build_status /
+  // cancel_build / list_build_jobs). A real build races concurrent agents,
+  // so the smoke verifies the deterministic surface: registration, refusals,
+  // and the (empty) job list — never a live cmake spawn.
+  for (const expected of ["start_build", "build_status", "cancel_build", "list_build_jobs"]) {
+    assert.ok(listed.result.tools.some((tool) => tool.name === expected), `tool registered: ${expected}`);
+  }
+  const noJobs = await request("tools/call", { name: "list_build_jobs", arguments: {} });
+  assert.deepEqual(JSON.parse(noJobs.result.content[0].text), { jobs: [] });
+  const badBuildTarget = await request("tools/call", { name: "start_build", arguments: { exe: "not_a_target" } });
+  assert.equal(badBuildTarget.result.isError, true);
+  assert.match(badBuildTarget.result.content[0].text, /unknown target/);
+  const unknownJob = await request("tools/call", { name: "build_status", arguments: { job_id: 1 } });
+  assert.equal(unknownJob.result.isError, true);
+  assert.match(unknownJob.result.content[0].text, /unknown build job/);
+  const cancelUnknown = await request("tools/call", { name: "cancel_build", arguments: { job_id: 1 } });
+  assert.equal(cancelUnknown.result.isError, true);
+  assert.match(cancelUnknown.result.content[0].text, /unknown build job/);
 
   const overview = await request("tools/call", { name: "engine_overview", arguments: {} });
   assert.equal(overview.result.isError, undefined);
@@ -563,9 +609,9 @@ try {
   // under src/engine/public must be self-contained (engine//std/vendor only,
   // canonical engine/<domain>/<Header>.hpp includes — never short names). A
   // header with an internal include or a short include breaks this gate.
-  const sdkCheck = spawnSync(process.execPath, [path.join(directory, "..", "sdk", "sdk-check.mjs"), "--expect-count", "67"], { encoding: "utf8" });
+  const sdkCheck = spawnSync(process.execPath, [path.join(directory, "..", "sdk", "sdk-check.mjs"), "--expect-count", "74"], { encoding: "utf8" });
   assert.equal(sdkCheck.status, 0, sdkCheck.stdout + sdkCheck.stderr);
-  assert.match(sdkCheck.stdout, /67 public headers/, sdkCheck.stdout);
+  assert.match(sdkCheck.stdout, /74 public headers/, sdkCheck.stdout);
 
   // The CLI exposes the same artifacts without a running server.
   const cliPath = path.join(directory, "registry-cli.mjs");
@@ -1387,6 +1433,85 @@ try {
     const gizmo = await request("tools/call", { name: "editor_set_gizmo", arguments: { mode: "move" } });
     assert.equal(gizmo.result.isError, undefined, JSON.stringify(gizmo));
     process.stdout.write("Control API smoke (live editor verified)\n");
+  }
+
+  // ---- limits + audit: audit_log records every tools/call with args keys,
+  // error status, timestamp and result hash; rate limit is generous (not hit).
+  assert.ok(listed.result.tools.some((tool) => tool.name === "audit_log"), "tool registered: audit_log");
+  const audit = await request("tools/call", { name: "audit_log", arguments: { limit: 200 } });
+  const auditPayload = JSON.parse(audit.result.content[0].text);
+  assert.ok(auditPayload.entries.length > 0, "audit_log has entries from this smoke run");
+  assert.ok(auditPayload.count > 0, "audit_log count > 0");
+  assert.ok(auditPayload.total_recorded >= auditPayload.count, "total_recorded >= count");
+  const first = auditPayload.entries[0];
+  assert.ok(first.ts, "audit entry has timestamp");
+  assert.ok(typeof first.tool === "string", "audit entry has tool name");
+  assert.ok(Array.isArray(first.args), "audit entry args are keys (never values)");
+  assert.equal(typeof first.is_error, "boolean", "audit entry has is_error");
+  assert.match(first.result_sha256, /^[a-f0-9]{64}$/, "audit entry has result SHA-256");
+  assert.ok(auditPayload.rate.per_second >= 1, "rate limit is configured");
+
+  // ---- subscriptions/events: subscribe_events / unsubscribe_events /
+  // list_event_topics. Firing a real build races concurrent agents, so the
+  // smoke verifies the deterministic surface: registration, topic list,
+  // subscribe/unsubscribe lifecycle, and refusals — never a live cmake spawn.
+  for (const expected of ["subscribe_events", "unsubscribe_events", "list_event_topics"]) {
+    assert.ok(listed.result.tools.some((tool) => tool.name === expected), `tool registered: ${expected}`);
+  }
+  const topics = await request("tools/call", { name: "list_event_topics", arguments: {} });
+  assert.deepEqual(JSON.parse(topics.result.content[0].text), { topics: ["build.status_changed"] });
+  const sub = await request("tools/call", { name: "subscribe_events", arguments: { kinds: ["build.status_changed"] } });
+  const subPayload = JSON.parse(sub.result.content[0].text);
+  assert.ok(subPayload.subscription_id >= 1, "subscribe returns an id");
+  assert.deepEqual(subPayload.kinds, ["build.status_changed"]);
+  const unsub = await request("tools/call", { name: "unsubscribe_events", arguments: { subscription_id: subPayload.subscription_id } });
+  const unsubPayload = JSON.parse(unsub.result.content[0].text);
+  assert.equal(unsubPayload.removed, true, "unsubscribe removes the subscription");
+  const unsubAgain = await request("tools/call", { name: "unsubscribe_events", arguments: { subscription_id: subPayload.subscription_id } });
+  assert.equal(JSON.parse(unsubAgain.result.content[0].text).removed, false, "re-unsubscribe is idempotent (removed=false)");
+  const badSub = await request("tools/call", { name: "subscribe_events", arguments: { kinds: ["nope"] } });
+  assert.equal(badSub.result.isError, true);
+  assert.match(badSub.result.content[0].text, /unknown event kind/);
+  const emptySub = await request("tools/call", { name: "subscribe_events", arguments: { kinds: [] } });
+  assert.equal(emptySub.result.isError, true);
+
+  // ---- lifecycle: initialize -> shutdown -> exit terminates the server ----
+  {
+    const lifecycle = spawn(process.execPath, [path.join(directory, "server.mjs")], {
+      cwd: directory,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true
+    });
+    let lbuf = "";
+    let lPending = null;
+    lifecycle.stdout.setEncoding("utf8");
+    lifecycle.stdout.on("data", (chunk) => {
+      lbuf += chunk;
+      let nl;
+      while ((nl = lbuf.indexOf("\n")) >= 0) {
+        const line = lbuf.slice(0, nl).trim();
+        lbuf = lbuf.slice(nl + 1);
+        if (!line) continue;
+        const msg = JSON.parse(line);
+        if (lPending) { lPending(msg); lPending = null; }
+      }
+    });
+    const lRequest = (method, params = {}) => new Promise((resolve) => {
+      lPending = resolve;
+      lifecycle.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })}\n`);
+    });
+    const exited = new Promise((resolve) => lifecycle.on("exit", resolve));
+    const init = await lRequest("initialize", { protocolVersion: "2025-03-26", capabilities: {} });
+    assert.equal(init.result.serverInfo.name, "vulkancraft-engine");
+    const shutdown = await lRequest("shutdown", {});
+    assert.equal(shutdown.error, undefined, JSON.stringify(shutdown));
+    // notifications/exit is a notification (no response); it must terminate the server.
+    lifecycle.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/exit" })}\n`);
+    const code = await Promise.race([exited, new Promise((resolve) => setTimeout(() => resolve("timeout"), 5000))]);
+    assert.equal(code, 0, `server exited cleanly after shutdown+exit (got ${code})`);
+    lifecycle.stdin.end();
+    lifecycle.kill();
+    process.stdout.write("Lifecycle smoke (shutdown+exit) passed\n");
   }
 
   process.stdout.write("MCP protocol smoke test passed\n");

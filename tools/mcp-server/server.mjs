@@ -13,6 +13,36 @@ const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ENGINE_ROOT = path.resolve(SERVER_DIR, "..", "..");
 const SERVER_NAME = "vulkancraft-engine";
 const SERVER_VERSION = "0.1.0";
+// The single MCP protocol version this server implements. Clients request a
+// version in `initialize`; the server MUST refuse any version it does not
+// implement (echoing an unsupported version would make the client believe it
+// can use features this server does not have).
+const SUPPORTED_PROTOCOL_VERSION = "2025-03-26";
+
+// Engine semantic version, parsed from the SINGLE source of truth
+// (src/engine/public/engine/version.hpp — engine_version()), so the MCP
+// surface can never drift from the C++ API. Tolerant parse: if the header
+// shape changes, fall back to a documented sentinel instead of guessing.
+function parseEngineVersion() {
+  try {
+    const src = fs.readFileSync(path.join(ENGINE_ROOT, "src/engine/public/engine/version.hpp"), "utf8");
+    const match = src.match(/return\s+VersionInfo\s*\{\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"\s*\}/);
+    if (match) {
+      return {
+        major: Number(match[1]),
+        minor: Number(match[2]),
+        patch: Number(match[3]),
+        codename: match[4],
+        abi: match[5],
+        string: `${match[1]}.${match[2]}.${match[3]}`
+      };
+    }
+  } catch {
+    // fall through to sentinel
+  }
+  return { major: 0, minor: 0, patch: 0, codename: "unknown", abi: "unknown", string: "0.0.0" };
+}
+const ENGINE_VERSION = parseEngineVersion();
 const MAX_READ_LINES = 500;
 const MAX_TEXT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_SEARCH_RESULTS = 80;
@@ -212,6 +242,19 @@ function engineOverview() {
     cmake_targets: targets,
     authoritative_docs: ["README.md", "docs/ARCHITECTURE.md", "docs/MIGRATION_STATUS.md", "docs/FALTANTES.md"],
     concurrency_rule: "Read before edit and pass expected_sha256 to every edit of an existing file."
+  };
+}
+
+function versionTool() {
+  return {
+    engine: ENGINE_VERSION.string,
+    engine_abi: ENGINE_VERSION.abi,
+    codename: ENGINE_VERSION.codename,
+    major: ENGINE_VERSION.major,
+    minor: ENGINE_VERSION.minor,
+    patch: ENGINE_VERSION.patch,
+    server: SERVER_VERSION,
+    protocol: SUPPORTED_PROTOCOL_VERSION
   };
 }
 
@@ -425,7 +468,8 @@ function buildGameTool(args) {
   const logPath = path.join(GAME_RUN_ROOT, name);
   const argsList = ["--build", "build", "--config", config];
   if (exe !== "ALL_BUILD") argsList.push("--target", exe);
-  const result = spawnSync("cmake", argsList, { cwd: ENGINE_ROOT, encoding: "utf8", windowsHide: true, maxBuffer: 32 * 1024 * 1024 });
+  // Bounded: a hung build must never wedge the MCP server forever.
+  const result = spawnSync("cmake", argsList, { cwd: ENGINE_ROOT, encoding: "utf8", windowsHide: true, maxBuffer: 32 * 1024 * 1024, timeout: 15 * 60 * 1000 });
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
   fs.writeFileSync(logPath, output, "utf8");
   const lines = output.split(/\r?\n/);
@@ -433,11 +477,182 @@ function buildGameTool(args) {
   return {
     target: exe,
     log: path.relative(ENGINE_ROOT, logPath).replaceAll(path.sep, "/"),
-    status: result.status,
+    status: result.error ? (result.error.code === "ETIMEDOUT" ? "timeout" : "error") : result.status,
+    timed_out: result.error?.code === "ETIMEDOUT",
     errors: errors.length,
     error_lines: errors,
     tail: lines.slice(-60).join("\n")
   };
+}
+
+// FALTANTES item 5 (MCP server) — subscriptions/events. A client subscribes
+// to an event kind (e.g. build.status_changed) and the server emits a
+// `notifications/...` message whenever that event fires, interleaved with the
+// normal request/response stream. Support is OPT-IN via subscribe_events;
+// without a subscription the server emits nothing (no notification spam).
+// Events are delivered in the order they fire; a subscriber receives ONLY the
+// kinds it subscribed to (topic fan-out by kind).
+const EVENT_SUBSCRIPTIONS = new Map();  // eventKind -> Set<subscriptionId>
+const EVENT_TOPICS = new Set(["build.status_changed"]);
+let nextSubscriptionId = 1;
+
+function emitEvent(kind, payload) {
+  const subs = EVENT_SUBSCRIPTIONS.get(kind);
+  if (!subs || subs.size === 0) return;
+  for (const subId of subs) {
+    send({
+      jsonrpc: "2.0",
+      method: `notifications/${kind}`,
+      params: { subscription_id: subId, kind, ...payload }
+    });
+  }
+}
+
+function subscribeEventsTool(args) {
+  const kinds = Array.isArray(args.kinds) ? args.kinds.map(String) : [];
+  const unknown = kinds.filter((k) => !EVENT_TOPICS.has(k));
+  if (unknown.length > 0) {
+    throw new Error(`unknown event kind(s): ${unknown.join(", ")}; available: ${[...EVENT_TOPICS].join(", ")}`);
+  }
+  if (kinds.length === 0) {
+    throw new Error(`kinds must be a non-empty array; available: ${[...EVENT_TOPICS].join(", ")}`);
+  }
+  const id = nextSubscriptionId++;
+  for (const kind of kinds) {
+    if (!EVENT_SUBSCRIPTIONS.has(kind)) EVENT_SUBSCRIPTIONS.set(kind, new Set());
+    EVENT_SUBSCRIPTIONS.get(kind).add(id);
+  }
+  return { subscription_id: id, kinds };
+}
+
+function unsubscribeEventsTool(args) {
+  const id = Number(args.subscription_id);
+  let removed = false;
+  for (const subs of EVENT_SUBSCRIPTIONS.values()) {
+    if (subs.delete(id)) removed = true;
+  }
+  return { subscription_id: id, removed };
+}
+
+function listEventTopicsTool() {
+  return { topics: [...EVENT_TOPICS].sort() };
+}
+
+// FALTANTES item 5 (MCP server) — long operations with job id, progress,
+// cancellation, timeout and artifacts. A build can run for minutes; the
+// synchronous build_game would freeze the stdio loop, so start_build spawns
+// the build asynchronously and returns a job id immediately. The caller polls
+// build_status for progress (live log tail) and can cancel_build to kill the
+// in-flight child. Jobs are kept in memory for the server's lifetime.
+const BUILD_JOBS = new Map();
+let nextBuildJobId = 1;
+
+function startBuildTool(args) {
+  const exe = String(args.exe ?? "VulkanEngineGame");
+  const known = new Set(["VulkanEngineGame", "VulkanEngineEditor", "VulkanEngineServer",
+    "VulkanEngineCooker", "vulkan_craft", "ALL_BUILD"]);
+  if (!known.has(exe)) throw new Error(`unknown target '${exe}'`);
+  const config = String(args.config ?? "Release");
+  const buildRoot = path.join(ENGINE_ROOT, "build");
+  if (!fs.existsSync(buildRoot)) throw new Error(`build dir not found: ${buildRoot}`);
+
+  fs.mkdirSync(GAME_RUN_ROOT, { recursive: true });
+  const jobId = nextBuildJobId++;
+  const name = `build-${exe}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
+  const logPath = path.join(GAME_RUN_ROOT, name);
+  const argsList = ["--build", "build", "--config", config];
+  if (exe !== "ALL_BUILD") argsList.push("--target", exe);
+
+  const job = {
+    job_id: jobId,
+    exe,
+    config,
+    status: "running",
+    log: path.relative(ENGINE_ROOT, logPath).replaceAll(path.sep, "/"),
+    started_at: new Date().toISOString(),
+    exit_code: null,
+    child: null
+  };
+  const child = spawn("cmake", argsList, { cwd: ENGINE_ROOT, windowsHide: true });
+  job.child = child;
+  const stream = fs.createWriteStream(logPath, { flags: "a" });
+  child.stdout.on("data", (chunk) => stream.write(chunk));
+  child.stderr.on("data", (chunk) => stream.write(chunk));
+  child.on("error", (error) => {
+    job.status = "error";
+    job.error = error.message;
+    job.finished_at = new Date().toISOString();
+    stream.end();
+    emitEvent("build.status_changed", { job_id: job.job_id, status: job.status, exe: job.exe, config: job.config });
+  });
+  child.on("exit", (code, signal) => {
+    stream.end();
+    if (job.status === "cancelled") return;  // cancel wins
+    job.status = code === 0 ? "succeeded" : "failed";
+    job.exit_code = code;
+    job.signal = signal ?? null;
+    job.finished_at = new Date().toISOString();
+    emitEvent("build.status_changed", { job_id: job.job_id, status: job.status, exe: job.exe, config: job.config });
+  });
+  BUILD_JOBS.set(jobId, job);
+  return {
+    job_id: jobId,
+    status: job.status,
+    log: job.log,
+    poll_with: "build_status"
+  };
+}
+
+function buildStatusTool(args) {
+  const jobId = Number(args.job_id);
+  const job = BUILD_JOBS.get(jobId);
+  if (!job) throw new Error(`unknown build job '${args.job_id}' (see list_build_jobs)`);
+  const logPath = path.join(ENGINE_ROOT, job.log);
+  const tail = fs.existsSync(logPath) ? tailLines(logPath, 60) : "";
+  const lines = tail.split(/\r?\n/);
+  return {
+    job_id: job.job_id,
+    status: job.status,
+    exe: job.exe,
+    config: job.config,
+    started_at: job.started_at,
+    finished_at: job.finished_at ?? null,
+    exit_code: job.exit_code,
+    signal: job.signal ?? null,
+    error: job.error ?? null,
+    log: job.log,
+    tail
+  };
+}
+
+function cancelBuildTool(args) {
+  const job = BUILD_JOBS.get(Number(args.job_id));
+  if (!job) throw new Error(`unknown build job '${args.job_id}' (see list_build_jobs)`);
+  if (job.status !== "running") {
+    return { job_id: job.job_id, cancelled: false, status: job.status };
+  }
+  job.status = "cancelled";
+  job.finished_at = new Date().toISOString();
+  const child = job.child;
+  job.child = null;
+  child?.kill();
+  emitEvent("build.status_changed", { job_id: job.job_id, status: "cancelled", exe: job.exe, config: job.config });
+  return { job_id: job.job_id, cancelled: true, status: "cancelled" };
+}
+
+function listBuildJobsTool() {
+  const jobs = [...BUILD_JOBS.values()]
+    .sort((a, b) => b.job_id - a.job_id)
+    .map((job) => ({
+      job_id: job.job_id,
+      status: job.status,
+      exe: job.exe,
+      config: job.config,
+      started_at: job.started_at,
+      finished_at: job.finished_at ?? null,
+      log: job.log
+    }));
+  return { jobs };
 }
 
 const TOOLS = [
@@ -451,6 +666,11 @@ const TOOLS = [
   {
     name: "engine_pending_work",
     description: "Return only unchecked work items from docs/FALTANTES.md.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false }
+  },
+  {
+    name: "engine_version",
+    description: "Return the engine semantic version, ABI token and MCP server/protocol versions (single source of truth: engine/version.hpp).",
     inputSchema: { type: "object", properties: {}, additionalProperties: false }
   },
   {
@@ -568,6 +788,77 @@ const TOOLS = [
       },
       additionalProperties: false
     }
+  },
+  {
+    name: "start_build",
+    description: "Start a build asynchronously and return a job id immediately (the synchronous build_game blocks the server for the whole build). Poll build_status for progress and cancel_build to abort.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        exe: { type: "string", default: "VulkanEngineGame", description: "Target: VulkanEngineGame, VulkanEngineEditor, VulkanEngineServer, VulkanEngineCooker, vulkan_craft or ALL_BUILD" },
+        config: { type: "string", default: "Release" }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "build_status",
+    description: "Poll an async build job (start_build) for its status and live log tail.",
+    inputSchema: {
+      type: "object",
+      required: ["job_id"],
+      properties: { job_id: { type: "integer", minimum: 1 } },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "cancel_build",
+    description: "Cancel a running build job (start_build); a finished job is reported but not re-cancelled.",
+    inputSchema: {
+      type: "object",
+      required: ["job_id"],
+      properties: { job_id: { type: "integer", minimum: 1 } },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "list_build_jobs",
+    description: "List build jobs (start_build) newest first with their status and log path.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false }
+  },
+  {
+    name: "audit_log",
+    description: "Return the recent tool-call audit trail (tool, argument keys, error status, result hash) from this server process.",
+    inputSchema: {
+      type: "object",
+      properties: { limit: { type: "integer", minimum: 1, maximum: 500, default: 100 } },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "subscribe_events",
+    description: "Subscribe to server events (notifications/... messages). Only 'build.status_changed' is emitted today — when a start_build job transitions state. Returns a subscription_id.",
+    inputSchema: {
+      type: "object",
+      required: ["kinds"],
+      properties: { kinds: { type: "array", items: { type: "string" }, description: "Event kinds to subscribe to" } },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "unsubscribe_events",
+    description: "Unsubscribe a subscription (by id) and stop receiving its notifications.",
+    inputSchema: {
+      type: "object",
+      required: ["subscription_id"],
+      properties: { subscription_id: { type: "integer", minimum: 1 } },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "list_event_topics",
+    description: "List the event kinds this server can emit.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false }
   },
   {
     name: "run_game",
@@ -813,41 +1104,139 @@ const RESOURCE_MAP = new Map([
   ["engine://readme", "README.md"],
   ["engine://architecture", "docs/ARCHITECTURE.md"],
   ["engine://migration-status", "docs/MIGRATION_STATUS.md"],
-  ["engine://pending-work", "docs/FALTANTES.md"]
+  ["engine://pending-work", "docs/FALTANTES.md"],
+  ["engine://sdk-manifest", "docs/SDK_MANIFEST.md"],
+  ["engine://dependencies", "docs/SOLUCOES_E_DEPENDENCIAS.md"],
+  ["engine://determinism", "docs/DETERMINISMO_PROVIDERS.md"],
+  ["engine://dependency-policy", "docs/DEPENDENCY_POLICY.md"]
 ]);
 
+// FALTANTES item 5 (MCP server) — limits + audit: every tools/call is recorded
+// in a bounded ring buffer (and appended to Projects/.runs/audit.jsonl) with its
+// tool, argument keys (never the values — args can hold source text), error
+// status, timestamp and result SHA. A per-process rate limit bounds the request
+// rate so a runaway client cannot saturate the server (each stdio client spawns
+// its own process, so the limit never affects other clients).
+const AUDIT_LOG_PATH = path.join(GAME_RUN_ROOT, "audit.jsonl");
+const AUDIT_RING = [];
+const AUDIT_RING_MAX = 1000;
+const RATE_LIMIT_PER_SECOND = 200;
+const RATE_LIMIT_BURST = 400;
+let rateTokens = RATE_LIMIT_BURST;
+let rateLastRefill = Date.now();
+
+function refillRateTokens() {
+  const now = Date.now();
+  const elapsed = (now - rateLastRefill) / 1000;
+  rateTokens = Math.min(RATE_LIMIT_BURST, rateTokens + elapsed * RATE_LIMIT_PER_SECOND);
+  rateLastRefill = now;
+}
+
+function consumeRateToken() {
+  refillRateTokens();
+  if (rateTokens < 1) throw new Error("rate limit exceeded; retry shortly");
+  rateTokens -= 1;
+}
+
+function summarizeArgs(args) {
+  if (args === null || typeof args !== "object") return [];
+  return Object.keys(args);
+}
+
+function recordAudit(name, args, isError, result) {
+  const entry = {
+    ts: new Date().toISOString(),
+    tool: name,
+    args: summarizeArgs(args),
+    is_error: Boolean(isError),
+    result_sha256: sha256(String(result ?? ""))
+  };
+  AUDIT_RING.push(entry);
+  if (AUDIT_RING.length > AUDIT_RING_MAX) AUDIT_RING.shift();
+  try {
+    fs.mkdirSync(GAME_RUN_ROOT, { recursive: true });
+    fs.appendFileSync(AUDIT_LOG_PATH, `${JSON.stringify(entry)}\n`, "utf8");
+  } catch {
+    // auditing is best-effort; a full disk must not fail the tool call
+  }
+}
+
+function auditLogTool(args) {
+  const limit = Math.min(Math.max(Number(args.limit ?? 100), 1), 500);
+  const entries = AUDIT_RING.slice(-limit).reverse();
+  return {
+    entries,
+    count: entries.length,
+    total_recorded: AUDIT_RING.length,
+    rate: { per_second: RATE_LIMIT_PER_SECOND, burst: RATE_LIMIT_BURST }
+  };
+}
+
 async function toolCall(name, args = {}) {
+  consumeRateToken();
   const semanticResult = callSemanticTool(ENGINE_ROOT, name, args);
-  if (semanticResult !== undefined) return { content: jsonText(semanticResult) };
+  if (semanticResult !== undefined) {
+    const isError = Boolean(semanticResult && semanticResult.isError);
+    recordAudit(name, args, isError, JSON.stringify(semanticResult));
+    return { content: jsonText(semanticResult) };
+  }
   const controlApiResult = await callControlApiTool(name, args);
-  if (controlApiResult !== undefined) return { content: jsonText(controlApiResult) };
+  if (controlApiResult !== undefined) {
+    const isError = Boolean(controlApiResult && controlApiResult.isError);
+    recordAudit(name, args, isError, JSON.stringify(controlApiResult));
+    return { content: jsonText(controlApiResult) };
+  }
+  let result;
   switch (name) {
-    case "engine_overview": return { content: jsonText(engineOverview()) };
-    case "engine_pending_work": return { content: jsonText(pendingStatus()) };
-    case "list_directory": return { content: jsonText(walkDirectory(args.path ?? ".", Number(args.depth ?? 1), Number(args.max_entries ?? 120))) };
-    case "search_code": return { content: jsonText(searchCode(args)) };
-    case "inspect_symbol": return { content: jsonText(inspectSymbol(args)) };
-    case "read_file": return { content: jsonText(readFileTool(args)) };
-    case "apply_text_edits": return { content: jsonText(applyTextEdits(args)) };
-    case "create_file": return { content: jsonText(createFile(args)) };
-    case "build_game": return { content: jsonText(buildGameTool(args)) };
-    case "run_game": return { content: jsonText(await runGameTool(args)) };
-    case "list_game_logs": return { content: jsonText(listGameLogsTool()) };
-    case "read_game_log": return { content: jsonText(readGameLogTool(args)) };
+    case "engine_overview": result = engineOverview(); break;
+    case "engine_pending_work": result = pendingStatus(); break;
+    case "engine_version": result = versionTool(); break;
+    case "list_directory": result = walkDirectory(args.path ?? ".", Number(args.depth ?? 1), Number(args.max_entries ?? 120)); break;
+    case "search_code": result = searchCode(args); break;
+    case "inspect_symbol": result = inspectSymbol(args); break;
+    case "read_file": result = readFileTool(args); break;
+    case "apply_text_edits": result = applyTextEdits(args); break;
+    case "create_file": result = createFile(args); break;
+    case "build_game": result = buildGameTool(args); break;
+    case "start_build": result = startBuildTool(args); break;
+    case "build_status": result = buildStatusTool(args); break;
+    case "cancel_build": result = cancelBuildTool(args); break;
+    case "list_build_jobs": result = listBuildJobsTool(); break;
+    case "subscribe_events": result = subscribeEventsTool(args); break;
+    case "unsubscribe_events": result = unsubscribeEventsTool(args); break;
+    case "list_event_topics": result = listEventTopicsTool(); break;
+    case "audit_log": result = auditLogTool(args); break;
+    case "run_game": result = await runGameTool(args); break;
+    case "list_game_logs": result = listGameLogsTool(); break;
+    case "read_game_log": result = readGameLogTool(args); break;
     default: throw new Error(`unknown tool '${name}'`);
   }
+  recordAudit(name, args, false, JSON.stringify(result));
+  return { content: jsonText(result) };
 }
 
 async function handleRequest(message) {
   const { id, method, params = {} } = message;
   if (method === "initialize") {
+    const requested = params.protocolVersion ?? SUPPORTED_PROTOCOL_VERSION;
+    if (requested !== SUPPORTED_PROTOCOL_VERSION) {
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: -32602,
+          message: `unsupported protocol version '${requested}'`,
+          data: { supportedProtocolVersions: [SUPPORTED_PROTOCOL_VERSION] }
+        }
+      };
+    }
     return {
       jsonrpc: "2.0",
       id,
       result: {
-        protocolVersion: params.protocolVersion ?? "2025-03-26",
+        protocolVersion: SUPPORTED_PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false }, resources: { subscribe: false, listChanged: false }, prompts: { listChanged: false } },
-        serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+        serverInfo: { name: SERVER_NAME, version: SERVER_VERSION, engineVersion: ENGINE_VERSION.string, engineAbi: ENGINE_VERSION.abi },
         instructions: "Create games through game_capabilities and the semantic game-authoring tools. Do not modify engine source code for supported capabilities. Use source-maintenance tools only when explicitly asked to develop the engine. For existing engine files, call read_file and pass its expected_sha256 to apply_text_edits."
       }
     };
@@ -875,6 +1264,7 @@ async function handleRequest(message) {
     try {
       return { jsonrpc: "2.0", id, result: await toolCall(params.name, params.arguments ?? {}) };
     } catch (error) {
+      recordAudit(params.name, params.arguments ?? {}, true, error instanceof Error ? error.message : String(error));
       return { jsonrpc: "2.0", id, result: errorResult(error) };
     }
   }
@@ -900,6 +1290,14 @@ async function handleRequest(message) {
     } catch (error) {
       return { jsonrpc: "2.0", id, error: { code: -32002, message: error instanceof Error ? error.message : String(error) } };
     }
+  }
+  if (method === "shutdown") {
+    shuttingDown = true;
+    return { jsonrpc: "2.0", id, result: null };
+  }
+  if (method === "notifications/exit") {
+    if (shuttingDown) process.exit(0);
+    return null;
   }
   if (method?.startsWith("notifications/")) return null;
   return { jsonrpc: "2.0", id, error: { code: -32601, message: `method not found: ${method}` } };
@@ -938,6 +1336,8 @@ function drainInput() {
     if (line) dispatch(line);
   }
 }
+
+let shuttingDown = false;
 
 function dispatch(serialized) {
   let message;

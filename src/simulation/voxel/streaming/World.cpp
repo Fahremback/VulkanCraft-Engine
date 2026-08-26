@@ -930,10 +930,22 @@ void World::update_fluid_physics(const glm::vec3& playerPos) {
             }
             const RuntimeBlockId neighborType = get_block_at(pos(neighbor));
             const uint8_t neighborLevel = get_fluid_level_at(pos(neighbor));
+            // Density displacement (task D.2 / META §13): a spreading fluid
+            // displaces a DIFFERENT fluid occupying the target cell only when
+            // it is denser (heavier sinks). A lighter fluid never displaces a
+            // denser one — it spreads around instead; equal density keeps a
+            // stable boundary. Solid cells are never displaced (fluid params
+            // exist only for fluids).
+            const FluidParams* neighborParams = fluid_params_for_id(neighborType);
+            const bool differentFluid =
+                neighborParams != nullptr && neighborType != type;
+            const bool denserWins =
+                differentFluid && params->density > neighborParams->density;
             if (neighborType == kRuntimeAirId ||
                 (neighborType == type && neighborLevel != WATER_SOURCE_LEVEL &&
-                 water_base_level(neighborLevel) > spread)) {
-                if (neighborType == kRuntimeAirId) set_block_at(pos(neighbor), type);
+                 water_base_level(neighborLevel) > spread) ||
+                denserWins) {
+                if (neighborType != type) set_block_at(pos(neighbor), type);
                 set_fluid_level_at(pos(neighbor), spread);
             }
         }

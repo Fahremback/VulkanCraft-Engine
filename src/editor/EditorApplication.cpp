@@ -180,6 +180,12 @@ EditorApplication::EditorApplication() {
     // via curl http://127.0.0.1:8321/{play,pause,resume,stop,step,state}.
     m_controlApi.start(8321);
 
+    // Panel plugin registry: the shell derives menus/palette/layout from this
+    // (ezEngine "tools as replaceable plugins" pillar). Populated here so the
+    // control API can expose it from the very first frame.
+    register_editor_panels();
+    register_project_templates();
+
     // Playback sink for the play-in-editor mixer (audio previews + play-mode
     // audio components). Before this the Mixer rendered into a buffer that was
     // never sent to a device, so nothing produced sound.
@@ -213,6 +219,86 @@ EditorApplication::~EditorApplication() {
     // main loop / teardown (it only talks to 127.0.0.1).
     m_controlApi.stop();
     cleanup();
+}
+
+void EditorApplication::register_project_templates() {
+    // Built-in project templates for the wizard (ezEngine pillar). The wizard
+    // lists these; create_project_from_template materializes the scaffold.
+    Engine::Editor::register_builtin_templates(m_templateRegistry);
+}
+
+void EditorApplication::register_editor_panels() {
+    // Shell + Wicked-port panels, declared once so menus/command palette/layout
+    // can be derived from the registry instead of hardcoded flags. Categories
+    // follow the PORTS.md grouping; titles are the localized strings the menu
+    // already shows. toggleable = appears in the View menu with a show/hide.
+    using Engine::Editor::EditorPanelSpec;
+    const auto add = [this](const char* id, const char* title, const char* category,
+                            bool toggleable = true, bool default_open = false) {
+        EditorPanelSpec spec;
+        spec.id = id;
+        spec.title = title;
+        spec.category = category;
+        spec.toggleable = toggleable;
+        spec.default_open = default_open;
+        m_panelRegistry.register_panel(std::move(spec));
+    };
+
+    // Core editor shell.
+    add("hierarchy", "Hierarchy", "scene", true, true);
+    add("inspector", "Inspector", "scene", true, true);
+    add("viewport", "Viewport", "scene", false, true);
+    add("content_browser", "Content Browser", "assets", true, true);
+    add("console", "Console", "debug", true, false);
+
+    // Scene / object (Wicked hierarchy & object toolset).
+    add("object_name", "Object Name", "scene");
+    add("layers", "Layers", "scene");
+    add("object", "Object", "scene");
+
+    // Components (Wicked component windows).
+    add("light", "Light", "components");
+    add("camera", "Camera", "components");
+    add("material", "Material", "components");
+    add("sound", "Sound", "components");
+    add("rigid_body", "Rigid Body", "components");
+    add("collider", "Collider", "components");
+    add("constraint", "Constraint", "components");
+    add("soft_body", "Soft Body", "components");
+    add("spring", "Spring", "components");
+    add("decal", "Decal", "components");
+    add("emitter", "Emitter", "components");
+    add("hair_particle", "Hair Particle", "components");
+    add("spline", "Spline", "components");
+    add("force_field", "Force Field", "components");
+    add("env_probe", "Env Probe", "components");
+    add("weather", "Weather", "components");
+
+    // Animation (Wicked animation toolset).
+    add("animation", "Animation", "animation");
+    add("armature", "Armature", "animation");
+    add("humanoid", "Humanoid", "animation");
+    add("ik", "IK", "animation");
+    add("expression", "Expression", "animation");
+
+    // Terrain / painting.
+    add("terrain", "Terrain", "terrain");
+    add("paint_tool", "Paint Tool", "terrain");
+
+    // Import / content.
+    add("mesh", "Mesh", "import");
+    add("model_importer", "Model Importer", "import");
+    add("video", "Video", "import");
+    add("gaussian_splat", "Gaussian Splat", "import");
+
+    // Editor tools / project.
+    add("project_creator", "Project Creator", "editor");
+    add("general", "General", "editor");
+    add("graphics", "Graphics", "editor");
+    add("profiler", "Profiler", "editor");
+    add("theme_editor", "Theme Editor", "editor");
+    add("developer", "Developer", "editor");
+    add("guide", "Guide", "editor");
 }
 
 // ---------------------------------------------------------------------------
@@ -996,6 +1082,8 @@ void EditorApplication::main_loop() {
                 api.camTargetY = m_editorCamera.orbitTarget.y;
                 api.camTargetZ = m_editorCamera.orbitTarget.z;
                 api.lastSelfTest = m_lastSelfTestResult;
+                api.panels = m_panelRegistry.panel_ids();
+                api.templates = m_templateRegistry.template_ids();
                 switch (m_playScript.status()) {
                     case VMStatus::Idle: api.scriptState = "idle"; break;
                     case VMStatus::Running: api.scriptState = "running"; break;

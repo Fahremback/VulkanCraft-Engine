@@ -5526,6 +5526,87 @@ void test_project_defined_fluids() {
                  "simulate per JSON OK\n";
 }
 
+// Density displacement (task D.2 / META §13): a fluid's declared density now
+// resolves what happens when two DIFFERENT fluids meet. A denser fluid
+// displaces a lighter one in the cell it spreads into (heavier sinks); a
+// lighter fluid never displaces a denser one (it spreads around it). Density
+// was previously parsed into FluidParams but never read by the simulation.
+void test_fluid_density_displacement() {
+    const auto build = [](std::unique_ptr<engine::voxel::IVoxelWorld>& worldOut,
+                          uint32_t& heavyId, uint32_t& lightId) {
+        auto world = engine::voxel::create_default_voxel_world();
+        world->register_generator(std::make_shared<FlatGenerator>(kFluidTestTerrain));
+        auto blocks = std::make_shared<engine::registry::BlockRegistry>();
+        std::string error;
+        CHECK(blocks->load_from_json(
+            R"([{"name":"heavy","namespace":"test","class":"fluid","color":[0.6,0.1,0.6]},)"
+            R"({"name":"light","namespace":"test","class":"fluid","color":[0.1,0.6,0.6]}])",
+            error));
+        world->set_block_registry(blocks);
+        auto fluids = std::make_shared<engine::registry::FluidRegistry>();
+        CHECK(fluids->load_from_json(
+            R"([{"block":"test:heavy","viscosity":1.0,"range":2,"falling":false,"evaporation":false,"density":3.0},)"
+            R"({"block":"test:light","viscosity":1.0,"range":2,"falling":false,"evaporation":false,"density":0.5}])",
+            error));
+        CHECK(world->set_fluid_registry(fluids, error));
+        CHECK(error.empty());
+        CHECK(boot_world(*world, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+        CHECK(world->resolve_block_id("test:heavy", heavyId, error));
+        CHECK(world->resolve_block_id("test:light", lightId, error));
+        worldOut = std::move(world);
+    };
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+
+    // (1) A DENSER fluid displaces a lighter one it spreads into.
+    {
+        std::unique_ptr<engine::voxel::IVoxelWorld> world;
+        uint32_t heavyId = 0, lightId = 0;
+        build(world, heavyId, lightId);
+        // Light pool (range 2, viscosity 1): source (8) -> ring (9) lvl1 ->
+        // ring (10) lvl2. Settle on the outer ring.
+        world->set_block(8, kFluidTestGroundedY, 8, lightId);
+        CHECK(settle(*world, player, [&] {
+            return world->get_fluid_level(10, kFluidTestGroundedY, 8) == 2;
+        }));
+        // A heavy source adjacent to the light pool's edge: it displaces the
+        // lighter fluid in (10) instead of stopping at the boundary.
+        world->set_block(11, kFluidTestGroundedY, 8, heavyId);
+        CHECK(settle(*world, player, [&] {
+            return world->get_block(10, kFluidTestGroundedY, 8) == heavyId;
+        }));
+        CHECK(world->get_block(10, kFluidTestGroundedY, 8) == heavyId);
+    }
+
+    // (2) A LIGHTER fluid does NOT displace a denser one: it flows around it.
+    {
+        std::unique_ptr<engine::voxel::IVoxelWorld> world;
+        uint32_t heavyId = 0, lightId = 0;
+        build(world, heavyId, lightId);
+        // Heavy source at (11) — its range-2 ring reaches (9) (level 2) but
+        // leaves (7)/(8) as open air (the source is far enough that the ring
+        // never reaches that side). Freeze it by removing the source: the
+        // pooled ring stays (evaporation:false) but no longer spreads.
+        world->set_block(11, kFluidTestGroundedY, 8, heavyId);
+        CHECK(settle(*world, player, [&] {
+            return world->get_fluid_level(9, kFluidTestGroundedY, 8) == 2;
+        }));
+        world->set_block(11, kFluidTestGroundedY, 8, kBlockAir);
+        // A light source on the open side of the frozen heavy ring: it must
+        // flow into the air at (7) but never displace the denser heavy at
+        // (9) (density 0.5 < 3.0).
+        world->set_block(8, kFluidTestGroundedY, 8, lightId);
+        CHECK(settle(*world, player, [&] {
+            return world->get_block(7, kFluidTestGroundedY, 8) == lightId;
+        }));
+        CHECK(world->get_block(9, kFluidTestGroundedY, 8) == heavyId);   // not displaced
+        CHECK(world->get_block(10, kFluidTestGroundedY, 8) == heavyId);  // ring intact
+        CHECK(world->get_block(7, kFluidTestGroundedY, 8) == lightId);   // flowed around
+    }
+
+    std::cout << "[sdk] fluids: density displacement (denser wins, lighter "
+                 "flows around) OK\n";
+}
+
 void test_block_registry() {
     engine::registry::BlockRegistry blocks;
     CHECK(blocks.size() > 40);  // builtin table registered
@@ -6117,6 +6198,146 @@ void test_item_stack_inventory() {
 
     std::cout << "[sdk] inventory: typed filters, transfer/split/merge/swap, "
                  "events and JSON round-trip OK\n";
+}
+
+// Task E.3 (META section 14): transactional undo/redo for slot contents.
+// Every successful mutation pushes the pre-mutation slot vector, so undo()
+// restores exact contents with no loss or duplication and redo() re-applies
+// the change. A new mutation clears the redo tail; a refused mutation does
+// not push history. Undo/redo are themselves mutations (version + callback).
+void test_inventory_undo_redo() {
+    using engine::registry::Inventory;
+    using engine::registry::ItemStack;
+    using engine::registry::SlotFilter;
+
+    engine::registry::ItemRegistry items;
+    std::string error;
+    {
+        engine::registry::ItemDefinition def;
+        def.ns = "vulkancraft";
+        def.name = "cobblestone";
+        def.maxStack = 64;
+        CHECK(items.register_item(def, error));
+        def = {};
+        def.ns = "vulkancraft";
+        def.name = "coal";
+        def.maxStack = 64;
+        CHECK(items.register_item(def, error));
+    }
+
+    SlotFilter any;
+    any.allowAny = true;
+
+    Inventory inv(4);
+    for (int s = 0; s < 4; ++s) inv.set_filter(s, any);
+    int changes = 0;
+    inv.set_change_callback([&](const Inventory&) { ++changes; });
+
+    ItemStack stone;
+    stone.item = "vulkancraft:cobblestone";
+    stone.count = 10;
+    ItemStack coal;
+    coal.item = "vulkancraft:coal";
+    coal.count = 5;
+
+    // Fresh inventory has no history; undo/redo are no-ops.
+    CHECK(!inv.can_undo());
+    CHECK(!inv.can_redo());
+    CHECK(!inv.undo());
+    CHECK(!inv.redo());
+
+    // (1) set -> undo restores the exact prior (empty) slot; redo re-applies.
+    CHECK(inv.set(0, stone, items, error));
+    CHECK(inv.get(0).count == 10);
+    CHECK(inv.can_undo());
+    CHECK(!inv.can_redo());
+    CHECK(inv.undo());
+    CHECK(inv.get(0).empty());
+    CHECK(inv.can_redo());
+    CHECK(inv.redo());
+    CHECK(inv.get(0).count == 10);
+
+    // (2) A refused mutation pushes nothing (no history growth).
+    ItemStack ghost;
+    ghost.item = "vulkancraft:ghost";
+    ghost.count = 1;
+    const uint64_t vBefore = inv.version();
+    error.clear();
+    CHECK(!inv.set(0, ghost, items, error));
+    CHECK(!error.empty());
+    CHECK(inv.version() == vBefore);
+
+    // (3) add + remove compose across slots; undo walks back in LIFO order.
+    CHECK(inv.set(1, coal, items, error));
+    ItemStack more;
+    more.item = "vulkancraft:cobblestone";
+    more.count = 4;
+    CHECK(inv.add(more, items, error).empty());   // merges into slot 0
+    CHECK(inv.get(0).count == 14);
+    CHECK(inv.undo());                             // undo add
+    CHECK(inv.get(0).count == 10);
+    CHECK(inv.undo());                             // undo set(1, coal)
+    CHECK(inv.get(1).empty());
+
+    // (4) consume() participates; a zero-consume (empty slot) pushes nothing.
+    CHECK(inv.redo());                             // redo set(1, coal)
+    CHECK(inv.redo());                             // redo add
+    CHECK(inv.get(1).count == 5);
+    CHECK(inv.get(0).count == 14);
+    CHECK(inv.consume(1, 2) == 2);
+    CHECK(inv.get(1).count == 3);
+    CHECK(inv.undo());
+    CHECK(inv.get(1).count == 5);
+
+    // (5) A new mutation clears the redo tail (linear history).
+    CHECK(inv.redo());                             // redo consume
+    CHECK(inv.get(1).count == 3);
+    CHECK(inv.remove("vulkancraft:cobblestone", 4, items, error) == 4);
+    CHECK(inv.get(0).count == 10);
+    CHECK(!inv.can_redo());                        // redo tail cleared
+
+    // (6) Cross-inventory transfer records both sides independently.
+    Inventory srcInv(2), dstInv(2);
+    srcInv.set_filter(0, any);
+    srcInv.set_filter(1, any);
+    dstInv.set_filter(0, any);
+    dstInv.set_filter(1, any);
+    CHECK(srcInv.set(0, stone, items, error));
+    CHECK(Inventory::transfer(srcInv, 0, dstInv, 0, 3, items, error) == 3);
+    CHECK(srcInv.get(0).count == 7);
+    CHECK(dstInv.get(0).count == 3);
+    CHECK(srcInv.undo());
+    CHECK(dstInv.undo());
+    CHECK(srcInv.get(0).count == 10);
+    CHECK(dstInv.get(0).empty());
+
+    // (7) deserialize participates; undo restores the prior contents.
+    Inventory serInv(2);
+    serInv.set_filter(0, any);
+    serInv.set_filter(1, any);
+    CHECK(serInv.set(0, coal, items, error));
+    CHECK(serInv.set(1, stone, items, error));
+    CHECK(serInv.undo());                          // undo set(1, stone)
+    CHECK(serInv.get(1).empty());
+    CHECK(serInv.redo());
+    CHECK(serInv.get(1).count == 10);
+
+    // (8) undo/redo are themselves mutations: version + callback fire.
+    const uint64_t v8 = inv.version();
+    const int changes8 = changes;
+    CHECK(inv.undo());
+    CHECK(inv.version() == v8 + 1);
+    CHECK(changes == changes8 + 1);
+
+    // (9) clear_history drops both stacks.
+    inv.clear_history();
+    CHECK(!inv.can_undo());
+    CHECK(!inv.can_redo());
+    CHECK(!inv.undo());
+    CHECK(!inv.redo());
+
+    std::cout << "[sdk] inventory: transactional undo/redo (exact restore, "
+                 "no loss/duplication, redo-tail clearing) OK\n";
 }
 
 // META section 14: data-driven recipe graph — inputs (item/tag/alternatives),
@@ -12376,12 +12597,14 @@ int main(int argc, char** argv) {
         test_fluid_budgets();
         test_material_simulation_separation();
         test_project_defined_fluids();
+        test_fluid_density_displacement();
         test_block_registry();
         test_item_registry();
         test_cross_reference_validation();
         test_block_states_transitions();
         test_block_tool_physics();
         test_item_stack_inventory();
+        test_inventory_undo_redo();
         test_recipe_graph();
         test_entity_world();
         test_entity_world_save();

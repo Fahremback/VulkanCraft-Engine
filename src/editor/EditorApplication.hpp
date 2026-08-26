@@ -44,6 +44,8 @@
 #include "engine/navigation/INavigationProvider.hpp"
 #include "../engine/editor/ui/EditorGUI.hpp"
 #include "EditorControlApi.hpp"
+#include "EditorPlugin.hpp"
+#include "ProjectTemplate.hpp"
 #include "WindowClamp.hpp"
 #include "tools/WickedToolsPanel.hpp"
 
@@ -890,6 +892,17 @@ private:
     bool m_showContentBrowser{ true };
     bool m_contentBrowserDirty{ true }; // set when folder may have changed externally
     bool m_showConsole{ false };
+
+    // Editor panel plugin registry (ezEngine "tools as replaceable plugins"
+    // pillar): the shell derives menus/palette/layout from this instead of
+    // hardcoding every window. Populated by register_editor_panels().
+    Engine::Editor::EditorPluginRegistry m_panelRegistry;
+    void register_editor_panels();
+
+    // Project template registry (ezEngine "project templates" pillar): the
+    // wizard lists these; create_project_from_template materializes a scaffold.
+    Engine::Editor::ProjectTemplateRegistry m_templateRegistry;
+    void register_project_templates();
 
     // Play-mode frame stepping (PASSO button): advance the play world one
     // frame while paused.

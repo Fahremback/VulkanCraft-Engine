@@ -96,6 +96,20 @@ public:
         onChange_ = std::move(callback);
     }
 
+    // ---- Undo/redo history (META section 14, task E.3) ------------------
+    // Transactional: every successful slot mutation pushes the pre-mutation
+    // slot vector, so undo()/redo() restore exact contents with no loss or
+    // duplication. Filters are structural (not part of the undoable state).
+    // A new mutation clears the redo tail (standard linear history). Undo and
+    // redo are themselves mutations (they bump version + fire the callback).
+    bool can_undo() const noexcept { return !undoStack_.empty(); }
+    bool can_redo() const noexcept { return !redoStack_.empty(); }
+    // Restores the slot contents to the state before the last mutation.
+    bool undo();
+    // Re-applies the last undone mutation.
+    bool redo();
+    void clear_history() noexcept;
+
     // ---- Serialization (data-driven, ready for replication) --------------
     // {"version":1,"slots":[{"item":"...","count":N,"damage":D,"data":"..."}, null, ...]}
     // Unknown versions are refused on load (never guessed).
@@ -110,9 +124,12 @@ private:
     bool slot_accepts(int slot, const ItemStack& stack,
                       const ItemRegistry& items, std::string& errorOut) const;
     void bump();
+    void push_undo(std::vector<ItemStack>&& before);
 
     std::vector<ItemStack> slots_;
     std::vector<SlotFilter> filters_;
+    std::vector<std::vector<ItemStack>> undoStack_;
+    std::vector<std::vector<ItemStack>> redoStack_;
     uint64_t version_{ 0 };
     std::function<void(const Inventory&)> onChange_;
 };
