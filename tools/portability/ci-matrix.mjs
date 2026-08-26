@@ -57,8 +57,43 @@ run('node tools/portability/moved-prefix-gate.mjs');
 log('Step 5c: Debug/Release gate');
 run('node tools/portability/debug-release-gate.mjs');
 
+// Step 5d: MCP conformance gate (§7 mcp-typescript-sdk — the server's wire
+// responses must conform to the OFFICIAL MCP TypeScript SDK shapes, vendored
+// at external/solutions/mcp-typescript-sdk; field sets extracted from the
+// vendored schemas.ts at runtime — single source of truth).
+log('Step 5d: MCP conformance gate (vendored TS SDK)');
+run('node tools/portability/mcp-conformance-gate.mjs');
+
 // Step 6: Status report
 log('Step 6: Status report');
 run('node tools/portability/status-report.mjs');
+
+// Step 7: §11 platform gates (AGENT-6 — SDK/MCP platform mission)
+log('Step 7: Error registry (stable codes, no orphans)');
+run('node tools/portability/error-registry.mjs');
+
+log('Step 7a: CI workflow lint (ci.yml valid YAML + gates exist — BUG-015 class)');
+run('node tools/portability/ci-lint.mjs');
+
+log('Step 7b: Contract parity (C++/CLI/MCP)');
+run('node tools/portability/parity-tests.mjs game_capabilities list_game_projects');
+
+log('Step 7c: Fuzz smoke (parsers/schemas/MCP/manifests)');
+run('node tools/portability/fuzz-smoke.mjs');
+
+log('Step 7d: Multi-client MCP concurrency + cancellation');
+run('node tools/portability/concurrency-tests.mjs');
+
+log('Step 7e: Path-with-spaces gate');
+run('node tools/portability/spaces-path-gate.mjs');
+
+log('Step 7f: Generated docs (REFERENCE_GENERATED.md)');
+run('node tools/portability/gen-docs.mjs');
+
+log('Step 7g: Aggregate §11 platform gate');
+run('node tools/portability/platform-gate.mjs');
+
+log('Step 7h: One-shot swarm health check');
+run('node tools/portability/health-check.mjs');
 
 log(`CI matrix PASSED on ${platform} with preset ${preset}`);

@@ -106,11 +106,16 @@ try {
   assert.equal(versionPayload.engine_abi, initialized.result.serverInfo.engineAbi, "ABI agrees between tool and serverInfo");
   assert.equal(versionPayload.protocol, "2025-03-26", "engine_version exposes the protocol version");
 
-  // ---- handshake version negotiation: unsupported versions refused ----
+  // ---- handshake version negotiation: both published MCP spec versions ----
+  // are accepted and echoed; unknown versions refused with the full list ----
+  // (findings #234-mcp-multiversion).
+  const olderVersion = await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "smoke", version: "1" } });
+  assert.equal(olderVersion.result.protocolVersion, "2024-11-05", "2024-11-05 negotiated and echoed");
+  assert.equal(olderVersion.result.serverInfo.name, "vulkancraft-engine");
   const badVersion = await request("initialize", { protocolVersion: "2099-01-01", capabilities: {}, clientInfo: { name: "smoke", version: "1" } });
   assert.equal(badVersion.error.code, -32602);
   assert.match(badVersion.error.message, /unsupported protocol version/);
-  assert.deepEqual(badVersion.error.data.supportedProtocolVersions, ["2025-03-26"]);
+  assert.deepEqual(badVersion.error.data.supportedProtocolVersions, ["2024-11-05", "2025-03-26"]);
 
   // ---- prompts: game-creation recipes (FALTANTES item 5) ----
   const promptsListed = await request("prompts/list");
@@ -142,13 +147,24 @@ try {
 
   // §5 item 8: the plugin prompt is grounded in the REAL project-authoring
   // surface — create_game_project's plugins arg (the only honest plugin
-  // registration today; UI/system prompts stay deferred until those tools
-  // exist).
+  // registration today). create_system grounds on the source-maintenance
+  // tools (read_file/apply_text_edits/start_build). The UI prompt stays
+  // deferred — no UI component surface exists in the facade (editor-owned).
   const pluginPrompt = await request("prompts/get", { name: "create_plugin", arguments: { name: "MyMod" } });
   const pluginText = pluginPrompt.result.messages[0].content.text;
   assert.match(pluginText, /create_game_project/);
   assert.match(pluginText, /plugins: \["MyMod"\]/);
   assert.ok(promptsListed.result.prompts.some((p) => p.name === "create_plugin"), "create_plugin listed");
+
+  // §5 item 8 ("sistema"): create_system grounds on the REAL source-maintenance
+  // surface (engine_overview + read_file + apply_text_edits + start_build).
+  const systemPrompt = await request("prompts/get", { name: "create_system", arguments: { name: "ExampleSystem" } });
+  const systemText = systemPrompt.result.messages[0].content.text;
+  assert.match(systemText, /apply_text_edits/);
+  assert.match(systemText, /read_file/);
+  assert.match(systemText, /start_build/);
+  assert.match(systemText, /ExampleSystem/);
+  assert.ok(promptsListed.result.prompts.some((p) => p.name === "create_system"), "create_system listed");
 
   // Unknown prompt is refused with a protocol error.
   const unknownPrompt = await request("prompts/get", { name: "does_not_exist" });
@@ -175,6 +191,23 @@ try {
   assert.ok(metrics.tools.total >= metrics.tools.semantic && metrics.tools.semantic > 0, "tool counts coherent");
   assert.ok(metrics.audit_ring.max >= metrics.audit_ring.entries, "audit ring bounded");
   assert.ok(metrics.uptime_seconds >= 0, "uptime present");
+
+  // §5 item 3: the dynamic projects resource (engine://projects) — same
+  // enumeration as list_game_projects, generated on read, deterministic
+  // (sorted by name, each entry {name, managed, path}).
+  assert.ok(resourceUris.includes("engine://projects"), "resources expose live projects");
+  const projectsRead = await request("resources/read", { uri: "engine://projects" });
+  const projects = JSON.parse(projectsRead.result.contents[0].text);
+  assert.ok(Array.isArray(projects.projects), "projects resource carries the list");
+  const names = projects.projects.map((p) => p.name);
+  assert.deepEqual(names, [...names].sort(), "projects sorted by name");
+  for (const p of projects.projects) {
+    assert.equal(typeof p.name, "string") && assert.equal(typeof p.managed, "boolean") && assert.equal(typeof p.path, "string");
+  }
+  // Cross-check against the tool: same enumeration, same order.
+  const projectsTool = await request("tools/call", { name: "list_game_projects", arguments: {} });
+  const viaTool = JSON.parse(projectsTool.result.content[0].text);
+  assert.deepEqual(projects, viaTool, "projects resource == list_game_projects (single source)");
   const unknownResource = await request("resources/read", { uri: "engine://nope" });
   assert.equal(unknownResource.error.code, -32002);
 
@@ -212,13 +245,14 @@ try {
   const jobStart = JSON.parse(badConfigStart.result.content[0].text);
   assert.equal(jobStart.status, "running");
   assert.match(jobStart.log, /\.log$/);
-  // Budget 30s: in a concurrent tree `cmake --build` first runs ZERO_CHECK,
-  // which reconfigures when CMakeLists.txt changed (agents edit it constantly)
-  // — that can add seconds before the fast MSB8013 failure. No compilation
-  // ever happens for an invalid --config, so a generous budget stays safe.
+  // Budget 60s: in a concurrent tree `cmake --build` first runs ZERO_CHECK,
+  // which fully reconfigures when CMakeLists.txt changed (agents edit it
+  // constantly) — a full rocksdb re-configure alone takes ~27s before the
+  // fast failure (MSB8013/CMP0002) is even reached. No compilation ever
+  // happens for an invalid --config, so a generous budget stays safe.
   let jobFinal = null;
   let polled = null;
-  for (let attempt = 0; attempt < 60; attempt++) {
+  for (let attempt = 0; attempt < 120; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 500));
     const poll = await request("tools/call", { name: "build_status", arguments: { job_id: jobStart.job_id } });
     polled = JSON.parse(poll.result.content[0].text);
@@ -226,13 +260,29 @@ try {
   }
   assert.ok(jobFinal, `job reached a terminal state (last: ${JSON.stringify(polled ?? null)})`);
   assert.equal(jobFinal.status, "failed", JSON.stringify(jobFinal));
-  assert.equal(jobFinal.exit_code, 1);
+  // The fast-fail reason varies in a concurrent tree: the invalid --config is
+  // rejected either by MSBuild (MSB8013, exit 1) or by the ZERO_CHECK
+  // regeneration step when a concurrent agent's CMakeLists edit breaks
+  // configure (CMP0002, exit 127) or by a signal (exit null). The invariant
+  // is the terminal "failed" state with no binaries — not the exact reason.
+  assert.ok(jobFinal.exit_code === null || jobFinal.exit_code !== 0,
+    `non-zero/null exit (got ${jobFinal.exit_code})`);
+  // §5 item 5 ("progresso granular"): the coarse stage is derived from the
+  // log tail (configure/compile/link/running) — the fast-fail config never
+  // compiles, so the terminal job reports configure or running.
+  assert.ok(["configure", "compile", "link", "running"].includes(jobFinal.stage),
+    `stage is a known value (got ${jobFinal.stage})`);
+  // The invalid config fails either at configure (CMP0002 during ZERO_CHECK
+  // re-generation) or at compile (MSB8013 inside MSBuild) — never at link.
+  assert.ok(jobFinal.stage !== "link", `fast-fail job never reaches link (got ${jobFinal.stage})`);
   assert.deepEqual(jobFinal.artifacts, { log: jobFinal.log, binaries: [] }, "failed job exposes log artifact, no binaries");
-  assert.match(jobFinal.tail, /MSB8013|error/i, "log tail carries the failure");
+  assert.match(jobFinal.tail, /MSB8013|error|CMP0002|failed/i, "log tail carries the failure");
   const jobsAfter = await request("tools/call", { name: "list_build_jobs", arguments: {} });
   const jobsList = JSON.parse(jobsAfter.result.content[0].text);
   assert.ok(jobsList.jobs.some((job) => job.job_id === jobStart.job_id && job.status === "failed"
     && job.artifacts && Array.isArray(job.artifacts.binaries)), "list_build_jobs exposes artifacts");
+  assert.ok(jobsList.jobs.some((job) => job.job_id === jobStart.job_id && ["configure", "compile", "link", "running"].includes(job.stage)),
+    "list_build_jobs exposes the stage");
   // cancel of the now-terminal job is reported, not re-cancelled.
   const cancelDone = await request("tools/call", { name: "cancel_build", arguments: { job_id: jobStart.job_id } });
   const cancelPayload = JSON.parse(cancelDone.result.content[0].text);
@@ -297,6 +347,25 @@ try {
   const packageMissingProject = await request("tools/call", { name: "package_game", arguments: { project: "NopeNever" } });
   assert.equal(packageMissingProject.result.isError, true);
   assert.match(packageMissingProject.result.content[0].text, /does not exist/);
+
+  // §5 item 3 ("asset/cena"): per-project dynamic resources via URI templates
+  // — engine://projects/<name>[/assets|/scenes], grounded in the SAME
+  // inspection as inspect_game_project (single source of truth). Runs after
+  // create_game_project so smokeProject exists on disk.
+  const templates = await request("resources/templates/list", {});
+  const templateUris = templates.result.resourceTemplates.map((t) => t.uriTemplate);
+  assert.ok(templateUris.includes("engine://projects/{name}"), "resources advertise the project template");
+  assert.ok(templateUris.includes("engine://projects/{name}/assets"), "assets template advertised");
+  assert.ok(templateUris.includes("engine://projects/{name}/scenes"), "scenes template advertised");
+  const projectRead = await request("resources/read", { uri: `engine://projects/${smokeProject}` });
+  const projectDetails = JSON.parse(projectRead.result.contents[0].text);
+  assert.equal(projectDetails.project, smokeProject);
+  assert.ok(Array.isArray(projectDetails.scenes) && Array.isArray(projectDetails.assets), "project resource carries scenes + assets arrays");
+  const scenesRead = await request("resources/read", { uri: `engine://projects/${smokeProject}/scenes` });
+  const scenesOnly = JSON.parse(scenesRead.result.contents[0].text);
+  assert.ok(Array.isArray(scenesOnly.scenes) && scenesOnly.scenes.some((s) => s === "Initial.scene"), "scenes resource lists Initial.scene");
+  const missingProject = await request("resources/read", { uri: `engine://projects/NoSuchProject_${Date.now()}` });
+  assert.equal(missingProject.error.code, -32002, "unknown project resource is refused");
 
   const entityResponse = await request("tools/call", {
     name: "create_entity",
@@ -1856,6 +1925,55 @@ try {
       `HTTP server stopped after SIGTERM (got ${JSON.stringify(stopResult)})`
     );
     process.stdout.write("Remote transport smoke (HTTP + SSE + concurrency) passed\n");
+
+    // ---- §5 item 7: optional token auth on the HTTP transport. Off by
+    // default (the server above has no MCP_AUTH_TOKEN and served unauthenticated
+    // — the deliberate local default); with MCP_AUTH_TOKEN set, POST /mcp and
+    // GET /events require `Authorization: Bearer <token>` (HTTP 401 otherwise).
+    {
+      const authPort = 8423 + (Date.now() % 1000);
+      const authChild = spawn(process.execPath, [path.join(directory, "server.mjs"), "--http", "--port", String(authPort)], {
+        cwd: directory,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+        env: { ...process.env, MCP_AUTH_TOKEN: "secret-token" }
+      });
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("auth server not ready")), 8000);
+        authChild.stderr.setEncoding("utf8");
+        authChild.stderr.on("data", (c) => { if (String(c).includes("ready")) { clearTimeout(timer); resolve(); } });
+      });
+      const authPost = (body, token) => new Promise((resolve, reject) => {
+        const payload = JSON.stringify(body);
+        const headers = { "content-type": "application/json", "content-length": Buffer.byteLength(payload) };
+        if (token) headers.authorization = `Bearer ${token}`;
+        const req = http.request({ host: "127.0.0.1", port: authPort, path: "/mcp", method: "POST", headers }, (res) => {
+          let buf = "";
+          res.setEncoding("utf8");
+          res.on("data", (c) => { buf += c; });
+          res.on("end", () => resolve({ status: res.statusCode, body: buf }));
+        });
+        req.on("error", reject);
+        req.end(payload);
+      });
+      const denied = await authPost({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+      assert.equal(denied.status, 401, "token auth rejects requests without a token");
+      assert.equal(JSON.parse(denied.body).error.code, -32001, "401 carries a JSON-RPC server error");
+      const wrong = await authPost({ jsonrpc: "2.0", id: 2, method: "initialize", params: {} }, "nope");
+      assert.equal(wrong.status, 401, "token auth rejects a wrong token");
+      const ok = await authPost({ jsonrpc: "2.0", id: 3, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "auth-smoke", version: "1" } } }, "secret-token");
+      assert.equal(ok.status, 200, "token auth accepts the right token");
+      assert.equal(JSON.parse(ok.body).result.serverInfo.name, "vulkancraft-engine");
+      const sseDenied = await new Promise((resolve, reject) => {
+        const req = http.request({ host: "127.0.0.1", port: authPort, path: "/events", method: "GET",
+          headers: { accept: "text/event-stream" } }, (res) => resolve(res.statusCode));
+        req.on("error", reject);
+        req.end();
+      });
+      assert.equal(sseDenied, 401, "SSE endpoint requires the token when auth is enabled");
+      authChild.kill("SIGTERM");
+      process.stdout.write("Token auth smoke (MCP_AUTH_TOKEN) passed\n");
+    }
   }
 
   // ---- Semantic Engine API CLI (§4/§8): the full 36-tool semantic surface

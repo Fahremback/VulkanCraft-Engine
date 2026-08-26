@@ -43,5 +43,14 @@ public:
     // Recomputes sky occlusion + block light for the chunk at (cx, cz) and
     // writes them into the chunk. Returns true when the chunk's light state
     // changed (the caller re-dirties neighbors so light crosses borders).
-    static bool compute(Chunk& chunk, const ChunkLightAccess& access);
+    //
+    // skipSkylight (C.1): when the caller can PROVE the chunk's own content is
+    // unchanged since the last compute (dataVersion/revision gate — every
+    // block/fluid/state write bumps it), the per-column sky occlusion is
+    // provably identical, so the 16x16x256-column rescan is skipped. Only the
+    // block-light pass runs (its seed set must be complete — own emitters are
+    // unchanged, halo inflow may have changed). Used for neighbor-convergence
+    // re-dirties, where the chunk's content did NOT change.
+    static bool compute(Chunk& chunk, const ChunkLightAccess& access,
+                        bool skipSkylight = false);
 };

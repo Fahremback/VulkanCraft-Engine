@@ -18,16 +18,25 @@ constexpr int kMaxPasses = 16;  // light levels strictly decrease per edge
 
 }  // namespace
 
-bool ChunkLighting::compute(Chunk& chunk, const ChunkLightAccess& access) {
+bool ChunkLighting::compute(Chunk& chunk, const ChunkLightAccess& access,
+                            bool skipSkylight) {
     const int cx = chunk.chunkX;
     const int cz = chunk.chunkZ;
     const int baseX = cx * CHUNK_SIZE_X;
     const int baseZ = cz * CHUNK_SIZE_Z;
 
     // ---- Skylight: per-column occlusion height ----
+    // C.1: when the caller proves the chunk's content is unchanged since the
+    // last compute (dataVersion gate), every column's occlusion is identical
+    // (occlusion is a pure function of the column's blocks), so the rescan is
+    // skipped entirely — skyOcclusionTop is still valid.
     bool skyChanged = false;
-    for (int x = 0; x < CHUNK_SIZE_X; ++x) {
-        for (int z = 0; z < CHUNK_SIZE_Z; ++z) {
+    if (skipSkylight) {
+        // No sky scan: the stored skyOcclusionTop is provably current.
+        skyChanged = false;
+    } else {
+        for (int x = 0; x < CHUNK_SIZE_X; ++x) {
+            for (int z = 0; z < CHUNK_SIZE_Z; ++z) {
             uint16_t occlusionTop = 0;
             int topY = chunk.highestOccupiedY;
             for (const auto& entry : chunk.upperSections) {
@@ -41,9 +50,10 @@ bool ChunkLighting::compute(Chunk& chunk, const ChunkLightAccess& access) {
                     break;
                 }
             }
-            if (chunk.skyOcclusionTop[x][z] != occlusionTop) {
-                chunk.skyOcclusionTop[x][z] = occlusionTop;
-                skyChanged = true;
+                if (chunk.skyOcclusionTop[x][z] != occlusionTop) {
+                    chunk.skyOcclusionTop[x][z] = occlusionTop;
+                    skyChanged = true;
+                }
             }
         }
     }

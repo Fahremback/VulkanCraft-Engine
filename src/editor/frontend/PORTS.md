@@ -55,12 +55,12 @@ Nota: `wiGUI.h` herda `wi::scene::TransformComponent` (classe pequena de transfo
 Painéis do `Editor/` do Wicked (cada um exige adapter `wi::gui` → ImGui e
 `wi::scene` → nossa `Scene`; DirectXMath → glm):
 
-- [ ] `ContentBrowserWindow` — navegador de conteúdo
-- [ ] `ComponentsWindow` — inspector por componente
-- [ ] `CameraWindow` / `CameraComponentWindow` — câmera
-- [ ] `Translator` (gizmos move/rotate/scale)
-- [ ] layout/docking completo do `Editor.cpp`
-- [ ] fontes/ícones adicionais (`fonts/`, `IconDefinitions.h`)
+- [ ] `ContentBrowserWindow` — navegador de conteúdo. **Núcleo headless DONE (findings #222-content-browser)**: `IContentBrowser` (índice de assets + árvore de pastas + search/filtro/seleção) alimentado pelo snapshot REAL do AssetRegistry → `GET /content-browser`. Resta o widget visual (HUMAN-VISUAL).
+- [ ] `ComponentsWindow` — inspector por componente. **Núcleo headless DONE (findings #231-inspector-doc)**: `IInspectorDoc` (grupos semânticos + descritores tipados) construído dos componentes REAIS da entidade → `GET /inspector`. Resta o widget visual (HUMAN-VISUAL).
+- [ ] `CameraWindow` / `CameraComponentWindow` — câmera. **Núcleo headless DONE (findings #227-editor-camera)**: `IEditorCamera` (órbita/pitch clamp/pan/dolly/fly) DELEGADO pelo frame loop real → `GET /camera`. Resta o widget visual (HUMAN-VISUAL).
+- [ ] `Translator` (gizmos move/rotate/scale). **Núcleo headless DONE (findings #228-gizmo-controller)**: `IGizmoController` (fórmulas exatas translate/scale/rotate + hit-test) DELEGADO pelo drag real → `GET /gizmo`. Resta o desenho GPU (HUMAN-VISUAL).
+- [ ] layout/docking completo do `Editor.cpp`. **Núcleo headless DONE (findings #195-editor-layout)**: `EditorLayout` (visibilidade derivada do registry + apply_snapshot all-or-nothing + JSON bit-exact) → `GET /layout`; docking ImGui já hosteado no shell. Resta aplicar o snapshot às janelas/dockspace reais (HUMAN-VISUAL).
+- [ ] fontes/ícones adicionais (`fonts/`, `IconDefinitions.h`). Sem núcleo headless (assets binários/GPU) — HUMAN-VISUAL.
 
 ## Regras
 

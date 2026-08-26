@@ -2207,7 +2207,7 @@ function runBatch(engineRoot, args) {
   };
 }
 
-function listProjects(engineRoot) {
+export function listProjects(engineRoot) {
   const root = path.join(engineRoot, "Projects");
   fs.mkdirSync(root, { recursive: true });
   const projects = fs.readdirSync(root, { withFileTypes: true })
@@ -2262,7 +2262,7 @@ function createProject(engineRoot, args) {
   };
 }
 
-function inspectProject(engineRoot, projectName) {
+export function inspectProject(engineRoot, projectName) {
   const paths = requireProject(engineRoot, projectName);
   const manifest = readJson(paths.manifest);
   const files = (directory, extension) => fs.existsSync(directory)

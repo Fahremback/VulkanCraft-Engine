@@ -211,8 +211,16 @@ EditorApplication::EditorApplication() {
         m_cameraContract = engine::editor::create_editor_camera(camState);
     }
     m_gizmoContract = engine::editor::create_gizmo_controller();
+    m_publishPipeline = engine::editor::create_publish_pipeline();
+    m_inspectorDoc = engine::editor::create_inspector_doc();
+    m_sceneHierarchy = engine::editor::create_scene_hierarchy();
+    m_onboardingTour = engine::editor::create_onboarding_tour();
     refresh_camera();
     refresh_gizmo();
+    refresh_publish();
+    refresh_inspector();
+    refresh_hierarchy();
+    refresh_onboarding();
 
     // Playback sink for the play-in-editor mixer (audio previews + play-mode
     // audio components). Before this the Mixer rendered into a buffer that was
@@ -451,6 +459,115 @@ void EditorApplication::refresh_camera() {
     } else {
         m_cameraJson = std::string();
     }
+}
+
+void EditorApplication::refresh_publish() {
+    // The build pipeline stage machine (plano agente 2 §C), driven by the
+    // real build_game() flow — exposed via GET /publish.
+    if (m_publishPipeline) {
+        m_publishJson = m_publishPipeline->to_json();
+    } else {
+        m_publishJson = std::string();
+    }
+}
+
+void EditorApplication::refresh_onboarding() {
+    // The onboarding tour step machine (plano agente 2 §C) — a default first-
+    // run tour over the real editor surfaces (panels + publish + scene). The
+    // shell drives start/next/skip/complete/dismiss; this publishes the state.
+    if (m_onboardingTour && m_onboardingTour->state() == engine::editor::TourState::Idle) {
+        std::vector<engine::editor::TourStepDef> steps;
+        engine::editor::TourStepDef s1;
+        s1.id = "welcome";
+        s1.title = "Welcome";
+        s1.copy = "Open or create a project, then play the scene.";
+        s1.target = "panels/ProjectLauncher";
+        steps.push_back(s1);
+        engine::editor::TourStepDef s2;
+        s2.id = "scene";
+        s2.title = "Scene";
+        s2.copy = "Entities live in the Hierarchy; select one to inspect it.";
+        s2.target = "panels/Hierarchy";
+        steps.push_back(s2);
+        engine::editor::TourStepDef s3;
+        s3.id = "inspector";
+        s3.title = "Inspector";
+        s3.copy = "Components and properties appear here for the selection.";
+        s3.target = "panels/Inspector";
+        steps.push_back(s3);
+        engine::editor::TourStepDef s4;
+        s4.id = "publish";
+        s4.title = "Build & Publish";
+        s4.copy = "Package the game from the Build menu when ready.";
+        s4.target = "command/publish";
+        steps.push_back(s4);
+        m_onboardingTour->start("first-run", steps);
+    }
+    if (m_onboardingTour) {
+        m_onboardingJson = m_onboardingTour->to_json();
+    } else {
+        m_onboardingJson = std::string();
+    }
+}
+
+void EditorApplication::refresh_hierarchy() {
+    // The deterministic flat scene tree (plano agente 2 §B) built from the
+    // REAL entities and parent links — exposed via GET /hierarchy.
+    if (!m_sceneHierarchy) {
+        m_hierarchyJson = std::string();
+        return;
+    }
+    Scene* scene = m_playMode.get_active_scene();
+    if (!scene) scene = m_editorScene.get();
+    std::vector<engine::editor::HierarchyEntity> entities;
+    std::vector<engine::editor::HierarchyLink> links;
+    if (scene) {
+        for (const auto& [id, ent] : scene->get_entities()) {
+            entities.push_back({id.to_string(), ent.get_name()});
+        }
+        // ordem estável: id sort para determinismo entre publicações
+        std::sort(entities.begin(), entities.end(),
+                  [](const auto& a, const auto& b) { return a.id < b.id; });
+        for (const auto& [childId, comp] : scene->hierarchyComponents) {
+            links.push_back({childId.to_string(), comp.parentID.to_string()});
+        }
+    }
+    const std::vector<engine::editor::HierarchyRow> rows =
+        m_sceneHierarchy->build(entities, links, m_hierarchySearch);
+    m_hierarchyJson = m_sceneHierarchy->to_json(rows);
+}
+
+void EditorApplication::refresh_inspector() {
+    // The semantic inspector model (plano agente 2 §C) built from the REAL
+    // selected entity's components — exposed via GET /inspector.
+    if (!m_inspectorDoc) {
+        m_inspectorJson = std::string();
+        return;
+    }
+    const bool has = m_selectedEntity.is_valid();
+    std::string name;
+    if (has) name = m_selectedEntity.get_name();
+    Scene* scene = m_playMode.get_active_scene();
+    if (!scene) scene = m_editorScene.get();
+    const UUID id = m_selectedEntity.get_id();
+    const auto contains = [&](const auto& map) { return map.contains(id); };
+    const engine::editor::InspectorDoc doc = m_inspectorDoc->build(
+        name, has,
+        scene && contains(scene->transformComponents),
+        scene && contains(scene->meshRendererComponents),
+        scene && contains(scene->rigidbodyComponents),
+        scene && contains(scene->destructionComponents),
+        scene && contains(scene->weaponComponents),
+        scene && contains(scene->vehicleComponents),
+        scene && contains(scene->ragdollComponents),
+        scene && contains(scene->animationComponents),
+        scene && contains(scene->timelineComponents),
+        scene && contains(scene->ikComponents),
+        scene && contains(scene->retargetComponents),
+        scene && contains(scene->missionComponents),
+        scene && contains(scene->dialogueComponents),
+        scene && contains(scene->navigationComponents));
+    m_inspectorJson = m_inspectorDoc->to_json(doc);
 }
 
 void EditorApplication::refresh_gizmo() {
@@ -1138,11 +1255,10 @@ void EditorApplication::init_default_scene() {
 
 
 // ===========================================================================
-// Core (constructor, init, main loop, render frame)
-// Panels → EditorApplication_Panels.cpp
-// Vulkan  → EditorApplication_Vulkan.cpp
-// Play    → EditorApplication_PlayMode.cpp
-// Assets  → EditorApplication_Assets.cpp
+// Core (constructor, init, main loop, render frame). Monolithic: a split
+// attempt (EditorApplication_{Panels,Vulkan,PlayMode,Assets}.cpp, 18/ago) was
+// never wired into CMake — those orphan duplicates were removed (2026-08-26,
+// AGENT-2 §B dedup). All editor code lives here.
 // ===========================================================================
 
 int EditorApplication::run_render_graph_self_test() {
@@ -1462,6 +1578,14 @@ void EditorApplication::main_loop() {
                 api.camera = m_cameraJson;
                 refresh_gizmo();
                 api.gizmo = m_gizmoJson;
+                refresh_publish();
+                api.publish = m_publishJson;
+                refresh_inspector();
+                api.inspector = m_inspectorJson;
+                refresh_hierarchy();
+                api.hierarchy = m_hierarchyJson;
+                refresh_onboarding();
+                api.onboarding = m_onboardingJson;
                 switch (m_playScript.status()) {
                     case VMStatus::Idle: api.scriptState = "idle"; break;
                     case VMStatus::Running: api.scriptState = "running"; break;
@@ -4593,9 +4717,11 @@ void EditorApplication::run_game_build() {
 
     if (!m_editorScene || !m_assetPipeline) {
         log("Build failed: no scene open");
+        if (m_publishPipeline) m_publishPipeline->fail("no scene open");
         return;
     }
     log("Build started for project '" + m_currentProjectName + "'");
+    if (m_publishPipeline) m_publishPipeline->begin(m_currentProjectName);
 
     // 1. Cook every uncooked asset (same path as the Content Browser).
     size_t imported = 0, failed = 0;
@@ -4606,6 +4732,7 @@ void EditorApplication::run_game_build() {
         else { ++failed; log("  cook failed: " + result.error); }
     }
     log(std::to_string(imported) + " asset(s) cooked, " + std::to_string(failed) + " failed");
+    if (m_publishPipeline) m_publishPipeline->cooking_done(imported, failed);
 
     // 2. Package all cooked assets (Content/<uuid>/<file> + AssetManifest.txt).
     std::vector<UUID> roots;
@@ -4614,19 +4741,23 @@ void EditorApplication::run_game_build() {
     }
     if (roots.empty()) {
         log("Build failed: no cooked assets to package");
+        if (m_publishPipeline) m_publishPipeline->fail("no cooked assets to package");
         return;
     }
     const AssetPackageResult packaged = AssetPackager::package(m_assetRegistry, roots, buildRoot);
     if (!packaged) {
         log("Build failed: " + packaged.error);
+        if (m_publishPipeline) m_publishPipeline->fail(packaged.error);
         return;
     }
     log(std::to_string(packaged.assets.size()) + " asset(s) packaged");
+    if (m_publishPipeline) m_publishPipeline->packaging_done(packaged.assets.size());
 
     // 3. Save the authored scene as the game's initial scene.
     std::filesystem::create_directories(buildRoot / "Content" / "Scenes", ec);
     if (!m_editorScene->save_to_file((buildRoot / "Content" / "Scenes" / "Initial.scene").string())) {
         log("Build failed: could not save scene");
+        if (m_publishPipeline) m_publishPipeline->fail("could not save scene");
         return;
     }
     log("Scene saved to Content/Scenes/Initial.scene");
@@ -4662,6 +4793,7 @@ void EditorApplication::run_game_build() {
              << "\ninitialScene Content/Scenes/Initial.scene\n";
     std::ofstream launcher(buildRoot / "run_game.bat", std::ios::trunc);
     launcher << "@echo off\ncd /d %~dp0\nBin\\VulkanEngineGame.exe\n";
+    if (m_publishPipeline) m_publishPipeline->publishing_done();
     log("Build complete: " + buildRoot.string());
 }
 

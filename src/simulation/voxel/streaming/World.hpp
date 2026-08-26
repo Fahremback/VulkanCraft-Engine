@@ -313,6 +313,15 @@ private:
     // Chunks whose discrete light is stale (edits, water changes, uploads and
     // changed neighbors). Processed by the budgeted light pass in update().
     std::unordered_set<std::pair<int, int>, ChunkHash> lightDirtyChunks_;
+    // C.1: dataVersion of each chunk at its last light compute. When a chunk
+    // is re-dirtied with an UNCHANGED dataVersion (neighbor-convergence
+    // re-dirty — the common case), its content is provably identical, so the
+    // light pass skips the 16x16x256-column sky-occlusion rescan (bit-identical
+    // result by construction; only block-light re-runs for halo inflow).
+    // Erased on eviction so a re-loaded chunk with a fresh small dataVersion
+    // never false-matches a stale entry.
+    std::unordered_map<std::pair<int, int>, uint64_t, ChunkHash>
+        lightContentRevision_;
     // Restore mode (set_restoring): suppresses chunk eviction during loads.
     bool restoring_{ false };
     void run_light_pass(const glm::vec3& playerPos);

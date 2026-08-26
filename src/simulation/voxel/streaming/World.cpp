@@ -125,6 +125,10 @@ void World::set_runtime_block_table(
     std::lock_guard<std::recursive_mutex> lock(chunksMutex);
     runtimeBlocks_ = std::move(table);
     runtimeUuidToId_ = std::move(uuidToId);
+    // C.1: emission/absorption for dynamic ids can change here (registry
+    // attach) without touching chunk content — the sky-occlusion skip gate
+    // must not keep stale occlusion.
+    lightContentRevision_.clear();
 }
 
 bool World::is_valid_block_id(RuntimeBlockId id) const {
@@ -813,6 +817,11 @@ bool World::restore_chunk_data(int cx, int cz, int extent,
         }
     }
     chunk->dataVersion.fetch_add(1, std::memory_order_acq_rel);
+    // C.1: the restore REPLACES the chunk's content wholesale — any sky-occlusion
+    // revision recorded for this chunk before the load is stale by construction
+    // (the skip gate must not keep old occlusion for restored bytes). Same
+    // pattern as the eviction paths (erase on chunk removal).
+    lightContentRevision_.erase({ cx, cz });
     // The saved extent is derived from the source chunk's vertical extent, so
     // the restored content occupies exactly [0, extent) (mesh/raycast queries
     // read highestOccupiedY).
@@ -1052,6 +1061,11 @@ void World::update(const glm::vec3& playerPos, WorldRenderBridge& renderBridge, 
                 // Work que aguardava este chunk não pode sobreviver ao descarrego:
                 // cancela células/random ticks do chunk (nada de trabalho morto).
                 scheduler_.cancel_chunk(it->first.first, it->first.second);
+                // C.1: a clean chunk's dataVersion is 1 before AND after reload
+                // (a fresh chunk object restarts at 1) — a stale revision entry
+                // would false-match the skip gate and never recompute the sky
+                // occlusion of the reloaded chunk. Erase on EVERY eviction.
+                lightContentRevision_.erase(it->first);
                 it = chunks.erase(it);
             } else {
                 ++it;
@@ -1434,6 +1448,9 @@ void World::update(const glm::vec3& playerPos, WorldRenderBridge& renderBridge, 
                 scheduler_.cancel_chunk(key.first, key.second);
                 usage -= chunk_memory_estimate(*it->second);
                 chunks.erase(it);
+                // C.1: a re-loaded chunk starts with a fresh small dataVersion;
+                // a stale entry would false-match and skip its sky rescan.
+                lightContentRevision_.erase(key);
             }
         }
     }
@@ -1450,6 +1467,11 @@ void World::set_light_table_overrides(
     // the next budgeted relight pass.
     {
         std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+        // C.1: overrides change ABSORPTION, which feeds the sky-occlusion
+        // scan — content (dataVersion) is unchanged, so the skip gate would
+        // wrongly keep stale occlusion. Clear the revisions so every chunk
+        // does the full pass.
+        lightContentRevision_.clear();
         for (const auto& [key, chunk] : chunks) {
             chunk->isDirty.store(true, std::memory_order_release);
             mark_chunk_light_dirty(key.first, key.second);
@@ -1595,7 +1617,16 @@ void World::run_light_pass(const glm::vec3& playerPos) {
         access.emission = [this](RuntimeBlockId id) { return light_emission(id); };
         access.absorption = [this](RuntimeBlockId id) { return light_absorption(id); };
 
-        const bool changed = ChunkLighting::compute(*chunk, access);
+        // C.1: skip the sky-occlusion rescan when this chunk's content is
+        // provably unchanged since the last compute (neighbor-convergence
+        // re-dirty). The first compute for a chunk has no recorded revision,
+        // so it always does the full pass.
+        const uint64_t revision = chunk->revision();
+        const auto lastIt = lightContentRevision_.find(key);
+        const bool skipSkylight =
+            lastIt != lightContentRevision_.end() && lastIt->second == revision;
+        const bool changed = ChunkLighting::compute(*chunk, access, skipSkylight);
+        lightContentRevision_[key] = revision;
         lightDirtyChunks_.erase(key);
         // Light changed: neighbors must re-see it (cross-border propagation).
         if (changed) {

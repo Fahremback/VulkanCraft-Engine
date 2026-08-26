@@ -460,6 +460,66 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
         send_response(conn, out.str());
         return;
     }
+    if (method == "GET" && path == "/publish") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.publish.empty()) {
+            out << "{\"valid\":false,\"publish\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"publish\":" << snapshot.publish << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/inspector") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.inspector.empty()) {
+            out << "{\"valid\":false,\"inspector\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"inspector\":" << snapshot.inspector << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/hierarchy") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.hierarchy.empty()) {
+            out << "{\"valid\":false,\"hierarchy\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"hierarchy\":" << snapshot.hierarchy << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/onboarding") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.onboarding.empty()) {
+            out << "{\"valid\":false,\"onboarding\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"onboarding\":" << snapshot.onboarding << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
     if (method == "GET" && path == "/health") {
         send_response(conn, "ok", "text/plain");
         return;

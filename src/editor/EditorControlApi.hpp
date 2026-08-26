@@ -101,6 +101,18 @@ struct EditorApiState {
     // The gizmo JSON (engine/editor IGizmoController) — live gizmo mode, local
     // flag and snap values, via GET /gizmo.
     std::string gizmo;
+    // The publish-pipeline JSON (engine/editor IPublishPipeline) — build stage
+    // machine driven by build_game(), via GET /publish.
+    std::string publish;
+    // The inspector-doc JSON (engine/editor IInspectorDoc) — semantic
+    // component/group model of the selected entity, via GET /inspector.
+    std::string inspector;
+    // The scene-hierarchy JSON (engine/editor ISceneHierarchy) — deterministic
+    // flat scene tree of the real entities, via GET /hierarchy.
+    std::string hierarchy;
+    // The onboarding-tour JSON (engine/editor IOnboardingTour) — tutorial step
+    // machine state, via GET /onboarding.
+    std::string onboarding;
 };
 
 class EditorControlApi {

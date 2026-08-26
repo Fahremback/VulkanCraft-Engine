@@ -56,6 +56,10 @@
 #include "engine/editor/IWindowMode.hpp"
 #include "engine/editor/IEditorCamera.hpp"
 #include "engine/editor/IGizmoController.hpp"
+#include "engine/editor/IPublishPipeline.hpp"
+#include "engine/editor/IInspectorDoc.hpp"
+#include "engine/editor/ISceneHierarchy.hpp"
+#include "engine/editor/IOnboardingTour.hpp"
 #include "engine/profiling/IFrameProfiler.hpp"
 #include "WindowClamp.hpp"
 #include "tools/WickedToolsPanel.hpp"
@@ -986,6 +990,30 @@ private:
     std::unique_ptr<engine::editor::IGizmoController> m_gizmoContract;
     std::string m_gizmoJson;
     void refresh_gizmo();
+
+    // Publish pipeline (plano agente 2 §C): the build_game() flow drives this
+    // stage machine (cook→package→publish) — exposed via GET /publish.
+    std::unique_ptr<engine::editor::IPublishPipeline> m_publishPipeline;
+    std::string m_publishJson;
+    void refresh_publish();
+
+    // Onboarding tour (plano agente 2 §C): deterministic tutorial step machine
+    // driven by the shell — exposed via GET /onboarding.
+    std::unique_ptr<engine::editor::IOnboardingTour> m_onboardingTour;
+    std::string m_onboardingJson;
+    void refresh_onboarding();
+
+    // Inspector doc (plano agente 2 §C): semantic component/group model of
+    // the selected entity — exposed via GET /inspector.
+    std::unique_ptr<engine::editor::IInspectorDoc> m_inspectorDoc;
+    std::string m_inspectorJson;
+    void refresh_inspector();
+
+    // Scene hierarchy (plano agente 2 §B): deterministic flat scene tree of
+    // the real entities — exposed via GET /hierarchy.
+    std::unique_ptr<engine::editor::ISceneHierarchy> m_sceneHierarchy;
+    std::string m_hierarchyJson;
+    void refresh_hierarchy();
 
     // Play-mode frame stepping (PASSO button): advance the play world one
     // frame while paused.

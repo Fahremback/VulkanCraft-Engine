@@ -33,6 +33,8 @@ O servidor é `stdio`-first (o transporte padrão do MCP `command`/`args`); o mo
 }
 ```
 
+**Auth opcional no transporte remoto** (`--http`): defina `MCP_AUTH_TOKEN` no ambiente do servidor para exigir `Authorization: Bearer <token>` em todo `POST /mcp` e `GET /events` (HTTP 401 sem token válido). Off por default — stdio (pipe local) nunca exige auth (findings #240).
+
 ## CLI de registry assets (FALTANTES item 10)
 
 Sem servidor MCP, o mesmo contrato está disponível em linha de comando (`registry-cli.mjs`, sem dependências — reusa exatamente as factories do servidor):
@@ -145,6 +147,7 @@ Projetos são armazenados em `engine/Projects/<nome>` com referência relativa `
 
 ## Framing e recursos
 
+- **Protocolo**: o handshake aceita **as duas versões publicadas do spec MCP** — `2024-11-05` e `2025-03-26` (default) — e devolve a versão negociada no `initialize`; versão desconhecida → erro `-32602` com `supportedProtocolVersions` completo (findings #234).
 - **Framing**: o servidor aceita `Content-Length` (MCP canônico) **e** newline (linha JSON por `\n`). Frames parciais são segurados até completar o byte count declarado — sem resposta prematura nem crash (verificado por smoke dedicado). No transporte remoto, `POST /mcp` recebe JSON-RPC e responde na mesma conexão.
-- **Resources**: `resources/list` expõe documentos (README, architecture, migration, pending-work, SDK manifest, dependências, determinismo, política de dependência) e o **resource dinâmico `engine://metrics`** — métricas vivas do servidor (uptime, transport, contagem de tools, ring de auditoria, rate limit, subscriptions, SSE clients) geradas na leitura.
+- **Resources**: `resources/list` expõe documentos (README, architecture, migration, pending-work, SDK manifest, dependências, determinismo, política de dependência) e os **resources dinâmicos `engine://metrics`** (métricas vivas do servidor — uptime, transport, contagem de tools, ring de auditoria, rate limit, subscriptions, SSE clients) **`engine://projects`** (lista viva de projetos, MESMA enumeração do tool `list_game_projects` — fonte única) e **por projeto via templates** (`resources/templates/list`): `engine://projects/{name}`, `.../{name}/assets`, `.../{name}/scenes` — grounded na MESMA inspeção do tool `inspect_game_project`; projeto inexistente → -32002. Todos gerados na leitura.
 - **Transacional**: `run_batch` executa N operações de autoria all-or-nothing (valida tudo → aplica → reverte em falha), com `dry_run` e `update` no nível do batch.

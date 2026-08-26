@@ -350,7 +350,13 @@ class CoordinatorApp:
             finally:
                 pyautogui.keyUp("alt")
         time.sleep(0.25)
-        pyautogui.click(x, y)
+        # Libera um botão físico/lógico eventualmente preso antes de mover o cursor;
+        # assim o deslocamento nunca vira um arrasto de janela.
+        pyautogui.mouseUp(button="left")
+        pyautogui.moveTo(x, y, duration=0.45, tween=pyautogui.easeInOutQuad)
+        pyautogui.mouseDown(button="left")
+        time.sleep(0.06)
+        pyautogui.mouseUp(button="left")
         time.sleep(max(0.5, delay_after_click))
         pyautogui.press("enter")
         time.sleep(0.20)

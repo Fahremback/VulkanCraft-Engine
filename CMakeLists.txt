@@ -395,8 +395,99 @@ vc_object_module(vc_voxel_runtime
     src/simulation/voxel/tools/VoxelTools.cpp
     src/plugins/voxel/VoxelStructure.cpp
 )
+set(VC_EMBREE_TUS
+    src/engine/sdk/EmbreeRayTracer.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/builders/primrefgen.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh4_factory.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh8_factory.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_builder.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_builder_hair.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_builder_hair_mb.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_builder_morton.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_builder_sah.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_builder_sah_mb.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_builder_sah_spatial.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_builder_subdiv.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_builder_twolevel.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_collider.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_intersector1.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_intersector1_bvh4.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_intersector_hybrid.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_intersector_hybrid4_bvh4.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_refit.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_rotate.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_statistics.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/acceln.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/accelset.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/alloc.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/device.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/geometry.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/motion_derivative.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/rtcore.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/rtcore_builder.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/scene.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/scene_curves.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/scene_grid_mesh.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/scene_instance.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/scene_instance_array.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/scene_line_segments.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/scene_points.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/scene_quad_mesh.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/scene_subdiv_mesh.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/scene_triangle_mesh.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/scene_user_geometry.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/scene_verify.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/stat.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/common/state.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/geometry/curve_intersector_virtual_4i.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/geometry/curve_intersector_virtual_4i_mb.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/geometry/curve_intersector_virtual_4v.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/geometry/curve_intersector_virtual_8i.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/geometry/curve_intersector_virtual_8i_mb.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/geometry/curve_intersector_virtual_8v.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/geometry/grid_soa.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/geometry/instance_array_intersector.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/geometry/instance_intersector.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_intersector1_bvh8.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_intersector_hybrid4_bvh8.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_intersector_hybrid8_bvh4.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/bvh/bvh_intersector_hybrid8_bvh8.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/geometry/primitive8.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/geometry/primitive4.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/subdiv/bezier_curve.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/subdiv/bspline_curve.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/subdiv/catmullclark_coefficients.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/subdiv/catmullrom_curve.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/subdiv/subdivpatch1base.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/subdiv/subdivpatch1base_eval.cpp
+    ${VC_SOLUTIONS_DIR}/embree/kernels/subdiv/tessellation_cache.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/lexers/stringstream.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/lexers/tokenstream.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/math/constants.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/simd/sse.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/sys/alloc.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/sys/barrier.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/sys/condition.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/sys/estring.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/sys/filename.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/sys/library.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/sys/mutex.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/sys/regression.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/sys/sysinfo.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/sys/thread.cpp
+    ${VC_SOLUTIONS_DIR}/embree/common/tasking/taskschedulerinternal.cpp
+)
+
 vc_object_module(vc_sdk_public
     src/engine/sdk/VoxelWorldFacade.cpp
+    # Codec/hash/storage providers — restaurados ao módulo (refactor alheio 07:36
+    # os removeu e quebrou todo consumer de $<TARGET_OBJECTS:vc_sdk_public>: o
+    # VoxelWorldFacade referencia create_zstd_compression_provider etc.).
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:src/engine/core/compression/ZstdCompression.cpp>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:src/engine/core/hashing/Blake3Hash.cpp>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:src/engine/core/storage/RocksDbChunkStorage.cpp>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:src/engine/core/storage/RegionChunkStorage.cpp>
     src/engine/sdk/BlockRegistry.cpp
     src/engine/sdk/FluidRegistry.cpp
     src/engine/sdk/ItemRegistry.cpp
@@ -471,6 +562,12 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/WindowMode.cpp
     src/engine/sdk/EditorCamera.cpp
     src/engine/sdk/GizmoController.cpp
+    src/engine/sdk/PublishPipeline.cpp
+    src/engine/sdk/InspectorDoc.cpp
+    src/engine/sdk/SceneHierarchy.cpp
+    src/engine/sdk/OnboardingTour.cpp
+    src/engine/sdk/AnimationTimelineEditor.cpp
+    src/engine/sdk/ProjectLauncher.cpp
     src/engine/sdk/Steering.cpp
     src/engine/sdk/Perception.cpp
     src/engine/sdk/Fsm.cpp
@@ -516,13 +613,75 @@ vc_object_module(vc_sdk_public
     ${VC_SOLUTIONS_DIR}/atmospheric-scattering/atmosphere/reference/functions.cc
     src/engine/sdk/Ktx2Transcoder.cpp
     ${VC_SOLUTIONS_DIR}/ktx-software/external/basis_universal/transcoder/basisu_transcoder.cpp
-    src/engine/sdk/RegistryJson.cpp
-
-    src/engine/core/compression/ZstdCompression.cpp
-    src/engine/core/hashing/Blake3Hash.cpp
-    src/engine/core/storage/RocksDbChunkStorage.cpp
-    src/engine/core/storage/RegionChunkStorage.cpp
+    src/engine/sdk/EffekseerParticles.cpp
+    # Effekseer CPU core (MIT, promoted) — compiled INTO the object module
+    # (BUG-010 pattern) so the adapter's symbols travel with the objects.
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.Client.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.Color.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.CurveLoader.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.DefaultEffectLoader.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.DefaultFile.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.Effect.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.EffectNode.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.EffectNodeModel.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.EffectNodeRibbon.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.EffectNodeRing.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.EffectNodeRoot.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.EffectNodeSprite.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.EffectNodeTrack.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.FCurves.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.Instance.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.InstanceChunk.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.InstanceContainer.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.InstanceGlobal.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.InstanceGroup.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.InternalScript.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.Manager.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.Matrix43.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.Matrix44.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.Random.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.RectF.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.Resource.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.ResourceManager.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.Server.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.Setting.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.Socket.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.Vector2D.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.Vector3D.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Effekseer.WorkerThread.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/ForceField/ForceFields.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/IO/Effekseer.EfkEfcFactory.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Material/Effekseer.CompiledMaterial.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Material/Effekseer.MaterialCompiler.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Material/Effekseer.MaterialFile.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Model/Model.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Model/ModelLoader.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Model/ProceduralModelGenerator.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Model/SplineGenerator.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Noise/CurlNoise.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Parameter/Easing.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Parameter/Effekseer.Parameters.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Parameter/Rotation.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/SIMD/Mat43f.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/SIMD/Mat44f.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/SIMD/Utils.cpp
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer/Effekseer/Utils/Effekseer.CustomAllocator.cpp
+    ${VC_EMBREE_TUS}
 )
+target_compile_definitions(vc_sdk_public PRIVATE
+    EMBREE_STATIC_LIB
+    TASKING_INTERNAL
+    EMBREE_LOWEST_ISA
+    BASISD_SUPPORT_KTX2_ZSTD=0
+)
+# SIMD defines do Embree (o build oficial define /D__SSE4_2__ etc.; __64BIT__ é
+# do compilador Intel e habilita o popcnt(size_t) escalar — sem ele o MSVC
+# resolve ambiguamente popcnt(size_t) nos kernels AVX). Escopado aos TUs
+# embree para não afetar o resto do módulo.
+foreach(_embree_tu ${VC_EMBREE_TUS})
+    set_source_files_properties(${_embree_tu} PROPERTIES COMPILE_DEFINITIONS
+        "__SSE__;__SSE2__;__SSE3__;__SSSE3__;__SSE4_1__;__SSE4_2__;__AVX__;__AVX2__;__64BIT__")
+endforeach()
 # Promoted-solution adapters: these TUs are the ONLY ones that include the
 # external headers; the include dirs stay private to this module.
 target_include_directories(vc_sdk_public PRIVATE
@@ -538,6 +697,10 @@ target_include_directories(vc_sdk_public PRIVATE
     ${VC_SOLUTIONS_DIR}/atmospheric-scattering
     ${VC_SOLUTIONS_DIR}/atmospheric-scattering/external/dimensional_types
     ${VC_SOLUTIONS_DIR}/ktx-software/external/basis_universal/transcoder
+    ${VC_SOLUTIONS_DIR}/effekseer/Dev/Cpp/Effekseer
+    ${VC_SOLUTIONS_DIR}/embree/include
+    ${VC_SOLUTIONS_DIR}/embree/kernels
+    ${VC_SOLUTIONS_DIR}/embree/common
     ${VC_SOLUTIONS_DIR}/ozz-animation/include
     ${VC_SOLUTIONS_DIR}/acl/includes
     ${VC_SOLUTIONS_DIR}/acl/external/rtm/includes
@@ -552,14 +715,12 @@ if(VC_ENABLE_ZSTD OR VC_ENABLE_BLAKE3 OR VC_ENABLE_FLATBUFFERS OR VC_ENABLE_ROCK
     )
 endif()
 if(VC_ENABLE_FLATBUFFERS)
-    # The generated header is produced by flatc before this module compiles.
     add_dependencies(vc_sdk_public vc_generate_world_save)
 endif()
-# Public gameplay runtime (FALTANTES item 9 / META section 20): the adapter
-# src/engine/sdk/GameplayRuntime.cpp is the ONLY TU that crosses from the
-# public surface into the internal physics/gameplay layers. The internal TUs
-# are compiled into this module so external consumers (tests, projects) link
-# them together with the public contract.
+
+# Restaurado (refactor alheio 07:36 removeu o módulo mas deixou 33 refs
+# $<TARGET_OBJECTS:vc_gameplay_sdk> + vc_sdk STATIC dependendo dele — P0 de
+# configure; fontes intactos no tree).
 vc_object_module(vc_gameplay_sdk
     src/engine/sdk/GameplayRuntime.cpp
     src/engine/physics/PhysicsRuntime.cpp
@@ -583,303 +744,35 @@ vc_object_module(vc_gameplay_sdk
     src/engine/gameplay/DestructionTelemetry.cpp
     src/engine/core/uuid/UUID.cpp
 )
-# RegistryJson stays owned by vc_sdk_public (the canonical copy every consumer
-# links); the gameplay TUs reference its json_* helpers, resolved at link time.
 target_include_directories(vc_gameplay_sdk PRIVATE src)
-vc_object_module(vc_advanced_runtime
-    src/engine/physics/PhysicsRuntime.cpp
-    src/engine/physics/PhysicsAdvanced.cpp
-    src/engine/physics/Ragdoll.cpp
-    src/engine/physics/SkeletonPoseMapper.cpp
-    src/engine/physics/PhysicsStreamingBridge.cpp
-    src/engine/physics/VoxelConnectivity.cpp
-    src/engine/physics/VoxelBoxMerger.cpp
-    src/engine/physics/PhysicsBackend.cpp
-    src/engine/physics/JoltPhysicsBackend.cpp
-    src/engine/physics/BulletPhysicsBackend.cpp
-    src/engine/gameplay/GameplayVisual.cpp
-    src/engine/gameplay/WeaponSystem.cpp
-    src/engine/gameplay/VehicleRuntime.cpp
-    src/engine/gameplay/BeamChassisRuntime.cpp
-    src/engine/gameplay/DestructionRuntime.cpp
-    src/engine/gameplay/FractureConfig.cpp
-    src/engine/gameplay/ExplosionRuntime.cpp
-    src/engine/gameplay/DebrisRuntime.cpp
-    src/engine/gameplay/DestructionHistoryRuntime.cpp
-    src/engine/gameplay/DestructionBudget.cpp
-    src/engine/gameplay/DestructionTelemetry.cpp
-    src/engine/gameplay/ParticleSimulation.cpp
-    src/engine/gameplay/MissionSystem.cpp
-    src/engine/gameplay/DialogueSystem.cpp
-    src/engine/audio/AudioRuntime.cpp
-    src/engine/networking/NetworkRuntime.cpp
-    src/engine/scripting/ScriptRuntime.cpp
-    src/engine/scripting/ScriptDebugger.cpp
-    src/engine/scripting/VisualScriptCanvas.cpp
-    src/engine/scripting/ScriptGraphBridge.cpp
-    src/engine/world/WorldPartition.cpp
-    src/engine/world/WorldPartitionProfiler.cpp
-    src/engine/world/WorldRegionPackage.cpp
-    src/engine/rendering/MaterialGraph.cpp
-    src/engine/rendering/RenderGraph.cpp
-    src/engine/rendering/RenderingFoundation.cpp
-)
-# Material pipeline is Vulkan-only: the headless server must not link it.
-vc_object_module(vc_material_pipeline src/engine/rendering/vulkan/MaterialPipeline.cpp)
-vc_object_module(vc_editor_extensions
-    src/editor/tools/EditorRegistry.cpp
-    src/editor/tools/RenderingToolModels.cpp
-    src/plugins/PluginContract.cpp
-    src/plugins/PluginEditorExtensions.cpp
-    src/plugins/vehicles/VehiclesPlugin.cpp
-    src/plugins/weapons/WeaponsPlugin.cpp
-    src/plugins/missions/MissionsPlugin.cpp
-    src/plugins/procedural_animation/ProceduralAnimationPlugin.cpp
-    src/plugins/advanced_physics/AdvancedPhysicsPlugin.cpp
-    src/plugins/networking/NetworkingPlugin.cpp
-)
-vc_object_module(vc_feature_player src/features/player/Player.cpp)
-vc_object_module(vc_engine_runtime
-    src/engine/audio/SoundEngine.cpp
-    src/engine/audio/AudioEvent.cpp
-    src/engine/physics/Physics.cpp
-    src/engine/scripting/VisualScriptGraph.cpp
-    src/engine/rendering/renderer/ChunkRenderer.cpp
-    src/engine/rendering/renderer/WorldRenderer.cpp
-    src/engine/rendering/renderer/FarTerrain.cpp
-    src/engine/rendering/renderer/MobRenderer.cpp
-    src/engine/rendering/materials/TextureManager.cpp
-    src/engine/rendering/lighting/RadianceCache.cpp
-)
-vc_object_module(vc_app_runtime
-    src/app/Engine.cpp
-    src/app/EngineLifecycle.cpp
-    src/app/GameApplication.cpp
-    src/platform/window/EngineWindow.cpp
-)
 
-set(VC_SHADER_SOURCE_DIR "${CMAKE_SOURCE_DIR}/shaders/active")
-set(VC_SHADER_OUTPUT_DIR "${CMAKE_BINARY_DIR}/shaders")
-file(MAKE_DIRECTORY "${VC_SHADER_OUTPUT_DIR}")
-find_program(GLSLC_EXECUTABLE NAMES glslc HINTS "$ENV{VULKAN_SDK}/Bin" REQUIRED)
-set(VC_SHADERS
-    voxel.vert far_surface.vert voxel.frag grass.vert foliage.vert
-    sky.vert sky.frag post.vert post.frag shadow.vert
-    shadow_far_surface.vert shadow.frag shadow_foliage.vert shadow_grass.vert
-    editor_viewport.vert editor_viewport.frag editor_pick.frag editor_material.vert
-    editor_grid.vert editor_grid.frag editor_splat.vert editor_splat.frag
-    editor_envsphere.vert editor_envsphere.frag block.vert block.frag
-)
-set(VC_SHADER_OUTPUTS)
-foreach(shader IN LISTS VC_SHADERS)
-    set(output "${VC_SHADER_OUTPUT_DIR}/${shader}.spv")
-    add_custom_command(
-        OUTPUT "${output}"
-        COMMAND "${GLSLC_EXECUTABLE}" -I "${VC_SHADER_SOURCE_DIR}"
-                "${VC_SHADER_SOURCE_DIR}/${shader}" -o "${output}"
-        DEPENDS "${VC_SHADER_SOURCE_DIR}/${shader}" "${VC_SHADER_SOURCE_DIR}/radiance_cache.glsl"
-        VERBATIM
-    )
-    list(APPEND VC_SHADER_OUTPUTS "${output}")
-endforeach()
-add_custom_target(compile_shaders ALL DEPENDS ${VC_SHADER_OUTPUTS})
-
-set(VC_REQUIRED_ASSETS
-    assets/audio
-    assets/skins
-    assets/textures/minecraft/assets/minecraft/textures/block
-    assets/textures/grass/assets/minecraft/textures/block
-)
-foreach(asset_dir IN LISTS VC_REQUIRED_ASSETS)
-    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/${asset_dir}")
-        message(FATAL_ERROR "Runtime asset directory is missing: ${asset_dir}")
-    endif()
-endforeach()
-
-add_executable(VulkanEngineGame
-    src/app/main_game.cpp
-    # RegistryJson lives in vc_sdk_public; these app targets link vc_advanced_runtime
-    # (which compiles FractureConfig using the json helpers) without sdk_public, so
-    # they compile the sdk TU directly — same pattern as vulkan_craft below.
-    # BeamChassisRuntime (vc_gameplay_sdk) references the public beam-chassis and
-    # XPBD solver contracts, so those two sdk TUs are compiled here too.
-    src/engine/sdk/RegistryJson.cpp
-    src/engine/sdk/BeamGraphAsset.cpp
-    src/engine/sdk/VehicleProvider.cpp
-    src/engine/sdk/MotionDatabase.cpp
-    src/engine/sdk/XpbdDeformable.cpp
-    $<TARGET_OBJECTS:vc_core_runtime>
-    $<TARGET_OBJECTS:vc_advanced_runtime>
-)
-target_compile_features(VulkanEngineGame PRIVATE cxx_std_20)
-target_include_directories(VulkanEngineGame PRIVATE src ${glm_SOURCE_DIR})
-target_link_libraries(VulkanEngineGame PRIVATE vc_build_options glfw glm vk-bootstrap Vulkan::Vulkan vc_material_pipeline vc_ozz vc_acl)
-
-if(VC_ENABLE_VOXEL_PLUGIN)
-add_executable(vulkan_craft
-    src/app/main.cpp
-    src/plugins/voxel/VoxelPlugin.cpp
-    # Public entity layer + mob behavior (FALTANTES item 11): the legacy
-    # Mob/MobManager track was removed; the app hosts mobs as IEntityWorld
-    # entities advanced by the public IMobBehavior.
-    src/engine/sdk/EntityWorld.cpp
-    src/engine/sdk/MobBehavior.cpp
-    src/engine/sdk/RegistryJson.cpp
-    # BeamChassisRuntime (vc_gameplay_sdk) references the public beam-chassis
-    # and XPBD solver contracts; compile those sdk TUs directly like the rest.
-    src/engine/sdk/BeamGraphAsset.cpp
-    src/engine/sdk/VehicleProvider.cpp
-    src/engine/sdk/MotionDatabase.cpp
-    src/engine/sdk/XpbdDeformable.cpp
-    $<TARGET_OBJECTS:vc_core_runtime>
-    $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:$<TARGET_OBJECTS:vc_voxel_generation>>
-    $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:$<TARGET_OBJECTS:vc_voxel_runtime>>
-    $<TARGET_OBJECTS:vc_advanced_runtime>
-    $<TARGET_OBJECTS:vc_editor_extensions>
-    $<TARGET_OBJECTS:vc_feature_player>
-    $<TARGET_OBJECTS:vc_engine_runtime>
-    $<TARGET_OBJECTS:vc_app_runtime>
-)
-add_dependencies(vulkan_craft compile_shaders)
-target_include_directories(vulkan_craft PRIVATE
-    ${VC_SOLUTIONS_DIR}/entt/single_include
-)
-target_link_libraries(vulkan_craft PRIVATE
-    vc_build_options glfw glm vk-bootstrap Vulkan::Vulkan windowscodecs ole32 vc_ozz vc_acl
-)
-endif()
-
-set(IMGUI_SOURCES
-    ${imgui_SOURCE_DIR}/imgui.cpp
-    ${imgui_SOURCE_DIR}/imgui_draw.cpp
-    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-    ${imgui_SOURCE_DIR}/imgui_tables.cpp
-    ${imgui_SOURCE_DIR}/imgui_demo.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
-)
-
-add_executable(VulkanEngineEditor
-    src/editor/main_editor.cpp
-    src/editor/EditorApplication.cpp
-    # Loopback HTTP control API (curl 127.0.0.1:8321/{play,pause,resume,stop,step,state})
-    src/editor/EditorControlApi.cpp
-    # Editor plugin API (ezEngine-style swappable tools; headless registry).
-    src/editor/EditorPlugin.cpp
-    # Project templates (ezEngine "project templates" pillar; headless scaffold).
-    src/editor/ProjectTemplate.cpp
-    # Shell layout persistence (plano agente 2 §B): registry-derived defaults,
-    # safe reset, tolerant snapshot apply — model-only.
-    src/editor/EditorLayout.cpp
-    src/engine/editor/ui/EditorGUI.cpp
-    src/editor/tools/SpecializedEditorsPanel.cpp
-    # Wicked-port tool panels (frontend; PORTS.md): windows wired to the
-    # VulkanCraft scene/components, with TODO(frontend-port) markers where the
-    # runtime feature still needs implementing.
-    src/editor/tools/WickedToolsPanel.cpp
-    # Forge design system (light theme + reusable editor widgets).
-    src/editor/frontend/ForgeTheme.cpp
-    src/editor/frontend/ForgeWidgets.cpp
-    # Public navigation provider (FALTANTES item 12): the editor's play nav
-    # bakes via Recast + Detour — the legacy grid track was removed.
-    src/engine/sdk/RecastNavigation.cpp
-    # RegistryJson lives in vc_sdk_public; this target links vc_advanced_runtime
-    # (which compiles FractureConfig using the json helpers) without sdk_public,
-    # so it compiles the sdk TU directly — same pattern as vulkan_craft below.
-    # BeamChassisRuntime (vc_gameplay_sdk) references the public beam-chassis and
-    # XPBD solver contracts, so those two sdk TUs are compiled here too.
-    src/engine/sdk/RegistryJson.cpp
-    src/engine/sdk/BeamGraphAsset.cpp
-    src/engine/sdk/VehicleProvider.cpp
-    src/engine/sdk/MotionDatabase.cpp
-    src/engine/sdk/XpbdDeformable.cpp
-    # Public UI contracts (plano agente 2 §A): the editor composes its own
-    # UI document (GET /ui-doc) from these sdk TUs — same direct-TU pattern.
-    src/engine/sdk/UiLayout.cpp
-    src/engine/sdk/UiWidgets.cpp
-    src/engine/sdk/UiViewport.cpp
-    src/engine/sdk/UiConfirmation.cpp
-    src/engine/sdk/UiDoc.cpp
-    # Message catalog + shortcut doc (plano agente 2 §C): the shell exposes
-    # GET /messages and GET /shortcuts from these sdk TUs — direct-TU pattern.
-    src/engine/sdk/MessageCatalog.cpp
-    src/engine/sdk/ActionMap.cpp
-    src/engine/sdk/ShortcutDoc.cpp
-    # Play mode (plano agente 2 §B): unambiguous play-state machine.
-    src/engine/sdk/PlayMode.cpp
-    # Command search (plano agente 2 §B): ranked global search backbone.
-    src/engine/sdk/CommandSearch.cpp
-    # Frame profiler (plano agente 2 §B): deterministic frame/memory stats.
-    src/engine/sdk/FrameProfiler.cpp
-    # Undo history (plano agente 2 §B): the editor's UndoSystem delegates its
-    # stacks to this generic contract (GET /undo) — direct-TU pattern.
-    src/engine/sdk/UndoHistory.cpp
-    # Content browser (plano agente 2 §B): asset-tree navigation model.
-    src/engine/sdk/ContentBrowser.cpp
-    # Window mode (plano agente 2 §B): fullscreen/borderless state machine.
-    src/engine/sdk/WindowMode.cpp
-    # Undo history (plano agente 2 §B): generic undo/redo stack with cap.
-    src/engine/sdk/UndoHistory.cpp
-    # Editor camera (plano agente 2 §B): orbit/pan/zoom/fly model (deterministic).
-    src/engine/sdk/EditorCamera.cpp
-    # Gizmo math (plano agente 2 §B): translate/rotate/scale drag + hit-test.
-    src/engine/sdk/GizmoController.cpp
-    $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:src/engine/audio/SoundEngine.cpp>
-    $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:src/plugins/voxel/VoxelPlugin.cpp>
-    # Frontend port (Wicked Editor, MIT): the UI base font (Liberation Sans) is
-    # embedded zstd-compressed; the adapter TU decompresses it through the
-    # public ICompressionProvider — same pattern as the sdk TUs above.
-    $<$<BOOL:${VC_ENABLE_ZSTD}>:src/engine/core/compression/ZstdCompression.cpp>
-    ${IMGUI_SOURCES}
-    $<TARGET_OBJECTS:vc_core_runtime>
-    $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:$<TARGET_OBJECTS:vc_voxel_generation>>
-    $<$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>:$<TARGET_OBJECTS:vc_voxel_runtime>>
-    $<TARGET_OBJECTS:vc_advanced_runtime>
-    $<TARGET_OBJECTS:vc_editor_extensions>
-)
-target_include_directories(VulkanEngineEditor PRIVATE
-    ${imgui_SOURCE_DIR}
-    ${imgui_SOURCE_DIR}/backends
-    src/editor
-    # Frontend port (Wicked GUI, MIT): base layer of the ported wiGUI module.
-    src/editor/frontend/wicked
-    ${VC_SOLUTIONS_DIR}/recast-navigation/Recast/Include
-    ${VC_SOLUTIONS_DIR}/recast-navigation/Detour/Include
-)
-target_link_libraries(VulkanEngineEditor PRIVATE
-    vc_build_options glfw glm vk-bootstrap Vulkan::Vulkan windowscodecs ole32 vc_material_pipeline vc_navigation vc_ozz vc_acl
-    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
-)
-add_dependencies(VulkanEngineEditor compile_shaders)
-
-add_executable(VulkanEngineServer
-    src/server/main_server.cpp
-    $<TARGET_OBJECTS:vc_core_runtime>
-    $<TARGET_OBJECTS:vc_advanced_runtime>
+add_executable(effekseer_particles_tests
+    tests/EffekseerParticlesTests.cpp
     $<TARGET_OBJECTS:vc_sdk_public>
+)
+
+
+# Agente 1 — C5 embree: IRayTracer (Test #19) — ray tracing offline CPU.
+add_executable(embree_ray_tracer_tests
+    tests/EmbreeRayTracerTests.cpp
+    $<TARGET_OBJECTS:vc_sdk_public>
+)
+target_include_directories(embree_ray_tracer_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(embree_ray_tracer_tests PRIVATE vc_build_options
     $<TARGET_OBJECTS:vc_voxel_runtime>
     $<TARGET_OBJECTS:vc_voxel_generation>
-)
-target_compile_features(VulkanEngineServer PRIVATE cxx_std_20)
-target_include_directories(VulkanEngineServer PRIVATE
-    src
-    src/engine/public
-    ${glm_SOURCE_DIR}
-)
-target_link_libraries(VulkanEngineServer PRIVATE
-    vc_build_options
-    vc_ozz vc_acl
-    glm vulkan_jolt bullet
+    vc_ozz vc_acl vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
     $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
-    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
 )
-if(TARGET vc_generate_world_save)
-    add_dependencies(VulkanEngineServer vc_generate_world_save)
-endif()
+add_test(NAME embree_ray_tracer_tests COMMAND embree_ray_tracer_tests)
 
+# Restaurados (refactor alheio 07:36 os removeu; TestLabels os referencia).
 add_executable(terrain_generator_tests
     tests/TerrainGeneratorTests.cpp
     src/simulation/voxel/generation/TerrainGenerator.cpp
@@ -901,198 +794,6 @@ add_test(NAME gltf_geometry_tests COMMAND gltf_geometry_tests)
 add_executable(radiance_cache_math_tests tests/RadianceCacheMathTests.cpp)
 target_link_libraries(radiance_cache_math_tests PRIVATE vc_build_options glm)
 add_test(NAME radiance_cache_math_tests COMMAND radiance_cache_math_tests)
-
-# Public GI/reflection contracts (Agente 1, task_plan A.1/A.2): the
-# IGiCore/IGlobalIlluminationProvider/IReflectionProvider headless gate —
-# deterministic pure core (toroidal clipmaps, budget, sun revision) + data-
-# driven backend selection + capability-check refusal. No GPU required.
-add_executable(global_illumination_tests
-    tests/GlobalIlluminationTests.cpp
-    src/engine/sdk/GlobalIllumination.cpp
-)
-target_include_directories(global_illumination_tests PRIVATE
-    src/engine/public
-    src/engine/rendering/lighting
-    src
-)
-target_link_libraries(global_illumination_tests PRIVATE vc_build_options glm)
-add_test(NAME global_illumination_tests COMMAND global_illumination_tests)
-
-# Public Lumen-style surface cache (Agente 1, task_plan A.3): the headless
-# ILumenScene gate — deterministic surface cards, incremental dirty-chunk
-# updates, coplanar carding, LRU budget, hierarchical distance cascades.
-add_executable(lumen_scene_tests
-    tests/LumenSceneTests.cpp
-    src/engine/sdk/LumenScene.cpp
-)
-target_include_directories(lumen_scene_tests PRIVATE
-    src/engine/public
-    src
-)
-target_link_libraries(lumen_scene_tests PRIVATE vc_build_options glm)
-add_test(NAME lumen_scene_tests COMMAND lumen_scene_tests)
-
-# Public material-card capture (Agente 1, task_plan A.4): the headless
-# ISurfaceCacheCapture gate — capture budget, nearest-camera-first, LOCALIZED
-# invalidation, revision-bump re-capture, self-luminous, exact vram.
-add_executable(surface_cache_capture_tests
-    tests/SurfaceCacheCaptureTests.cpp
-    src/engine/sdk/SurfaceCacheCapture.cpp
-    src/engine/sdk/LumenScene.cpp
-)
-target_include_directories(surface_cache_capture_tests PRIVATE
-    src/engine/public
-    src
-)
-target_link_libraries(surface_cache_capture_tests PRIVATE vc_build_options glm)
-add_test(NAME surface_cache_capture_tests COMMAND surface_cache_capture_tests)
-
-# Public multi-bounce diffuse GI (Agente 1, task_plan A.5): the headless
-# IDiffuseGlobalIllumination gate — radiosity, color bleeding, shadowed
-# skylight, energy tracking, determinism.
-add_executable(diffuse_global_illumination_tests
-    tests/DiffuseGlobalIlluminationTests.cpp
-    src/engine/sdk/DiffuseGlobalIllumination.cpp
-)
-target_include_directories(diffuse_global_illumination_tests PRIVATE
-    src/engine/public
-    src
-)
-target_link_libraries(diffuse_global_illumination_tests PRIVATE vc_build_options glm)
-add_test(NAME diffuse_global_illumination_tests COMMAND diffuse_global_illumination_tests)
-
-# Public software ray tracer (Agente 1, task_plan A.7): the headless
-# ISoftwareTracer gate — sphere tracing against SDFs (hit/miss/occlusion/normal).
-add_executable(software_tracer_tests
-    tests/SoftwareTracerTests.cpp
-    src/engine/sdk/SoftwareTracer.cpp
-)
-target_include_directories(software_tracer_tests PRIVATE
-    src/engine/public
-    src
-)
-target_link_libraries(software_tracer_tests PRIVATE vc_build_options glm)
-add_test(NAME software_tracer_tests COMMAND software_tracer_tests)
-
-# Public quality presets (Agente 1, task_plan A.16): the headless
-# IRenderingPresets gate — deterministic per-level budgets + all-or-nothing
-# validation across all rendering contracts.
-add_executable(rendering_presets_tests
-    tests/RenderingPresetsTests.cpp
-    src/engine/sdk/RenderingPresets.cpp
-)
-target_include_directories(rendering_presets_tests PRIVATE
-    src/engine/public
-    src
-)
-target_link_libraries(rendering_presets_tests PRIVATE vc_build_options glm)
-add_test(NAME rendering_presets_tests COMMAND rendering_presets_tests)
-
-# Public screen-space tracer (Agente 1, task_plan A.6): the headless
-# IScreenSpaceTracer gate — screen ray march, off-screen fallback, reprojection,
-# disocclusion, determinism.
-add_executable(screen_space_tracer_tests
-    tests/ScreenSpaceTracerTests.cpp
-    src/engine/sdk/ScreenSpaceTracer.cpp
-)
-target_include_directories(screen_space_tracer_tests PRIVATE
-    src/engine/public
-    src
-)
-target_link_libraries(screen_space_tracer_tests PRIVATE vc_build_options glm)
-add_test(NAME screen_space_tracer_tests COMMAND screen_space_tracer_tests)
-
-# Public debug-view data model (Agente 1, task_plan A.17): the headless
-# IRenderingDebugView gate — snapshot aggregation + deterministic JSON emitter.
-add_executable(rendering_debug_view_tests
-    tests/RenderingDebugViewTests.cpp
-    src/engine/sdk/RenderingDebugView.cpp
-)
-target_include_directories(rendering_debug_view_tests PRIVATE
-    src/engine/public
-    src
-)
-target_link_libraries(rendering_debug_view_tests PRIVATE vc_build_options glm)
-add_test(NAME rendering_debug_view_tests COMMAND rendering_debug_view_tests)
-
-# IRenderGraph gate — public Render Graph DAG core: topological compile,
-# hazards/barriers/lifetimes, cycle detection, and BIT-EXACT equivalence with
-# the internal RenderGraph (compiled in the probe TU with renamed helpers).
-add_executable(render_graph_core_tests
-    tests/RenderGraphCoreTests.cpp
-    tests/RenderGraphInternalProbe.cpp
-    src/engine/sdk/RenderGraphCore.cpp
-)
-target_include_directories(render_graph_core_tests PRIVATE
-    src/engine/public
-    src
-    tests
-)
-target_link_libraries(render_graph_core_tests PRIVATE vc_build_options glm)
-add_test(NAME render_graph_core_tests COMMAND render_graph_core_tests)
-
-# ISpirvReflection gate — SPIR-V reflection (descriptors/sets/push constants)
-# of a real module (embedded sample.spv), determinism, all-or-nothing refusals.
-add_executable(spirv_reflection_tests
-    tests/SpirvReflectionTests.cpp
-    src/engine/sdk/SpirvReflection.cpp
-    ${VC_SOLUTIONS_DIR}/spirv-reflect/spirv_reflect.cpp
-)
-target_include_directories(spirv_reflection_tests PRIVATE
-    src/engine/public
-    src
-    ${VC_SOLUTIONS_DIR}/spirv-reflect
-)
-target_link_libraries(spirv_reflection_tests PRIVATE vc_build_options glm)
-add_test(NAME spirv_reflection_tests COMMAND spirv_reflection_tests)
-
-# IAtmosphereScattering gate — analytic core of Bruneton's atmosphere model
-# (density profiles, optical length, spectral transmittance), physical
-# invariants + upstream golden values + determinism, all headless.
-add_executable(atmosphere_scattering_tests
-    tests/AtmosphereScatteringTests.cpp
-    src/engine/sdk/AtmosphereScattering.cpp
-    ${VC_SOLUTIONS_DIR}/atmospheric-scattering/atmosphere/reference/functions.cc
-)
-target_include_directories(atmosphere_scattering_tests PRIVATE
-    src/engine/public
-    src
-    ${VC_SOLUTIONS_DIR}/atmospheric-scattering
-    ${VC_SOLUTIONS_DIR}/atmospheric-scattering/external/dimensional_types
-)
-target_link_libraries(atmosphere_scattering_tests PRIVATE vc_build_options)
-add_test(NAME atmosphere_scattering_tests COMMAND atmosphere_scattering_tests)
-
-# IRenderPassMetrics gate — renderer telemetry producer (passes/GPU/memory/
-# streaming), deterministic windows + p95/p99 + JSON, refusals, determinism.
-add_executable(render_pass_metrics_tests
-    tests/RenderPassMetricsTests.cpp
-    src/engine/sdk/RenderPassMetrics.cpp
-)
-target_include_directories(render_pass_metrics_tests PRIVATE src/engine/public src)
-target_link_libraries(render_pass_metrics_tests PRIVATE vc_build_options)
-add_test(NAME render_pass_metrics_tests COMMAND render_pass_metrics_tests)
-
-# IKtx2Transcoder gate — CPU KTX2/Basis decode (promoted ktx-software).
-# The vendored basisu_transcoder.cpp is compiled WITHOUT Zstd support
-# (BASISD_SUPPORT_KTX2_ZSTD=0) so the gate stays self-contained; the supported
-# surface is the ETC1S/UASTC arithmetic payloads (the common GPU path).
-set_source_files_properties(
-    ${VC_SOLUTIONS_DIR}/ktx-software/external/basis_universal/transcoder/basisu_transcoder.cpp
-    PROPERTIES COMPILE_DEFINITIONS "BASISD_SUPPORT_KTX2_ZSTD=0"
-)
-add_executable(ktx2_transcoder_tests
-    tests/Ktx2TranscoderTests.cpp
-    src/engine/sdk/Ktx2Transcoder.cpp
-    ${VC_SOLUTIONS_DIR}/ktx-software/external/basis_universal/transcoder/basisu_transcoder.cpp
-)
-target_include_directories(ktx2_transcoder_tests PRIVATE
-    src/engine/public
-    src
-    ${VC_SOLUTIONS_DIR}/ktx-software/external/basis_universal/transcoder
-)
-target_link_libraries(ktx2_transcoder_tests PRIVATE vc_build_options)
-add_test(NAME ktx2_transcoder_tests COMMAND ktx2_transcoder_tests)
 
 add_executable(voxel_box_merger_tests
     tests/VoxelBoxMergerTests.cpp
@@ -1176,6 +877,9 @@ add_executable(engine_foundation_tests
     third_party/miniz.c
     third_party/ufbx.c
     src/engine/sdk/MotionDatabase.cpp
+    # UndoSystem (interno) delega ao contrato IUndoHistory (findings #216) —
+    # o target precisa do adapter para linkar create_undo_history (discovery #236).
+    src/engine/sdk/UndoHistory.cpp
 )
 target_link_libraries(engine_foundation_tests PRIVATE vc_build_options vc_ozz vc_acl)
 add_test(NAME engine_foundation_tests COMMAND engine_foundation_tests)
@@ -1705,6 +1409,86 @@ target_include_directories(gizmo_controller_tests PRIVATE
 target_link_libraries(gizmo_controller_tests PRIVATE vc_build_options)
 add_test(NAME gizmo_controller_tests COMMAND gizmo_controller_tests)
 
+# Publish pipeline (plano agente 2 §C): build stage machine with valid
+# transitions only and deterministic JSON. Headless gate.
+add_executable(publish_pipeline_tests
+    tests/PublishPipelineTests.cpp
+    src/engine/sdk/PublishPipeline.cpp
+)
+target_include_directories(publish_pipeline_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(publish_pipeline_tests PRIVATE vc_build_options)
+add_test(NAME publish_pipeline_tests COMMAND publish_pipeline_tests)
+
+# Inspector doc (plano agente 2 §C): semantic component/group model with
+# typed property descriptors and deterministic JSON. Headless gate.
+add_executable(inspector_doc_tests
+    tests/InspectorDocTests.cpp
+    src/engine/sdk/InspectorDoc.cpp
+)
+target_include_directories(inspector_doc_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(inspector_doc_tests PRIVATE vc_build_options)
+add_test(NAME inspector_doc_tests COMMAND inspector_doc_tests)
+
+# Scene hierarchy (plano agente 2 §B): deterministic flat scene tree with
+# stable DFS order, depth and case-insensitive name search. Headless gate.
+add_executable(scene_hierarchy_tests
+    tests/SceneHierarchyTests.cpp
+    src/engine/sdk/SceneHierarchy.cpp
+)
+target_include_directories(scene_hierarchy_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(scene_hierarchy_tests PRIVATE vc_build_options)
+add_test(NAME scene_hierarchy_tests COMMAND scene_hierarchy_tests)
+
+# Onboarding tour (plano agente 2 §C): deterministic tutorial step machine
+# (start/next/skip/complete/reset/dismiss, all-or-nothing refusals). Headless gate.
+add_executable(onboarding_tour_tests
+    tests/OnboardingTourTests.cpp
+    src/engine/sdk/OnboardingTour.cpp
+)
+target_include_directories(onboarding_tour_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(onboarding_tour_tests PRIVATE vc_build_options)
+add_test(NAME onboarding_tour_tests COMMAND onboarding_tour_tests)
+
+# Animation timeline editor (plano agente 2 §B l.33): deterministic timeline
+# document model (duration/playhead/loop/tracks/keys, all-or-nothing refusals).
+# Headless gate.
+add_executable(animation_timeline_editor_tests
+    tests/AnimationTimelineEditorTests.cpp
+    src/engine/sdk/AnimationTimelineEditor.cpp
+)
+target_include_directories(animation_timeline_editor_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(animation_timeline_editor_tests PRIVATE vc_build_options)
+add_test(NAME animation_timeline_editor_tests COMMAND animation_timeline_editor_tests)
+
+# Project launcher (plano agente 2 §C l.66): deterministic project-launcher
+# session model (hub mode / open project / open scene / dirty / recents).
+# Headless gate.
+add_executable(project_launcher_tests
+    tests/ProjectLauncherTests.cpp
+    src/engine/sdk/ProjectLauncher.cpp
+)
+target_include_directories(project_launcher_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(project_launcher_tests PRIVATE vc_build_options)
+add_test(NAME project_launcher_tests COMMAND project_launcher_tests)
+
 # Steering behaviors (agente 4 §3 item 3): forças de Reynolds puras e
 # determinísticas (seek/flee/arrive/pursue/separation/alignment/cohesion/
 # obstacle_avoidance/blend) — contrato self-contained std, gate headless
@@ -2118,20 +1902,175 @@ target_include_directories(anim_budget_tests PRIVATE
 target_link_libraries(anim_budget_tests PRIVATE vc_build_options glm)
 add_test(NAME anim_budget_tests COMMAND anim_budget_tests)
 
-# Explosion (agente 4 §5 item 58, CORE): blast determinístico com falloff
+# Explosion CORE (agente 4 §5 item 58, blast determinístico): falloff
 # (1 − d/r)^power + fragmentos por seed (xorshift32) — 1º contrato do domínio
-# engine/physics, contrato self-contained std, JSON bit-exact all-or-nothing.
-add_executable(explosion_tests
-    tests/ExplosionTests.cpp
+# engine/physics, self-contained std, JSON bit-exact all-or-nothing.
+# (NOTA: nome único explosion_core_tests — o target explosion_tests pertence
+# à integração do AGENT-2 em tests/ExplosionTests.cpp.)
+add_executable(explosion_core_tests
+    tests/ExplosionCoreTests.cpp
     src/engine/sdk/RegistryJson.cpp
     src/engine/sdk/Explosion.cpp
 )
-target_include_directories(explosion_tests PRIVATE
+target_include_directories(explosion_core_tests PRIVATE
     src/engine/public
     src
 )
-target_link_libraries(explosion_tests PRIVATE vc_build_options glm)
-add_test(NAME explosion_tests COMMAND explosion_tests)
+target_link_libraries(explosion_core_tests PRIVATE vc_build_options glm)
+add_test(NAME explosion_core_tests COMMAND explosion_core_tests)
+
+# Replay determinístico (agente 4 §5 item 60): gravação de (tick, seed,
+# inputs) por frame + reprodução bit-exact na ordem gravada, seek/trim,
+# limite de frames e JSON bit-exact all-or-nothing — self-contained std.
+add_executable(replay_tests
+    tests/ReplayTests.cpp
+    src/engine/sdk/Replay.cpp
+)
+target_include_directories(replay_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(replay_tests PRIVATE vc_build_options glm)
+add_test(NAME replay_tests COMMAND replay_tests)
+
+# Character controller (agente 4 §4 item 54, CORE): resolução cinemática de
+# movimento sobre terreno — step-up/step-down/snap, projeção de inclinação,
+# água (arrasto + flutuação) — self-contained std, determinístico.
+add_executable(character_controller_tests
+    tests/CharacterControllerTests.cpp
+    src/engine/sdk/CharacterController.cpp
+)
+target_include_directories(character_controller_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(character_controller_tests PRIVATE vc_build_options glm)
+add_test(NAME character_controller_tests COMMAND character_controller_tests)
+
+# Hit reaction (agente 4 §4 item 48, CORE): modelo determinístico de
+# knockback/stagger/down/recovery — self-contained std, sem física.
+add_executable(hit_reaction_tests
+    tests/HitReactionTests.cpp
+    src/engine/sdk/HitReaction.cpp
+)
+target_include_directories(hit_reaction_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(hit_reaction_tests PRIVATE vc_build_options glm)
+add_test(NAME hit_reaction_tests COMMAND hit_reaction_tests)
+
+# Balance (agente 4 §4 item 47, equilíbrio): fecho convexo do suporte +
+# CoM dentro/na borda/fora com correção tornozelo/quadril determinística —
+# self-contained std.
+add_executable(balance_tests
+    tests/BalanceTests.cpp
+    src/engine/sdk/Balance.cpp
+)
+target_include_directories(balance_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(balance_tests PRIVATE vc_build_options glm)
+add_test(NAME balance_tests COMMAND balance_tests)
+
+# Hierarchical pathfinding (agente 4 §4 item 26, CORE): A* de 2 níveis sobre
+# regiões (abstrato + concreto nos extremos) — self-contained std.
+add_executable(hierarchical_path_tests
+    tests/HierarchicalPathTests.cpp
+    src/engine/sdk/HierarchicalPath.cpp
+)
+target_include_directories(hierarchical_path_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(hierarchical_path_tests PRIVATE vc_build_options glm)
+add_test(NAME hierarchical_path_tests COMMAND hierarchical_path_tests)
+
+# Agent capabilities (agente 4 §4 itens 25/28, CORE): perfil de agente com
+# capacidades walk/jump/climb/swim/fly + verificação determinística de
+# trecho — self-contained std.
+add_executable(agent_capabilities_tests
+    tests/AgentCapabilitiesTests.cpp
+    src/engine/sdk/AgentCapabilities.cpp
+)
+target_include_directories(agent_capabilities_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(agent_capabilities_tests PRIVATE vc_build_options glm)
+add_test(NAME agent_capabilities_tests COMMAND agent_capabilities_tests)
+
+# Gameplay events (agente 4 §5 item 65, CORE): fila FIFO determinística de
+# eventos para hooks visuais/sonoros sem acoplar — self-contained std.
+add_executable(gameplay_events_tests
+    tests/GameplayEventsTests.cpp
+    src/engine/sdk/GameplayEvents.cpp
+)
+target_include_directories(gameplay_events_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(gameplay_events_tests PRIVATE vc_build_options glm)
+add_test(NAME gameplay_events_tests COMMAND gameplay_events_tests)
+
+# Effect stacks (agente 4 §5 item 64, stacking): modelo determinístico de
+# efeitos acumuláveis (apply/refresh/tick/clear) — self-contained std.
+add_executable(effect_stacks_tests
+    tests/EffectStacksTests.cpp
+    src/engine/sdk/EffectStacks.cpp
+)
+target_include_directories(effect_stacks_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(effect_stacks_tests PRIVATE vc_build_options glm)
+add_test(NAME effect_stacks_tests COMMAND effect_stacks_tests)
+
+# Ragdoll asset (agente 4 §4 item 55, CORE do asset configurável): skeleton
+# data-driven (joints/limits/drives/auto-balance/blend) em JSON versionado
+# all-or-nothing bit-exact + build_bones p/ o RagdollBone público do runtime
+# — self-contained std (RegistryJson p/ o parser).
+add_executable(ragdoll_asset_tests
+    tests/RagdollAssetTests.cpp
+    src/engine/sdk/RagdollAsset.cpp
+    src/engine/sdk/RegistryJson.cpp
+)
+target_include_directories(ragdoll_asset_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(ragdoll_asset_tests PRIVATE vc_build_options glm)
+add_test(NAME ragdoll_asset_tests COMMAND ragdoll_asset_tests)
+
+# Async query scheduler (agente 4 §2 item 27, CORE): fila de consultas
+# assíncronas com prioridade (maior vence, FIFO em empate), timeout no
+# relógio do scheduler e despacho por frame com orçamento (greedy) —
+# self-contained std, sem navmesh/threads (o chamador roda o lote).
+add_executable(async_query_scheduler_tests
+    tests/AsyncQuerySchedulerTests.cpp
+    src/engine/sdk/AsyncQueryScheduler.cpp
+)
+target_include_directories(async_query_scheduler_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(async_query_scheduler_tests PRIVATE vc_build_options)
+add_test(NAME async_query_scheduler_tests COMMAND async_query_scheduler_tests)
+
+# Gameplay metrics (agente 4 §2 item 30, CORE): registro de métricas de
+# gameplay nomeadas (counter/gauge/sample) com snapshot determinístico e
+# JSON — self-contained std, sem depender do profiler de frame.
+add_executable(gameplay_metrics_tests
+    tests/GameplayMetricsTests.cpp
+    src/engine/sdk/GameplayMetrics.cpp
+)
+target_include_directories(gameplay_metrics_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(gameplay_metrics_tests PRIVATE vc_build_options)
+add_test(NAME gameplay_metrics_tests COMMAND gameplay_metrics_tests)
 
 # Mission/dialogue assets (FALTANTES item 23 "missões e diálogos"): a mission
 # is a data-driven JSON asset (objectives, dialogue graph, unlock conditions,
