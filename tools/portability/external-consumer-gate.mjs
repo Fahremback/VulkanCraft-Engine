@@ -210,7 +210,20 @@ function main() {
         exe: "advanced_consumer.exe",
         markers: ["advanced-consumer-ok worlds", "advanced-consumer-ok portal",
           "advanced-consumer-ok gameplay", "advanced-consumer-ok all"],
-        label: "advanced (worlds + portal + gameplay)" }
+        label: "advanced (worlds + portal + gameplay)" },
+      // AGENT-5 (2026-08-26, findings #159): the META S32 content-pipeline
+      // differentials (TimelineGraph/CausalResolver/MacroMicroReconciler/
+      // WorldDirector/EpisodeCompiler/HeadlessSimulationFarm/SemanticEngineAPI)
+      // claim "self-contained std" but no consumer compiled them against the
+      // INSTALLED SDK. This consumer compiles + runs all seven through their
+      // public contracts only.
+      { template: "external-project-differentials",
+        exe: "differentials_consumer.exe",
+        markers: ["differentials-consumer-ok timeline", "differentials-consumer-ok causal",
+          "differentials-consumer-ok reconciler", "differentials-consumer-ok director",
+          "differentials-consumer-ok semantic", "differentials-consumer-ok episode-farm",
+          "differentials-consumer-ok all"],
+        label: "differentials (S32 content pipeline)" }
     ];
     const allConsumerBuilds = [];
     for (const spec of consumers) {

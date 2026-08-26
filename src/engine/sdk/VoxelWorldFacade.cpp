@@ -2339,6 +2339,11 @@ public:
 #endif
 
     bool save_world(const std::string& filePath, std::string& errorOut) override {
+        // SDK convention: clear the diagnostic buffer at entry so a stale
+        // error from a previous failed call can never poison a caller that
+        // reuses the buffer and checks `!errorOut.empty()` after a successful
+        // save (false-negative; same bug class as json_parse — #153).
+        errorOut.clear();
         if (storage_ && storage_->supports_regions()) {
             return save_world_regions(filePath, errorOut);
         }

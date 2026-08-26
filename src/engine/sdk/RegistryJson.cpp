@@ -40,6 +40,11 @@ std::uint64_t fnv1a(const std::string& text, std::uint64_t seed) {
 }  // namespace
 
 bool json_parse(const std::string& text, JsonValue& out, std::string& errorOut) {
+    // SDK convention: clear the diagnostic buffer at entry so a stale error
+    // from a previous failed call can never poison a caller that reuses the
+    // buffer and checks `!errorOut.empty()` after a successful parse
+    // (false-negative; see findings #152 — same bug class as #140/#142/#145).
+    errorOut.clear();
     std::size_t pos = 0;
     const std::size_t length = text.size();
     int line = 1;

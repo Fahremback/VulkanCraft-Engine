@@ -6,26 +6,32 @@
 # ---- Jolt Physics ----
 set(PHYSICS_REPO_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/jolt)
 include(${CMAKE_CURRENT_SOURCE_DIR}/jolt/Jolt/Jolt.cmake)
+# The vendored Jolt.cmake creates a `Jolt` target that the engine does NOT
+# link (the engine builds Jolt once as its own target below, with its own
+# compile definitions). Left as-is it would (a) write Jolt.lib racing the
+# engine's target and (b) generate Jolt.vcxproj whose name case-collides with
+# the engine target's project in the .slnx (MSB4025). Nothing links Jolt::Jolt,
+# so keep the vendored target out of the default build and give it a distinct
+# output name; the engine target remains the sole producer of Jolt.lib.
+set_target_properties(Jolt PROPERTIES
+    OUTPUT_NAME JoltVendored
+    EXCLUDE_FROM_ALL TRUE
+)
 set(JOLT_CPP_SOURCES)
 foreach(source IN LISTS JOLT_PHYSICS_SRC_FILES)
     if(source MATCHES "\\.cpp$")
         list(APPEND JOLT_CPP_SOURCES ${source})
     endif()
 endforeach()
-# The target is named vulkan_jolt (NOT jolt): the vendored Jolt.cmake above
-# creates add_library(Jolt ...) which on Windows generates third_party/Jolt.vcxproj;
-# a target named jolt would generate third_party/jolt.vcxproj — case-insensitive
-# collision in the .slnx (MSB4025 duplicate item). The engine target is distinct;
-# OUTPUT_NAME stays Jolt so the installed archive remains lib/Jolt.lib.
-add_library(vulkan_jolt STATIC ${JOLT_CPP_SOURCES})
-target_include_directories(vulkan_jolt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/jolt)
-target_compile_features(vulkan_jolt PRIVATE cxx_std_17)
-target_compile_definitions(vulkan_jolt PRIVATE
+add_library(jolt STATIC ${JOLT_CPP_SOURCES})
+target_include_directories(jolt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/jolt)
+target_compile_features(jolt PRIVATE cxx_std_17)
+target_compile_definitions(jolt PRIVATE
     $<$<CONFIG:Debug>:JPH_ENABLE_ASSERTS=1>
     $<$<NOT:$<CONFIG:Debug>>:JPH_ENABLE_ASSERTS=0>
 )
 if(MSVC)
-    target_compile_options(vulkan_jolt PRIVATE /w)
+    target_compile_options(jolt PRIVATE /w)
 endif()
 
 # ---- Bullet (amalgamated) ----

@@ -319,13 +319,9 @@ int test_registries() {
     // Item registry: load from JSON.
     engine::registry::ItemRegistry items;
     CHECK(items.load_from_json(
-        R"([
-          {"namespace":"test","name":"ruby","maxStack":64,"tags":["gem"]},
-          {"namespace":"test","name":"iron_ingot","maxStack":64},
+        R"([          {"namespace":"test","name":"ruby","maxStack":64,"tags":["gem"]},          {"namespace":"test","name":"iron_ingot","maxStack":64},
           {"namespace":"test","name":"pickaxe","maxStack":1,"durability":250,"tags":["tool","pickaxe"]}
-        ])",
-        error));
-    CHECK(error.empty());
+        ])",        error));    CHECK(error.empty());
     CHECK(items.size() == 3);
     const engine::registry::ItemDefinition* rubyItem = items.find_by_name("test:ruby");
     CHECK(rubyItem != nullptr);
@@ -346,22 +342,16 @@ int test_inventory_crafting() {
     engine::registry::ItemRegistry items;
     std::string error;
     CHECK(items.load_from_json(
-        R"([
-          {"namespace":"test","name":"cobblestone","maxStack":64,"tags":["stone"]},
-          {"namespace":"test","name":"stick","maxStack":64,"tags":["stick"]},
+        R"([          {"namespace":"test","name":"cobblestone","maxStack":64,"tags":["stone"]},          {"namespace":"test","name":"stick","maxStack":64,"tags":["stick"]},
           {"namespace":"test","name":"log","maxStack":64},
           {"namespace":"test","name":"plank","maxStack":64},
           {"namespace":"test","name":"iron_pickaxe","maxStack":1,"durability":250}
-        ])",
-        error));
-    CHECK(error.empty());
+        ])",        error));    CHECK(error.empty());
 
     // Load recipes from JSON.
     engine::registry::RecipeRegistry recipes(&items);
     CHECK(recipes.load_from_json(
-        R"({
-          "namespace":"test",
-          "recipes":[
+        R"({          "namespace":"test",          "recipes":[
             {"name":"plank_from_log","inputs":[{"item":"test:log","count":1}],
              "outputs":[{"item":"test:plank","count":4}]},
             {"name":"stick_from_plank","inputs":[{"item":"test:plank","count":2}],
@@ -370,9 +360,7 @@ int test_inventory_crafting() {
              "inputs":[{"item":"test:stick","count":2},{"item":"test:cobblestone","count":3}],
              "outputs":[{"item":"test:iron_pickaxe","count":1}]}
           ]
-        })",
-        error));
-    CHECK(error.empty());
+        })",        error));    CHECK(error.empty());
     CHECK(recipes.size() == 3);
 
     // Set up inventory with crafting materials.
@@ -419,49 +407,31 @@ int test_inventory_crafting() {
 // --- World profile + structure placement (data-driven biomes/structures) ---
 int test_world_profile() {
     using namespace engine::procgen;
-
-    // Create a world profile from JSON — height, climate, caves, ores, structures.
     std::string error;
     auto profile = create_world_profile_from_json(
         R"({
-          "version": 1,
-          "height": {"noiseType":"simplex","seed":42,"frequency":0.01},
-          "baseHeight": 131, "amplitude": 4,
-          "climate": {
-            "temperature": {"noiseType":"simplex","seed":43,"frequency":0.005},
-            "moisture": {"noiseType":"simplex","seed":44,"frequency":0.005}
-          },
-          "biomes": {
-            "biomes": [
-              {"id":"plains","temperature":[0.3,0.7],"moisture":[0.2,0.6],"surface":3,"under":2},
-              {"id":"desert","temperature":[0.7,1.0],"moisture":[0.0,0.3],"surface":12,"under":2}
-            ]
-          },
-          "caves": {"density":{"noiseType":"simplex","seed":45,"frequency":0.02},"scale":1.0,"offset":0.0},
-          "ores": {"density":{"noiseType":"simplex","seed":46,"frequency":0.03},"scale":1.0,"offset":0.0,
-                   "table":{"ores":[{"block":18,"minY":0,"maxY":64,"threshold":0.7,"noise":"density"}]}},
-          "structures": {
-            "definitions": [{
-              "id":"test:house",
-              "spec":{"sampleWidth":4,"sampleHeight":3,"patternSize":2,"seed":99,
-                      "sample":[1,1,1,1,1,2,2,1,1,1,1,1],
-                      "profiles":[{"block":3,"layers":[3,3,3]},{"block":5,"layers":[5]}]},
-              "sockets":[{"name":"door","position":[0,1,0],"facing":0,"connectTag":"door"}]
-            }],
-            "rules": [{"structureId":"test:house","biomes":["plains"],"minSurfaceHeight":128,"maxSurfaceHeight":140,"density":1.0,"spacing":8,"yOffset":1}]
-          }
-        })", error);
-    CHECK(profile != nullptr);
-    CHECK(error.empty());
-
-    // Profile composes a generator and a structure placement system.
+  "version": 1,
+  "height": {"version":1,"seed":2026,"root":1,"nodes":[{"type":"perlin","params":[0.05,0.0],"sources":[]},{"type":"fbm","params":[4,0.5,2.0,0.0],"sources":[0]}]},
+  "baseHeight": 131, "amplitude": 4,
+  "climate": {"temperature": {"version":1,"seed":43,"root":0,"nodes":[{"type":"constant","params":[0.5],"sources":[]}]},"moisture": {"version":1,"seed":44,"root":0,"nodes":[{"type":"constant","params":[0.3],"sources":[]}]}},
+  "biomes": {"version":1,"biomes":[{"name":"plains_rule","engineBiomeIndex":0,"climate":{"temperature":[0.25,0.75],"moisture":[0.0,0.6]},"surface":[{"blockId":3,"minDepth":0,"maxDepth":0}]},{"name":"desert_rule","engineBiomeIndex":1,"climate":{"temperature":[0.75,1.0],"moisture":[-1.0,0.3]},"surface":[{"blockId":12,"minDepth":0,"maxDepth":0}]}]},
+  "caves": {"density":{"version":1,"seed":45,"root":0,"nodes":[{"type":"constant","params":[0.0],"sources":[]}]}},
+  "ores": {"density":{"version":1,"seed":46,"root":0,"nodes":[{"type":"constant","params":[0.0],"sources":[]}]},"table":{"version":1,"rules":[{"blockId":18,"minDensity":0.7,"maxDensity":0.8,"minY":10,"maxY":120}]}},
+  "carver": {"version":1,"fluidMaxY":60,"fluidBlockId":12},
+  "decorators": {"version":1,"decorators":[]},
+  "structures": {"version":1,"definitions":[{"id":"test:house","outputWidth":8,"outputHeight":6,"spec":{"version":1,"sampleWidth":4,"sampleHeight":3,"patternSize":2,"symmetry":1,"periodicOutput":false,"ground":false,"seed":99,"sample":[1,1,1,1,1,2,2,1,1,1,1,1],"profiles":[{"blockId":3,"layers":[3,3,3]},{"blockId":5,"layers":[5]}]},"sockets":[{"name":"door","position":[0,1,0],"facing":0,"connectTag":"door"}]}],"rules":[{"structureId":"test:house","biomes":["plains_rule"],"density":1.0,"spacing":8,"yOffset":1,"seedOffset":0}]}
+})", error);
+    if (!profile) {
+        std::cerr << "PROFILE CREATE ERROR: " << error << "\n";
+        return 1;
+    }
     auto gen = profile->generator();
     CHECK(gen != nullptr);
     auto placement = profile->structure_placement();
     CHECK(placement != nullptr);
     CHECK(placement->definition("test:house") != nullptr);
-
-    // Deterministic round-trip: serialize -> parse -> re-serialize is byte-identical.
+    CHECK(placement->definition("test:house")->sockets.size() == 1);
+    CHECK(placement->rules().size() == 1);
     std::string json1;
     CHECK(profile->serialize(json1));
     CHECK(!json1.empty());
@@ -470,9 +440,8 @@ int test_world_profile() {
     std::string json2;
     CHECK(roundtrip->serialize(json2));
     CHECK(json1 == json2);
-    // Plan region using flat-world functions (surface 131, biome "plains").
     const auto surfaceAt = [](int, int) { return 131; };
-    const auto biomeAt = [](int, int) { return std::string("plains"); };
+    const auto biomeAt = [](int, int) { return std::string("plains_rule"); };
     std::vector<StructurePlacement> plan;
     CHECK(placement->plan_region(
         { placement->rules()[0] }, 0, 0, 2, 2,
@@ -481,8 +450,6 @@ int test_world_profile() {
     CHECK(plan.size() > 0);
     CHECK(plan[0].structureId == "test:house");
     CHECK(plan[0].origin.y > 0);
-
-    // place_structure writes blocks atomically into a world.
     auto world = engine::voxel::create_default_voxel_world();
     CHECK(world != nullptr);
     const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
@@ -491,8 +458,7 @@ int test_world_profile() {
     while (!world->is_chunk_loaded(0, 0)) {
         if (std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - bstart).count() > 20000) {
-            std::cerr << "world profile: boot timed out
-";
+            std::cerr << "world profile: boot timed out\n";
             return 1;
         }
         world->update(player, 1.0f / 60.0f);
@@ -503,8 +469,6 @@ int test_world_profile() {
     CHECK(placeErr.empty());
     const auto& origin = plan[0].origin;
     CHECK(world->get_block(origin.x, origin.y, origin.z) != 0);
-    CHECK(world->get_block(origin.x, origin.y, origin.z) != 0);
-
     std::cout << "advanced-consumer-ok world-profile\n";
     return 0;
 }

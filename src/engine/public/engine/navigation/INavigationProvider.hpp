@@ -83,6 +83,20 @@ struct PathResult {
     uint64_t revision{ 0 };        // navmesh revision that produced the path
 };
 
+// Lifecycle of an asynchronous path request (FALTANTES item 12 — async and
+// cancellable queries). Queued -> Running -> Succeeded | Failed | Cancelled.
+// A request cancelled via cancel_async_path is guaranteed to reach Cancelled
+// before cancel_async_path returns (join semantics — see the provider).
+// Invalid = the request id is unknown to the provider.
+enum class PathRequestStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Invalid,
+};
+
 // A dynamic obstacle (FALTANTES item 12 — doors, platforms, moving
 // obstacles): a named set of solid voxel columns whose footprint blocks the
 // navmesh while ACTIVE and is passable while INACTIVE. Toggling an obstacle
@@ -96,6 +110,25 @@ struct DynamicObstacle {
     // terrain columns at the same grid positions (blocking); while INACTIVE
     // the terrain columns are restored (passable).
     std::vector<VoxelColumn> columns;
+};
+
+// An off-mesh link (FALTANTES item 12 — jump/climb): a point-to-point edge
+// in the navigation graph that is NOT part of the walkable surface — a jump
+// across a gap, a climb up a ledge, a ladder. Traversing a link teleports the
+// agent from start to end in one step (both endpoints must be near a walkable
+// poly within `radius` horizontally and agentMaxClimb vertically). Links are
+// baked into the tile that contains their midpoint (tiled mode), so setting
+// links re-bakes only the affected tiles; the result is equivalent to baking
+// the links with build() from the start.
+struct OffMeshLink {
+    float startX{ 0.0f };
+    float startY{ 0.0f };
+    float startZ{ 0.0f };
+    float endX{ 0.0f };
+    float endY{ 0.0f };
+    float endZ{ 0.0f };
+    float radius{ 0.5f };  // horizontal snap radius around each endpoint
+    bool bidirectional{ true };  // false = only start -> end
 };
 
 class INavigationProvider {
@@ -176,6 +209,49 @@ public:
 
     // Current cost multiplier of a surface cost area (1.0 when never set).
     virtual float area_cost(int area) const = 0;
+
+    // Replaces the off-mesh links of the navmesh (FALTANTES item 12 — jump/
+    // climb): each link is baked into the tile containing its midpoint and
+    // ONLY the overlapping tiles are re-baked (tiled mode). A path that
+    // cannot cross a gap/wall without a link becomes routable once the link
+    // exists. Refused with a diagnostic in single-navmesh mode, before
+    // build(), for a non-finite endpoint, a non-positive/non-finite radius,
+    // or when a tile bake fails (all-or-nothing: the previous link set is
+    // preserved). Links are independent of the column set — obstacles and
+    // terrain updates do not clear them.
+    virtual bool set_off_mesh_links(const std::vector<OffMeshLink>& links,
+                                    std::string& errorOut) = 0;
+
+    // Asynchronous and cancellable path queries (FALTANTES item 12): the
+    // query runs on the provider's background worker, so the caller never
+    // blocks. The result of a Succeeded request is bit-identical to
+    // find_path for the same points at the same navmesh revision.
+    //
+    // begin_async_path enqueues the request and returns its id (0 with a
+    // diagnostic when refused: before build(), non-finite points, or no
+    // worker available). poll_async_path returns the current status and
+    // fills `out` only on Succeeded (and `errorOut` on Failed); it never
+    // blocks. cancel_async_path marks the request cancelled and BLOCKS
+    // until it reaches a terminal state — after it returns, poll reports
+    // Cancelled (join semantics, no race); returns false for an unknown id.
+    // Requests are processed in FIFO order; a cancelled request that is
+    // still queued is dropped without running. Terrain edits, obstacle
+    // toggles and link changes serialize with in-flight queries, so a query
+    // never observes a half-swapped tile. The provider joins its worker in
+    // the destructor.
+    virtual uint64_t begin_async_path(float startX, float startY,
+                                      float startZ, float goalX, float goalY,
+                                      float goalZ, std::string& errorOut) = 0;
+
+    // Non-blocking status check; fills `out` only on Succeeded (and
+    // `errorOut` on Failed). Invalid for an unknown request id.
+    virtual PathRequestStatus poll_async_path(uint64_t requestId,
+                                              PathResult& out,
+                                              std::string& errorOut) = 0;
+
+    // Cancels a request with join semantics (see begin_async_path); false
+    // for an unknown request id.
+    virtual bool cancel_async_path(uint64_t requestId) = 0;
 };
 
 // Recast + Detour-backed implementation (the only TU with Recast headers).

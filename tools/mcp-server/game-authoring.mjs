@@ -37,6 +37,53 @@ export const SCRIPT_NODE_KINDS = Object.freeze([
   "Function", "FunctionCall", "Log", "Scope", "ScopeEnd"
 ]);
 
+// Per-kind required fields, mirroring what the real ScriptCompiler produces a
+// MEANINGFUL program from (ScriptRuntime.cpp): an Event/Function without a
+// name registers eventEntries[""] (never dispatched by start_event); a
+// Get/SetVariable without a variable reads/writes the "" slot; a Constant*
+// without a literal pushes an empty value; a Wait without a literal never
+// waits (execute_one reads the duration only from a double). All-or-nothing:
+// refuse instead of emitting a dead node the runtime would silently ignore.
+export const SCRIPT_NODE_REQUIRED_FIELDS = Object.freeze({
+  Event: ["event"], Function: ["event"],
+  GetVariable: ["variable"], SetVariable: ["variable"],
+  ConstantFloat: ["literal"], ConstantInteger: ["literal"], ConstantBoolean: ["literal"],
+  Wait: ["literal"]
+});
+
+// Engine literal semantics (ScriptRuntime.cpp): the literal TYPE follows the
+// node kind — ConstantFloat/Wait carry doubles, ConstantInteger int64,
+// ConstantBoolean bool (script_value_to_json emits type "float"/"int"/"bool").
+// A JS number is always a float semantically; emitting {type:"int"} for 1.0
+// (Number.isInteger(1.0) is true) makes the VM store an int64 (observable type
+// drift vs the engine's own authoring) and — worse — makes a Wait node a silent
+// no-op, since execute_one only honors a double operand. Coerce/validate per kind.
+export const SCRIPT_LITERAL_KINDS = Object.freeze({
+  ConstantFloat: "float", Wait: "float", ConstantInteger: "int", ConstantBoolean: "bool"
+});
+
+export function scriptLiteralForKind(kind, value) {
+  const expected = SCRIPT_LITERAL_KINDS[kind];
+  if (!expected) return literalToEngineJson(value);
+  if (value && typeof value === "object" && ["bool", "int", "float", "string", "uuid"].includes(value.type)) {
+    if (value.type !== expected) throw new Error(`script literal type '${value.type}' does not match ${kind} (expected '${expected}')`);
+    return value;
+  }
+  if (expected === "float") {
+    if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${kind} requires a finite number literal`);
+    return { type: "float", value };
+  }
+  if (expected === "int") {
+    if (typeof value !== "number" || !Number.isInteger(value)) throw new Error(`${kind} requires an integer literal`);
+    return { type: "int", value };
+  }
+  if (expected === "bool") {
+    if (typeof value !== "boolean") throw new Error(`${kind} requires a boolean literal`);
+    return { type: "bool", value };
+  }
+  return literalToEngineJson(value);
+}
+
 // Registry asset kinds the MCP authors (FALTANTES item 23 / prioridade 5). Each
 // document mirrors EXACTLY the versioned JSON the public C++ registries parse
 // (BlockRegistry/ItemRegistry/FluidRegistry/RecipeRegistry in
@@ -2192,12 +2239,20 @@ function createVisualScript(engineRoot, args) {
   const nodes = args.nodes.map((node) => {
     if (keys.has(node.key)) throw new Error(`duplicate script node key '${node.key}'`);
     if (!SCRIPT_NODE_KINDS.includes(node.kind)) throw new Error(`unsupported script node kind '${node.kind}'`);
+    for (const field of SCRIPT_NODE_REQUIRED_FIELDS[node.kind] ?? []) {
+      const value = node[field];
+      const empty = value === undefined || (typeof value === "string" && value.length === 0);
+      if (empty) throw new Error(`script node '${node.key}' (${node.kind}) requires a non-empty '${field}'`);
+    }
     const id = uuid();
     keys.set(node.key, id);
     const result = { id, kind: node.kind };
     if (node.event !== undefined) result.event = String(node.event);
     if (node.variable !== undefined) result.variable = String(node.variable);
-    if (node.literal !== undefined) result.literal = literalToEngineJson(node.literal);
+    if (node.literal !== undefined) {
+      try { result.literal = scriptLiteralForKind(node.kind, node.literal); }
+      catch (error) { throw new Error(`script node '${node.key}' (${node.kind}) ${error.message}`); }
+    }
     return result;
   });
   const links = args.links.map((link) => {
@@ -2207,8 +2262,31 @@ function createVisualScript(engineRoot, args) {
   const document = { id: uuid(), name: scriptName, nodes, links };
   const directory = args.scene_companion ? project.scenes : project.scripts;
   const file = path.join(directory, `${scriptName}.script`);
+  const existed = fs.existsSync(file);
+  const previous = existed ? readJson(file) : null;
   atomicWriteJson(file, document);
-  return { created: true, project: project.project, script: scriptName, path: path.relative(project.root, file).replaceAll(path.sep, "/"), node_ids: Object.fromEntries(keys), nodes: nodes.length, links: links.length };
+  // Runtime honesty (main_game.cpp setupGameplay): the demo game/editor auto-load
+  // ONLY Content/Scenes/Initial.script and Content/Initial.script (hardcoded).
+  // scene_companion + name "Initial" matches that convention; anything else is a
+  // library asset the runtime does not auto-load — say so instead of implying it runs.
+  const runtimeLoads = args.scene_companion === true && scriptName === "Initial";
+  const location = args.scene_companion ? "scene_companion" : "library";
+  return {
+    created: true,
+    replaced: existed,
+    ...(existed ? { previous } : {}),
+    project: project.project,
+    script: scriptName,
+    path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+    location,
+    runtime_loads: runtimeLoads,
+    notice: runtimeLoads
+      ? "runtime auto-loads this script (demo convention: Content/Scenes/Initial.script)"
+      : "library asset — the demo runtime auto-loads only Content/Scenes/Initial.script and Content/Initial.script; author it as a scene companion named 'Initial' to wire it into the game",
+    node_ids: Object.fromEntries(keys),
+    nodes: nodes.length,
+    links: links.length
+  };
 }
 
 function assetName(name) {
@@ -4899,7 +4977,18 @@ function validateProject(engineRoot, projectName) {
       try {
         const script = readJson(path.join(directory, fileName));
         const ids = new Set((script.nodes ?? []).map((node) => node.id));
-        for (const node of script.nodes ?? []) if (!SCRIPT_NODE_KINDS.includes(node.kind)) errors.push(`${fileName}: unsupported node kind '${node.kind}'`);
+        for (const node of script.nodes ?? []) {
+          if (!SCRIPT_NODE_KINDS.includes(node.kind)) errors.push(`${fileName}: unsupported node kind '${node.kind}'`);
+          for (const field of SCRIPT_NODE_REQUIRED_FIELDS[node.kind] ?? []) {
+            const value = node[field];
+            const empty = value === undefined || (typeof value === "string" && value.length === 0);
+            if (empty) errors.push(`${fileName}: node ${node.id} (${node.kind}) requires a non-empty '${field}'`);
+          }
+          if (node.literal !== undefined && SCRIPT_LITERAL_KINDS[node.kind]) {
+            try { scriptLiteralForKind(node.kind, node.literal); }
+            catch (error) { errors.push(`${fileName}: node ${node.id} (${node.kind}) ${error.message}`); }
+          }
+        }
         for (const link of script.links ?? []) if (!ids.has(link.from) || !ids.has(link.to)) errors.push(`${fileName}: dangling script link`);
       } catch (error) { errors.push(`${fileName}: ${error.message}`); }
     }

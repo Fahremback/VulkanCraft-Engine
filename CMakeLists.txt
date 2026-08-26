@@ -324,7 +324,7 @@ target_link_libraries(vc_build_options INTERFACE
     glm
     vk-bootstrap
     Vulkan::Vulkan
-    vulkan_jolt
+    jolt
     bullet
 )
 
@@ -738,7 +738,7 @@ target_include_directories(VulkanEngineServer PRIVATE
 target_link_libraries(VulkanEngineServer PRIVATE
     vc_build_options
     vc_ozz vc_acl
-    glm vulkan_jolt bullet
+    glm jolt bullet
     $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
     $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
     $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
@@ -1823,6 +1823,51 @@ target_link_libraries(episode_compiler_zstd_blake3_tests PRIVATE
 )
 add_test(NAME episode_compiler_zstd_blake3_tests COMMAND episode_compiler_zstd_blake3_tests)
 
+# Full-chain production gate (AGENT-5, findings #155): semantic -> episode ->
+# farm END-TO-END with the REAL promoted seams (zstd codec + blake3 hasher).
+# #147 proved the chain with defaults, #151 proved the seams on the compiler
+# alone — this gate proves the chain with production wiring together.
+add_executable(semantic_episode_farm_zstd_blake3_tests
+    tests/SemanticEpisodeFarmZstdBlake3Tests.cpp
+    src/engine/sdk/RegistryJson.cpp
+    src/engine/sdk/SemanticApi.cpp
+    src/engine/sdk/EpisodeCompiler.cpp
+    src/engine/sdk/SimulationFarm.cpp
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:src/engine/core/compression/ZstdCompression.cpp>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:src/engine/core/hashing/Blake3Hash.cpp>
+)
+target_include_directories(semantic_episode_farm_zstd_blake3_tests PRIVATE
+    src/engine/public
+    src
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:${VC_SOLUTIONS_DIR}/zstd/lib>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:${VC_SOLUTIONS_DIR}/blake3/c>
+)
+target_link_libraries(semantic_episode_farm_zstd_blake3_tests PRIVATE
+    vc_build_options glm
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+)
+add_test(NAME semantic_episode_farm_zstd_blake3_tests COMMAND semantic_episode_farm_zstd_blake3_tests)
+
+# RegistryJson — contrato "json_parse limpa errorOut na entrada" (AGENT-5,
+# findings #152): convenção dos adapters do SDK (clear na entrada); o resíduo
+# stale de um parse malformado anterior contaminava o buffer reusado pelo
+# caller, gerando falso-negativo em quem checa `!errorOut.empty()` após
+# sucesso (causa-raiz da classe de bug dos #140/#142/#145). Gate RED->GREEN.
+add_executable(registry_json_tests
+    tests/RegistryJsonTests.cpp
+    src/engine/sdk/RegistryJson.cpp
+)
+target_include_directories(registry_json_tests PRIVATE
+    src/engine/public
+    src/engine/sdk
+    src
+)
+target_link_libraries(registry_json_tests PRIVATE
+    vc_build_options
+)
+add_test(NAME registry_json_tests COMMAND registry_json_tests)
+
 # Multi-scale streaming (META §19 / FALTANTES §15 vision "streaming
 # multi-escala", Fase 5 checkbox): the world function streamed at several
 # scales around a focus — fine voxel detail near, coarser height-fields far —
@@ -2554,11 +2599,10 @@ if(TARGET vc_generate_world_save)
     add_dependencies(vc_sdk vc_generate_world_save)
 endif()
 
-# The engine's jolt target is named vulkan_jolt (its vcxproj must not collide
-# with the vendored Jolt target's third_party/Jolt.vcxproj — case-insensitive
-# slnx collision, MSB4025); OUTPUT_NAME stays Jolt so the installed archive
-# remains lib/Jolt.lib, deterministic on every filesystem.
-set_target_properties(vulkan_jolt PROPERTIES OUTPUT_NAME Jolt)
+# The engine's jolt target shares its OUTPUT_NAME with the Jolt target created
+# by Jolt.cmake; pin it so the installed archive name is deterministic on every
+# filesystem (the build already writes Jolt.lib via case-insensitive collision).
+set_target_properties(jolt PROPERTIES OUTPUT_NAME Jolt)
 
 # The vc_sdk archive links vc_sdk_public, which includes the storage TUs
 # (zstd/blake3/rocksdb/flatbuffers) unconditionally — it cannot be built when
@@ -2575,7 +2619,7 @@ foreach(vc_lib vc_zstd vc_blake3 vc_navigation vc_fastwfc vc_meshoptimizer vc_xa
         install(FILES "$<TARGET_FILE:${vc_lib}>" DESTINATION lib OPTIONAL)
     endif()
 endforeach()
-foreach(vc_lib flatbuffers rocksdb vulkan_jolt bullet)
+foreach(vc_lib flatbuffers rocksdb jolt bullet)
     if(TARGET ${vc_lib})
         install(FILES "$<TARGET_FILE:${vc_lib}>" DESTINATION lib OPTIONAL)
     endif()
@@ -2587,7 +2631,7 @@ install(DIRECTORY ${glm_SOURCE_DIR}/glm DESTINATION include)
 # Relocatable package config: every path resolves from this file's location, so
 # the staged prefix can move or be consumed from another checkout/machine.
 set(VULKAN_CRAFT_SDK_LINK_LIBS "")
-foreach(vc_lib vc_zstd vc_blake3 vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas flatbuffers rocksdb vulkan_jolt bullet)
+foreach(vc_lib vc_zstd vc_blake3 vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas flatbuffers rocksdb jolt bullet)
     if(TARGET ${vc_lib})
         get_target_property(_vc_on ${vc_lib} OUTPUT_NAME)
         if(NOT _vc_on)

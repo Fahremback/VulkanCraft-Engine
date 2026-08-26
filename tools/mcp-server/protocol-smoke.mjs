@@ -188,6 +188,45 @@ try {
     }
   });
   assert.equal(scriptResponse.result.isError, undefined);
+  const scriptPayload = JSON.parse(scriptResponse.result.content[0].text);
+  assert.equal(scriptPayload.runtime_loads, true, "scene companion Initial.script is auto-loaded by the demo runtime");
+  assert.equal(scriptPayload.location, "scene_companion");
+  assert.ok(fs.existsSync(path.join(smokeProjectPath, "Content", "Scenes", "Initial.script")));
+
+  const deadScriptResponse = await request("tools/call", {
+    name: "create_visual_script",
+    arguments: {
+      project: smokeProject,
+      name: "DeadGraph",
+      nodes: [
+        { key: "start", kind: "Event" }, // Event without event: dead entry (eventEntries[""] never dispatches)
+        { key: "set", kind: "SetVariable", variable: "x" }
+      ],
+      links: [{ from: "start", to: "set" }]
+    }
+  });
+  assert.ok(deadScriptResponse.result.isError, "Event node without event must be refused (dead graph)");
+  assert.match(deadScriptResponse.result.content[0].text, /'start'/);
+  assert.ok(!fs.existsSync(path.join(smokeProjectPath, "Content", "Scripts", "DeadGraph.script")));
+
+  const libraryScriptResponse = await request("tools/call", {
+    name: "create_visual_script",
+    arguments: {
+      project: smokeProject,
+      name: "LibraryHelper",
+      nodes: [
+        { key: "start", kind: "Event", event: "OnStart" },
+        { key: "one", kind: "ConstantFloat", literal: 2.0 },
+        { key: "set", kind: "SetVariable", variable: "helper" }
+      ],
+      links: [{ from: "start", to: "one" }, { from: "one", to: "set" }]
+    }
+  });
+  assert.equal(libraryScriptResponse.result.isError, undefined);
+  const libraryScriptPayload = JSON.parse(libraryScriptResponse.result.content[0].text);
+  assert.equal(libraryScriptPayload.location, "library");
+  assert.equal(libraryScriptPayload.runtime_loads, false, "Content/Scripts assets are library-only, never auto-loaded");
+  assert.ok(fs.existsSync(path.join(smokeProjectPath, "Content", "Scripts", "LibraryHelper.script")));
 
   const materialResponse = await request("tools/call", {
     name: "create_material",

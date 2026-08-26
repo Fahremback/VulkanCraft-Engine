@@ -720,6 +720,48 @@ void test_persistence() {
                  "corruption & file roundtrip OK\n";
 }
 
+// SDK convention (same bug class as json_parse — #153): a diagnostic buffer
+// reused by a caller must never poison the success path. save_world must
+// clear errorOut at entry, so a stale message from a previous failed call
+// cannot turn a successful save into a false-negative `!errorOut.empty()`
+// check right after serialize_world (which leaves the buffer untouched on
+// success).
+void test_save_world_clears_error_out() {
+    std::unique_ptr<engine::voxel::IVoxelWorld> a =
+        engine::voxel::create_default_voxel_world();
+    a->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*a, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    {
+        std::unique_ptr<engine::voxel::IVoxelTransaction> tx = a->begin_transaction();
+        tx->set_block(3, 130, 3, kBlockStone);
+        std::string error;
+        CHECK(tx->commit(error));
+        CHECK(error.empty());
+    }
+    CHECK(a->get_block(3, 130, 3) == kBlockStone);
+
+    const std::string path = scratch_dir() + "/vc_test_world_clear_err.vcwld";
+    // Caller reuses a buffer that still holds an old error message.
+    std::string errorOut = "stale error from a previous failed call";
+    CHECK(a->save_world(path, errorOut));
+    CHECK(errorOut.empty());  // stale residue must NOT surface as failure
+
+    // The save really landed: a fresh world loads it.
+    std::unique_ptr<engine::voxel::IVoxelWorld> b =
+        engine::voxel::create_default_voxel_world();
+    b->register_generator(std::make_shared<FlatGenerator>(96));
+    CHECK(boot_world(*b, glm::vec3(8.0f, 200.0f, 8.0f), 16));
+    std::string loadError = "stale";
+    CHECK(b->load_world(path, loadError));
+    CHECK(loadError.empty());
+    CHECK(b->get_block(3, 130, 3) == kBlockStone);
+
+    std::error_code removeEc;
+    std::filesystem::remove(path, removeEc);
+    std::cout << "[sdk] save_world clears errorOut at entry (no stale "
+                 "false-negative)\n";
+}
+
 // Promoted solution (META section 32): Zstandard adapter round-trips byte
 // strings, detects its own frames and fails cleanly on foreign input.
 void test_compression_provider() {
@@ -3059,7 +3101,32 @@ void test_eviction_preserves_edits() {
     CHECK(settle(*world, home, [&] { return world->is_chunk_loaded(0, 0); }));
     CHECK(world->get_block(8, 130, 8) == kBlockStone);
 
-    std::cout << "[sdk] streaming eviction preserves unsaved edits OK\n";
+    // Phase 2: with a region-capable storage (the paged save path that
+    // production and autosave use), a save persists the edit AND releases the
+    // pin — the chunk becomes evictable again (memory is not held forever by
+    // a protected chunk) and the edit lives in the save file. (The
+    // no-storage monolithic save keeps the pin — registered as a finding;
+    // this test exercises the supported path.)
+    world->register_storage(engine::storage::create_region_chunk_storage(8));
+    const std::string saveDir = scratch_dir() + "/evict_after_save";
+    std::string saveError;
+    CHECK(world->save_world(saveDir, saveError));
+    CHECK(saveError.empty());
+    CHECK(settle(*world, far, [&] { return !world->is_chunk_loaded(0, 0); }));
+
+    // The edit is persisted: a fresh world loaded from the save has it.
+    std::unique_ptr<engine::voxel::IVoxelWorld> loaded =
+        engine::voxel::create_default_voxel_world();
+    loaded->register_generator(std::make_shared<FlatGenerator>(96));
+    loaded->register_storage(engine::storage::create_region_chunk_storage(8));
+    CHECK(boot_world(*loaded, home, 16));
+    std::string loadError;
+    CHECK(loaded->load_world(saveDir, loadError));
+    CHECK(loadError.empty());
+    CHECK(loaded->get_block(8, 130, 8) == kBlockStone);
+
+    std::cout << "[sdk] streaming eviction preserves unsaved edits (pin "
+                 "until save, evictable + persisted after) OK\n";
 }
 
 // The block registry is the source of truth for settable ids on the world
@@ -7267,6 +7334,432 @@ void test_navigation_area_costs() {
     std::cout << "[sdk] navigation area costs: material strip detours at cost "
                  "10 (straight at 1), slope hump tagged at the heightfield "
                  "detours at cost 50, refusals OK\n";
+}
+
+// FALTANTES item 12 — off-mesh links (jump/climb): a point-to-point edge in
+// the navigation graph that is NOT part of the walkable surface. A wall
+// splitting the map in two is impassable without a link; with a link the
+// path jumps across it. Links are baked into the tile containing their
+// midpoint (only that tile re-bakes on set_off_mesh_links) and Detour snaps
+// each endpoint to the nearest poly in that tile.
+void test_navigation_off_mesh_links() {
+    using engine::navigation::NavmeshConfig;
+    using engine::navigation::OffMeshLink;
+    using engine::navigation::PathResult;
+    using engine::navigation::VoxelColumn;
+
+    const float step = 0.5f;
+    // Flat ground [0,32]^2 at y 0..1 with a wall at x~=12 spanning ALL z:
+    // the wall (solid to y=4, top ledge-filtered) splits the map into west
+    // (x<12) and east (x>12) islands — no path without an off-mesh link.
+    const auto split_columns = [&]() {
+        std::vector<VoxelColumn> columns;
+        for (float x = 0.25f; x <= 31.75f; x += step) {
+            for (float z = 0.25f; z <= 31.75f; z += step) {
+                VoxelColumn column;
+                column.x = x;
+                column.z = z;
+                column.solidMinY = 0.0f;
+                column.solidMaxY = 1.0f;
+                column.solid = true;
+                if (std::fabs(x - 12.0f) <= 0.25f) {
+                    column.solidMaxY = 4.0f;  // the splitting wall
+                }
+                columns.push_back(column);
+            }
+        }
+        return columns;
+    };
+    // The wall + erosion leave the walkable gap at [11.0, 13.0]: endpoints
+    // sit 0.4 inside the poly edges with radius 0.75 (the addTile snap
+    // search box must OVERLAP the target poly — the erosion AABB is strict).
+    const auto make_jump = [&](bool bidirectional) {
+        OffMeshLink jump;
+        jump.startX = 11.4f;
+        jump.startY = 1.2f;
+        jump.startZ = 16.0f;
+        jump.endX = 12.6f;
+        jump.endY = 1.2f;
+        jump.endZ = 16.0f;
+        jump.radius = 0.75f;
+        jump.bidirectional = bidirectional;
+        return jump;
+    };
+
+    NavmeshConfig config;
+    config.boundsMinX = 0.0f;
+    config.boundsMaxX = 32.0f;
+    config.boundsMinZ = 0.0f;
+    config.boundsMaxZ = 32.0f;
+    config.cellSize = step;
+    config.tileSize = 8.0f;  // tiled mode: 4x4 tiles of 8 world units
+
+    std::string error;
+
+    // ---- baseline: no link -> the map is split, no path either way ----
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav->build(config, split_columns(), error));
+        CHECK(error.empty());
+        CHECK(nav->valid());
+        PathResult none;
+        CHECK(!nav->find_path(4.0f, 0.5f, 16.0f, 28.0f, 0.5f, 16.0f, none));
+        CHECK(!nav->find_path(28.0f, 0.5f, 16.0f, 4.0f, 0.5f, 16.0f, none));
+    }
+
+    // ---- link over the wall -> path with a jump, both directions ----
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav->build(config, split_columns(), error));
+        CHECK(error.empty());
+        const uint64_t r0 = nav->tile_revision(4.0f, 4.0f);
+        CHECK(r0 > 0);
+
+        CHECK(nav->set_off_mesh_links({ make_jump(true) }, error));
+        CHECK(error.empty());
+
+        PathResult fwd;
+        CHECK(nav->find_path(4.0f, 0.5f, 16.0f, 28.0f, 0.5f, 16.0f, fwd));
+        CHECK(fwd.found);
+        CHECK(fwd.totalLength > 0.0f);
+        // The jump: two consecutive waypoints straddle the wall (x crosses
+        // 12) — the path crosses the split via the link.
+        bool sawJump = false;
+        for (std::size_t i = 3; i + 2 < fwd.waypoints.size(); i += 3) {
+            const float x0 = fwd.waypoints[i - 3];
+            const float x1 = fwd.waypoints[i];
+            if ((x0 < 12.0f && x1 > 12.0f) || (x0 > 12.0f && x1 < 12.0f))
+                sawJump = true;
+        }
+        CHECK(sawJump);
+
+        // Reverse direction works (bidirectional), same length.
+        PathResult rev;
+        CHECK(nav->find_path(28.0f, 0.5f, 16.0f, 4.0f, 0.5f, 16.0f, rev));
+        CHECK(rev.found);
+        CHECK(std::fabs(rev.totalLength - fwd.totalLength) < 0.001f);
+
+        // Locality: only the tile holding the link midpoint (x=12,z=16 ->
+        // tile (1,2)) re-baked; all other tiles keep their revision.
+        CHECK(nav->tile_revision(4.0f, 4.0f) == r0);    // tile (0,0)
+        CHECK(nav->tile_revision(28.0f, 4.0f) == r0);   // tile (3,0)
+        CHECK(nav->tile_revision(20.0f, 20.0f) == r0);  // tile (2,2)
+        CHECK(nav->tile_revision(12.0f, 16.0f) > r0);   // tile (1,2)
+
+        // Determinism: an identical provider is bit-identical.
+        std::unique_ptr<engine::navigation::INavigationProvider> nav2 =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav2->build(config, split_columns(), error));
+        CHECK(nav2->set_off_mesh_links({ make_jump(true) }, error));
+        PathResult fwd2;
+        CHECK(nav2->find_path(4.0f, 0.5f, 16.0f, 28.0f, 0.5f, 16.0f, fwd2));
+        CHECK(fwd2.found);
+        CHECK(fwd2.totalLength == fwd.totalLength);
+        CHECK(fwd2.waypoints == fwd.waypoints);
+    }
+
+    // ---- one-way link: only start -> end ----
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav->build(config, split_columns(), error));
+        CHECK(nav->set_off_mesh_links({ make_jump(false) }, error));
+        CHECK(error.empty());
+        PathResult ok, refused;
+        CHECK(nav->find_path(4.0f, 0.5f, 16.0f, 28.0f, 0.5f, 16.0f, ok));
+        CHECK(ok.found);
+        CHECK(!nav->find_path(28.0f, 0.5f, 16.0f, 4.0f, 0.5f, 16.0f, refused));
+    }
+
+    // ---- clearing the links removes the jump ----
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav->build(config, split_columns(), error));
+        CHECK(nav->set_off_mesh_links({ make_jump(true) }, error));
+        PathResult jumpy;
+        CHECK(nav->find_path(4.0f, 0.5f, 16.0f, 28.0f, 0.5f, 16.0f, jumpy));
+        CHECK(jumpy.found);
+        CHECK(nav->set_off_mesh_links({}, error));  // clear
+        CHECK(error.empty());
+        PathResult none;
+        CHECK(!nav->find_path(4.0f, 0.5f, 16.0f, 28.0f, 0.5f, 16.0f, none));
+    }
+
+    // ---- links survive terrain updates and obstacle toggles ----
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav->build(config, split_columns(), error));
+        CHECK(nav->set_off_mesh_links({ make_jump(true) }, error));
+
+        // Terrain edit FAR from the link (dig a hole at x=24): update() must
+        // re-bake only that tile and keep the link working.
+        std::vector<VoxelColumn> dug;
+        for (float z = 7.75f; z <= 8.25f; z += step) {
+            VoxelColumn c;
+            c.x = 24.0f;
+            c.z = z;
+            c.solid = false;  // removed column
+            dug.push_back(c);
+        }
+        CHECK(nav->update(dug, error));
+        CHECK(error.empty());
+        PathResult after;
+        CHECK(nav->find_path(4.0f, 0.5f, 16.0f, 28.0f, 0.5f, 16.0f, after));
+        CHECK(after.found);  // link still works
+
+        // Obstacle toggle elsewhere must not clear the link either.
+        engine::navigation::DynamicObstacle wall;
+        for (float z = 0.25f; z <= 31.75f; z += step) {
+            VoxelColumn c;
+            c.x = 24.0f;
+            c.z = z;
+            c.solidMinY = 0.0f;
+            c.solidMaxY = 4.0f;
+            c.solid = true;
+            wall.columns.push_back(c);
+        }
+        CHECK(nav->set_dynamic_obstacle(7, wall, error));
+        CHECK(error.empty());
+        CHECK(nav->set_obstacle_active(7, false, error));
+        CHECK(error.empty());
+        PathResult afterObstacle;
+        CHECK(nav->find_path(4.0f, 0.5f, 16.0f, 28.0f, 0.5f, 16.0f,
+                             afterObstacle));
+        CHECK(afterObstacle.found);  // link still works
+    }
+
+    // ---- refusals ----
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(!nav->set_off_mesh_links({}, error));  // before build
+        CHECK(!error.empty());
+        CHECK(nav->build(config, split_columns(), error));
+        CHECK(error.empty());
+
+        const OffMeshLink good = make_jump(true);
+
+        OffMeshLink nanLink = good;
+        nanLink.startX = std::nanf("");
+        CHECK(!nav->set_off_mesh_links({ nanLink }, error));  // NaN endpoint
+        CHECK(!error.empty());
+
+        OffMeshLink zeroRad = good;
+        zeroRad.radius = 0.0f;
+        CHECK(!nav->set_off_mesh_links({ zeroRad }, error));  // radius <= 0
+        CHECK(!error.empty());
+
+        OffMeshLink negRad = good;
+        negRad.radius = -1.0f;
+        CHECK(!nav->set_off_mesh_links({ negRad }, error));  // negative
+        CHECK(!error.empty());
+
+        OffMeshLink outOfBounds = good;
+        outOfBounds.startX = 30.0f;
+        outOfBounds.endX = 40.0f;  // midpoint 35 -> outside bounds
+        CHECK(!nav->set_off_mesh_links({ outOfBounds }, error));
+        CHECK(!error.empty());
+
+        // Single-navmesh mode refused.
+        NavmeshConfig legacy = config;
+        legacy.tileSize = 0.0f;
+        std::unique_ptr<engine::navigation::INavigationProvider> single =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(single->build(legacy, split_columns(), error));
+        CHECK(!single->set_off_mesh_links({ good }, error));
+        CHECK(!error.empty());
+    }
+
+    std::cout << "[sdk] navigation off-mesh links: wall-split map crossed "
+                 "only via the jump link (bidirectional + one-way), clear "
+                 "restores the split, links survive updates/obstacles, "
+                 "locality + determinism, refusals OK\n";
+}
+
+void test_navigation_async_paths() {
+    using engine::navigation::NavmeshConfig;
+    using engine::navigation::PathRequestStatus;
+    using engine::navigation::PathResult;
+    using engine::navigation::VoxelColumn;
+
+    const float step = 0.5f;
+    // Flat ground [0,32]^2 at y 0..1 with a wall at x=16 spanning z in
+    // [8,24] (a detour around the wall ends, z<8 or z>24).
+    const auto columns = [&]() {
+        std::vector<VoxelColumn> cols;
+        for (float x = 0.25f; x <= 31.75f; x += step) {
+            for (float z = 0.25f; z <= 31.75f; z += step) {
+                VoxelColumn c;
+                c.x = x;
+                c.z = z;
+                c.solidMinY = 0.0f;
+                c.solidMaxY = 1.0f;
+                c.solid = true;
+                if (std::fabs(x - 16.0f) <= 0.25f && z >= 8.0f &&
+                    z <= 24.0f) {
+                    c.solidMaxY = 4.0f;  // the blocking wall segment
+                }
+                cols.push_back(c);
+            }
+        }
+        return cols;
+    }();
+
+    NavmeshConfig config;
+    config.boundsMinX = 0.0f;
+    config.boundsMaxX = 32.0f;
+    config.boundsMinZ = 0.0f;
+    config.boundsMaxZ = 32.0f;
+    config.cellSize = step;
+    config.tileSize = 8.0f;  // tiled mode: 4x4 tiles of 8 world units
+
+    std::string error;
+
+    // Poll until the request is terminal (bounded wait; the worker is
+    // serialized so this never hangs).
+    const auto drain = [](engine::navigation::INavigationProvider& nav,
+                          uint64_t id, PathResult& out, std::string& err) {
+        for (int i = 0; i < 20000; ++i) {
+            const PathRequestStatus st = nav.poll_async_path(id, out, err);
+            if (st != PathRequestStatus::Queued &&
+                st != PathRequestStatus::Running) {
+                return st;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return PathRequestStatus::Invalid;
+    };
+
+    // ---- sync baseline ----
+    float syncLen = -1.0f;
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav->build(config, columns, error));
+        CHECK(error.empty());
+        CHECK(nav->valid());
+        PathResult r;
+        CHECK(nav->find_path(2.0f, 0.5f, 12.0f, 30.0f, 0.5f, 12.0f, r));
+        CHECK(r.found);
+        syncLen = r.totalLength;
+        CHECK(syncLen > 0.0f);
+    }
+
+    // ---- async result == sync result (bit-exact) ----
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav->build(config, columns, error));
+        CHECK(error.empty());
+
+        const uint64_t id = nav->begin_async_path(2.0f, 0.5f, 12.0f, 30.0f,
+                                                  0.5f, 12.0f, error);
+        CHECK(id != 0);
+        CHECK(error.empty());
+        PathResult out;
+        std::string err;
+        CHECK(drain(*nav, id, out, err) == PathRequestStatus::Succeeded);
+        CHECK(err.empty());
+        CHECK(out.found);
+        CHECK(out.totalLength == syncLen);   // bit-exact vs sync find_path
+        CHECK(out.waypoints.size() >= 3);
+        // poll of a completed request stays Succeeded (idempotent).
+        PathResult again;
+        CHECK(nav->poll_async_path(id, again, err) ==
+              PathRequestStatus::Succeeded);
+        CHECK(again.totalLength == syncLen);
+    }
+
+    // ---- many async requests, FIFO ids, all match sync ----
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav->build(config, columns, error));
+        std::vector<uint64_t> ids;
+        for (int i = 0; i < 8; ++i) {
+            ids.push_back(nav->begin_async_path(2.0f, 0.5f, 12.0f, 30.0f,
+                                                0.5f, 12.0f, error));
+            CHECK(ids.back() != 0);
+            CHECK(ids.back() == static_cast<uint64_t>(i + 1));  // ids 1..8
+        }
+        for (const uint64_t id : ids) {
+            PathResult out;
+            std::string err;
+            CHECK(drain(*nav, id, out, err) == PathRequestStatus::Succeeded);
+            CHECK(out.totalLength == syncLen);
+        }
+    }
+
+    // ---- cancel a queued request (join semantics, deterministic) ----
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav->build(config, columns, error));
+        const uint64_t idA = nav->begin_async_path(2.0f, 0.5f, 12.0f, 30.0f,
+                                                   0.5f, 12.0f, error);
+        const uint64_t idB = nav->begin_async_path(2.0f, 0.5f, 12.0f, 30.0f,
+                                                   0.5f, 12.0f, error);
+        CHECK(idA != 0 && idB != 0);
+        // idB is queued behind idA (serialized worker): cancel joins to
+        // Cancelled before returning.
+        CHECK(nav->cancel_async_path(idB));
+        PathResult outB;
+        std::string errB;
+        CHECK(nav->poll_async_path(idB, outB, errB) ==
+              PathRequestStatus::Cancelled);
+        // idA still completes normally.
+        PathResult outA;
+        std::string errA;
+        CHECK(drain(*nav, idA, outA, errA) == PathRequestStatus::Succeeded);
+        CHECK(outA.totalLength == syncLen);
+        // Cancelled is sticky.
+        CHECK(nav->poll_async_path(idB, outB, errB) ==
+              PathRequestStatus::Cancelled);
+    }
+
+    // ---- async queries honor area costs ----
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        CHECK(nav->build(config, columns, error));
+        CHECK(nav->set_area_cost(1, 50.0f, error));  // no area-1 -> no-op
+        CHECK(error.empty());
+        const uint64_t id = nav->begin_async_path(2.0f, 0.5f, 12.0f, 30.0f,
+                                                  0.5f, 12.0f, error);
+        PathResult out;
+        std::string err;
+        CHECK(drain(*nav, id, out, err) == PathRequestStatus::Succeeded);
+        CHECK(out.totalLength == syncLen);
+    }
+
+    // ---- refusals ----
+    {
+        std::unique_ptr<engine::navigation::INavigationProvider> nav =
+            engine::navigation::create_recast_navigation_provider();
+        // Before build.
+        CHECK(nav->begin_async_path(2.0f, 0.5f, 12.0f, 30.0f, 0.5f, 12.0f,
+                                    error) == 0);
+        CHECK(!error.empty());
+        // NaN point.
+        CHECK(nav->build(config, columns, error));
+        CHECK(error.empty());
+        CHECK(nav->begin_async_path(std::nanf(""), 0.5f, 12.0f, 30.0f,
+                                    0.5f, 12.0f, error) == 0);
+        CHECK(!error.empty());
+        // Unknown ids.
+        PathResult out;
+        CHECK(nav->poll_async_path(999, out, error) ==
+              PathRequestStatus::Invalid);
+        CHECK(!nav->cancel_async_path(999));
+    }
+
+    std::cout << "[sdk] navigation async paths: async result bit-exact vs "
+                 "sync find_path, FIFO ids, cancel join semantics "
+                 "(queued stays cancelled), area costs apply, refusals OK\n";
 }
 
 // ---- META section 17 / FALTANTES item 13: authoritative voxel replication ----
@@ -11826,6 +12319,7 @@ int main(int argc, char** argv) {
         test_transaction_failure_stages();
         test_transaction_policy_limits();
         test_persistence();
+        test_save_world_clears_error_out();
         test_compression_provider();
         test_hash_provider();
         test_save_v4_legacy();
@@ -11897,6 +12391,8 @@ int main(int argc, char** argv) {
         test_navigation_local_update_world();
         test_navigation_dynamic_obstacle();
         test_navigation_area_costs();
+        test_navigation_off_mesh_links();
+        test_navigation_async_paths();
         test_replication_authority();
         test_replication_deltas_reorder();
         test_commit_replication_persistence();

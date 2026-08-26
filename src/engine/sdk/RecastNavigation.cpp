@@ -31,11 +31,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -153,10 +157,29 @@ struct TileKeyHash {
 // Returns true with `outData` EMPTY when the region has no walkable surface
 // (a valid empty tile — the caller decides what that means for the mode);
 // returns false with a diagnostic only on a real bake failure.
+// True when the link's midpoint falls inside the region [minX,maxX]x
+// [minZ,maxZ]. Links are owned by the tile containing their midpoint; a
+// midpoint on the LAST tile's outer edge (== bounds max) belongs to that
+// last tile (the half-open rule would otherwise drop it).
+bool link_in_region(const OffMeshLink& link, float minX, float maxX, float minZ,
+                    float maxZ, const NavmeshConfig& config) {
+    const float midX = 0.5f * (link.startX + link.endX);
+    const float midZ = 0.5f * (link.startZ + link.endZ);
+    if (midX < minX || midZ < minZ) return false;
+    if (midX >= maxX && !(maxX >= config.boundsMaxX - 1e-4f &&
+                          midX <= config.boundsMaxX + 1e-4f))
+        return false;
+    if (midZ >= maxZ && !(maxZ >= config.boundsMaxZ - 1e-4f &&
+                          midZ <= config.boundsMaxZ + 1e-4f))
+        return false;
+    return true;
+}
+
 bool bake_navmesh_data(const NavmeshConfig& config,
                        float minX, float minZ, float maxX, float maxZ,
                        int borderCells, bool exactCells,
                        const std::vector<VoxelColumn>& columns,
+                       const std::vector<OffMeshLink>& links,
                        std::vector<std::byte>& outData,
                        int outTileX, int outTileY,
                        std::string& errorOut) {
@@ -365,6 +388,48 @@ bool bake_navmesh_data(const NavmeshConfig& config,
     params.detailTris = detail.tris;
     params.detailTriCount = detail.ntris;
     params.offMeshConCount = 0;
+
+    // Off-mesh links (FALTANTES item 12 — jump/climb): each link whose
+    // midpoint is inside this region is baked as a Detour off-mesh
+    // connection (point-to-point poly). baseOffMeshLinks (addTile) snaps
+    // each endpoint to the nearest poly in this tile within radius
+    // horizontally and walkableClimb vertically, so short links near the
+    // tile center connect cleanly. The connection poly gets the walk flag
+    // and the default walkable area (cost 1.0).
+    std::vector<float> conVerts;
+    std::vector<float> conRad;
+    std::vector<unsigned short> conFlags;
+    std::vector<unsigned char> conAreas;
+    std::vector<unsigned char> conDir;
+    std::vector<unsigned int> conUserID;
+    if (!links.empty()) {
+        conVerts.reserve(links.size() * 6);
+        conRad.reserve(links.size());
+        conFlags.reserve(links.size());
+        conAreas.reserve(links.size());
+        conDir.reserve(links.size());
+        conUserID.reserve(links.size());
+        for (const OffMeshLink& link : links) {
+            if (!link_in_region(link, minX, maxX, minZ, maxZ, config)) continue;
+            conVerts.insert(conVerts.end(),
+                            { link.startX, link.startY, link.startZ,
+                              link.endX, link.endY, link.endZ });
+            conRad.push_back(link.radius);
+            conFlags.push_back(kWalkFlag);
+            conAreas.push_back(kWalkableArea);
+            conDir.push_back(link.bidirectional ? DT_OFFMESH_CON_BIDIR : 0);
+            conUserID.push_back(static_cast<unsigned int>(conUserID.size() + 1));
+        }
+    }
+    if (!conVerts.empty()) {
+        params.offMeshConVerts = conVerts.data();
+        params.offMeshConRad = conRad.data();
+        params.offMeshConFlags = conFlags.data();
+        params.offMeshConAreas = conAreas.data();
+        params.offMeshConDir = conDir.data();
+        params.offMeshConUserID = conUserID.data();
+        params.offMeshConCount = static_cast<int>(conRad.size());
+    }
     params.buildBvTree = true;
     params.walkableHeight = config.agentHeight;
     params.walkableRadius = config.agentRadius;
@@ -397,12 +462,19 @@ public:
     RecastNavigationProvider() : query_(dtAllocNavMeshQuery()) {}
 
     ~RecastNavigationProvider() override {
+        {  // stop the async worker and wait for it to finish the current query
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            shutdown_ = true;
+        }
+        queueCv_.notify_all();
+        if (worker_.joinable()) worker_.join();
         if (navmesh_) dtFreeNavMesh(navmesh_);
         if (query_) dtFreeNavMeshQuery(query_);
     }
 
     bool build(const NavmeshConfig& config, const std::vector<VoxelColumn>& columns,
                std::string& errorOut) override {
+        std::lock_guard<std::mutex> lock(queryMutex_);
         if (config.cellSize <= 0.0f || config.cellHeight <= 0.0f ||
             config.boundsMaxX <= config.boundsMinX ||
             config.boundsMaxZ <= config.boundsMinZ) {
@@ -422,6 +494,7 @@ public:
 
     bool update(const std::vector<VoxelColumn>& changedColumns,
                 std::string& errorOut) override {
+        std::lock_guard<std::mutex> lock(queryMutex_);
         if (tileSize_ <= 0.0f) {
             errorOut = "navigation: update() requires tiled mode "
                        "(NavmeshConfig::tileSize > 0)";
@@ -481,6 +554,7 @@ public:
 
     bool set_dynamic_obstacle(uint64_t id, const DynamicObstacle& obstacle,
                               std::string& errorOut) override {
+        std::lock_guard<std::mutex> lock(queryMutex_);
         if (tileSize_ <= 0.0f) {
             errorOut = "navigation: dynamic obstacles require tiled mode "
                        "(NavmeshConfig::tileSize > 0)";
@@ -513,6 +587,7 @@ public:
 
     bool set_obstacle_active(uint64_t id, bool active,
                              std::string& errorOut) override {
+        std::lock_guard<std::mutex> lock(queryMutex_);
         if (tileSize_ <= 0.0f) {
             errorOut = "navigation: dynamic obstacles require tiled mode "
                        "(NavmeshConfig::tileSize > 0)";
@@ -666,8 +741,26 @@ public:
             return a.z != b.z ? a.z < b.z : a.x < b.x;
         });
 
-        // Bake every affected tile FIRST (all-or-nothing): no tile is swapped
-        // unless every bake succeeds; an empty bake removes the tile.
+        if (!rebake_tiles(order, errorOut)) {
+            // Roll the stored set back — nothing was swapped.
+            for (const auto& entry : oldColumns) {
+                if (entry.second.present) {
+                    columnsByKey_[entry.first] = entry.second.value;
+                } else {
+                    columnsByKey_.erase(entry.first);
+                }
+            }
+            return false;
+        }
+        errorOut.clear();
+        return true;
+    }
+
+    // Re-bakes the given tiles from the CURRENT stored column set and off-mesh
+    // links (all-or-nothing): every tile is baked first, then the old tiles
+    // are swapped for the fresh ones; a bake failure leaves the navmesh
+    // untouched. An empty bake removes the tile.
+    bool rebake_tiles(const std::vector<TileKey>& order, std::string& errorOut) {
         std::vector<VoxelColumn> fullColumns;
         fullColumns.reserve(columnsByKey_.size());
         for (const auto& entry : columnsByKey_) fullColumns.push_back(entry.second);
@@ -682,16 +775,8 @@ public:
             std::string bakeError;
             if (!bake_navmesh_data(config_, tile_min_x(key.x), tile_min_z(key.z),
                                    tile_max_x(key.x), tile_max_z(key.z),
-                                   borderCells_, true, fullColumns, data, key.x,
-                                   key.z, bakeError)) {
-                // Roll the stored set back and report — nothing was swapped.
-                for (const auto& entry : oldColumns) {
-                    if (entry.second.present) {
-                        columnsByKey_[entry.first] = entry.second.value;
-                    } else {
-                        columnsByKey_.erase(entry.first);
-                    }
-                }
+                                   borderCells_, true, fullColumns, offMeshLinks_,
+                                   data, key.x, key.z, bakeError)) {
                 errorOut = bakeError.empty() ? "navigation: local tile bake failed"
                                              : bakeError;
                 return false;
@@ -726,12 +811,13 @@ public:
         return true;
     }
 
-    bool find_path(float startX, float startY, float startZ, float goalX,
-                   float goalY, float goalZ, PathResult& out) const override {
+    // Query core shared by the synchronous find_path and the async worker:
+    // runs the Recast/Detour query against the CURRENT navmesh. Callers hold
+    // queryMutex_ (mutation of the mesh and queries are serialized).
+    bool run_path_query(const float start[3], const float goal[3],
+                        PathResult& out) const {
         out = PathResult{};
         if (!navmesh_ || !query_ || revision_ == 0) return false;
-        const float start[3] = { startX, startY, startZ };
-        const float goal[3] = { goalX, goalY, goalZ };
         const float ext[3] = { config_.agentRadius * 4.0f, config_.agentHeight,
                                config_.agentRadius * 4.0f };
 
@@ -791,7 +877,16 @@ public:
         return true;
     }
 
+    bool find_path(float startX, float startY, float startZ, float goalX,
+                   float goalY, float goalZ, PathResult& out) const override {
+        std::lock_guard<std::mutex> lock(queryMutex_);
+        const float start[3] = { startX, startY, startZ };
+        const float goal[3] = { goalX, goalY, goalZ };
+        return run_path_query(start, goal, out);
+    }
+
     bool is_walkable(float x, float y, float z) const override {
+        std::lock_guard<std::mutex> lock(queryMutex_);
         if (!navmesh_ || !query_ || revision_ == 0) return false;
         const float pos[3] = { x, y, z };
         const float ext[3] = { config_.agentRadius * 2.0f, config_.agentHeight,
@@ -807,6 +902,7 @@ public:
 
     bool set_area_cost(int area, float cost,
                        std::string& errorOut) override {
+        std::lock_guard<std::mutex> lock(queryMutex_);
         if (area < 0 || area >= DT_MAX_AREAS) {
             errorOut = "navigation: area cost out of range (0.." +
                        std::to_string(DT_MAX_AREAS - 1) + ")";
@@ -822,13 +918,89 @@ public:
     }
 
     float area_cost(int area) const override {
+        std::lock_guard<std::mutex> lock(queryMutex_);
         if (area < 0 || area >= DT_MAX_AREAS) return 1.0f;
         return queryFilter_.getAreaCost(area);
     }
 
-    uint64_t revision() const override { return revision_; }
+    bool set_off_mesh_links(const std::vector<OffMeshLink>& links,
+                            std::string& errorOut) override {
+        std::lock_guard<std::mutex> lock(queryMutex_);
+        if (tileSize_ <= 0.0f) {
+            errorOut = "navigation: set_off_mesh_links requires tiled mode "
+                       "(NavmeshConfig::tileSize > 0)";
+            return false;
+        }
+        if (columnsByKey_.empty()) {
+            errorOut = "navigation: set_off_mesh_links before build()";
+            return false;
+        }
+
+        // Validate the whole set FIRST (all-or-nothing): finite endpoints, a
+        // positive finite radius, midpoint in bounds. The affected tiles are
+        // the union of the NEW links' tiles and the CURRENT links' tiles (a
+        // removed or moved link must re-bake its old tile to drop it).
+        const auto tile_of_link = [&](const OffMeshLink& link) {
+            const float midX = 0.5f * (link.startX + link.endX);
+            const float midZ = 0.5f * (link.startZ + link.endZ);
+            const int tx = std::min(
+                tileCountX_ - 1, std::max(0, tile_index(midX)));
+            const int tz = std::min(
+                tileCountZ_ - 1, std::max(0, tile_index(midZ)));
+            return TileKey{ tx, tz };
+        };
+        std::unordered_set<TileKey, TileKeyHash> affected;
+        for (const OffMeshLink& link : links) {
+            const float midX = 0.5f * (link.startX + link.endX);
+            const float midZ = 0.5f * (link.startZ + link.endZ);
+            if (!std::isfinite(link.startX) || !std::isfinite(link.startY) ||
+                !std::isfinite(link.startZ) || !std::isfinite(link.endX) ||
+                !std::isfinite(link.endY) || !std::isfinite(link.endZ)) {
+                errorOut = "navigation: off-mesh link endpoint is not finite";
+                return false;
+            }
+            if (!std::isfinite(link.radius) || link.radius <= 0.0f) {
+                errorOut = "navigation: off-mesh link radius must be positive "
+                           "and finite";
+                return false;
+            }
+            if (midX < config_.boundsMinX || midX > config_.boundsMaxX ||
+                midZ < config_.boundsMinZ || midZ > config_.boundsMaxZ) {
+                errorOut = "navigation: off-mesh link midpoint outside the "
+                           "navmesh bounds";
+                return false;
+            }
+            affected.insert(tile_of_link(link));
+        }
+        for (const OffMeshLink& link : offMeshLinks_) {
+            affected.insert(tile_of_link(link));
+        }
+
+        // Deterministic bake order (z-major, like build).
+        std::vector<TileKey> order(affected.begin(), affected.end());
+        std::sort(order.begin(), order.end(), [](const TileKey& a, const TileKey& b) {
+            return a.z != b.z ? a.z < b.z : a.x < b.x;
+        });
+
+        // Swap the link set, then re-bake the affected tiles. All-or-nothing:
+        // the previous link set is restored if the bake fails.
+        const std::vector<OffMeshLink> oldLinks = offMeshLinks_;
+        offMeshLinks_ = links;
+        if (!rebake_tiles(order, errorOut)) {
+            offMeshLinks_ = oldLinks;
+            return false;
+        }
+        errorOut.clear();
+        return true;
+    }
+
+    uint64_t revision() const override {
+        std::lock_guard<std::mutex> lock(queryMutex_);
+        return revision_;
+    }
 
     uint64_t tile_revision(float x, float z) const override {
+        std::lock_guard<std::mutex> lock(queryMutex_);
         if (tileSize_ <= 0.0f) return 0;
         const int tx = static_cast<int>(std::floor((x - config_.boundsMinX) / tileSize_));
         const int tz = static_cast<int>(std::floor((z - config_.boundsMinZ) / tileSize_));
@@ -837,7 +1009,178 @@ public:
         return it == tiles_.end() ? 0 : it->second.revision;
     }
 
-    bool valid() const override { return navmesh_ != nullptr && revision_ > 0; }
+    bool valid() const override {
+        std::lock_guard<std::mutex> lock(queryMutex_);
+        return navmesh_ != nullptr && revision_ > 0;
+    }
+
+    uint64_t begin_async_path(float startX, float startY, float startZ,
+                              float goalX, float goalY, float goalZ,
+                              std::string& errorOut) override {
+        if (!std::isfinite(startX) || !std::isfinite(startY) ||
+            !std::isfinite(startZ) || !std::isfinite(goalX) ||
+            !std::isfinite(goalY) || !std::isfinite(goalZ)) {
+            errorOut = "navigation: async path point is not finite";
+            return 0;
+        }
+        {
+            std::lock_guard<std::mutex> lock(queryMutex_);
+            if (navmesh_ == nullptr || revision_ == 0) {
+                errorOut = "navigation: begin_async_path before build()";
+                return 0;
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        ensure_worker_locked();
+        // Retire the oldest terminal requests (bounded retention; polling a
+        // retired id returns Invalid).
+        const std::size_t kMaxRetained = 64;
+        if (queue_.size() >= kMaxRetained) {
+            queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
+                                        [](const AsyncJob& j) {
+                                            return is_async_terminal(j.status);
+                                        }),
+                         queue_.end());
+        }
+        AsyncJob job;
+        job.id = nextRequestId_++;
+        job.start[0] = startX;
+        job.start[1] = startY;
+        job.start[2] = startZ;
+        job.goal[0] = goalX;
+        job.goal[1] = goalY;
+        job.goal[2] = goalZ;
+        job.status = PathRequestStatus::Queued;
+        queue_.push_back(std::move(job));
+        queueCv_.notify_one();
+        errorOut.clear();
+        return queue_.back().id;
+    }
+
+    PathRequestStatus poll_async_path(uint64_t requestId, PathResult& out,
+                                      std::string& errorOut) override {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        for (const AsyncJob& job : queue_) {
+            if (job.id != requestId) continue;
+            switch (job.status) {
+                case PathRequestStatus::Succeeded:
+                    out = job.result;
+                    errorOut.clear();
+                    return PathRequestStatus::Succeeded;
+                case PathRequestStatus::Failed:
+                    errorOut = job.error;
+                    return PathRequestStatus::Failed;
+                default:
+                    return job.status;
+            }
+        }
+        errorOut = "navigation: unknown async request id";
+        return PathRequestStatus::Invalid;
+    }
+
+    bool cancel_async_path(uint64_t requestId) override {
+        // Join semantics: mark cancelled and wait until the request reaches a
+        // terminal state (the worker publishes Cancelled for a queued or
+        // running request). After this returns, poll_async_path reports
+        // Cancelled — no race with the worker.
+        std::unique_lock<std::mutex> lock(queueMutex_);
+        bool found = false;
+        for (AsyncJob& job : queue_) {
+            if (job.id != requestId) continue;
+            found = true;
+            if (job.status == PathRequestStatus::Queued ||
+                job.status == PathRequestStatus::Running) {
+                job.cancelled = true;
+            }
+            break;  // already terminal -> nothing to wait for
+        }
+        if (!found) return false;
+        queueCv_.wait(lock, [&] {
+            for (const AsyncJob& j : queue_) {
+                if (j.id == requestId) return is_async_terminal(j.status);
+            }
+            return true;  // retired — treat as terminal
+        });
+        return true;
+    }
+
+    // Lazily starts the worker thread (first async request). Caller holds
+    // queueMutex_.
+    void ensure_worker_locked() {
+        if (worker_.joinable()) return;
+        worker_ = std::thread([this] { worker_main(); });
+    }
+
+    void worker_main() {
+        for (;;) {
+            std::unique_lock<std::mutex> lock(queueMutex_);
+            queueCv_.wait(lock, [this] {
+                return shutdown_ ||
+                       std::any_of(queue_.begin(), queue_.end(),
+                                   [](const AsyncJob& j) {
+                                       return j.status ==
+                                              PathRequestStatus::Queued;
+                                   });
+            });
+            // Take the first queued (not yet started) request in FIFO order.
+            auto it = std::find_if(
+                queue_.begin(), queue_.end(),
+                [](const AsyncJob& j) {
+                    return j.status == PathRequestStatus::Queued;
+                });
+            if (it == queue_.end()) {
+                if (shutdown_) break;
+                continue;
+            }
+            AsyncJob job = std::move(*it);
+            queue_.erase(it);
+            job.status = PathRequestStatus::Running;
+            queueCv_.notify_all();
+
+            if (job.cancelled) {
+                // Dropped before running: publish the cancellation.
+                job.status = PathRequestStatus::Cancelled;
+                queue_.push_back(std::move(job));
+                queueCv_.notify_all();
+                continue;
+            }
+            lock.unlock();
+
+            // Run the query against the current navmesh (serialized with
+            // mutations and other queries via queryMutex_).
+            const float start[3] = { job.start[0], job.start[1],
+                                     job.start[2] };
+            const float goal[3] = { job.goal[0], job.goal[1], job.goal[2] };
+            PathResult result;
+            bool ok = false;
+            {
+                std::lock_guard<std::mutex> qlock(queryMutex_);
+                ok = run_path_query(start, goal, result);
+            }
+
+            lock.lock();
+            if (job.cancelled) {
+                // Cancelled while running: discard the result.
+                job.status = PathRequestStatus::Cancelled;
+            } else if (ok) {
+                job.status = PathRequestStatus::Succeeded;
+                job.result = std::move(result);
+            } else {
+                job.status = PathRequestStatus::Failed;
+                job.error =
+                    "navigation: async path query failed (no path or mesh state)";
+            }
+            queue_.push_back(std::move(job));
+            queueCv_.notify_all();
+        }
+    }
+
+    static bool is_async_terminal(PathRequestStatus status) {
+        return status == PathRequestStatus::Succeeded ||
+               status == PathRequestStatus::Failed ||
+               status == PathRequestStatus::Cancelled;
+    }
 
 private:
     struct TileState {
@@ -859,7 +1202,7 @@ private:
         std::string bakeError;
         if (!bake_navmesh_data(config, config.boundsMinX, config.boundsMinZ,
                                config.boundsMaxX, config.boundsMaxZ, 0, false,
-                               columns, data, 0, 0, bakeError)) {
+                               columns, offMeshLinks_, data, 0, 0, bakeError)) {
             errorOut = bakeError.empty() ? "navigation: bake failed" : bakeError;
             return false;
         }
@@ -892,6 +1235,7 @@ private:
         columnsByKey_.clear();
         baseColumnsByKey_.clear();
         obstacles_.clear();
+        offMeshLinks_.clear();
         ++revision_;
         errorOut.clear();
         return true;
@@ -926,7 +1270,8 @@ private:
                 std::vector<std::byte> data;
                 std::string bakeError;
                 if (!bake_navmesh_data(config, minX, minZ, maxX, maxZ, borderCells,
-                                       true, columns, data, tx, tz, bakeError)) {
+                                       true, columns, offMeshLinks_, data, tx,
+                                       tz, bakeError)) {
                     errorOut = bakeError.empty() ? "navigation: tile bake failed"
                                                  : bakeError;
                     return false;
@@ -999,6 +1344,7 @@ private:
             baseColumnsByKey_[key] = column;
         }
         obstacles_.clear();
+        offMeshLinks_.clear();
         errorOut.clear();
         return true;
     }
@@ -1038,6 +1384,30 @@ private:
     // toggles never do) — the fallback when no active obstacle covers a key.
     std::unordered_map<ColumnKey, VoxelColumn, ColumnKeyHash> baseColumnsByKey_;
     std::unordered_map<std::uint64_t, ObstacleState> obstacles_;
+    std::vector<OffMeshLink> offMeshLinks_;
+
+    // ---- async queries (FALTANTES item 12) ----
+    // queryMutex_ serializes every mesh mutation and query (sync find_path/
+    // is_walkable included), so the async worker never observes a
+    // half-swapped tile. queueMutex_/queueCv_ guard the request queue and
+    // the published status/result of each request.
+    struct AsyncJob {
+        uint64_t id{ 0 };
+        float start[3]{ 0.0f, 0.0f, 0.0f };
+        float goal[3]{ 0.0f, 0.0f, 0.0f };
+        bool cancelled{ false };
+        PathRequestStatus status{ PathRequestStatus::Queued };
+        PathResult result;
+        std::string error;
+    };
+
+    mutable std::mutex queryMutex_;
+    std::mutex queueMutex_;
+    std::condition_variable queueCv_;
+    std::deque<AsyncJob> queue_;
+    bool shutdown_{ false };
+    uint64_t nextRequestId_{ 1 };
+    std::thread worker_;
 };
 
 std::unique_ptr<INavigationProvider> create_recast_navigation_provider() {
