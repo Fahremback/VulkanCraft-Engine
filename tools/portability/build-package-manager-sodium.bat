@@ -1,0 +1,6 @@
+@echo off
+call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+cd /d C:\Users\fahre\.gemini\antigravity\scratch\vulkan_craft\engine
+cl /nologo /EHsc /std:c++17 /O1 /DSODIUM_STATIC /I C:\Users\fahre\.gemini\antigravity\scratch\vulkan_craft\engine\external\solutions\libsodium\src\libsodium\include /I C:\Users\fahre\.gemini\antigravity\scratch\vulkan_craft\engine\src\engine\public /I C:\Users\fahre\.gemini\antigravity\scratch\vulkan_craft\engine\src /I C:\Users\fahre\.gemini\antigravity\scratch\vulkan_craft\engine\tools\portability C:\Users\fahre\.gemini\antigravity\scratch\vulkan_craft\engine\tools\portability\package-manager-sodium-gate.cpp C:\Users\fahre\.gemini\antigravity\scratch\vulkan_craft\engine\src\engine\sdk\PackageManager.cpp C:\Users\fahre\.gemini\antigravity\scratch\vulkan_craft\engine\external\solutions\libsodium\bin\x64\Release\v143\static\libsodium.lib /Fe:C:\Users\fahre\.gemini\antigravity\scratch\vulkan_craft\engine\build\Release\package-manager-sodium-gate.exe
+if errorlevel 1 exit /b 1
+C:\Users\fahre\.gemini\antigravity\scratch\vulkan_craft\engine\build\Release\package-manager-sodium-gate.exe

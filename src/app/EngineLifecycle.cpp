@@ -50,19 +50,34 @@ void Engine::run() {
                 player.swingProgress = 0.0f;
                 RaycastResult hit = player.perform_raycast(world, 7.0f);
                 if (hit.hit) {
-                    BlockType hitBlock = as_builtin_block(world.get_block_at(hit.hitBlockPos));
-                    if (hitBlock != BlockType::Air && hitBlock != BlockType::Bedrock) {
+                    // A.2: registry-driven id — as_builtin_block mapped dynamic
+                    // blocks to Air, so JSON-defined blocks were unbreakable
+                    // through this gate. Air/Bedrock are builtin ids.
+                    const RuntimeBlockId hitId =
+                        world.get_block_at(hit.hitBlockPos);
+                    const RuntimeBlockId airId = kRuntimeAirId;
+                    const RuntimeBlockId bedrockId =
+                        static_cast<RuntimeBlockId>(BlockType::Bedrock);
+                    if (hitId != airId && hitId != bedrockId) {
                         // 1. Quebra de Bloco Nível Voxel World
-                        world.set_block_at(hit.hitBlockPos, runtime_id(BlockType::Air));
+                        world.set_block_at(hit.hitBlockPos, airId);
                         
                         // 2. Timber V2: Derrubada de Árvores em Cadeia se for Madeira
-                        if (hitBlock == BlockType::Wood || hitBlock == BlockType::WoodOak || hitBlock == BlockType::WoodBirch || hitBlock == BlockType::WoodSpruce) {
+                        // (builtin wood ids — the chain is a gameplay stub)
+                        const RuntimeBlockId woodId =
+                            static_cast<RuntimeBlockId>(BlockType::Wood);
+                        const RuntimeBlockId birchId =
+                            static_cast<RuntimeBlockId>(BlockType::WoodBirch);
+                        const RuntimeBlockId spruceId =
+                            static_cast<RuntimeBlockId>(BlockType::WoodSpruce);
+                        if (hitId == woodId || hitId == birchId ||
+                            hitId == spruceId) {
                         }
 
                         // 3. Dropz: Spawn de Item Entidade Física 3D Flutuante
 
                         // 4. Som Específico por Bloco
-                        soundEngine.play_break_sound_for_block(hitBlock);
+                        soundEngine.play_break_sound_for_block(hitId);
                     }
                 }
             }
@@ -72,9 +87,18 @@ void Engine::run() {
                 player.swingProgress = 0.0f;
                 RaycastResult hit = player.perform_raycast(world, 7.0f);
                 if (hit.hit && player.selectedBlock != BlockType::Air) {
-                    BlockType airTarget = as_builtin_block(world.get_block_at(hit.placeBlockPos));
-                    if (airTarget == BlockType::Air || airTarget == BlockType::Water) {
-                        world.set_block_at(hit.placeBlockPos, runtime_id(player.selectedBlock));
+                    // A.2: registry-driven — placement allowed into air or
+                    // fluid (water id is builtin Water). as_builtin_block
+                    // collapsed dynamic blocks to Air here (false allows).
+                    const RuntimeBlockId targetId =
+                        world.get_block_at(hit.placeBlockPos);
+                    const RuntimeBlockId airId = kRuntimeAirId;
+                    const RuntimeBlockId waterId =
+                        static_cast<RuntimeBlockId>(BlockType::Water);
+                    if (targetId == airId || targetId == waterId ||
+                        world.is_fluid_runtime_id(targetId)) {
+                        world.set_block_at(hit.placeBlockPos,
+                                          runtime_id(player.selectedBlock));
                         soundEngine.play_place_sound();
                     }
                 }

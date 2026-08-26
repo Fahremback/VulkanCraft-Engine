@@ -75,9 +75,12 @@ void SoundEngine::update_ambience(const glm::vec3& listener, const World& world,
         for (int dx = -12; dx <= 12; dx += 4) for (int dz = -12; dz <= 12; dz += 4) {
             bool open = true;
             for (int dy = 2; dy <= 18; dy += 4) {
-                BlockType b = as_builtin_block(world.get_block_at(listener + glm::vec3(dx, dy, dz)));
-                if (is_solid_block(b)) open = false;
-                if (b == BlockType::Water) ++waterHits;
+                // A.2: registry-driven queries — as_builtin_block mapped dynamic
+                // blocks to Air, so ambience never heard JSON-defined blocks.
+                const RuntimeBlockId b =
+                    world.get_block_at(listener + glm::vec3(dx, dy, dz));
+                if (world.is_solid_block_id(b)) open = false;
+                if (world.is_fluid_runtime_id(b)) ++waterHits;
                 ++samples;
             }
             if (open) ++openRays;
@@ -99,10 +102,14 @@ void SoundEngine::update_ambience(const glm::vec3& listener, const World& world,
     fade("water", std::max(waterPresence * 0.30f, submerged ? 0.25f : 0.0f));
 }
 
-void SoundEngine::play_break_sound_for_block(BlockType block) {
-    if (block == BlockType::Grass) play_sound("break_grass");
-    else if (block == BlockType::Wood || block == BlockType::Planks) play_sound("break_wood");
-    else if (block == BlockType::Leaves) play_sound("break_leaves");
+void SoundEngine::play_break_sound_for_block(RuntimeBlockId block) {
+    // A.2: registry-id driven — as_builtin_block collapsed every dynamic block
+    // to Air, so breaking a JSON-defined block always played the stone sound.
+    // Compare against builtin ids; anything else falls back to stone.
+    if (block == static_cast<RuntimeBlockId>(BlockType::Grass)) play_sound("break_grass");
+    else if (block == static_cast<RuntimeBlockId>(BlockType::Wood) ||
+             block == static_cast<RuntimeBlockId>(BlockType::Planks)) play_sound("break_wood");
+    else if (block == static_cast<RuntimeBlockId>(BlockType::Leaves)) play_sound("break_leaves");
     else play_sound("break_stone");
 }
 void SoundEngine::play_place_sound() { play_sound("place_block"); }

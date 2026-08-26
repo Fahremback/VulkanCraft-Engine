@@ -710,12 +710,17 @@ function startBuildTool(args) {
 // Deterministic: the log is always an artifact; for a SUCCEEDED single-target
 // build the produced binary lives at build/<config>/<exe>.exe. Computed at
 // read time so a job created before the binary existed still reports it.
+// §5 item 5 ("bytes exatos"): each binary carries its real byte size, and the
+// artifacts object exposes the total — real granular progress per target.
 function jobArtifacts(job) {
-  const artifacts = { log: job.log, binaries: [] };
+  const artifacts = { log: job.log, binaries: [], bytes_total: 0 };
   if (job.status === "succeeded" && job.exe !== "ALL_BUILD") {
     const exePath = path.join(ENGINE_ROOT, "build", job.config, `${job.exe}.exe`);
     if (fs.existsSync(exePath)) {
-      artifacts.binaries.push(path.relative(ENGINE_ROOT, exePath).replaceAll(path.sep, "/"));
+      const rel = path.relative(ENGINE_ROOT, exePath).replaceAll(path.sep, "/");
+      const bytes = fs.statSync(exePath).size;
+      artifacts.binaries.push({ path: rel, bytes });
+      artifacts.bytes_total += bytes;
     }
   }
   return artifacts;
@@ -733,6 +738,15 @@ function jobStage(tail) {
   if (/Building CXX|Building Custom Rule|Compiling|MSBuild|-> .*\.vcxproj/.test(lines)) return "compile";
   if (/Re-running cmake|Configuring done|Build files have been written|CMake Configure|CMake Error/.test(lines)) return "configure";
   return "running";
+}
+
+// §5 item 5 ("progresso granular"): count of completed MSBuild targets from the
+// FULL job log — MSBuild prints `  Target.vcxproj -> <build-dir>\Target.exe` for
+// every completed target, so counting those lines is real granular progress.
+function jobTargetsBuilt(logPath) {
+  if (!fs.existsSync(logPath)) return 0;
+  const log = fs.readFileSync(logPath, "utf8");
+  return (log.match(/> .*\.(exe|dll|lib)/g) || []).length;
 }
 
 function buildStatusTool(args) {
@@ -754,6 +768,7 @@ function buildStatusTool(args) {
     error: job.error ?? null,
     log: job.log,
     stage: jobStage(tail),
+    targets_built: jobTargetsBuilt(logPath),
     artifacts: jobArtifacts(job),
     tail
   };
@@ -1108,6 +1123,11 @@ const PROMPTS = [
     name: "create_system",
     description: "Develop a new engine system (public contract + adapter + gate) using the source-maintenance tools (read_file/apply_text_edits/build).",
     arguments: [{ name: "name", description: "system name/domain", required: true }]
+  },
+  {
+    name: "create_ui",
+    description: "Author a UI screen document (UiDoc) in a game project, following the public IUiDoc contract (layout + widgets + viewport + confirmations).",
+    arguments: [{ name: "name", description: "ui screen name (becomes the file name)", required: true }]
   }
 ];
 
@@ -1293,6 +1313,18 @@ After the project exists, you can add blocks, items, entities, and scenes to it.
         }]
       };
 
+    case "create_ui":
+      return {
+        messages: [{
+          role: "user",
+          content: { type: "text", text: template(`Author a UI screen named "{name}" in a game project. Steps:
+
+1. Call \`read_file\` on \`src/engine/public/engine/ui/IUiDoc.hpp\` (and \`ILayout.hpp\`, \`IWidgets.hpp\`, \`IViewport.hpp\`, \`IConfirmation.hpp\`) to learn the EXACT UiDoc JSON document shape — the public engine/ui contracts compose into ONE versioned document (layout tree + widgets + viewport + confirmations), and the header explicitly declares it the data surface for MCP tooling.
+2. Write the UiDoc JSON to \`Content/UI/{name}.json\` in the game project with \`create_file\` (or \`apply_text_edits\` if the file exists), following the sub-contract field names and validation rules you read in step 1 (all-or-nothing: an invalid sub-document is rejected).
+3. Call \`build_game\` with the project to compile the UI document into the game.`) }
+        }]
+      };
+
     default: throw new Error(`unknown prompt '${name}'`);
   }
 }
@@ -1314,7 +1346,11 @@ const RESOURCE_MAP = new Map([
   // §5 item 3 ("projetos"): DYNAMIC resource — the live project list, same
   // enumeration as the list_game_projects tool (single source, no duplicate
   // walk). Sentinel "__projects__" is special-cased in resources/read.
-  ["engine://projects", "__projects__"]
+  ["engine://projects", "__projects__"],
+  // §5 item 3 ("tests"): DYNAMIC resource — the registered ctest tests of the
+  // current build tree (ctest -N lists them WITHOUT executing — fast and
+  // deterministic). Sentinel "__tests__" is special-cased in resources/read.
+  ["engine://tests", "__tests__"]
 ]);
 
 // FALTANTES item 5 (MCP server) — limits + audit: every tools/call is recorded
@@ -1522,6 +1558,27 @@ async function handleRequest(message) {
       }
       const file = RESOURCE_MAP.get(params.uri);
       if (!file) throw new Error(`unknown resource '${params.uri}'`);
+      if (file === "__tests__") {
+        // §5 item 3 ("tests") — dynamic tests resource: the registered ctest
+        // tests of the current build tree. ctest -N lists without executing
+        // (fast, deterministic per configured tree). If the tree is not
+        // configured, the resource reports it instead of failing hard.
+        const ctest = spawnSync("ctest", ["-N", "-C", "Release"], { cwd: path.join(ENGINE_ROOT, "build"), encoding: "utf8", windowsHide: true, timeout: 15000 });
+        const tests = [];
+        if (ctest.status === 0) {
+          for (const m of ctest.stdout.matchAll(/Test\s+#\d+:\s+([^\r\n]+)/g)) tests.push(m[1].trim());
+        }
+        const payload = {
+          build_configured: ctest.status === 0,
+          count: tests.length,
+          tests: tests.sort()
+        };
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: { contents: [{ uri: params.uri, mimeType: "application/json", text: JSON.stringify(payload, null, 2) }] }
+        };
+      }
       if (file === "__projects__") {
         // §5 item 3 — dynamic projects resource (no backing file): the same
         // enumeration as list_game_projects (imported — single source of

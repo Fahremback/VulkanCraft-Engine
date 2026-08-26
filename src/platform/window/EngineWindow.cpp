@@ -70,9 +70,11 @@ void Engine::mouse_button_callback(GLFWwindow* window, int button, int action, i
     RaycastResult res = instancePtr->player.perform_raycast(instancePtr->world);
     if (res.hit) {
         if (button == GLFW_MOUSE_BUTTON_LEFT) {
-            BlockType targetBlock = as_builtin_block(instancePtr->world.get_block_at(res.hitBlockPos));
-            instancePtr->soundEngine.play_break_sound_for_block(targetBlock);
-            instancePtr->world.set_block_at(res.hitBlockPos, runtime_id(BlockType::Air));
+            // A.2: registry-driven id (see SoundEngine) — dynamic blocks get
+            // their own break sound path instead of collapsing to Air.
+            instancePtr->soundEngine.play_break_sound_for_block(
+                instancePtr->world.get_block_at(res.hitBlockPos));
+            instancePtr->world.set_block_at(res.hitBlockPos, kRuntimeAirId);
             instancePtr->world.force_fluid_tick();
         } else if (button == GLFW_MOUSE_BUTTON_RIGHT) {
             instancePtr->soundEngine.play_place_sound();

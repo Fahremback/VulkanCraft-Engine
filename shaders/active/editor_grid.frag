@@ -1,18 +1,11 @@
 #version 450
 
-// VulkanCraft Stable Adaptive Grid — fragment stage.
+// VulkanCraft Stable World Grid — fragment stage.
 //
-// Hierarchical CONTINUOUS LOD. The previous version picked one decade
-// (fineStep) and crossfaded to the next (coarseStep): the handoff is
-// concentrated in a narrow phase band, so the projection draws it as a
-// perceptible straight/curved frontier across the viewport, and the two
-// partially-faded incommensurate frequencies interfere into dotted
-// "starfield" artifacts near the transition.
-//
-// Instead, every scale decides its own visibility from the real pixel
-// footprint (pixelsPerCell) and scales COEXIST: fine lines are strongest near
-// the camera, coarser lines are already present underneath and take over
-// smoothly as the fine ones retire. There is no decade boundary to see.
+// The grid is anchored permanently to world units: one minor line per metre
+// and one major line every ten metres. Camera distance never changes the set
+// of scales, so there is no LOD frontier, density band or colour step. Each
+// fixed frequency only fades when its projected footprint approaches Nyquist.
 //
 // Explicit Nyquist rule: a frequency whose cell spans fewer than ~1.5 pixels
 // can never be rasterized reliably (partial coverage -> shimmer, moiré,
@@ -37,10 +30,8 @@ layout (push_constant) uniform PushConstants {
     vec4 cameraPos;
 } pc;
 
-// Cells of the reference scale span roughly this many pixels before the finer
-// scales retire (the coarser ones keep going to the horizon). Raise to 96 for
-// even earlier retirement.
-const float TARGET_PIXELS_PER_CELL = 64.0;
+const float MINOR_GRID_STEP = 1.0;
+const float MAJOR_GRID_STEP = 10.0;
 
 // One family of parallel grid lines with a constant screen-space width.
 // fwidth(coord) is the cell size in pixels; below ~1.5 px/cell the frequency
@@ -68,12 +59,13 @@ float gridAtScale(vec2 worldXZ, float step) {
     return max(x, z);
 }
 
-// Visibility of one scale: ramps 0->1 as its cells span enough pixels. The
-// lower edge is the same Nyquist kill as gridLine1D (belt and suspenders:
-// coarse scales never bleed into the subpixel zone either).
-float scaleVisibility(float step, float worldPerPixel) {
+// Visibility of the complete square cell, shared by both line orientations.
+// Using the largest 2D footprint is intentionally conservative: a cell retires
+// as a unit when either projected dimension becomes undersampled. This avoids
+// the triangular holes where oblique lines vanished while radial lines lived on.
+float cellVisibility(float step, float worldPerPixel) {
     float pixelsPerCell = step / max(worldPerPixel, 1e-8);
-    return smoothstep(1.5, 6.0, pixelsPerCell);
+    return smoothstep(1.5, 5.0, pixelsPerCell);
 }
 
 // Constant screen-width world axis (width in pixels, not meters), so the axis
@@ -107,28 +99,17 @@ void main() {
 
     vec3 p = rayOrigin + safeT * rayDirection;
 
-    // ----------------------------------------------------------------------
-    // How much world does one pixel cover? (screen-space footprint)
-    // ----------------------------------------------------------------------
-    vec2 dx = dFdx(p.xz);
-    vec2 dy = dFdy(p.xz);
-    float worldPerPixel = max(max(length(dx), length(dy)), 1e-6);
+    // Full projected footprint of the ground cell. This is shared by X lines,
+    // Z lines and axes so their fade cannot disagree by viewing orientation.
+    float worldPerPixel = max(max(length(dFdx(p.xz)), length(dFdy(p.xz))), 1e-6);
 
-    // ----------------------------------------------------------------------
-    // Hierarchical continuous LOD: evaluate the reference decade and the three
-    // coarser ones. Each scale's own pixelsPerCell visibility decides — finer
-    // scales retire smoothly as they approach the Nyquist limit, coarser ones
-    // are already present underneath (sparse), so the handoff is invisible.
-    // log10 is not a GLSL builtin: ln(x) / ln(10).
-    // ----------------------------------------------------------------------
-    float logarithmicStep = log(max(worldPerPixel * TARGET_PIXELS_PER_CELL, 1e-6)) / 2.302585093;
-    float decade = floor(logarithmicStep);
-
-    float grid = 0.0;
-    for (int i = 0; i <= 3; ++i) {
-        float step = pow(10.0, decade + float(i));
-        grid = max(grid, gridAtScale(p.xz, step) * scaleVisibility(step, worldPerPixel));
-    }
+    // Fixed world hierarchy. Both families exist everywhere and are exact
+    // multiples, so their intersections remain aligned while fwidth performs
+    // the only distance-dependent operation: a gradual anti-aliasing fade.
+    float minorGrid = gridAtScale(p.xz, MINOR_GRID_STEP)
+                    * cellVisibility(MINOR_GRID_STEP, worldPerPixel);
+    float majorGrid = gridAtScale(p.xz, MAJOR_GRID_STEP)
+                    * cellVisibility(MAJOR_GRID_STEP, worldPerPixel);
 
     // ----------------------------------------------------------------------
     // Horizon: only the extreme grazing angle fades, to fight numerical
@@ -142,21 +123,27 @@ void main() {
     float horizonFade = smoothstep(0.001, 0.006, incidence);
 
     // ----------------------------------------------------------------------
-    // Visual: the grid gets discretely stronger with distance so it stays
-    // readable (darker near the camera, brighter toward the horizon).
+    // Stable colours and strengths. Major lines are deliberately only a little
+    // stronger than minor lines; they identify the fixed 10 m hierarchy without
+    // turning into a second oversized grid at distance.
     // ----------------------------------------------------------------------
-    vec3 gridColor = vec3(0.265, 0.300, 0.385);
-    float hierarchy = clamp(decade * 0.25, 0.0, 1.0);
-    gridColor = mix(gridColor, vec3(0.345, 0.390, 0.500), hierarchy * 0.45);
-
-    float alpha = grid * 0.72;
+    vec3 minorColor = vec3(0.255, 0.290, 0.365);
+    vec3 majorColor = vec3(0.315, 0.355, 0.445);
+    float minorAlpha = minorGrid * 0.46;
+    float majorAlpha = majorGrid * 0.58;
+    float alpha = max(minorAlpha, majorAlpha);
+    float majorMix = majorAlpha / max(alpha, 1e-6);
+    vec3 gridColor = mix(minorColor, majorColor, majorMix);
 
     // ----------------------------------------------------------------------
     // Axes at constant screen width: X = red along world X (distance to Z=0),
     // Z = blue along world Z (distance to X=0).
     // ----------------------------------------------------------------------
-    float xAxis = axisLine(p.z, 1.55);
-    float zAxis = axisLine(p.x, 1.55);
+    // Axes belong to the local editing grid. Fading them with the minor cells
+    // prevents a single coloured ray from surviving alone to the vanishing point.
+    float axisVisibility = cellVisibility(MINOR_GRID_STEP, worldPerPixel);
+    float xAxis = axisLine(p.z, 1.55) * axisVisibility;
+    float zAxis = axisLine(p.x, 1.55) * axisVisibility;
 
     vec3 color = gridColor;
     color = mix(color, vec3(0.92, 0.24, 0.28), xAxis);

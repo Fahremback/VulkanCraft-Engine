@@ -64,6 +64,13 @@ struct EditorApiState {
     // Project templates (ProjectTemplateRegistry), insertion order — the
     // project wizard's catalog, exposed for CLI/MCP observability.
     std::vector<std::string> templates;
+    // Qt editor shell document (engine/ui/qt IQtEditorDoc — porte Qt, decisão
+    // do usuário): docks/actions/menus/toolbars/status for the QMainWindow
+    // Qt shell (separate process over the Control API).
+    std::string qt_doc;
+    // Qt theme (engine/ui/qt IQtThemeModel): Wicked charcoal as QPalette
+    // roles + QSS selectors.
+    std::string qt_theme;
     // The editor's composed UI document (engine/ui IUiDoc): layout + widgets
     // + viewport + confirmations as ONE versioned JSON doc — the data surface
     // for reflection/scripting/MCP tooling.
@@ -113,6 +120,17 @@ struct EditorApiState {
     // The onboarding-tour JSON (engine/editor IOnboardingTour) — tutorial step
     // machine state, via GET /onboarding.
     std::string onboarding;
+    // The animation-timeline-editor JSON (engine/editor IAnimationTimelineEditor)
+    // — deterministic timeline document of the real timeline editor, via
+    // GET /timeline-editor.
+    std::string timeline_editor;
+    // The project-launcher JSON (engine/editor IProjectLauncher) — session
+    // model of the launcher hub / open-project flow, via GET /launcher.
+    std::string launcher;
+    // The animation-retargeting editor JSON (engine/editor IRetargeting) —
+    // deterministic retarget document (skeletons/mapping/root motion), via
+    // GET /retargeting.
+    std::string retargeting;
 };
 
 class EditorControlApi {

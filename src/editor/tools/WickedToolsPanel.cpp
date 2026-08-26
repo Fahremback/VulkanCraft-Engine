@@ -1194,27 +1194,34 @@ void WickedToolsPanel::draw_gaussian_splat_window() {
     ImGui::End();
 }
 
+void WickedToolsPanel::apply_theme_to_style() {
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(m_themeBg.r, m_themeBg.g, m_themeBg.b, 1.0f);
+    style.Colors[ImGuiCol_ChildBg] = ImVec4(m_themePanel.r, m_themePanel.g, m_themePanel.b, 1.0f);
+    style.Colors[ImGuiCol_PopupBg] = ImVec4(m_themePanel.r, m_themePanel.g, m_themePanel.b, 1.0f);
+    style.Colors[ImGuiCol_MenuBarBg] = ImVec4(m_themePanel.r, m_themePanel.g, m_themePanel.b, 1.0f);
+    // Derive the frame/button tones from the panel color (slightly lighter).
+    const float lift = 0.08f;
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(m_themePanel.r + lift, m_themePanel.g + lift, m_themePanel.b + lift, 1.0f);
+    style.Colors[ImGuiCol_Button] = ImVec4(m_themePanel.r + lift, m_themePanel.g + lift, m_themePanel.b + lift, 1.0f);
+}
+
 void WickedToolsPanel::draw_theme_editor_window() {
     if (!showThemeEditorWindow) return;
     ImGui::Begin(tr("Editor de Tema", "Theme Editor"), &showThemeEditorWindow);
     clamp_floating_window_on_screen();
     ImGui::TextWrapped("%s", tr(
         "Ajusta as cores base do editor ao vivo (o tema charcoal do Wicked "
-        "continua sendo o padrão). TODO(frontend-port): persistir o tema em disco.",
+        "continua sendo o padrão). O tema é persistido em settings.json e "
+        "reaplicado no boot.",
         "Tunes the editor base colors live (the Wicked charcoal theme remains "
-        "the default). TODO(frontend-port): persist the theme to disk."));
+        "the default). The theme is persisted to settings.json and reapplied "
+        "on boot."));
     ImGui::ColorEdit3(tr("Fundo", "Background"), &m_themeBg.r);
     ImGui::ColorEdit3(tr("Painel", "Panel"), &m_themePanel.r);
     if (ImGui::Button(tr("Aplicar Tema", "Apply Theme"))) {
-        ImGuiStyle& style = ImGui::GetStyle();
-        style.Colors[ImGuiCol_WindowBg] = ImVec4(m_themeBg.r, m_themeBg.g, m_themeBg.b, 1.0f);
-        style.Colors[ImGuiCol_ChildBg] = ImVec4(m_themePanel.r, m_themePanel.g, m_themePanel.b, 1.0f);
-        style.Colors[ImGuiCol_PopupBg] = ImVec4(m_themePanel.r, m_themePanel.g, m_themePanel.b, 1.0f);
-        style.Colors[ImGuiCol_MenuBarBg] = ImVec4(m_themePanel.r, m_themePanel.g, m_themePanel.b, 1.0f);
-        // Derive the frame/button tones from the panel color (slightly lighter).
-        const float lift = 0.08f;
-        style.Colors[ImGuiCol_FrameBg] = ImVec4(m_themePanel.r + lift, m_themePanel.g + lift, m_themePanel.b + lift, 1.0f);
-        style.Colors[ImGuiCol_Button] = ImVec4(m_themePanel.r + lift, m_themePanel.g + lift, m_themePanel.b + lift, 1.0f);
+        apply_theme_to_style();
+        if (m_saveSettings) m_saveSettings();
     }
     ImGui::End();
 }

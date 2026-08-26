@@ -1,0 +1,18 @@
+// rt_anyhit.rahit — cull de backface (semântica single-sided do IRayTracer):
+// a face frontal é o lado do normal right-hand da winding (v0,v1,v2); rays
+// vindos por trás (dot(normal, dir) >= 0) são ignorados — idêntico ao Embree.
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+layout(set = 0, binding = 2, std430) readonly buffer Verts { vec4 verts[]; };
+
+void main() {
+    uint tri = gl_PrimitiveID;
+    vec3 a = verts[tri * 3u + 0u].xyz;
+    vec3 b = verts[tri * 3u + 1u].xyz;
+    vec3 c = verts[tri * 3u + 2u].xyz;
+    vec3 n = cross(b - a, c - a);
+    if (dot(n, gl_WorldRayDirectionEXT) >= 0.0) {
+        ignoreIntersectionEXT;
+    }
+}

@@ -322,9 +322,28 @@ private:
     // never false-matches a stale entry.
     std::unordered_map<std::pair<int, int>, uint64_t, ChunkHash>
         lightContentRevision_;
+    // C.1 passo 2: chunk-local edited cells (light_key) recorded by
+    // set_block_at/set_water_at since the chunk's last light pass. The light
+    // pass uses them to bound the block-light recompute to the affected AABB
+    // (edit +- kMaxLight) — cells beyond that are provably unchanged (light
+    // attenuates by >=1 per step, max kMaxLight). Cleared per chunk after the
+    // pass. Capped: a chunk with too many pending edits falls back to the full
+    // recompute (AABB would cover most of the chunk anyway).
+    std::unordered_map<std::pair<int, int>, std::vector<uint32_t>, ChunkHash>
+        pendingLightEdits_;
     // Restore mode (set_restoring): suppresses chunk eviction during loads.
     bool restoring_{ false };
+    // C.2: in-flight per-chunk light jobs (dispatched by run_light_pass to the
+    // worker pool, executed by run_light_job). Capped so a burst of dirty
+    // chunks cannot queue unbounded work behind the mesh/generation jobs.
+    std::atomic<int> pendingLightJobs{ 0 };
     void run_light_pass(const glm::vec3& playerPos);
+    // C.2: executes one chunk's light compute on a worker thread (holds
+    // chunksMutex for the whole compute — the same lock every chunk-data
+    // writer takes, so the lock-free access lambdas stay safe).
+    void run_light_job(std::pair<int, int> key, std::shared_ptr<Chunk> chunk,
+                       std::shared_ptr<Chunk> (&neighbors)[4],
+                       uint64_t dispatchedRevision, std::vector<uint32_t> edits);
     // Emission/absorption tables (builtin + registry-derived dynamic blocks).
     uint8_t light_emission(RuntimeBlockId id) const;
     uint8_t light_absorption(RuntimeBlockId id) const;

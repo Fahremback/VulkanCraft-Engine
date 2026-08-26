@@ -1,0 +1,59 @@
+// rt_query.comp — closest-hit via VK_KHR_ray_query (compute). Substitui o
+// pipeline RT (SBT/hit-groups) por um dispatch de compute: muito mais robusto
+// e com a MESMA semântica single-sided do IRayTracer (cull de backface com
+// dot(normal, dir) >= 0, idêntico ao Embree e ao brute-force do gate).
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_ray_tracing : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct RayData {
+    vec4 org;      // ox, oy, oz, pad
+    vec4 dir;      // dx, dy, dz, pad (dir NORMALIZADA)
+    vec4 tminmax;  // tMin, tMax, pad, pad
+};
+
+struct ResultData {
+    uint hit;   // 0 = miss, 1 = hit
+    float t;    // distância do closest-hit (ou -1)
+    int  prim;  // índice do triângulo (ou -1)
+    uint pad;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer Rays    { RayData    rays[];    };
+layout(set = 0, binding = 1, std430) buffer       Results   { ResultData results[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Verts    { vec4       verts[];   };
+layout(set = 0, binding = 3) uniform accelerationStructureEXT tlas;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    RayData r = rays[idx];
+    ResultData res;
+    res.hit = 0u;
+    res.t = -1.0;
+    res.prim = -1;
+    res.pad = 0u;
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas, 0u, 0xFFu, r.org.xyz, r.tminmax.x, r.dir.xyz, r.tminmax.y);
+    while (rayQueryProceedEXT(rq)) {
+        // Candidate = triângulo (front ou back). Cull de backface com o normal
+        // da winding (v0,v1,v2): dot(normal, dir) >= 0 -> descarta.
+        uint tri = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+        vec3 a = verts[tri * 3u + 0u].xyz;
+        vec3 b = verts[tri * 3u + 1u].xyz;
+        vec3 c = verts[tri * 3u + 2u].xyz;
+        vec3 n = cross(b - a, c - a);
+        if (dot(n, r.dir.xyz) < 0.0) {
+            rayQueryConfirmIntersectionEXT(rq);
+        }
+    }
+
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+        res.hit = 1u;
+        res.t = rayQueryGetIntersectionTEXT(rq, true);
+        res.prim = int(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+    }
+    results[idx] = res;
+}

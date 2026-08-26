@@ -15,6 +15,8 @@
 #include <engine/voxel/IVoxelWorld.hpp>
 #include <engine/voxel/IVoxelServices.hpp>
 #include <engine/voxel/IVoxelBlockEntity.hpp>
+#include <engine/voxel/IBlockEntityScripting.hpp>
+#include "engine/sdk/FastNoise2Adapter.hpp"
 #include <engine/registry/BlockRegistry.hpp>
 #include <engine/registry/FluidRegistry.hpp>
 #include <engine/registry/ItemRegistry.hpp>
@@ -3118,13 +3120,94 @@ void test_block_entity_optional_capabilities() {
                  "lean, roundtrip OK\n";
 }
 
-// Task C.3 (handoff 3->1): the renderer-facing dirty-region contract. The
-// world exposes the chunk-level dirty signals (mesh + light) with monotonic
-// per-chunk revisions — exactly what a renderer needs to drive ILumenScene's
-// incremental replace_chunk (the stale gate compares revisions). The snapshot
-// is read-only and NON-consuming: the world keeps owning the signals, so
-// repeated polls return the same deterministic (sorted) state until the world
-// processes them.
+// Task B.2 (engine-side scripting leg): the block-entity scripting bridge
+// runs the scripts that entities declare through script_id() using the
+// engine's ScriptVM, consuming the block-entity listener contract
+// (Attached/Detached) and exposing live variables to the inspector seam.
+void test_block_entity_scripting() {
+    using engine::voxel::BlockEntityScriptSpec;
+    using engine::voxel::IBlockEntityScripting;
+
+    std::unique_ptr<engine::voxel::IVoxelWorld> world =
+        engine::voxel::create_default_voxel_world();
+    world->register_generator(std::make_shared<FlatGenerator>(96));
+    world->register_block_entity_type("project:chest",
+        [] { return std::make_shared<ChestEntity>(); });
+    const glm::vec3 player{ 8.0f, 200.0f, 8.0f };
+    CHECK(boot_world(*world, player, 16));
+
+    // Create the scripting bridge — it subscribes to the world's
+    // block-entity listener for its lifetime.
+    auto scripting = engine::voxel::create_block_entity_scripting(*world);
+    CHECK(scripting != nullptr);
+    CHECK(scripting->active_instances() == 0);
+    CHECK(scripting->completed_runs() == 0);
+    CHECK(scripting->failed_runs() == 0);
+
+    // Register a trivial script: increment "count" on every tick.
+    BlockEntityScriptSpec spec;
+    spec.scriptId = "project:chest_loot";
+    spec.graphJson = R"({
+        "id": "00000000-0000-0000-0000-000000000001",
+        "name": "counter",
+        "nodes": [
+            {"id": "00000000-0000-0000-0000-000000000010", "kind": "Event", "event": "on_tick"},
+            {"id": "00000000-0000-0000-0000-000000000011", "kind": "ConstantFloat", "literal": {"type": "float", "value": 1.0}},
+            {"id": "00000000-0000-0000-0000-000000000012", "kind": "AddFloat", "variable": "count"},
+            {"id": "00000000-0000-0000-0000-000000000013", "kind": "Return"}
+        ],
+        "links": [
+            {"from": "00000000-0000-0000-0000-000000000010", "to": "00000000-0000-0000-0000-000000000011"},
+            {"from": "00000000-0000-0000-0000-000000000011", "to": "00000000-0000-0000-0000-000000000012"},
+            {"from": "00000000-0000-0000-0000-000000000012", "to": "00000000-0000-0000-0000-000000000013"}
+        ]
+    })";
+    CHECK(scripting->register_script(spec));
+    CHECK(scripting->has_script("project:chest_loot"));
+    CHECK(scripting->last_error().empty());
+
+    // Attach a chest with matching script_id — the bridge picks it up
+    // via the Attached listener. The first tick creates the instance.
+    auto chest = std::make_shared<ChestEntity>();
+    std::string error;
+    CHECK(world->attach_block_entity(8, 96, 8, chest, error));
+    CHECK(error.empty());
+
+    // Tick: the script's on_tick fires, incrementing "count".
+    // After the first tick, the instance is live and active_instances > 0.
+    scripting->tick(1.0 / 20.0);
+    scripting->tick(1.0 / 20.0);
+    scripting->tick(1.0 / 20.0);
+    CHECK(scripting->active_instances() == 1);
+
+    // Read the live variable through the inspector seam.
+    double count = -1.0;
+    CHECK(scripting->script_variable({8, 96, 8}, "count", count));
+    CHECK(count > 0.5);
+    CHECK(scripting->completed_runs() >= 3);
+    CHECK(scripting->failed_runs() == 0);
+
+    // Unregister the script — the bridge no longer drives the entity.
+    CHECK(scripting->unregister_script("project:chest_loot"));
+    CHECK(!scripting->has_script("project:chest_loot"));
+
+    // Detach the chest — the bridge removes the instance.
+    CHECK(world->remove_block_entity(8, 96, 8));
+    CHECK(scripting->active_instances() == 0);
+
+    // Re-register and re-attach: fresh VM, count starts from zero again.
+    CHECK(scripting->register_script(spec));
+    CHECK(world->attach_block_entity(8, 96, 8, chest, error));
+    scripting->tick(1.0 / 20.0);
+    CHECK(scripting->active_instances() == 1);
+    double count2 = -1.0;
+    CHECK(scripting->script_variable({8, 96, 8}, "count", count2));
+    CHECK(count2 > 0.5);
+
+    std::cout << "[sdk] block-entity scripting bridge: register/tick/variable/"
+                 "detach/reattach OK\n";
+}
+
 void test_render_handoff_dirty_updates() {
     std::unique_ptr<engine::voxel::IVoxelWorld> world =
         engine::voxel::create_default_voxel_world();
@@ -3400,11 +3483,15 @@ void test_light_load_unload_during_propagation() {
     std::unique_ptr<engine::voxel::IVoxelWorld> keep = buildSkylight();
     std::unique_ptr<engine::voxel::IVoxelWorld> evict = buildSkylight();
     const auto skylightConverged = [](engine::voxel::IVoxelWorld& w) {
+        // True fixed point (C.2): the probe cells converged AND no light work
+        // remains (dirty or in flight). With async light the 2-cell probe
+        // alone is satisfiable mid-cascade — the chunk's full column is only
+        // final once every relight job has run.
+        const auto snap = w.streaming_snapshot();
         return w.get_sky_light(8, 96, 8) == 0 &&   // stone occludes
-               w.get_sky_light(8, 200, 8) == 15;   // open air: full sun
+               w.get_sky_light(8, 200, 8) == 15 && // open air: full sun
+               snap.lightDirtyChunks == 0 && snap.pendingLightJobs == 0;
     };
-    CHECK(settle(*keep, home, [&] { return skylightConverged(*keep); }));
-    CHECK(settle(*evict, home, [&] { return skylightConverged(*evict); }));
 
     // Teleport far away: the clean (0,0) chunk falls out of the streaming
     // window and is evicted.
@@ -9509,10 +9596,19 @@ void test_region_replication() {
 
     server->set_block(10, surface + 1, 10, kWaterId);
     server->set_block(11, surface + 1, 11, kBlockGlowstone);
-    // Let the deterministic engine settle fluid + light on the authority.
+    // Let the deterministic engine settle fluid + light on the authority. C.2:
+    // light runs on workers, so the light-arrival sim-tick is NOT a fixed
+    // point — settle to the actual fixed point instead: the water must have
+    // fully spread (active fluid set drained) AND the emitter cell lit. The
+    // region snapshot packs the current fluid/light cells, so packing before
+    // convergence would make the two bit-identical servers diverge by tick.
     const glm::vec3 player(16.0f, 200.0f, 16.0f);
-    CHECK(settle(*server, player,
-                 [&] { return server->get_block_light(11, surface + 1, 11) > 0; }));
+    CHECK(settle(*server, player, [&] {
+        const auto snap = server->streaming_snapshot();
+        return server->get_block_light(11, surface + 1, 11) > 0 &&
+               snap.activeFluidCells == 0 && snap.pendingFluidTicks == 0 &&
+               snap.lightDirtyChunks == 0 && snap.pendingLightJobs == 0;
+    }));
     CHECK(server->get_fluid_level(10, surface + 1, 10) != 0xFF);
 
     auto srv = engine::voxel::create_voxel_replication(*server);
@@ -9619,8 +9715,14 @@ void test_region_replication() {
     CHECK(entityWorld2->set_component(holder2, inventory));
     server2->set_block(10, surface2 + 1, 10, kWaterId);
     server2->set_block(11, surface2 + 1, 11, kBlockGlowstone);
-    CHECK(settle(*server2, player,
-                 [&] { return server2->get_block_light(11, surface2 + 1, 11) > 0; }));
+    // Same fixed-point gate as the first server (C.2): fluid spread converged
+    // + emitter lit, so both pack bit-identical regions.
+    CHECK(settle(*server2, player, [&] {
+        const auto snap = server2->streaming_snapshot();
+        return server2->get_block_light(11, surface2 + 1, 11) > 0 &&
+               snap.activeFluidCells == 0 && snap.pendingFluidTicks == 0 &&
+               snap.lightDirtyChunks == 0 && snap.pendingLightJobs == 0;
+    }));
     auto srv2 = engine::voxel::create_voxel_replication(*server2);
     srv2->server_register_connection(kRepConnB);
     srv2->server_set_interest(kRepConnB, {{8, surface2, 8}, 0});
@@ -9631,6 +9733,47 @@ void test_region_replication() {
     {
         const std::vector<std::byte> encoded2 =
             engine::voxel::encode_replication_region(region2);
+        if (!(encode_replication_region(region2) == encoded)) {
+            const std::vector<std::byte>& e1 = encoded;
+            const std::vector<std::byte>& e2 = encoded2;
+            std::size_t firstDiff = 0;
+            while (firstDiff < e1.size() && firstDiff < e2.size() &&
+                   e1[firstDiff] == e2[firstDiff]) ++firstDiff;
+            std::cout << "[sdk] REGION-DIFF size1=" << e1.size()
+                      << " size2=" << e2.size()
+                      << " firstDiff=" << firstDiff
+                      << " cells1=" << region.cells.size()
+                      << " cells2=" << region2.cells.size()
+                      << " seq1=" << region.sequence
+                      << " seq2=" << region2.sequence
+                      << " chunks1=" << region.chunks.size()
+                      << " chunks2=" << region2.chunks.size()
+                      << " ent1=" << region.entities.size()
+                      << " ent2=" << region2.entities.size()
+                      << " be1=" << region.blockEntities.size()
+                      << " be2=" << region2.blockEntities.size() << "\n";
+            for (std::size_t i = 0; i < region.cells.size() &&
+                                    i < region2.cells.size(); ++i) {
+                if (region.cells[i].position != region2.cells[i].position ||
+                    region.cells[i].blockLight != region2.cells[i].blockLight ||
+                    region.cells[i].skyLight != region2.cells[i].skyLight ||
+                    region.cells[i].fluidLevel != region2.cells[i].fluidLevel) {
+                    std::cout << "  CELL[" << i << "] p1=("
+                              << region.cells[i].position.x << ","
+                              << region.cells[i].position.y << ","
+                              << region.cells[i].position.z << ") bl="
+                              << +region.cells[i].blockLight << " sl="
+                              << +region.cells[i].skyLight << " fl="
+                              << +region.cells[i].fluidLevel << " | p2=("
+                              << region2.cells[i].position.x << ","
+                              << region2.cells[i].position.y << ","
+                              << region2.cells[i].position.z << ") bl="
+                              << +region2.cells[i].blockLight << " sl="
+                              << +region2.cells[i].skyLight << " fl="
+                              << +region2.cells[i].fluidLevel << "\n";
+                }
+            }
+        }
         CHECK(encode_replication_region(region2) == encoded);
     }
 
@@ -10728,6 +10871,81 @@ void test_graph_generator_world() {
 
     std::cout << "[sdk] procgen: graph-driven voxel generator (deterministic "
                  "terrain, non-flat) OK\n";
+}
+
+// G.fastnoise2: FastNoise2 SIMD backend for INoiseGraph.
+// Validates: compile, determinism (same spec+seed -> same samples),
+// and basic 2D/3D sampling.
+void test_fastnoise2_backend() {
+    std::string error;
+
+    // Build a simple graph: perlin noise.
+    NoiseGraphSpec spec;
+    spec.seed = 42;
+    spec.nodes.push_back({ "perlin", { 0.02f, 0.0f }, {} });
+    spec.root = 0;
+
+    auto first = engine::procgen::create_noise_graph_from_spec_fastnoise2(spec, error);
+    CHECK(first != nullptr);
+    CHECK(error.empty());
+
+    // Determinism: same spec + same seed -> identical samples.
+    auto second = engine::procgen::create_noise_graph_from_spec_fastnoise2(spec, error);
+    CHECK(second != nullptr);
+    for (float x = -10.0f; x <= 10.0f; x += 1.0f) {
+        for (float z = -10.0f; z <= 10.0f; z += 1.0f) {
+            CHECK(first->sample_2d(x, z) == second->sample_2d(x, z));
+        }
+    }
+    for (float x = -5.0f; x <= 5.0f; x += 2.0f) {
+        for (float y = -5.0f; y <= 5.0f; y += 2.0f) {
+            for (float z = -5.0f; z <= 5.0f; z += 2.0f) {
+                CHECK(first->sample_3d(x, y, z) == second->sample_3d(x, y, z));
+            }
+        }
+    }
+
+    // Different seed -> different samples (at least one should differ).
+    spec.seed = 99;
+    auto diffSeed = engine::procgen::create_noise_graph_from_spec_fastnoise2(spec, error);
+    CHECK(diffSeed != nullptr);
+    bool differs = false;
+    for (float x = 0.0f; x <= 10.0f && !differs; x += 1.0f) {
+        if (first->sample_2d(x, 0.0f) != diffSeed->sample_2d(x, 0.0f))
+            differs = true;
+    }
+    CHECK(differs);
+
+    // Serialize/deserialize round-trip.
+    std::string json;
+    CHECK(first->serialize(json));
+    CHECK(!json.empty());
+    auto restored = engine::procgen::create_noise_graph_from_spec_fastnoise2(spec, error);
+    CHECK(restored != nullptr);
+    // After deserialize, sampling should match the original (same seed).
+    CHECK(restored->deserialize(json, error));
+    CHECK(error.empty());
+    for (float x = 0.0f; x <= 5.0f; x += 1.0f) {
+        CHECK(restored->sample_2d(x, 0.0f) == first->sample_2d(x, 0.0f));
+    }
+
+    // Fractal: fbm wrapping a simplex base.
+    NoiseGraphSpec fbmSpec;
+    fbmSpec.seed = 7;
+    fbmSpec.nodes.push_back({ "simplex", { 0.01f, 0.0f }, {} });
+    fbmSpec.nodes.push_back({ "fbm", { 4.0f, 0.5f, 2.0f, 0.0f }, { 0 } });
+    fbmSpec.root = 1;
+    auto fbm = engine::procgen::create_noise_graph_from_spec_fastnoise2(fbmSpec, error);
+    CHECK(fbm != nullptr);
+    CHECK(error.empty());
+    // FBM output should be finite and bounded.
+    for (float x = -10.0f; x <= 10.0f; x += 2.0f) {
+        float v = fbm->sample_2d(x, 0.0f);
+        CHECK(std::isfinite(v));
+    }
+
+    std::cout << "[sdk] procgen: FastNoise2 SIMD backend (determinism, 2D/3D, "
+                 "fractal, serialize) OK\n";
 }
 
 // ---- Item 8: climate graph, biome registry and surface rules (META 18) ----
@@ -13241,6 +13459,7 @@ int main(int argc, char** argv) {
         test_block_entity_persistence();
         test_block_entities_json_defined();
         test_block_entity_optional_capabilities();
+        test_block_entity_scripting();
         test_render_handoff_dirty_updates();
         test_light_skylight();
         test_light_block_emitter();
@@ -13320,6 +13539,7 @@ int main(int argc, char** argv) {
         test_noise_graph_nodes();
         test_noise_graph_serialization();
         test_graph_generator_world();
+        test_fastnoise2_backend();
         test_climate_registry();
         test_climate_sampler();
         test_climate_generator_world();

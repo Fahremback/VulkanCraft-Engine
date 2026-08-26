@@ -59,7 +59,19 @@ public:
     virtual bool occluded(const RayTracerRay& ray) const = 0;
 };
 
-// Factory do SDK (adapter EmbreeRayTracer.cpp no vc_sdk_public).
+// Factory do SDK — backend SOFTWARE (adapter EmbreeRayTracer.cpp no
+// vc_sdk_public): sempre disponível, CPU, determinístico.
 std::unique_ptr<IRayTracer> create_ray_tracer();
+
+// Factory HARDWARE (GPU) — backend Vulkan ray tracing (VkRayTracer.cpp no
+// vc_sdk_public): mesma interface e a MESMA semântica single-sided, mas roda
+// na GPU (VK_KHR_ray_tracing_pipeline). Retorna nullptr quando a GPU não
+// expuser ray tracing (fallback honesto para o software).
+std::unique_ptr<IRayTracer> create_hw_ray_tracer();
+
+// Seleção data-driven (A.8 — "hardware ray tracing quando disponível, sem
+// mudar a API pública"): preferHardware=true tenta a GPU RT e cai para o
+// software (Embree) automaticamente se indisponível; false força o software.
+std::unique_ptr<IRayTracer> create_ray_tracer_preferred(bool preferHardware);
 
 }  // namespace vc::rendering

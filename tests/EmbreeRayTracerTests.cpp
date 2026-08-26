@@ -145,11 +145,11 @@ int main() {
         auto tr = vc::rendering::create_ray_tracer();
         CHECK(tr->build(tris.data(), (int32_t)tris.size()), "rebuild ok");
         vc::rendering::RayTracerRay shortRay = rays[0];
-        shortRay.tMax = 0.2f;                     // hit real em t=0.5
+        shortRay.tMax = 0.05f;                    // hit real em t=0.1 (face slanted)
         auto h = tr->closestHit(shortRay);
         CHECK(!h.hit, "tMax menor que o hit deve cortar");
         vc::rendering::RayTracerRay tight = rays[0];
-        tight.tMin = 0.6f;                        // hit real em t=0.5
+        tight.tMin = 0.2f;                        // hit real em t=0.1
         auto h2 = tr->closestHit(tight);
         CHECK(!h2.hit, "tMin maior que o hit deve cortar");
     }

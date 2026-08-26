@@ -1,0 +1,47 @@
+// rt_raygen.rgen — backend GPU (Vulkan RT) do IRayTracer.
+// Um raio por invocação (gl_LaunchIDEXT.x); lê do SSBO Rays, traça contra a
+// TLAS, grava o resultado no SSBO Results.
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+struct RayData {
+    vec4 org;      // ox, oy, oz, pad
+    vec4 dir;      // dx, dy, dz, pad (dir NORMALIZADA)
+    vec4 tminmax;  // tMin, tMax, pad, pad
+};
+
+struct ResultData {
+    uint hit;   // 0 = miss, 1 = hit
+    float t;    // distância do closest-hit (ou -1)
+    int  prim;  // índice do triângulo (ou -1)
+    uint pad;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer Rays    { RayData    rays[];    };
+layout(set = 0, binding = 1, std430) buffer       Results   { ResultData results[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Verts    { vec4       verts[];   };
+layout(set = 0, binding = 3) uniform accelerationStructureEXT tlas;
+
+layout(location = 0) rayPayloadEXT Payload {
+    uint hit;
+    float t;
+    int  prim;
+} payload;
+
+void main() {
+    uint idx = gl_LaunchIDEXT.x;
+    RayData r = rays[idx];
+    payload.hit  = 0u;
+    payload.t    = -1.0;
+    payload.prim = -1;
+    // rayFlags = 0 (gl_RayFlagsNoneEXT): SEM Opaque — o any-hit roda o cull
+    // de backface (semântica single-sided do IRayTracer, igual ao Embree).
+    traceRayEXT(tlas, 0u, 0xFFu, 0u, 0u, 0u,
+                r.org.xyz, r.tminmax.x, r.dir.xyz, r.tminmax.y, 0);
+    ResultData res;
+    res.hit  = payload.hit;
+    res.t    = payload.t;
+    res.prim = payload.prim;
+    res.pad  = 0u;
+    results[idx] = res;
+}

@@ -520,6 +520,81 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
         send_response(conn, out.str());
         return;
     }
+    if (method == "GET" && path == "/timeline-editor") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.timeline_editor.empty()) {
+            out << "{\"valid\":false,\"timeline_editor\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"timeline_editor\":" << snapshot.timeline_editor << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/launcher") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.launcher.empty()) {
+            out << "{\"valid\":false,\"launcher\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"launcher\":" << snapshot.launcher << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/retargeting") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.retargeting.empty()) {
+            out << "{\"valid\":false,\"retargeting\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"retargeting\":" << snapshot.retargeting << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/qt-doc") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.qt_doc.empty()) {
+            out << "{\"valid\":false,\"qt_doc\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"qt_doc\":" << snapshot.qt_doc << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/qt-theme") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.qt_theme.empty()) {
+            out << "{\"valid\":false,\"qt_theme\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"qt_theme\":" << snapshot.qt_theme << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
     if (method == "GET" && path == "/health") {
         send_response(conn, "ok", "text/plain");
         return;
@@ -701,6 +776,13 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
         else if (path.rfind("/selftest/", 0) == 0) cmd = "selftest " + path.substr(10);
         else if (path == "/package") cmd = "package";
         else if (path == "/hot-reload") cmd = "hot-reload";
+        else if (path.rfind("/screenshot-ui", 0) == 0) {
+            // /screenshot-ui?path=... — captures the FINAL FRAME (viewport + UI
+            // ImGui/docks) from the UI snapshot; validar o visual por algoritmo.
+            // Deve vir ANTES do /screenshot (prefixo tambem casa /screenshot-ui).
+            const std::string p = query_value_after(path, "path");
+            cmd = p.empty() ? "screenshot-ui" : "screenshot-ui " + p;
+        }
         else if (path.rfind("/screenshot", 0) == 0) {
             // /screenshot?path=... — captures the viewport to a PNG and returns
             // the saved path in `data` so an agent can see the result.

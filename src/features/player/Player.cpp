@@ -28,8 +28,12 @@ bool Player::check_collision(const glm::vec3& targetPos, const World& world) con
     for (int bx = minBlockX; bx <= maxBlockX; bx++) {
         for (int by = minBlockY; by <= maxBlockY; by++) {
             for (int bz = minBlockZ; bz <= maxBlockZ; bz++) {
-                BlockType type = as_builtin_block(world.get_block_at(glm::vec3(bx + 0.5f, by + 0.5f, bz + 0.5f)));
-                if (is_solid_block(type)) {
+                // A.2: registry-driven solidity — as_builtin_block mapped every
+                // dynamic (registry-defined) block to Air, so collision never
+                // saw JSON-defined blocks. is_solid_block_id resolves builtin
+                // and dynamic blocks alike from the runtime table.
+                if (world.is_solid_block_id(world.get_block_at(
+                        glm::vec3(bx + 0.5f, by + 0.5f, bz + 0.5f)))) {
                     return true;
                 }
             }
@@ -95,8 +99,9 @@ RaycastResult Player::perform_raycast(const World& world, float maxDistance) con
 
     for (float t = 0.0f; t < maxDistance; t += step) {
         currentPos = rayOrigin + rayDir * t;
-        BlockType type = as_builtin_block(world.get_block_at(currentPos));
-        if (is_solid_block(type)) {
+        // A.2: registry-driven solidity (see check_collision) — dynamic blocks
+        // now stop the ray too.
+        if (world.is_solid_block_id(world.get_block_at(currentPos))) {
             return { true, currentPos, lastAirPos };
         }
         lastAirPos = currentPos;

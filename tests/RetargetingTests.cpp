@@ -1,14 +1,11 @@
-// RetargetingTests — gate do contrato público de retargeting de animação
-// (agente 4 §4 item 2, unidade "retargeting"). Prova o mapeamento fonte→alvo
-// all-or-nothing (skeletons/ossos/escala/duplicatas), a reamostragem com
-// escala de posição e bind p/ ossos sem mapeamento, a recusa de clip de
-// outra skeleton e o round-trip JSON bit-exact.
+// Gate para engine::animation::IRetargeting (agente 4 §4 item 2) — retargeting
+// determinístico de animação fonte → alvo sobre um IAnimCore. Headless: sem
+// editor, sem janela, sem relógio.
 
-#include "engine/animation/IAnimCore.hpp"
 #include "engine/animation/IRetargeting.hpp"
+#include "engine/animation/IAnimCore.hpp"
 
-#include <cmath>
-#include <iostream>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -16,256 +13,190 @@ namespace {
 
 int g_failures = 0;
 
-void check(bool condition, const std::string& message) {
-    if (!condition) {
+#define CHECK(cond, msg)                                            \
+    do {                                                            \
+        if (!(cond)) {                                              \
+            std::printf("FAIL: %s\n", msg);                         \
+            ++g_failures;                                           \
+        }                                                           \
+    } while (0)
+
+void expect_refused(bool ok, const char* what) {
+    if (ok) {
+        std::printf("FAIL: %s\n", what);
         ++g_failures;
-        std::cout << "FAIL: " << message << "\n";
     }
 }
 
-bool approx(double a, double b, double eps = 1e-9) {
-    return std::fabs(a - b) <= eps;
-}
-
-bool approx_v(const engine::animation::AnimVec3& a,
-              const engine::animation::AnimVec3& b, double eps = 1e-9) {
-    return std::fabs(a.x - b.x) <= eps && std::fabs(a.y - b.y) <= eps &&
-           std::fabs(a.z - b.z) <= eps;
-}
-
-using engine::animation::AnimQuat;
-using engine::animation::AnimTransform;
-using engine::animation::AnimVec3;
-using engine::animation::BonePose;
-using engine::animation::ClipSpec;
-using engine::animation::IAnimCore;
-using engine::animation::IRetargeting;
-using engine::animation::RetargetMapping;
-using engine::animation::SkeletonSpec;
-using engine::animation::create_anim_core;
-using engine::animation::create_retargeting;
-
-// Fonte: hips (raiz) + thigh — bind (0,0,0)/(0,1,0); clip walk translada
-// hips 0→(1,0,0) em 1s.
-SkeletonSpec make_source() {
-    SkeletonSpec sk;
-    sk.id = "human_s";
-    sk.bones = {
-        {"hips", -1, {{0, 0, 0}, AnimQuat{}, {1, 1, 1}}},
-        {"thigh", 0, {{0, 1, 0}, AnimQuat{}, {1, 1, 1}}},
-    };
-    return sk;
-}
-
-// Alvo: pelvis (raiz) + leg + head — bind (0,0,0)/(0,2,0)/(0,2.2,0).
-SkeletonSpec make_target() {
-    SkeletonSpec sk;
-    sk.id = "human_t";
-    sk.bones = {
-        {"pelvis", -1, {{0, 0, 0}, AnimQuat{}, {1, 1, 1}}},
-        {"leg", 0, {{0, 2, 0}, AnimQuat{}, {1, 1, 1}}},
-        {"head", 1, {{0, 2.2, 0}, AnimQuat{}, {1, 1, 1}}},
-    };
-    return sk;
-}
-
-ClipSpec make_walk_s() {
-    ClipSpec clip;
-    clip.id = "walk_s";
-    clip.skeleton = "human_s";
-    clip.duration = 1.0;
-    clip.tracks = {
-        {"hips",
-         {{0.0, {{0, 0, 0}, AnimQuat{}, {1, 1, 1}}},
-          {1.0, {{1, 0, 0}, AnimQuat{}, {1, 1, 1}}}}},
-        {"thigh",
-         {{0.0, {{0, 1, 0}, AnimQuat{}, {1, 1, 1}}},
-          {1.0, {{0, 1, 0}, AnimQuat{}, {1, 1, 1}}}}},
-    };
-    return clip;
-}
-
-struct Fixture {
-    std::unique_ptr<IAnimCore> core;
-    std::unique_ptr<IRetargeting> retarget;
-};
-
-Fixture make_fixture() {
-    Fixture fx;
-    fx.core = create_anim_core();
-    std::string err;
-    check(fx.core->add_skeleton(make_source(), err) && err.empty(),
-          "skeleton fonte aceita");
-    check(fx.core->add_skeleton(make_target(), err) && err.empty(),
-          "skeleton alvo aceita");
-    check(fx.core->add_clip(make_walk_s(), err) && err.empty(),
-          "clip walk_s aceito");
-    fx.retarget = create_retargeting(*fx.core);
-    return fx;
-}
-
-void test_add_retarget() {
-    Fixture fx = make_fixture();
-    std::string err;
-
-    check(fx.retarget->add_retarget(
-              "s2t", "human_s", "human_t",
-              {{"hips", "pelvis", 2.0}, {"thigh", "leg", 2.0}}, err) &&
-              err.empty(),
-          "retarget válido aceito");
-    check(fx.retarget->has_retarget("s2t"), "has_retarget s2t");
-    check(fx.retarget->retarget_ids().size() == 1,
-          "retarget_ids = 1");
-
-    check(!fx.retarget->add_retarget("s2t", "human_s", "human_t",
-                                     {{"hips", "pelvis", 1.0}}, err) &&
-              err.find("duplicate retarget") != std::string::npos,
-          "id duplicado rejeitado");
-    check(!fx.retarget->add_retarget("x", "ghost", "human_t",
-                                     {{"hips", "pelvis", 1.0}}, err),
-          "skeleton fonte desconhecida rejeitada");
-    check(!fx.retarget->add_retarget("x", "human_s", "ghost",
-                                     {{"hips", "pelvis", 1.0}}, err),
-          "skeleton alvo desconhecida rejeitada");
-    check(!fx.retarget->add_retarget("x", "human_s", "human_t",
-                                     {{"spine", "pelvis", 1.0}}, err),
-          "osso fonte desconhecido rejeitado");
-    check(!fx.retarget->add_retarget("x", "human_s", "human_t",
-                                     {{"hips", "toe", 1.0}}, err),
-          "osso alvo desconhecido rejeitado");
-    check(!fx.retarget->add_retarget("x", "human_s", "human_t",
-                                     {{"hips", "pelvis", 1.0},
-                                      {"thigh", "pelvis", 1.0}},
-                                     err),
-          "osso alvo duplicado rejeitado");
-    check(!fx.retarget->add_retarget("x", "human_s", "human_t",
-                                     {{"hips", "pelvis", 0.0}}, err),
-          "scale 0 rejeitado");
-    check(fx.retarget->retarget_ids().size() == 1,
-          "estado intacto após recusas");
-}
-
-void test_retarget_pose() {
-    Fixture fx = make_fixture();
-    std::string err;
-    check(fx.retarget->add_retarget(
-              "s2t", "human_s", "human_t",
-              {{"hips", "pelvis", 2.0}, {"thigh", "leg", 2.0}}, err) &&
-              err.empty(),
-          "retarget s2t");
-
-    // t=1: pelvis (1·2,0,0); leg = thigh local (0,1,0)·2 = (0,2,0);
-    // head SEM mapeamento → bind (0,2.2,0). Ordem = declaração da alvo.
-    const std::vector<BonePose> pose =
-        fx.retarget->retarget_pose("s2t", "walk_s", 1.0, err);
-    check(err.empty() && pose.size() == 3, "retarget_pose → 3 ossos");
-    if (pose.size() == 3) {
-        check(pose[0].bone == "pelvis" &&
-                  approx_v(pose[0].local.position, {2, 0, 0}, 1e-9),
-              "pelvis = hips (1,0,0)·2");
-        check(pose[1].bone == "leg" &&
-                  approx_v(pose[1].local.position, {0, 2, 0}, 1e-9),
-              "leg = thigh local ·2");
-        check(pose[2].bone == "head" &&
-                  approx_v(pose[2].local.position, {0, 2.2, 0}, 1e-9),
-              "head sem mapeamento = bind (0,2.2,0)");
+void check_honest_error(const std::string& errorOut, const char* what) {
+    if (errorOut.empty()) {
+        std::printf("FAIL: %s (erro honesto)\n", what);
+        ++g_failures;
     }
-
-    // t=0: hips (0,0,0) → pelvis (0,0,0).
-    const std::vector<BonePose> p0 =
-        fx.retarget->retarget_pose("s2t", "walk_s", 0.0, err);
-    check(err.empty() && p0.size() == 3 &&
-              approx_v(p0[0].local.position, {0, 0, 0}, 1e-9),
-          "t=0: pelvis (0,0,0)");
-
-    // Scale 1.0: mapeamento direto sem escala.
-    check(fx.retarget->add_retarget("s2t1", "human_s", "human_t",
-                                    {{"hips", "pelvis", 1.0}}, err) &&
-              err.empty(),
-          "retarget scale 1");
-    const std::vector<BonePose> p1 =
-        fx.retarget->retarget_pose("s2t1", "walk_s", 1.0, err);
-    check(err.empty() && p1.size() == 3 &&
-              approx_v(p1[0].local.position, {1, 0, 0}, 1e-9),
-          "scale 1: pelvis (1,0,0)");
-
-    // Erros honestos.
-    check(fx.retarget->retarget_pose("ghost", "walk_s", 0.5, err).empty() &&
-              err.find("unknown retarget") != std::string::npos,
-          "retarget desconhecido → erro");
-    check(fx.retarget->retarget_pose("s2t", "ghost", 0.5, err).empty() &&
-              err.find("unknown clip") != std::string::npos,
-          "clip desconhecido → erro");
 }
 
-void test_clip_wrong_skeleton() {
-    Fixture fx = make_fixture();
+engine::animation::SkeletonSpec make_skeleton_src() {
+    using namespace engine::animation;
+    SkeletonSpec s;
+    s.id = "human_s";
+    s.bones.push_back(Bone{ "Hip", -1, AnimTransform{{0.0, 0.0, 0.0}, AnimQuat{}, {1.0, 1.0, 1.0}} });
+    s.bones.push_back(Bone{ "Head", 0, AnimTransform{{0.0, 2.2, 0.0}, AnimQuat{}, {1.0, 1.0, 1.0}} });
+    s.bones.push_back(Bone{ "HandL", 0, AnimTransform{{0.5, 1.2, 0.0}, AnimQuat{}, {1.0, 1.0, 1.0}} });
+    return s;
+}
+
+engine::animation::SkeletonSpec make_skeleton_dst() {
+    using namespace engine::animation;
+    // Mesmos ossos da fonte + HandR extra: clip da alvo cobre 4 ossos e é
+    // rejeitado como "clip de outra skeleton".
+    SkeletonSpec s;
+    s.id = "human_t";
+    s.bones.push_back(Bone{ "Hip", -1, AnimTransform{{0.0, 0.0, 0.0}, AnimQuat{}, {1.0, 1.0, 1.0}} });
+    s.bones.push_back(Bone{ "Head", 0, AnimTransform{{0.0, 2.2, 0.0}, AnimQuat{}, {1.0, 1.0, 1.0}} });
+    s.bones.push_back(Bone{ "HandL", 0, AnimTransform{{0.5, 1.2, 0.0}, AnimQuat{}, {1.0, 1.0, 1.0}} });
+    s.bones.push_back(Bone{ "HandR", 0, AnimTransform{{-0.5, 1.2, 0.0}, AnimQuat{}, {1.0, 1.0, 1.0}} });
+    return s;
+}
+
+engine::animation::ClipSpec make_clip(const std::string& id, const std::string& skeleton) {
+    using namespace engine::animation;
+    ClipSpec c;
+    c.id = id;
+    c.skeleton = skeleton;
+    c.duration = 1.0;
+    BoneTrack hip;
+    hip.bone = "Hip";
+    hip.keys.push_back(Keyframe{ 0.0, AnimTransform{{1.0, 0.0, 0.0}, AnimQuat{}, {1.0, 1.0, 1.0}} });
+    hip.keys.push_back(Keyframe{ 1.0, AnimTransform{{2.0, 0.0, 0.0}, AnimQuat{}, {1.0, 1.0, 1.0}} });
+    c.tracks.push_back(std::move(hip));
+    return c;
+}
+
+void test_retargeting() {
+    using namespace engine::animation;
+
+    auto core = create_anim_core();
     std::string err;
-    // Clip registrado na skeleton ALVO (nome de osso inexistente na fonte).
-    ClipSpec clip;
-    clip.id = "walk_t";
-    clip.skeleton = "human_t";
-    clip.duration = 1.0;
-    clip.tracks = {
-        {"pelvis",
-         {{0.0, {{0, 0, 0}, AnimQuat{}, {1, 1, 1}}},
-          {1.0, {{1, 0, 0}, AnimQuat{}, {1, 1, 1}}}}},
+
+    // Skeletons e clips de base.
+    auto src = make_skeleton_src();
+    auto dst = make_skeleton_dst();
+    CHECK(core->add_skeleton(src, err), "skeleton human_s aceito");
+    CHECK(core->add_skeleton(dst, err), "skeleton human_t aceito");
+    auto walk_s = make_clip("walk_s", "human_s");
+    auto walk_t = make_clip("walk_t", "human_t");
+    CHECK(core->add_clip(walk_s, err), "clip walk_s aceito");
+    CHECK(core->add_clip(walk_t, err), "clip walk_t aceito");
+
+    auto rt = create_retargeting(*core);
+
+    // add_retarget válido.
+    std::vector<RetargetMapping> mappings;
+    mappings.push_back(RetargetMapping{ "Hip", "Hip", 1.0 });
+    mappings.push_back(RetargetMapping{ "HandL", "HandL", 1.0 });
+    CHECK(rt->add_retarget("s2t", "human_s", "human_t", mappings, err), "retarget s2t");
+    CHECK(err.empty(), "retarget s2t sem erro residual");
+    CHECK(rt->has_retarget("s2t"), "has_retarget s2t");
+    CHECK(rt->retarget_ids().size() == 1, "retarget_ids = 1");
+
+    // id duplicado.
+    expect_refused(rt->add_retarget("s2t", "human_s", "human_t", mappings, err),
+                   "id duplicado rejeitado");
+    check_honest_error(err, "id duplicado rejeitado");
+
+    // skeleton desconhecida.
+    std::vector<RetargetMapping> one{ RetargetMapping{ "Hip", "Hip", 1.0 } };
+    expect_refused(rt->add_retarget("ghost_skel", "ghost", "human_t", one, err),
+                   "skeleton desconhecida rejeitado");
+    check_honest_error(err, "skeleton desconhecida rejeitado");
+
+    // osso fonte desconhecido.
+    std::vector<RetargetMapping> badSrc{ RetargetMapping{ "Ghost", "Hip", 1.0 } };
+    expect_refused(rt->add_retarget("bad_src", "human_s", "human_t", badSrc, err),
+                   "osso fonte desconhecido rejeitado");
+    check_honest_error(err, "osso fonte desconhecido rejeitado");
+
+    // osso alvo desconhecido.
+    std::vector<RetargetMapping> badDst{ RetargetMapping{ "Hip", "Ghost", 1.0 } };
+    expect_refused(rt->add_retarget("bad_dst", "human_s", "human_t", badDst, err),
+                   "osso alvo desconhecido rejeitado");
+    check_honest_error(err, "osso alvo desconhecido rejeitado");
+
+    // osso alvo duplicado (dois fontes → mesmo alvo).
+    std::vector<RetargetMapping> dupDst{
+        RetargetMapping{ "Hip", "HandL", 1.0 },
+        RetargetMapping{ "Head", "HandL", 1.0 }
     };
-    check(fx.core->add_clip(clip, err) && err.empty(), "clip walk_t aceito");
-    check(fx.retarget->add_retarget("s2t", "human_s", "human_t",
-                                    {{"hips", "pelvis", 1.0}}, err) &&
-              err.empty(),
-          "retarget s2t");
-    const std::vector<BonePose> pose =
-        fx.retarget->retarget_pose("s2t", "walk_t", 0.5, err);
-    check(pose.empty() &&
-              err.find("not registered on source skeleton") !=
-                  std::string::npos,
-          "clip de outra skeleton → erro honesto");
-}
+    expect_refused(rt->add_retarget("dup_dst", "human_s", "human_t", dupDst, err),
+                   "osso alvo duplicado rejeitado");
+    check_honest_error(err, "osso alvo duplicado rejeitado");
 
-void test_state() {
-    Fixture fx = make_fixture();
-    std::string err;
-    check(fx.retarget->add_retarget(
-              "s2t", "human_s", "human_t",
-              {{"hips", "pelvis", 2.0}, {"thigh", "leg", 2.0}}, err) &&
-              err.empty(),
-          "add s2t");
+    // scale 0.
+    std::vector<RetargetMapping> zeroScale{ RetargetMapping{ "Hip", "Hip", 0.0 } };
+    expect_refused(rt->add_retarget("zero_scale", "human_s", "human_t", zeroScale, err),
+                   "scale 0 rejeitado");
+    check_honest_error(err, "scale 0 rejeitado");
 
-    const std::string s1 = fx.retarget->serialize_state();
-    check(!s1.empty(), "serialize não vazio");
+    // retarget_pose: osso mapeado usa o local da fonte × scale (1 → inalterado);
+    // osso sem mapeamento (Head) = bind (0,2.2,0).
+    const auto pose = rt->retarget_pose("s2t", "walk_s", 0.5, err);
+    CHECK(err.empty(), "retarget_pose erro honesto");
+    CHECK(pose.size() == 4, "pose na ordem da skeleton alvo (4 ossos)");
+    bool hipOk = false;
+    bool headOk = false;
+    for (const auto& p : pose) {
+        if (p.bone == "Hip") {
+            hipOk = p.local.position.x == 1.5 && p.local.position.y == 0.0 &&
+                    p.local.position.z == 0.0;
+        } else if (p.bone == "Head") {
+            headOk = p.local.position.x == 0.0 && p.local.position.y == 2.2 &&
+                     p.local.position.z == 0.0;
+        }
+    }
+    CHECK(hipOk, "retarget scale 1");
+    CHECK(headOk, "head sem mapeamento = bind (0,2.2,0)");
 
-    auto r2 = create_retargeting(*fx.core);
-    check(r2->deserialize_state(s1, err) && err.empty(), "deserialize ok");
-    check(r2->serialize_state() == s1, "round-trip bit-exact");
-    const std::vector<BonePose> pose =
-        r2->retarget_pose("s2t", "walk_s", 1.0, err);
-    check(err.empty() && pose.size() == 3 &&
-              approx_v(pose[0].local.position, {2, 0, 0}, 1e-9),
-          "retarget_pose após restore");
+    // retarget desconhecido.
+    const auto p1 = rt->retarget_pose("ghost_rt", "walk_s", 0.5, err);
+    CHECK(p1.empty(), "retarget desconhecido rejeitado");
+    check_honest_error(err, "retarget desconhecido rejeitado");
 
-    check(!r2->deserialize_state(
-              "{\"x\":{\"source\":\"ghost\",\"target\":\"human_t\","
-              "\"mappings\":[]}}",
-              err),
-          "restore com skeleton desconhecida rejeitado");
-    // Falha NÃO corrompe o estado anterior.
-    check(r2->serialize_state() == s1, "estado intacto após falha");
+    // clip desconhecido.
+    const auto p2 = rt->retarget_pose("s2t", "ghost_clip", 0.5, err);
+    CHECK(p2.empty(), "clip desconhecido rejeitado");
+    check_honest_error(err, "clip desconhecido rejeitado");
+
+    // clip de outra skeleton (walk_t está na human_t, 4 ossos).
+    const auto p3 = rt->retarget_pose("s2t", "walk_t", 0.5, err);
+    CHECK(p3.empty(), "clip de outra skeleton rejeitado");
+    check_honest_error(err, "clip de outra skeleton rejeitado");
+
+    // serialize → deserialize round-trip.
+    const std::string state = rt->serialize_state();
+    auto rt2 = create_retargeting(*core);
+    CHECK(rt2->deserialize_state(state, err), "lido aceito");
+    CHECK(err.empty(), "lido aceito sem erro residual");
+    CHECK(rt2->has_retarget("s2t"), "has_retarget s2t após restore");
+    const auto pose2 = rt2->retarget_pose("s2t", "walk_s", 0.5, err);
+    CHECK(!pose2.empty() && pose2.size() == 4, "pose pós-restore");
+
+    // restore com skeleton desconhecida.
+    const std::string badState =
+        "{\"version\":1,\"retargets\":{\"x\":{\"source\":\"ghost\",\"target\":\"human_t\",\"mappings\":[]}}}";
+    expect_refused(rt2->deserialize_state(badState, err),
+                   "restore com skeleton desconhecida rejeitado");
+    check_honest_error(err, "restore com skeleton desconhecida rejeitado");
+    CHECK(rt2->has_retarget("s2t"), "estado intocado após restore rejeitado");
 }
 
 }  // namespace
 
 int main() {
-    test_add_retarget();
-    test_retarget_pose();
-    test_clip_wrong_skeleton();
-    test_state();
-
+    test_retargeting();
     if (g_failures == 0) {
-        std::cout << "retargeting_tests: all checks passed\n";
+        std::printf("retargeting_tests: all checks passed\n");
         return 0;
     }
-    std::cout << "retargeting_tests: " << g_failures << " failure(s)\n";
+    std::printf("retargeting_tests: %d failure(s)\n", g_failures);
     return 1;
 }

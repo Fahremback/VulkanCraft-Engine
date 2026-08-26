@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <chrono>
 #include <unordered_map>
 #include <unordered_set>
 #include <array>
@@ -50,8 +51,12 @@
 #include "engine/ui/IUiDoc.hpp"
 #include "engine/editor/IMessageCatalog.hpp"
 #include "engine/editor/IShortcutDoc.hpp"
+#include "engine/editor/IFileWatcher.hpp"
+#include "engine/editor/IFileChangeDebounce.hpp"
 #include "engine/editor/IPlayMode.hpp"
 #include "engine/editor/ICommandSearch.hpp"
+#include "engine/ui/qt/IQtEditorDoc.hpp"
+#include "engine/ui/qt/IQtThemeModel.hpp"
 #include "engine/editor/IContentBrowser.hpp"
 #include "engine/editor/IWindowMode.hpp"
 #include "engine/editor/IEditorCamera.hpp"
@@ -60,6 +65,9 @@
 #include "engine/editor/IInspectorDoc.hpp"
 #include "engine/editor/ISceneHierarchy.hpp"
 #include "engine/editor/IOnboardingTour.hpp"
+#include "engine/editor/IAnimationTimelineEditor.hpp"
+#include "engine/editor/IProjectLauncher.hpp"
+#include "engine/editor/IRetargeting.hpp"
 #include "engine/profiling/IFrameProfiler.hpp"
 #include "WindowClamp.hpp"
 #include "tools/WickedToolsPanel.hpp"
@@ -293,6 +301,8 @@ private:
     // via WIC. Returns empty string on success, or an error message. Used by
     // the Control-API `screenshot` command so an agent can SEE the result.
     std::string capture_viewport_screenshot(const std::string& path);
+    std::string capture_ui_screenshot(const std::string& path);
+    bool snapshot_ui_frame(VkCommandBuffer cmd, VkImage swapchainImage);
     // Runs one headless self-test (spawns this exe with the test env var,
     // waits for it, returns "PASS"/"FAIL"/error). 0=RenderGraph 1=HDR
     // 2=Material 3=Play 4=Build.
@@ -364,6 +374,17 @@ private:
     std::vector<VkImage> m_swapchainImages;
     std::vector<VkImageView> m_swapchainViews;
     std::vector<VkFramebuffer> m_framebuffers;
+
+    // Snapshot do frame final (viewport + UI ImGui) acumulado a cada frame;
+    // usado pelo /screenshot-ui p/ validar o visual por algoritmo (pixeis),
+    // sem depender de inspeção humana.
+    VkImage m_uiSnapshotImage{ VK_NULL_HANDLE };
+    VkImageView m_uiSnapshotView{ VK_NULL_HANDLE };
+    VkDeviceMemory m_uiSnapshotMemory{ VK_NULL_HANDLE };
+    uint32_t m_uiSnapshotW{ 0 };
+    uint32_t m_uiSnapshotH{ 0 };
+    VkFormat m_uiSnapshotFormat{ VK_FORMAT_UNDEFINED };
+    bool m_uiSnapshotReady{ false };
 
     VkRenderPass m_renderPass{ VK_NULL_HANDLE };
     VkCommandPool m_commandPool{ VK_NULL_HANDLE };
@@ -648,6 +669,9 @@ private:
     std::deque<UUID> m_thumbnailQueue;
     std::unordered_set<UUID> m_thumbnailQueued;
     std::unordered_map<UUID, VkDescriptorSet> m_asset3dThumbnails;
+    // Each descriptor needs its own immutable image. Pointing every card at
+    // m_thumbView makes all thumbnails change to the most recently rendered asset.
+    std::unordered_map<UUID, AssetThumbnail> m_asset3dThumbnailImages;
     std::unordered_map<UUID, std::uint64_t> m_asset3dThumbnailHashes; // content hash per 3D thumbnail
     void init_thumbnail_target();
     void destroy_thumbnail_target();
@@ -656,6 +680,8 @@ private:
     void render_mesh_thumbnail(const UUID& assetId, const EditorMeshResource& mesh);
     void render_block_thumbnail(const UUID& assetId, VkDescriptorSet textureDesc);
     void render_character_thumbnail(const UUID& assetId, const EditorMeshResource& mesh);
+    void snapshot_rendered_thumbnail(VkCommandBuffer cmd, const UUID& assetId);
+    void destroy_3d_thumbnail(const UUID& assetId);
 
     // Textured unit cube (block pipeline): renders Minecraft-style block
     // models assembled from a PNG texture, both as thumbnails and (via the
@@ -953,7 +979,19 @@ private:
     // catalog (id/label/category/keywords/action). Built once and exposed
     // via GET /commands/search.
     std::string m_commandIndexJson;
+    std::vector<engine::editor::CommandEntry> m_commandEntries;
     void build_command_index();
+    // Qt editor shell doc (porte Qt — decisão do usuário): the deterministic
+    // model of the QMainWindow shell (docks from the REAL panel registry,
+    // actions from the REAL command index, menus/toolbars, live status).
+    std::unique_ptr<engine::ui::IQtEditorDoc> m_qtDoc;
+    std::string m_qtDocJson;
+    void build_qt_doc();
+    void refresh_qt_doc();
+    // Qt theme (Wicked charcoal in QPalette roles + QSS).
+    std::unique_ptr<engine::ui::IQtThemeModel> m_qtTheme;
+    std::string m_qtThemeJson;
+    void build_qt_theme();
 
     // Frame profiler (plano agente 2 §B): deterministic frame-time/memory
     // stats (sliding window + percentiles + spikes). Fed every frame and
@@ -1002,6 +1040,21 @@ private:
     std::unique_ptr<engine::editor::IOnboardingTour> m_onboardingTour;
     std::string m_onboardingJson;
     void refresh_onboarding();
+    // Animation-timeline editor (agente 2 §B l.33): deterministic document
+    // model mirrored from the real timeline editor state (specialized editors
+    // panel) — exposed via GET /timeline-editor.
+    std::unique_ptr<engine::editor::IAnimationTimelineEditor> m_timelineEditor;
+    std::string m_timelineEditorJson;
+    void refresh_timeline_editor();
+    // Project launcher (agente 2 §C l.66): deterministic session model of the
+    // launcher hub / open-project flow mirrored from the real editor state
+    // (m_inLauncherMode / m_activeScenePath / m_sceneDirty) — GET /launcher.
+    std::unique_ptr<engine::editor::IProjectLauncher> m_projectLauncher;
+    std::string m_projectLauncherJson;
+    void refresh_project_launcher();
+    std::unique_ptr<engine::editor::IRetargeting> m_retargeting;
+    std::string m_retargetingJson;
+    void refresh_retargeting();
 
     // Inspector doc (plano agente 2 §C): semantic component/group model of
     // the selected entity — exposed via GET /inspector.
@@ -1084,6 +1137,17 @@ private:
     AssetRegistry m_assetRegistry;
     std::unique_ptr<AssetPipeline> m_assetPipeline;
     std::unique_ptr<AssetHotReloadService> m_assetHotReload;
+    // Native filesystem watcher (efsw) feeding IFileChangeDebounce: raw
+    // events on the asset source folder are coalesced and, once settled,
+    // trigger the hot-reload path below (instead of polling every frame).
+    std::unique_ptr<engine::editor::IFileWatcher> m_fileWatcher;
+    std::unique_ptr<engine::editor::IFileChangeDebounce> m_fileDebounce;
+    std::uint64_t m_fileDebounceTick{ 0 };
+    // Rate-limits the watcher->hot-reload trigger: efsw can deliver a burst
+    // of events for one save; the AssetHotReloadService poll() walks every
+    // registered asset (last_write_time), so triggering it on every settled
+    // frame is wasteful. Reimport at most once per second.
+    std::chrono::steady_clock::time_point m_lastWatcherReload{};
 
     // Play World runtime: the play scene is ticked (physics) and rendered in
     // the viewport during Play/Simulate, so the authored scene runs visibly.

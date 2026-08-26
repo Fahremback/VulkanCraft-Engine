@@ -35,6 +35,10 @@ public:
  void set_scene_context(Scene* scene, UUID selected) { scene_ = scene; selected_ = selected; }
  [[nodiscard]] const Rendering::MaterialGraph& live_material_graph() const noexcept { return materialGraph_; }
  [[nodiscard]] Rendering::MaterialGraph& live_material_graph_mutable() noexcept { return materialGraph_; }
+ // Timeline editor state (agente 2 §B l.33): the deterministic document model
+ // is mirrored from this real state by refresh_timeline_editor().
+    [[nodiscard]] const TimelineEditorModel& live_timeline() const noexcept { return timeline_; }
+    [[nodiscard]] const RetargetEditorModel& live_retarget() const noexcept { return retarget_; }
 private:
  void draw_validation(const EditorDocumentModel& model);
  ImGuiTabItemFlags tab_flags(const char* name) {

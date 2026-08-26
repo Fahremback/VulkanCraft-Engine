@@ -17,11 +17,13 @@ $generatedDirectories = @(
 )
 $allowedRootFiles = @(
     '.gitignore', 'atualizar_github.bat', 'CMakeLists.txt', 'CMakePresets.json',
-    'FALTANTES.md', 'findings.md', 'progress.md', 'README.md', 'task_plan.md'
+    'FALTANTES.md', 'findings.md', 'progress.md', 'README.md', 'task_plan.md',
+    'AGENTS.md', 'ABRIR_COORDENADOR_AGENTES.bat', 'MONITORAR_PROGRESSO.bat'
 )
 $allowedRootDirectories = @(
     'agentes', 'assets', 'cmake', 'docs', 'external', 'generated', 'out',
-    'Projects', 'schema', 'shaders', 'src', 'tests', 'third_party', 'tools'
+    'Projects', 'schema', 'shaders', 'src', 'tests', 'third_party', 'tools',
+    '.github', 'manifests'
 )
 
 $issues = [System.Collections.Generic.List[object]]::new()

@@ -1331,7 +1331,14 @@ void Engine::draw() {
         const glm::vec3 rayDir = glm::normalize(desiredCamPos - pivot);
         for (float r = 0.2f; r <= targetDist; r += 0.15f) {
             glm::vec3 samplePos = pivot + rayDir * r;
-            if (as_builtin_block(world.get_block_at(samplePos)) != BlockType::Air && as_builtin_block(world.get_block_at(samplePos)) != BlockType::Water) {
+            // A.2: registry-driven — solid OR non-water fluid stops the camera
+            // (same rule as the old as_builtin_block != Air/Water, but dynamic
+            // blocks now count too). Water id is the builtin Water (=12).
+            const RuntimeBlockId sampleId = world.get_block_at(samplePos);
+            const RuntimeBlockId waterId =
+                static_cast<RuntimeBlockId>(BlockType::Water);
+            if (world.is_solid_block_id(sampleId) ||
+                (world.is_fluid_runtime_id(sampleId) && sampleId != waterId)) {
                 actualDist = std::max(0.4f, r - 0.25f);
                 break;
             }

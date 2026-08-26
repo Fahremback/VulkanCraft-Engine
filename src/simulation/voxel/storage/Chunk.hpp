@@ -55,6 +55,18 @@ public:
     [[nodiscard]] ChunkId id() const { return id_; }
     [[nodiscard]] uint64_t revision() const { return dataVersion.load(std::memory_order_acquire); }
 
+    // C.1 incremental block light: cached emitter seed list (chunk-local
+    // light_key, emission) built by the FULL light pass. Replaying it on a
+    // content-unchanged re-dirty (skipSkylight) avoids rescanning the whole
+    // 16x16x(topY) emitter grid — the seed set is provably identical because
+    // emission is a pure function of the block, and every block/fluid/state
+    // write bumps dataVersion (revision), which the light pass compares.
+    // Invalidated implicitly: any content write bumps revision(), and a full
+    // pass rebuilds the list; a stale (revision-mismatched) cache is never
+    // replayed.
+    std::vector<std::pair<uint32_t, uint8_t>> emitterCache;
+    uint64_t emitterCacheRevision = 0;
+
 private:
     friend class VoxelMesher;
     ChunkId id_{};

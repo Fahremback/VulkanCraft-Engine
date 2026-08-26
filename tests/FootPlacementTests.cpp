@@ -18,6 +18,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <thread>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -178,6 +179,31 @@ void test_flat_placement() {
           "flat: world boots");
     auto sampler = engine::animation::create_voxel_foot_terrain_sampler(
         *world, 200.0f, 0.0f);
+
+    // BUG-022: boot_world only waits for chunk(0,0); FR/BL/BR foot columns
+    // sit in ring-1 chunks which can still be Generating when the sampler
+    // samples (sampler reports known=false -> surface -0.8 -> flaky FAIL).
+    // Wait until all four foot columns are readable before planting.
+    {
+        const float kFootXz[4][2] = {
+            {0.3f, 0.5f}, {-0.3f, 0.5f}, {0.3f, -0.5f}, {-0.3f, -0.5f}};
+        const auto start = std::chrono::steady_clock::now();
+        bool ready = false;
+        while (!ready && std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start).count() < 8000) {
+            ready = true;
+            for (const auto& c : kFootXz) {
+                const auto s = sampler->sample(c[0], c[1]);
+                if (!s.known) { ready = false; break; }
+            }
+            if (!ready) {
+                world->update(glm::vec3(8.0f, 200.0f, 8.0f), 1.0f / 60.0f);
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+        check(ready, "flat: all four foot columns readable before planting");
+    }
+
     auto planner = engine::animation::create_contact_planner();
     auto placer = engine::animation::create_foot_placer();
 
@@ -382,6 +408,31 @@ void test_ik_integration() {
           "ik: world boots");
     auto sampler = engine::animation::create_voxel_foot_terrain_sampler(
         *world, 200.0f, 0.0f);
+
+    // BUG-022: boot_world only waits for chunk(0,0); the FR/BL/BR foot columns
+    // sit in ring-1 chunks which can still be Generating when the placer
+    // samples (sampler reports known=false -> surface -0.8 -> flaky FAIL).
+    // Wait until all four foot columns are readable before planting.
+    {
+        const float kFootXz[4][2] = {
+            {0.3f, 0.5f}, {-0.3f, 0.5f}, {0.3f, -0.5f}, {-0.3f, -0.5f}};
+        const auto start = std::chrono::steady_clock::now();
+        bool ready = false;
+        while (!ready && std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start).count() < 8000) {
+            ready = true;
+            for (const auto& c : kFootXz) {
+                const auto s = sampler->sample(c[0], c[1]);
+                if (!s.known) { ready = false; break; }
+            }
+            if (!ready) {
+                world->update(glm::vec3(8.0f, 200.0f, 8.0f), 1.0f / 60.0f);
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+        check(ready, "ik: all four foot columns readable before planting");
+    }
+
     auto planner = engine::animation::create_contact_planner();
     auto placer = engine::animation::create_foot_placer();
     auto db = engine::animation::create_motion_database();

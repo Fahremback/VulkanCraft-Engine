@@ -24,7 +24,12 @@
       "name": "ninja-base",
       "hidden": true,
       "inherits": "default",
-      "generator": "Ninja"
+      "generator": "Ninja",
+      "description": "Ninja + MSVC cl.exe. Pinned to cl so MinGW GCC on PATH is never selected (BUG-008: MinGW-built flatc segfaults on any schema, exit 139). Configure from a VS Developer prompt (vcvars64) so INCLUDE/LIB are set.",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl"
+      }
     },
     {
       "name": "vs-base",
@@ -92,8 +97,8 @@
     },
     {
       "name": "asan",
-      "displayName": "ASan (Ninja)",
-      "description": "AddressSanitizer build for memory error detection",
+      "displayName": "ASan (Ninja, MSVC)",
+      "description": "AddressSanitizer build for memory error detection. MSVC /fsanitize=address required — MinGW GCC cannot link ASan on Windows (BUG-009). Configure from a VS Developer prompt.",
       "inherits": "ninja-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug"

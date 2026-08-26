@@ -45,6 +45,8 @@ struct StreamingSnapshot {
     // --- Other streaming-relevant state ---
     std::size_t blockEntities{ 0 };     // attached block entities
     std::size_t activeFluidCells{ 0 };  // fluid cells in the active queue
+    std::size_t pendingLightJobs{ 0 };  // light jobs dispatched, not yet done
+    std::size_t pendingFluidTicks{ 0 }; // fluid cells scheduled, not yet ticked
 
     // Structural equality: the monitor uses it to fire only on real change.
     bool operator==(const StreamingSnapshot&) const = default;

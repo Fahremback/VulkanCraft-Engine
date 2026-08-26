@@ -51,6 +51,20 @@ public:
     // block-light pass runs (its seed set must be complete — own emitters are
     // unchanged, halo inflow may have changed). Used for neighbor-convergence
     // re-dirties, where the chunk's content did NOT change.
+    //
+    // editedCells (C.1 passo 2): chunk-local light_keys of cells edited since
+    // the last compute. When provided and non-empty (content CHANGED), the
+    // block-light recompute is bounded to the affected AABB — each edit +-
+    // kMaxLight, clamped to the chunk — instead of the whole 16x16x256
+    // volume. Cells outside the AABB are provably UNCHANGED (light attenuates
+    // by >=1 per step and never exceeds kMaxLight, so no path from an edited
+    // cell reaches beyond kMaxLight steps), so their stored values are kept
+    // verbatim; the AABB boundary is seeded from those stored values as a
+    // fixed halo (correct by construction). Only the edited columns' sky
+    // occlusion is rescanned (occlusion is a pure function of the column's
+    // own blocks). With many edits the AABB covers most of the chunk — the
+    // caller caps the list and falls back to the full pass (pass empty).
     static bool compute(Chunk& chunk, const ChunkLightAccess& access,
-                        bool skipSkylight = false);
+                        bool skipSkylight = false,
+                        const std::vector<uint32_t>* editedCells = nullptr);
 };

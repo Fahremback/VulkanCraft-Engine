@@ -148,8 +148,10 @@ try {
   // §5 item 8: the plugin prompt is grounded in the REAL project-authoring
   // surface — create_game_project's plugins arg (the only honest plugin
   // registration today). create_system grounds on the source-maintenance
-  // tools (read_file/apply_text_edits/start_build). The UI prompt stays
-  // deferred — no UI component surface exists in the facade (editor-owned).
+  // tools (read_file/apply_text_edits/start_build). create_ui grounds on the
+  // public engine/ui contracts (IUiDoc — the versioned JSON UI-composition
+  // document declared in the header as the data surface for MCP tooling)
+  // authored via create_file/apply_text_edits into Content/UI/.
   const pluginPrompt = await request("prompts/get", { name: "create_plugin", arguments: { name: "MyMod" } });
   const pluginText = pluginPrompt.result.messages[0].content.text;
   assert.match(pluginText, /create_game_project/);
@@ -165,6 +167,19 @@ try {
   assert.match(systemText, /start_build/);
   assert.match(systemText, /ExampleSystem/);
   assert.ok(promptsListed.result.prompts.some((p) => p.name === "create_system"), "create_system listed");
+
+  // §5 item 8 ("UI"): create_ui grounds on the public engine/ui contracts —
+  // IUiDoc is a versioned JSON document composed of layout/widgets/viewport/
+  // confirmations, explicitly declared in the header as the data surface for
+  // MCP tooling. The recipe reads the contract, then authors Content/UI/<name>.json
+  // via create_file/apply_text_edits and compiles with build_game.
+  const uiPrompt = await request("prompts/get", { name: "create_ui", arguments: { name: "MainMenu" } });
+  const uiText = uiPrompt.result.messages[0].content.text;
+  assert.match(uiText, /IUiDoc\.hpp/);
+  assert.match(uiText, /create_file/);
+  assert.match(uiText, /Content\/UI\/MainMenu\.json/);
+  assert.match(uiText, /build_game/);
+  assert.ok(promptsListed.result.prompts.some((p) => p.name === "create_ui"), "create_ui listed");
 
   // Unknown prompt is refused with a protocol error.
   const unknownPrompt = await request("prompts/get", { name: "does_not_exist" });
@@ -191,6 +206,18 @@ try {
   assert.ok(metrics.tools.total >= metrics.tools.semantic && metrics.tools.semantic > 0, "tool counts coherent");
   assert.ok(metrics.audit_ring.max >= metrics.audit_ring.entries, "audit ring bounded");
   assert.ok(metrics.uptime_seconds >= 0, "uptime present");
+
+  // §5 item 3 ("tests"): the dynamic tests resource lists the REGISTERED ctest
+  // tests of the current build tree via ctest -N (no execution — deterministic
+  // per configured tree).
+  assert.ok(resourceUris.includes("engine://tests"), "resources expose the tests list");
+  const testsRead = await request("resources/read", { uri: "engine://tests" });
+  const testsPayload = JSON.parse(testsRead.result.contents[0].text);
+  assert.equal(testsPayload.build_configured, true, "build tree is configured");
+  assert.ok(testsPayload.count > 0, "ctest -N lists registered tests");
+  assert.ok(Array.isArray(testsPayload.tests) && testsPayload.tests.length === testsPayload.count, "tests array matches count");
+  const sortedTests = [...testsPayload.tests].sort();
+  assert.deepEqual(testsPayload.tests, sortedTests, "tests sorted deterministically");
 
   // §5 item 3: the dynamic projects resource (engine://projects) — same
   // enumeration as list_game_projects, generated on read, deterministic
@@ -275,7 +302,15 @@ try {
   // The invalid config fails either at configure (CMP0002 during ZERO_CHECK
   // re-generation) or at compile (MSB8013 inside MSBuild) — never at link.
   assert.ok(jobFinal.stage !== "link", `fast-fail job never reaches link (got ${jobFinal.stage})`);
-  assert.deepEqual(jobFinal.artifacts, { log: jobFinal.log, binaries: [] }, "failed job exposes log artifact, no binaries");
+  // §5 item 5 ("progresso granular"): targets_built counts completed MSBuild
+  // targets (`-> exe/dll/lib` lines) — the fast-fail job completes none.
+  assert.equal(typeof jobFinal.targets_built, "number") && assert.ok(Number.isInteger(jobFinal.targets_built) && jobFinal.targets_built >= 0,
+    `targets_built is a non-negative integer (got ${jobFinal.targets_built})`);
+  assert.equal(jobFinal.targets_built, 0, `fast-fail job builds no targets (got ${jobFinal.targets_built})`);
+  // §5 item 5 ("bytes exatos"): artifacts carry bytes_total (0 for a job that
+  // built nothing) and each binary entry carries its real size when present.
+  assert.deepEqual(jobFinal.artifacts, { log: jobFinal.log, binaries: [], bytes_total: 0 },
+    "failed job exposes log artifact, no binaries, zero bytes");
   assert.match(jobFinal.tail, /MSB8013|error|CMP0002|failed/i, "log tail carries the failure");
   const jobsAfter = await request("tools/call", { name: "list_build_jobs", arguments: {} });
   const jobsList = JSON.parse(jobsAfter.result.content[0].text);
@@ -337,6 +372,17 @@ try {
   });
   assert.equal(gameProject.result.isError, undefined);
   assert.ok(fs.existsSync(path.join(smokeProjectPath, "Content", "Scenes", "Initial.scene")));
+
+  // §8 item 4 ("plugins"): the plugin MANIFEST surface is testable today —
+  // create_game_project(plugins:) must materialize both the project manifest
+  // (project.json plugins array) and Config/Plugins.ini (one enabled=true per
+  // plugin). The plugin RUNTIME does not exist yet (§3), so the manifest is
+  // the honest extent of plugin coverage.
+  const smokeManifest = JSON.parse(fs.readFileSync(path.join(smokeProjectPath, "project.json"), "utf8"));
+  assert.deepEqual(smokeManifest.plugins, ["VoxelWorld", "Vehicles"], "project.json carries the plugin list");
+  const pluginsIni = fs.readFileSync(path.join(smokeProjectPath, "Config", "Plugins.ini"), "utf8");
+  assert.match(pluginsIni, /VoxelWorld=true/);
+  assert.match(pluginsIni, /Vehicles=true/);
 
   // §4 item 3 "empacotar projetos": package_game deterministic surface
   // (unknown exe / missing project — the tool was proven e2e against a real
@@ -767,6 +813,22 @@ try {
   const committedInventory = fs.readFileSync(inventoryPath, "utf8");
   const freshInventory = fs.readFileSync(inventoryTemp, "utf8");
   assert.equal(freshInventory, committedInventory, "docs/SDK_API_INVENTORY.md is fresh (regenerate: sdk-check.mjs --write-manifest docs/SDK_API_INVENTORY.md)");
+
+  // §1 item 5 ("namespaces"): the hard invariant from bugs.md B-219-2 — no
+  // namespace-less public header — is now enforced by namespace-gate.mjs, and
+  // the canonical map (docs/NAMESPACE_CANONICAL.md) must equal a fresh
+  // generation (single source: the same filesystem walk). Regenerate with:
+  //   node tools/sdk/namespace-gate.mjs --write docs/NAMESPACE_CANONICAL.md
+  const nsGate = spawnSync(process.execPath, [path.join(directory, "..", "sdk", "namespace-gate.mjs")], { encoding: "utf8" });
+  assert.equal(nsGate.status, 0, nsGate.stdout + nsGate.stderr);
+  const nsPath = path.resolve(directory, "..", "..", "docs", "NAMESPACE_CANONICAL.md");
+  const nsTemp = path.join(directory, "mcp-smoke-namespaces.md");
+  const nsGen = spawnSync(process.execPath, [path.join(directory, "..", "sdk", "namespace-gate.mjs"), "--write", nsTemp], { encoding: "utf8" });
+  assert.equal(nsGen.status, 0, nsGen.stderr);
+  const committedNs = fs.readFileSync(nsPath, "utf8");
+  const freshNs = fs.readFileSync(nsTemp, "utf8");
+  assert.equal(freshNs, committedNs, "docs/NAMESPACE_CANONICAL.md is fresh (regenerate: namespace-gate.mjs --write docs/NAMESPACE_CANONICAL.md)");
+  fs.rmSync(nsTemp, { force: true });
   fs.rmSync(inventoryTemp, { force: true });
 
   // §8 item 1: the COMMITTED capability matrix (docs/SDK_CAPABILITY_MATRIX.md)
@@ -781,6 +843,29 @@ try {
   const freshMatrix = fs.readFileSync(matrixTemp, "utf8");
   assert.equal(freshMatrix, committedMatrix, "docs/SDK_CAPABILITY_MATRIX.md is fresh (regenerate: capability-matrix.mjs docs/SDK_CAPABILITY_MATRIX.md)");
   fs.rmSync(matrixTemp, { force: true });
+
+  // §6 item 7: the COMMITTED generated docs (REFERENCE_GENERATED.md +
+  // COOKBOOK_GENERATED.md) must equal a fresh generation — same single
+  // sources (filesystem walk + semanticToolDefinitions() + schema/registry +
+  // error registry), never manual lists. Regenerate with:
+  //   node tools/portability/gen-docs.mjs
+  const genDocsDir = path.resolve(directory, "..", "portability");
+  const refTemp = path.join(directory, "mcp-smoke-reference.md");
+  const cookTemp = path.join(directory, "mcp-smoke-cookbook.md");
+  const refPath = path.resolve(directory, "..", "..", "docs", "REFERENCE_GENERATED.md");
+  const cookPath = path.resolve(directory, "..", "..", "docs", "COOKBOOK_GENERATED.md");
+  // Regen into temp: gen-docs writes fixed paths, so copy the committed files
+  // aside, regen in place, compare, and restore. Simpler: regen in place and
+  // diff against the committed bytes read BEFORE regeneration.
+  const committedRef = fs.readFileSync(refPath, "utf8");
+  const committedCook = fs.readFileSync(cookPath, "utf8");
+  const genDocs = spawnSync(process.execPath, [path.join(genDocsDir, "gen-docs.mjs")], { encoding: "utf8" });
+  assert.equal(genDocs.status, 0, genDocs.stdout + genDocs.stderr);
+  const freshRef = fs.readFileSync(refPath, "utf8");
+  const freshCook = fs.readFileSync(cookPath, "utf8");
+  assert.equal(freshRef, committedRef, "docs/REFERENCE_GENERATED.md is fresh (regenerate: gen-docs.mjs)");
+  assert.equal(freshCook, committedCook, "docs/COOKBOOK_GENERATED.md is fresh (regenerate: gen-docs.mjs)");
+  void refTemp; void cookTemp;
 
   // §1 item 6: the SDK package config template must carry per-config selection
   // (Debug archives staged in lib/Debug/, every other config in lib/) with a

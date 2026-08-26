@@ -25,6 +25,10 @@ constexpr int kDenseLodRadius = 5;
 constexpr int kDenseLodBudget = (kDenseLodRadius * 2 + 1) * (kDenseLodRadius * 2 + 1);
 // Quantos chunks com luz suja são relightados por frame (orçamento da §12).
 constexpr int kMaxLightChunksPerFrame = 4;
+// C.2: in-flight per-chunk light jobs cap (2x the per-frame budget — a burst
+// of dirty chunks queues at most this many jobs behind the mesh/generation
+// pool work; the rest stay in the dirty set for the next frame's dispatch).
+constexpr int kMaxLightJobsInFlight = 8;
 
 void print_far_lod_curve(float endpointFraction, int reachChunks) {
     const int safeReach = std::max(1, reachChunks);
@@ -348,9 +352,13 @@ engine::voxel::StreamingSnapshot World::streaming_snapshot() const {
     snapshot.memoryBudgetBytes = memoryBudget;
     snapshot.blockEntities = blockEntities_.size();
     snapshot.activeFluidCells = activeFluidSet.size();
-    snapshot.lightDirtyChunks = lightDirtyChunks_.size();
+    snapshot.pendingLightJobs =
+        static_cast<std::size_t>(pendingLightJobs.load(std::memory_order_acquire));
+    snapshot.pendingFluidTicks = scheduler_.fluid_pending_count();
     {
         std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+        // C.2: read under the lock — light workers mutate this set.
+        snapshot.lightDirtyChunks = lightDirtyChunks_.size();
         snapshot.chunksLoaded = chunks.size();
         uint64_t usage = 0;
         for (const auto& [key, chunk] : chunks) {
@@ -537,6 +545,11 @@ void World::set_block_at(const glm::vec3& worldPos, RuntimeBlockId type) {
         it->second->set_block(bx, by, bz, type);
         it->second->isDirty = true;
         it->second->hasUnsavedEdits.store(true, std::memory_order_release);
+        // C.1 passo 2: record the edited cell so the light pass can bound its
+        // block-light recompute to the affected region instead of the whole
+        // chunk. Capped in the pass (<= 64 edits) — above that it falls back
+        // to the full recompute (the AABB would cover the chunk anyway).
+        pendingLightEdits_[key].push_back(Chunk::light_key(bx, by, bz));
 
         // Placing any fluid creates a source cell (level 0, always fed) — the
         // water special case generalized to data-driven fluids (META §13).
@@ -587,6 +600,9 @@ void World::set_water_at(const glm::vec3& worldPos, uint8_t level) {
     it->second->set_water(bx, by, bz, level);
     it->second->isDirty = true;
     it->second->hasUnsavedEdits.store(true, std::memory_order_release);
+    // C.1 passo 2: water level changes absorption -> record for the bounded
+    // light pass (same as set_block_at).
+    pendingLightEdits_[{ cx, cz }].push_back(Chunk::light_key(bx, by, bz));
     if (bx == 0) { auto n = chunks.find({ cx - 1, cz }); if (n != chunks.end() && n->second) n->second->isDirty = true; }
     if (bx == CHUNK_SIZE_X - 1) { auto n = chunks.find({ cx + 1, cz }); if (n != chunks.end() && n->second) n->second->isDirty = true; }
     if (bz == 0) { auto n = chunks.find({ cx, cz - 1 }); if (n != chunks.end() && n->second) n->second->isDirty = true; }
@@ -822,6 +838,10 @@ bool World::restore_chunk_data(int cx, int cz, int extent,
     // (the skip gate must not keep old occlusion for restored bytes). Same
     // pattern as the eviction paths (erase on chunk removal).
     lightContentRevision_.erase({ cx, cz });
+    // C.1 passo 2: the restore replaced the whole chunk — a stale pending-edit
+    // list (from pre-load per-voxel edits) would bound the pass to a tiny AABB
+    // and leave the restored content unlit. Full pass required.
+    pendingLightEdits_.erase({ cx, cz });
     // The saved extent is derived from the source chunk's vertical extent, so
     // the restored content occupies exactly [0, extent) (mesh/raycast queries
     // read highestOccupiedY).
@@ -1066,6 +1086,10 @@ void World::update(const glm::vec3& playerPos, WorldRenderBridge& renderBridge, 
                 // would false-match the skip gate and never recompute the sky
                 // occlusion of the reloaded chunk. Erase on EVERY eviction.
                 lightContentRevision_.erase(it->first);
+                // C.1 passo 2: a reloaded chunk must get a FULL light pass — a
+                // stale pending-edit list would bound the fresh chunk's compute
+                // to the old AABB and leave the rest of it dark.
+                pendingLightEdits_.erase(it->first);
                 it = chunks.erase(it);
             } else {
                 ++it;
@@ -1451,12 +1475,19 @@ void World::update(const glm::vec3& playerPos, WorldRenderBridge& renderBridge, 
                 // C.1: a re-loaded chunk starts with a fresh small dataVersion;
                 // a stale entry would false-match and skip its sky rescan.
                 lightContentRevision_.erase(key);
+                // C.1 passo 2: stale pending edits would bound the reloaded
+                // chunk's light pass to the old AABB — full pass required.
+                pendingLightEdits_.erase(key);
             }
         }
     }
 }
 
 void World::mark_chunk_light_dirty(int cx, int cz) {
+    // The set is mutated both on the frame thread (edits, uploads, restores)
+    // and by light worker jobs (C.2 neighbor re-dirty) — always under the
+    // recursive chunksMutex so the two never race.
+    std::lock_guard<std::recursive_mutex> lock(chunksMutex);
     lightDirtyChunks_.insert({ cx, cz });
 }
 
@@ -1546,11 +1577,24 @@ uint8_t World::get_block_light(const glm::vec3& worldPos) const {
         static_cast<int>(std::floor(worldPos.z)) - cz * CHUNK_SIZE_Z);
 }
 
+// C.2: async light on workers. run_light_pass (frame thread) only DISPATCHES:
+// it snapshots the dirty set, sorts by player distance (priority), and hands
+// up to kMaxLightChunksPerFrame chunks (capped by kMaxLightJobsInFlight) to
+// the worker pool. Each job (run_light_job) re-validates the chunk under
+// chunksMutex (cancellation: evicted/replaced or edited while queued — the
+// edit already re-dirtied it) and runs the compute holding chunksMutex, the
+// same recursive lock every chunk-data writer (set_block/set_water/restore/
+// eviction) and reader (create_chunk_snapshot) takes — so the compute's
+// lookups never race.
 void World::run_light_pass(const glm::vec3& playerPos) {
-    if (lightDirtyChunks_.empty()) return;
     const int playerChunkX = static_cast<int>(std::floor(playerPos.x / CHUNK_SIZE_X));
     const int playerChunkZ = static_cast<int>(std::floor(playerPos.z / CHUNK_SIZE_Z));
-    std::vector<std::pair<int, int>> dirty(lightDirtyChunks_.begin(), lightDirtyChunks_.end());
+    std::vector<std::pair<int, int>> dirty;
+    {
+        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+        if (lightDirtyChunks_.empty()) return;
+        dirty.assign(lightDirtyChunks_.begin(), lightDirtyChunks_.end());
+    }
     std::sort(dirty.begin(), dirty.end(), [&](const auto& a, const auto& b) {
         const int da = std::max(std::abs(a.first - playerChunkX), std::abs(a.second - playerChunkZ));
         const int db = std::max(std::abs(b.first - playerChunkX), std::abs(b.second - playerChunkZ));
@@ -1558,11 +1602,13 @@ void World::run_light_pass(const glm::vec3& playerPos) {
         return std::tie(a.first, a.second) < std::tie(b.first, b.second);
     });
 
-    int processed = 0;
+    int dispatched = 0;
     for (const auto& key : dirty) {
-        if (processed >= kMaxLightChunksPerFrame) break;
+        if (dispatched >= kMaxLightChunksPerFrame) break;
+        if (pendingLightJobs.load(std::memory_order_acquire) >= kMaxLightJobsInFlight) break;
         std::shared_ptr<Chunk> chunk;
         std::shared_ptr<Chunk> neighbors[4];
+        std::vector<uint32_t> edits;
         {
             std::lock_guard<std::recursive_mutex> lock(chunksMutex);
             const auto found = chunks.find(key);
@@ -1581,60 +1627,94 @@ void World::run_light_pass(const glm::vec3& playerPos) {
                 const auto neighbor = chunks.find(offsets[i]);
                 if (neighbor != chunks.end() && neighbor->second) neighbors[i] = neighbor->second;
             }
+            // C.1 passo 2: edited cells recorded by set_block_at/set_water_at
+            // since this chunk's last light pass. Consumed at dispatch (the
+            // job owns them); cap: too many edits means the AABB would cover
+            // most of the chunk — fall back to the full pass (pass empty).
+            const auto pendingIt = pendingLightEdits_.find(key);
+            if (pendingIt != pendingLightEdits_.end()) {
+                if (pendingIt->second.size() <= 64) edits = std::move(pendingIt->second);
+                pendingLightEdits_.erase(pendingIt);
+            }
+            // Consume the dirty entry at dispatch (mirror of the mesher's
+            // pre-dispatch isDirty clear): a job in flight owns the relight.
+            // If the job is cancelled, the edit that changed the revision
+            // already re-dirtied the chunk — nothing is lost.
+            lightDirtyChunks_.erase(key);
         }
-
-        // Lock-free lookups: the pass runs on the frame thread; the captured
-        // chunk pointers are stable and workers never mutate them mid-frame.
-        const int baseX = key.first * CHUNK_SIZE_X;
-        const int baseZ = key.second * CHUNK_SIZE_Z;
-        ChunkLightAccess access;
-        access.blockAt = [chunk, neighbors, key, baseX, baseZ](int wx, int wy, int wz) {
-            const int cx = static_cast<int>(std::floor(static_cast<float>(wx) / CHUNK_SIZE_X));
-            const int cz = static_cast<int>(std::floor(static_cast<float>(wz) / CHUNK_SIZE_Z));
-            const Chunk* target = nullptr;
-            if (cx == key.first && cz == key.second) target = chunk.get();
-            else {
-                for (const auto& n : neighbors) {
-                    if (n && n->chunkX == cx && n->chunkZ == cz) { target = n.get(); break; }
-                }
-            }
-            if (!target) return kRuntimeAirId;
-            return target->get_block(wx - cx * CHUNK_SIZE_X, wy, wz - cz * CHUNK_SIZE_Z);
-        };
-        access.blockLightAt = [chunk, neighbors, key](int wx, int wy, int wz) {
-            const int cx = static_cast<int>(std::floor(static_cast<float>(wx) / CHUNK_SIZE_X));
-            const int cz = static_cast<int>(std::floor(static_cast<float>(wz) / CHUNK_SIZE_Z));
-            const Chunk* target = nullptr;
-            if (cx == key.first && cz == key.second) target = chunk.get();
-            else {
-                for (const auto& n : neighbors) {
-                    if (n && n->chunkX == cx && n->chunkZ == cz) { target = n.get(); break; }
-                }
-            }
-            if (!target) return static_cast<uint8_t>(0);
-            return target->get_block_light(wx - cx * CHUNK_SIZE_X, wy, wz - cz * CHUNK_SIZE_Z);
-        };
-        access.emission = [this](RuntimeBlockId id) { return light_emission(id); };
-        access.absorption = [this](RuntimeBlockId id) { return light_absorption(id); };
-
-        // C.1: skip the sky-occlusion rescan when this chunk's content is
-        // provably unchanged since the last compute (neighbor-convergence
-        // re-dirty). The first compute for a chunk has no recorded revision,
-        // so it always does the full pass.
         const uint64_t revision = chunk->revision();
-        const auto lastIt = lightContentRevision_.find(key);
-        const bool skipSkylight =
-            lastIt != lightContentRevision_.end() && lastIt->second == revision;
-        const bool changed = ChunkLighting::compute(*chunk, access, skipSkylight);
-        lightContentRevision_[key] = revision;
-        lightDirtyChunks_.erase(key);
-        // Light changed: neighbors must re-see it (cross-border propagation).
-        if (changed) {
+        ++pendingLightJobs;
+        threadPool.enqueue([this, key, chunk, neighbors, revision,
+                            edits = std::move(edits)]() mutable {
+            this->run_light_job(key, chunk, neighbors, revision, std::move(edits));
+            this->pendingLightJobs.fetch_sub(1, std::memory_order_release);
+        });
+        ++dispatched;
+    }
+}
+
+void World::run_light_job(std::pair<int, int> key, std::shared_ptr<Chunk> chunk,
+                          std::shared_ptr<Chunk> (&neighbors)[4],
+                          uint64_t dispatchedRevision, std::vector<uint32_t> edits) {
+    // Cancellation gate under chunksMutex: the chunk may have been evicted,
+    // replaced (reloaded), or edited while the job was queued. The eviction
+    // path erases the light bookkeeping; a reload re-dirties on upload; an
+    // edit bumps dataVersion (dispatchedRevision mismatch) AND re-dirtied the
+    // chunk — so skipping here is always safe (it will be re-dispatched).
+    std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+    const auto found = chunks.find(key);
+    if (found == chunks.end() || found->second.get() != chunk.get()) return;
+    if (chunk->state.load(std::memory_order_acquire) != ChunkState::Uploaded) return;
+    if (chunk->revision() != dispatchedRevision) return;
+
+    const int baseX = key.first * CHUNK_SIZE_X;
+    const int baseZ = key.second * CHUNK_SIZE_Z;
+    ChunkLightAccess access;
+    access.blockAt = [chunk, neighbors, key, baseX, baseZ](int wx, int wy, int wz) {
+        const int cx = static_cast<int>(std::floor(static_cast<float>(wx) / CHUNK_SIZE_X));
+        const int cz = static_cast<int>(std::floor(static_cast<float>(wz) / CHUNK_SIZE_Z));
+        const Chunk* target = nullptr;
+        if (cx == key.first && cz == key.second) target = chunk.get();
+        else {
             for (const auto& n : neighbors) {
-                if (n) mark_chunk_light_dirty(n->chunkX, n->chunkZ);
+                if (n && n->chunkX == cx && n->chunkZ == cz) { target = n.get(); break; }
             }
         }
-        ++processed;
+        if (!target) return kRuntimeAirId;
+        return target->get_block(wx - cx * CHUNK_SIZE_X, wy, wz - cz * CHUNK_SIZE_Z);
+    };
+    access.blockLightAt = [chunk, neighbors, key](int wx, int wy, int wz) {
+        const int cx = static_cast<int>(std::floor(static_cast<float>(wx) / CHUNK_SIZE_X));
+        const int cz = static_cast<int>(std::floor(static_cast<float>(wz) / CHUNK_SIZE_Z));
+        const Chunk* target = nullptr;
+        if (cx == key.first && cz == key.second) target = chunk.get();
+        else {
+            for (const auto& n : neighbors) {
+                if (n && n->chunkX == cx && n->chunkZ == cz) { target = n.get(); break; }
+            }
+        }
+        if (!target) return static_cast<uint8_t>(0);
+        return target->get_block_light(wx - cx * CHUNK_SIZE_X, wy, wz - cz * CHUNK_SIZE_Z);
+    };
+    access.emission = [this](RuntimeBlockId id) { return light_emission(id); };
+    access.absorption = [this](RuntimeBlockId id) { return light_absorption(id); };
+
+    // C.1: skip the sky-occlusion rescan when this chunk's content is
+    // provably unchanged since the last compute (neighbor-convergence
+    // re-dirty). The first compute for a chunk has no recorded revision,
+    // so it always does the full pass.
+    const uint64_t revision = chunk->revision();
+    const auto lastIt = lightContentRevision_.find(key);
+    const bool skipSkylight =
+        lastIt != lightContentRevision_.end() && lastIt->second == revision;
+    const bool changed = ChunkLighting::compute(
+        *chunk, access, skipSkylight, edits.empty() ? nullptr : &edits);
+    lightContentRevision_[key] = revision;
+    // Light changed: neighbors must re-see it (cross-border propagation).
+    if (changed) {
+        for (const auto& n : neighbors) {
+            if (n) mark_chunk_light_dirty(n->chunkX, n->chunkZ);
+        }
     }
 }
 

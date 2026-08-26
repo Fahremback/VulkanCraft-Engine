@@ -20,7 +20,9 @@ public:
     void update_ambience(const glm::vec3& listener, const World& world, float daylight, bool submerged, float dt);
 
     void play_sound(const std::string& soundName);
-    void play_break_sound_for_block(BlockType block);
+    // A.2: runtime block id (registry-driven) — callers never need the builtin
+    // enum. Builtin ids map to their sounds; dynamic blocks fall back to stone.
+    void play_break_sound_for_block(RuntimeBlockId block);
     void play_place_sound();
     void play_footstep_sound();
     void play_splash_sound();

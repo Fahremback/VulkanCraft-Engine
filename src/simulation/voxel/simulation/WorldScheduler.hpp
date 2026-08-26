@@ -166,6 +166,12 @@ public:
     // ---- observability ----
     [[nodiscard]] uint64_t current_tick() const { return tick_; }
     [[nodiscard]] std::size_t pending_count() const;
+    // Fluid cells awaiting a tick (fluidPending_). 0 together with a drained
+    // active queue is the fluid fixed point (no work scheduled, none in
+    // flight) — activeFluidCells alone is satisfiable between ticks.
+    [[nodiscard]] std::size_t fluid_pending_count() const {
+        return fluidPending_.size();
+    }
     [[nodiscard]] std::size_t executed_count(Phase phase) const {
         return executed_[static_cast<int>(phase)];
     }

@@ -145,6 +145,11 @@ public:
     void set_theme(glm::vec3 bg, glm::vec3 panel) { m_themeBg = bg; m_themePanel = panel; }
     glm::vec3 theme_background() const { return m_themeBg; }
     glm::vec3 theme_panel() const { return m_themePanel; }
+    // Applies the current theme colors to the live ImGui style (background,
+    // panels/menus/popups, and derived frame/button tones). Called on boot
+    // after load_settings() so a persisted theme is reapplied, and by the
+    // Theme Editor's "Aplicar Tema" button.
+    void apply_theme_to_style();
 
     // Draws the "Ferramentas" (Tools) menu content; call inside a BeginMenu.
     void draw_tools_menu();

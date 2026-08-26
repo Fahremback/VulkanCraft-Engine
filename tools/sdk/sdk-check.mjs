@@ -30,7 +30,7 @@ const ENGINE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const PUBLIC_ROOT = path.join(ENGINE_ROOT, "src", "engine", "public");
 
 const STD_HEADERS = new Set([
-  "algorithm", "array", "atomic", "cassert", "cctype", "charconv", "chrono", "cinttypes",
+  "algorithm", "array", "atomic", "cassert", "cctype", "charconv", "chrono", "cinttypes", "complex",
   "climits", "cmath", "cstdarg", "cstdbool", "cstddef", "cstdint", "cstdio", "cstdlib",
   "cstring", "ctime", "cwchar", "cwctype", "deque", "exception", "filesystem", "functional",
   "initializer_list", "iosfwd", "iterator", "limits", "list", "map", "memory", "mutex",

@@ -1,4 +1,5 @@
 #include "EditorApplication.hpp"
+#include "BlockTextureAtlas.hpp"
 // Frontend port from the Wicked Engine Editor (MIT, commit 2aa9fdf…): Font
 // Awesome 6 icon font + codepoint macros, and the Liberation Sans UI font
 // (zstd-compressed, same font Wicked ships). See frontend/PORTS.md.
@@ -8,6 +9,8 @@
 #include "frontend/ForgeTheme.hpp"
 #include "frontend/ForgeWidgets.hpp"
 #include "engine/compression/ICompressionProvider.hpp"
+#include "engine/editor/IFileWatcher.hpp"
+#include "engine/editor/IFileChangeDebounce.hpp"
 #include "../engine/assets/GltfGeometry.hpp"
 #include "../engine/physics/VoxelBoxMerger.hpp"
 #include "../engine/animation/AnimationAssets.hpp"
@@ -178,7 +181,17 @@ namespace Engine {
 EditorApplication::EditorApplication() {
     // Loopback HTTP control API: drive the editor from a terminal or an agent
     // via curl http://127.0.0.1:8321/{play,pause,resume,stop,step,state}.
-    m_controlApi.start(8321);
+    std::uint16_t controlPort = 8321;
+    if (const char* configuredPort = std::getenv("VC_EDITOR_CONTROL_PORT")) {
+        try {
+            const unsigned long parsed = std::stoul(configuredPort);
+            if (parsed > 0 && parsed <= 65535) controlPort = static_cast<std::uint16_t>(parsed);
+        } catch (...) {
+            std::cerr << "[ControlApi] invalid VC_EDITOR_CONTROL_PORT='" << configuredPort
+                      << "'; using 8321\n";
+        }
+    }
+    m_controlApi.start(controlPort);
 
     // Panel plugin registry: the shell derives menus/palette/layout from this
     // (ezEngine "tools as replaceable plugins" pillar). Populated here so the
@@ -190,6 +203,8 @@ EditorApplication::EditorApplication() {
     build_message_catalog();
     build_shortcut_doc();
     build_command_index();
+    build_qt_doc();
+    build_qt_theme();
     refresh_play_mode();
     m_frameProfiler = engine::profiling::create_frame_profiler(600, 33.3);
     refresh_profiler();
@@ -215,12 +230,18 @@ EditorApplication::EditorApplication() {
     m_inspectorDoc = engine::editor::create_inspector_doc();
     m_sceneHierarchy = engine::editor::create_scene_hierarchy();
     m_onboardingTour = engine::editor::create_onboarding_tour();
+    m_timelineEditor = engine::editor::create_animation_timeline_editor();
+    m_projectLauncher = engine::editor::create_project_launcher();
+    m_retargeting = engine::editor::create_retargeting();
     refresh_camera();
     refresh_gizmo();
     refresh_publish();
     refresh_inspector();
     refresh_hierarchy();
     refresh_onboarding();
+    refresh_timeline_editor();
+    refresh_project_launcher();
+    refresh_retargeting();
 
     // Playback sink for the play-in-editor mixer (audio previews + play-mode
     // audio components). Before this the Mixer rendered into a buffer that was
@@ -248,6 +269,28 @@ EditorApplication::EditorApplication() {
     m_assetHotReload = std::make_unique<AssetHotReloadService>(
         *m_assetPipeline, m_assetRegistry,
         std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Intermediate" / "DerivedDataCache");
+    // Native asset watcher (efsw): raw events on the Content folder feed the
+    // debounce; settled changes trigger the hot-reload path (see frame loop).
+    m_fileWatcher = engine::editor::create_file_watcher();
+    engine::editor::DebounceSpec debounceSpec;
+    debounceSpec.quiet_ticks = 5;
+    std::string debounceErr;
+    m_fileDebounce = engine::editor::create_file_change_debounce(debounceSpec, debounceErr);
+    if (m_fileDebounce) {
+        // Watch the asset SOURCE root (the same sourceRoot the Content
+        // Browser / import sweep uses: Projects/<projeto>/Assets, falling
+        // back to assets/). Raw changes there feed the debounce and trigger
+        // the hot-reload reimport path in the frame loop.
+        std::string watchErr;
+        const auto projectAssets =
+            std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "Projects" / m_currentProjectName / "Assets";
+        const auto fallbackAssets = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "assets";
+        const auto sourceRoot =
+            std::filesystem::exists(projectAssets) ? projectAssets : fallbackAssets;
+        if (std::filesystem::exists(sourceRoot)) {
+            m_fileWatcher->start_watch(sourceRoot.string(), true, watchErr);
+        }
+    }
 }
 
 EditorApplication::~EditorApplication() {
@@ -396,6 +439,133 @@ void EditorApplication::build_command_index() {
     add("play.toggle", "Play / Stop", "Play", "play.toggle", "play,run");
     add("palette", "Command Palette", "Tools", "palette.open", "search,ctrl+k");
     m_commandIndexJson = doc.to_json();
+    m_commandEntries = doc.entries;
+}
+
+void EditorApplication::build_qt_doc() {
+    // The Qt editor shell document (plano agente 2 §B — porte Qt, decisão do
+    // usuário): a QMainWindow-based Qt shell (separate process over the
+    // Control API) consumes this to build its QDockWidgets/QActions/QMenus/
+    // QToolBars. Built from the REAL sources so it can never drift: docks
+    // come from the panel registry, actions from the command index.
+    if (!m_qtDoc) {
+        m_qtDoc = engine::ui::create_qt_editor_doc();
+    }
+    engine::ui::QtEditorDocSnapshot doc;
+    doc.version = "qt-editor-doc-1";
+
+    // Docks: one per registered panel (QDockWidget analog). Default area
+    // Left; initial visibility = the panel's default_open.
+    for (const auto& p : m_panelRegistry.panels()) {
+        engine::ui::QtDockSpec dock;
+        dock.objectName = p.id;
+        dock.title = p.title;
+        dock.category = p.category;
+        dock.area = engine::ui::QtDockArea::Left;
+        dock.visible = p.default_open;
+        doc.docks.push_back(std::move(dock));
+    }
+
+    // Actions: one per real palette command (QAction analog). Shortcuts stay
+    // empty here on purpose — the real bindings live in /shortcuts (#203).
+    for (const auto& c : m_commandEntries) {
+        engine::ui::QtActionSpec action;
+        action.id = c.id;
+        action.text = c.label;
+        action.category = c.category;
+        action.action = c.action;
+        action.checkable = (c.id == "play.toggle");
+        doc.actions.push_back(std::move(action));
+    }
+
+    // Menus (QMenu analog) grouped by category; toolbar = the common actions.
+    const char* fileIds[] = { "scene.new", "scene.open", "scene.save",
+                              "scene.save_as" };
+    const char* editIds[] = { "entity.cube", "entity.empty", "entity.light" };
+    const char* assetIds[] = { "asset.import", "asset.refresh" };
+    const char* mainIds[] = { "entity.cube", "play.toggle", "scene.save",
+                              "build.game" };
+    auto menuWith = [&doc](const char* id, const char* title,
+                           const char* const* ids, std::size_t n) {
+        engine::ui::QtMenuSpec menu;
+        menu.id = id;
+        menu.title = title;
+        menu.actionIds.assign(ids, ids + n);
+        doc.menus.push_back(std::move(menu));
+    };
+    menuWith("file", "File", fileIds, 4);
+    menuWith("edit", "Edit", editIds, 3);
+    menuWith("assets", "Assets", assetIds, 2);
+    menuWith("play", "Play", &mainIds[1], 1);
+    engine::ui::QtToolbarSpec toolbar;
+    toolbar.id = "main";
+    toolbar.actionIds.assign(mainIds, mainIds + 4);
+    doc.toolbars.push_back(std::move(toolbar));
+
+    std::string err;
+    if (!m_qtDoc->set_doc(doc, err)) {
+        std::cerr << "[QtDoc] set_doc failed: " << err << std::endl;
+        m_qtDocJson.clear();
+        return;
+    }
+    refresh_qt_doc();
+}
+
+void EditorApplication::refresh_qt_doc() {
+    // Live status the shell's status bar shows (play mode / scene / entity
+    // count / frame time in millis). Runs every frame, like the other
+    // refresh_* mirrors.
+    if (!m_qtDoc) return;
+    engine::ui::QtStatusSpec status;
+    switch (m_playMode.get_state()) {
+        case PlayState::Play: status.state = "play"; break;
+        case PlayState::Pause: status.state = "pause"; break;
+        case PlayState::Simulate: status.state = "simulate"; break;
+        default: status.state = "edit"; break;
+    }
+    const std::string scenePath = m_activeScenePath.empty()
+        ? std::string("untitled")
+        : m_activeScenePath.substr(m_activeScenePath.find_last_of("/\\") + 1);
+    status.sceneName = scenePath;
+    Scene* s = m_playMode.get_active_scene();
+    if (!s) s = m_editorScene.get();
+    status.entityCount = s ? s->get_entities().size() : 0u;
+    status.frameMillis = static_cast<std::uint64_t>(
+        m_frameTimeMs > 0.0f ? m_frameTimeMs + 0.5f : 0.0f);
+    m_qtDoc->set_status(status);
+    m_qtDocJson = m_qtDoc->to_json();
+}
+
+void EditorApplication::build_qt_theme() {
+    // The Wicked charcoal theme in Qt-native form (QPalette roles + QSS).
+    // Same base colors the ImGui theme uses (theme_background/theme_panel)
+    // so the Qt shell and the ImGui editor stay in sync by construction.
+    if (!m_qtTheme) {
+        m_qtTheme = engine::ui::create_qt_theme_model();
+    }
+    const glm::vec3 bg = m_wickedTools.theme_background();
+    const glm::vec3 panel = m_wickedTools.theme_panel();
+    auto to8 = [](float v) -> std::uint8_t {
+        const int c = static_cast<int>(v * 255.0f + 0.5f);
+        return static_cast<std::uint8_t>(c < 0 ? 0 : (c > 255 ? 255 : c));
+    };
+    const engine::ui::QtRgba bgColor{ to8(bg.r), to8(bg.g), to8(bg.b), 255 };
+    const engine::ui::QtRgba panelColor{ to8(panel.r), to8(panel.g),
+                                         to8(panel.b), 255 };
+    // Charcoal text tone (0.85 gray), same as the ImGui theme's text.
+    const engine::ui::QtRgba textColor{ 217, 217, 217, 255 };
+    engine::ui::QtThemeSnapshot theme;
+    theme.name = "charcoal";
+    theme.palette = engine::ui::derive_charcoal_palette(bgColor, panelColor,
+                                                        textColor);
+    theme.qss = engine::ui::qss_from_palette(theme.palette);
+    std::string err;
+    if (!m_qtTheme->set_theme(theme, err)) {
+        std::cerr << "[QtTheme] set_theme failed: " << err << std::endl;
+        m_qtThemeJson.clear();
+        return;
+    }
+    m_qtThemeJson = m_qtTheme->to_json();
 }
 
 void EditorApplication::refresh_play_mode() {
@@ -508,6 +678,96 @@ void EditorApplication::refresh_onboarding() {
     } else {
         m_onboardingJson = std::string();
     }
+}
+
+void EditorApplication::refresh_timeline_editor() {
+    // The animation-timeline editor document (plano agente 2 §B l.33) —
+    // mirrored from the REAL timeline editor state in the specialized editors
+    // panel (the visual model the user edits), exposed via GET /timeline-editor.
+    if (!m_timelineEditor) {
+        m_timelineEditorJson = std::string();
+        return;
+    }
+    const auto& tl = m_specializedEditors.live_timeline();
+    std::string err;
+    if (m_timelineEditor->reset(tl.duration, tl.loop, err)) {
+        for (const auto& t : tl.tracks) {
+            engine::editor::TimelineTrackKind kind =
+                static_cast<engine::editor::TimelineTrackKind>(t.type);
+            if (m_timelineEditor->add_track(t.name, kind, err)) {
+                m_timelineEditor->set_muted(t.name, t.muted, err);
+                for (const auto& k : t.keys) {
+                    m_timelineEditor->add_key(t.name, k.time, k.value, err);
+                }
+            }
+        }
+        m_timelineEditor->seek(tl.playhead);
+    }
+    m_timelineEditorJson = m_timelineEditor->to_json();
+}
+
+void EditorApplication::refresh_project_launcher() {
+    // The project-launcher session (plano agente 2 §C l.66) — mirrored from
+    // the REAL editor session state (launcher hub / active scene / dirty),
+    // exposed via GET /launcher.
+    if (!m_projectLauncher) {
+        m_projectLauncherJson = std::string();
+        return;
+    }
+    std::string err;
+    if (m_inLauncherMode) {
+        m_projectLauncher->back_to_launcher();
+    } else {
+        if (!m_projectLauncher->snapshot().in_launcher_mode) {
+            if (!m_activeScenePath.empty() &&
+                m_projectLauncher->snapshot().scene != m_activeScenePath) {
+                // Scene changed underneath (open-scene / new-scene): reset the
+                // session to the current real state.
+                m_projectLauncher->back_to_launcher();
+            }
+        }
+        if (m_projectLauncher->snapshot().in_launcher_mode) {
+            // Open the active project + scene as the current session.
+            m_projectLauncher->add_recent("<active>", err);
+            m_projectLauncher->open_project("<active>", err);
+            if (!m_activeScenePath.empty()) {
+                m_projectLauncher->open_scene(m_activeScenePath, err);
+            }
+        } else if (!m_activeScenePath.empty() &&
+                   m_projectLauncher->snapshot().scene.empty()) {
+            m_projectLauncher->open_scene(m_activeScenePath, err);
+        }
+        m_projectLauncher->set_dirty(m_sceneDirty);
+    }
+    m_projectLauncherJson = m_projectLauncher->to_json();
+}
+
+void EditorApplication::refresh_retargeting() {
+    // The animation-retargeting editor document (plano agente 2 §B l.43) —
+    // mirrored from the REAL retargeting editor state in the specialized
+    // editors panel (skeletons / mapping / preserve root motion), exposed via
+    // GET /retargeting.
+    if (!m_retargeting) {
+        m_retargetingJson = std::string();
+        return;
+    }
+    const auto& rt = m_specializedEditors.live_retarget();
+    std::string err;
+    m_retargeting->set_skeletons(rt.sourceSkeleton.to_string(),
+                                 rt.targetSkeleton.to_string(), err);
+    m_retargeting->clear_mapping();
+    for (const auto& m : rt.mapping) {
+        engine::editor::RetargetBoneMapDef def;
+        def.sourceBone = m.sourceBone;
+        def.targetBone = m.targetBone;
+        def.translationScale = m.translationScale;
+        def.rotationOffsetX = m.rotationOffset.x;
+        def.rotationOffsetY = m.rotationOffset.y;
+        def.rotationOffsetZ = m.rotationOffset.z;
+        m_retargeting->map(def, err);
+    }
+    m_retargeting->set_preserve_root_motion(rt.preserveRootMotion);
+    m_retargetingJson = m_retargeting->to_json();
 }
 
 void EditorApplication::refresh_hierarchy() {
@@ -857,6 +1117,10 @@ int EditorApplication::run() {
         }
         // Persisted editor preferences (language, VSync, shadows, theme).
         load_settings();
+        // Reapply a persisted theme to the live ImGui style on boot (the
+        // Theme Editor panel persists bg/panel colors to settings.json; they
+        // used to only be applied when the user pressed "Aplicar Tema").
+        m_wickedTools.apply_theme_to_style();
 
         // VC_EDITOR_TEST_RENDERGRAPH=1: exercise the render graph executor on
         // the real device — a two-pass graph (Scene → Composite) is recorded
@@ -1506,6 +1770,37 @@ void EditorApplication::main_loop() {
             }
         }
 
+        // Native asset watcher -> debounce -> hot reload: efsw raw events are
+        // coalesced per path; once settled (quiet window elapsed), trigger the
+        // same reimport path the hot-reload command uses. The polling
+        // AssetHotReloadService still runs below (it is the reimporter); the
+        // watcher is the event source that makes reloads prompt.
+        if (m_fileWatcher && m_fileDebounce) {
+            const auto rawEvents = m_fileWatcher->poll_events();
+            if (!rawEvents.empty()) {
+                ++m_fileDebounceTick;
+                for (const auto& e : rawEvents) {
+                    m_fileDebounce->record(engine::editor::FileChangeEvent{
+                        e.path, e.kind, m_fileDebounceTick + e.tick });
+                }
+            }
+            m_fileDebounceTick += 1;
+            const auto settled = m_fileDebounce->advance(m_fileDebounceTick);
+            if (!settled.empty() && m_assetHotReload) {
+                // Rate-limit: a burst of raw events coalesces into a few
+                // settled changes; each trigger re-walks every registered
+                // asset (last_write_time) — once per second is plenty for
+                // hot reload and keeps the loop cheap.
+                const auto now = std::chrono::steady_clock::now();
+                if (m_lastWatcherReload.time_since_epoch().count() == 0 ||
+                    now - m_lastWatcherReload >= std::chrono::seconds(1)) {
+                    m_lastWatcherReload = now;
+                    m_assetHotReload->watch_registered_assets();
+                    m_assetHotReload->poll();
+                }
+            }
+        }
+
         if (!m_inLauncherMode) {
             {
                 EditorApiState api;
@@ -1586,6 +1881,15 @@ void EditorApplication::main_loop() {
                 api.hierarchy = m_hierarchyJson;
                 refresh_onboarding();
                 api.onboarding = m_onboardingJson;
+                refresh_timeline_editor();
+                api.timeline_editor = m_timelineEditorJson;
+                refresh_project_launcher();
+                api.launcher = m_projectLauncherJson;
+                refresh_retargeting();
+                api.retargeting = m_retargetingJson;
+                refresh_qt_doc();
+                api.qt_doc = m_qtDocJson;
+                api.qt_theme = m_qtThemeJson;
                 switch (m_playScript.status()) {
                     case VMStatus::Idle: api.scriptState = "idle"; break;
                     case VMStatus::Running: api.scriptState = "running"; break;
@@ -1918,6 +2222,8 @@ void EditorApplication::render_frame() {
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
 
     vkCmdEndRenderPass(cmd);
+    // Guarda o frame final (viewport + UI ImGui) p/ /screenshot-ui capturar.
+    snapshot_ui_frame(cmd, m_swapchainImages[imageIndex]);
     vkEndCommandBuffer(cmd);
 
     VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -3952,6 +4258,7 @@ void EditorApplication::draw_content_browser_panel() {
         const bool isBlockTexture = isTexture && is_block_texture(asset);
         const bool isSkinTexture = isTexture && !isBlockTexture && is_character_texture(asset);
         const bool isModel = (asset.type == AssetType::Mesh);
+        const bool isBlockAsset = (asset.type == AssetType::Block);
         VkDescriptorSet thumb = VK_NULL_HANDLE;
         if (isTexture && !isBlockTexture && !isSkinTexture) {
             const auto found = m_assetThumbnails.find(asset.id);
@@ -3960,7 +4267,7 @@ void EditorApplication::draw_content_browser_panel() {
             } else if (isVisible) {
                 request_asset_thumbnail_decode(asset); // async, 1 upload/frame
             }
-        } else if ((isModel || isBlockTexture || isSkinTexture) && isVisible) {
+        } else if ((isModel || isBlockAsset || isBlockTexture || isSkinTexture) && isVisible) {
             const auto thumbIt = m_asset3dThumbnails.find(asset.id);
             if (thumbIt != m_asset3dThumbnails.end()) {
                 thumb = thumbIt->second;
@@ -5557,18 +5864,55 @@ void EditorApplication::transition_image_layout(VkCommandBuffer cmd, VkImage ima
     barrier.subresourceRange = { aspect, baseMipLevel, std::max(levelCount, 1u), 0, 1 };
     VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+    if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+        srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
         srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    } else if (newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
+               newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL &&
+               newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
+               newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
         srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    } else if (newLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
+               newLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
         srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+               newLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL || oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
         srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        barrier.srcAccessMask = oldLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                              ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    } else if (newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     }
     vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
@@ -6720,7 +7064,7 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                     : glm::vec4(baseColor, 1.0f);
                 bool drewMesh = false;
                 const auto meshComp = renderScene->meshRendererComponents.find(id);
-                if (meshComp != m_editorScene->meshRendererComponents.end() &&
+                if (meshComp != renderScene->meshRendererComponents.end() &&
                     meshComp->second.meshAssetID.is_valid()) {
                     if (const auto* mesh = get_mesh_resource(meshComp->second.meshAssetID)) {
                         // Material-graph path: the mesh renderer's material asset,
@@ -6769,7 +7113,12 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                             // Minecraft character/mob skin in the scene: the
                             // humanoid mesh with the skin sampled directly —
                             // no sidecar, the texture IS the character.
-                            gmp = ensure_texture_pipeline(meshComp->second.meshAssetID, m_skinGraphPipelines, true);
+                            // The base humanoid mesh represents Minecraft's opaque base skin
+                            // layer. Do not route it through the material-graph opacity output:
+                            // outer-layer transparency belongs to a separate overlay mesh, and
+                            // mixing the two paths made the base skin pipeline unstable on some
+                            // Vulkan drivers.
+                            gmp = ensure_texture_pipeline(meshComp->second.meshAssetID, m_skinGraphPipelines, false);
                             if (!gmp) {
                                 std::cerr << "[Editor] skin pipeline failed for "
                                           << meshComp->second.meshAssetID.to_string() << std::endl;
@@ -6799,7 +7148,7 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                             if (matAssetIt != m_materialAssets.end()) matAsset = &matAssetIt->second;
                             const MaterialComponent* comp = nullptr;
                             const auto compIt = renderScene->materialComponents.find(id);
-                            if (compIt != m_editorScene->materialComponents.end()) comp = &compIt->second;
+                            if (compIt != renderScene->materialComponents.end()) comp = &compIt->second;
                             write_material_ubo(*gmp, matAsset, comp);
                             write_light_ubo(*gmp, renderScene, m_editorCamera.position);
                             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gmp->pipeline);
@@ -9247,6 +9596,120 @@ std::string EditorApplication::capture_viewport_screenshot(const std::string& pa
     return std::string();
 }
 
+bool EditorApplication::snapshot_ui_frame(VkCommandBuffer cmd, VkImage swapchainImage) {
+    // Copia o frame final (viewport + UI ImGui) do swapchain para uma imagem
+    // persistente m_uiSnapshot, para /screenshot-ui poder ler (capturar a UI).
+    const uint32_t w = m_swapchainExtent.width, h = m_swapchainExtent.height;
+    if (w == 0 || h == 0) return false;
+    if (m_uiSnapshotImage == VK_NULL_HANDLE || m_uiSnapshotW != w || m_uiSnapshotH != h ||
+        m_uiSnapshotFormat != m_swapchainFormat) {
+        if (m_uiSnapshotImage != VK_NULL_HANDLE) {
+            vkDestroyImageView(m_device, m_uiSnapshotView, nullptr);
+            vkDestroyImage(m_device, m_uiSnapshotImage, nullptr);
+            vkFreeMemory(m_device, m_uiSnapshotMemory, nullptr);
+            m_uiSnapshotImage = VK_NULL_HANDLE; m_uiSnapshotView = VK_NULL_HANDLE;
+            m_uiSnapshotMemory = VK_NULL_HANDLE; m_uiSnapshotReady = false;
+        }
+        create_image(w, h, m_swapchainFormat,
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                     m_uiSnapshotImage, m_uiSnapshotMemory);
+        if (m_uiSnapshotImage == VK_NULL_HANDLE) return false;
+        m_uiSnapshotView = create_image_view(m_uiSnapshotImage, m_swapchainFormat,
+                                             VK_IMAGE_ASPECT_COLOR_BIT);
+        m_uiSnapshotW = w; m_uiSnapshotH = h; m_uiSnapshotFormat = m_swapchainFormat;
+    }
+    transition_image_layout(cmd, swapchainImage, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    transition_image_layout(cmd, m_uiSnapshotImage, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkImageCopy region{};
+    region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.srcOffset = { 0, 0, 0 }; region.dstOffset = { 0, 0, 0 };
+    region.extent = { w, h, 1 };
+    vkCmdCopyImage(cmd, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   m_uiSnapshotImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    transition_image_layout(cmd, m_uiSnapshotImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    transition_image_layout(cmd, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_ASPECT_COLOR_BIT);
+    m_uiSnapshotReady = true;
+    return true;
+}
+
+std::string EditorApplication::capture_ui_screenshot(const std::string& path) {
+    // Lê a snapshot do frame final (viewport + UI) e grava PNG via WIC.
+    // O swapchain não inverte a vertical (ao contrário do offscreen), então
+    // nenhum flip é necessário.
+    if (!m_uiSnapshotReady || m_uiSnapshotImage == VK_NULL_HANDLE)
+        return "screenshot-ui: no frame snapshot (editor sem UI renderizada)";
+    const uint32_t w = m_uiSnapshotW, h = m_uiSnapshotH;
+    const VkDeviceSize size = static_cast<VkDeviceSize>(w) * h * 4;
+    vkDeviceWaitIdle(m_device);
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    create_buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  staging, stagingMemory);
+    if (staging == VK_NULL_HANDLE) return "screenshot-ui: staging allocation failed";
+    {
+        VkCommandBuffer cmd = begin_single_time_commands();
+        transition_image_layout(cmd, m_uiSnapshotImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.imageExtent = { w, h, 1 };
+        vkCmdCopyImageToBuffer(cmd, m_uiSnapshotImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               staging, 1, &region);
+        transition_image_layout(cmd, m_uiSnapshotImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        end_single_time_commands(cmd);
+    }
+    void* mapped = nullptr;
+    vkMapMemory(m_device, stagingMemory, 0, size, 0, &mapped);
+    if (!mapped) {
+        vkDestroyBuffer(m_device, staging, nullptr);
+        vkFreeMemory(m_device, stagingMemory, nullptr);
+        return "screenshot-ui: staging map failed";
+    }
+    std::vector<uint8_t> rgba(static_cast<size_t>(size));
+    std::memcpy(rgba.data(), mapped, static_cast<size_t>(size));
+    vkUnmapMemory(m_device, stagingMemory);
+    vkDestroyBuffer(m_device, staging, nullptr);
+    vkFreeMemory(m_device, stagingMemory, nullptr);
+
+    static ComPtr<IWICImagingFactory> factory;
+    if (!factory) {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(factory.ReleaseAndGetAddressOf()))))
+            return "screenshot-ui: WIC factory init failed";
+    }
+    ComPtr<IWICStream> stream;
+    if (FAILED(factory->CreateStream(&stream))) return "screenshot-ui: WIC stream creation failed";
+    { const std::wstring wide(path.begin(), path.end());
+      if (FAILED(stream->InitializeFromFilename(wide.c_str(), GENERIC_WRITE)))
+          return "screenshot-ui: cannot open file: " + path; }
+    ComPtr<IWICBitmapEncoder> encoder;
+    if (FAILED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)))
+        return "screenshot-ui: PNG encoder creation failed";
+    if (FAILED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)))
+        return "screenshot-ui: PNG encoder init failed";
+    ComPtr<IWICBitmapFrameEncode> frame;
+    ComPtr<IPropertyBag2> props;
+    if (FAILED(encoder->CreateNewFrame(&frame, &props))) return "screenshot-ui: PNG frame creation failed";
+    if (FAILED(frame->Initialize(props.Get()))) return "screenshot-ui: PNG frame init failed";
+    if (FAILED(frame->SetSize(w, h))) return "screenshot-ui: PNG frame size failed";
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppRGBA;
+    if (FAILED(frame->SetPixelFormat(&fmt))) return "screenshot-ui: PNG pixel format failed";
+    if (FAILED(frame->WritePixels(h, w * 4, static_cast<UINT>(rgba.size()), rgba.data())))
+        return "screenshot-ui: PNG write failed";
+    if (FAILED(frame->Commit())) return "screenshot-ui: PNG frame commit failed";
+    if (FAILED(encoder->Commit())) return "screenshot-ui: PNG encoder commit failed";
+    return std::string();
+}
+
 void EditorApplication::mark_scene_dirty() {
     m_sceneDirty = true;
     m_sceneLastChange = glfwGetTime();
@@ -9397,6 +9860,11 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
     } else if (cmd == "new-scene") {
         init_default_scene();
         m_sceneDirty = false;
+        // API-driven scene creation must leave the launcher hub, same as
+        // open-scene below: the control-API drain and play runtime are gated
+        // on !m_inLauncherMode (found while validating the Qt shell — a
+        // /new-scene with the editor on the hub left /state unpublished).
+        m_inLauncherMode = false;
         std::cout << "[ControlApi] new scene" << std::endl;
     } else if (cmd.rfind("open-scene ", 0) == 0) {
         // Resolve relative paths against the source root: the editor process
@@ -9881,6 +10349,32 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
             std::cout << "[ControlApi] reimport -> " << (result ? "ok" : result.error) << std::endl;
         } else {
             m_controlResult = "reimport: asset not found";
+        }
+    } else if (cmd.rfind("screenshot-ui", 0) == 0) {
+        // Captura a SNAPSHOT do frame final (viewport + UI ImGui/docks) e grava
+        // PNG. Complementa o /screenshot (que captura só o viewport offscreen).
+        // Permite validar o VISUAL por algoritmo (pixeis) via harness, sem
+        // inspeção humana. Deve ser checado ANTES de "screenshot" (prefixo).
+        std::string path = (cmd.size() > 14) ? cmd.substr(14) : std::string();
+        while (!path.empty() && path.front() == ' ') path.erase(path.begin());
+        if (path.empty()) {
+            const auto shots = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "screenshots";
+            std::error_code ec;
+            std::filesystem::create_directories(shots, ec);
+            const std::string stamp = std::to_string(static_cast<long long>(std::time(nullptr)));
+            path = (shots / ("ui_" + stamp + ".png")).string();
+        } else {
+            std::filesystem::path p(path);
+            if (p.is_relative()) p = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / p;
+            path = p.string();
+        }
+        const std::string err = capture_ui_screenshot(path);
+        if (!err.empty()) {
+            m_controlResult = err;
+            std::cout << "[ControlApi] screenshot-ui FAILED: " << err << std::endl;
+        } else {
+            m_controlData = path;
+            std::cout << "[ControlApi] screenshot-ui saved: " << path << std::endl;
         }
     } else if (cmd.rfind("screenshot", 0) == 0) {
         // Save the current viewport to a PNG so an agent can SEE the result.
@@ -10635,13 +11129,16 @@ void EditorApplication::ensure_character_mesh_resource(const UUID& texId) {
         if (cached->second.ib.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, cached->second.ib.memory, nullptr);
         m_meshResources.erase(cached);
     }
-    float skinHeight = 64.0f;
-    if (const auto meta = m_assetRegistry.find(texId); meta && meta->height > 0) {
-        skinHeight = static_cast<float>(meta->height);
+    float skinLayoutHeight = 64.0f;
+    if (const auto meta = m_assetRegistry.find(texId); meta && meta->width > 0 && meta->height > 0) {
+        // Minecraft HD skins scale the whole 64x64 layout (128x128, 256x256...)
+        // and therefore keep the same normalized UVs. Only legacy skins use a
+        // genuinely different 64x32 layout.
+        skinLayoutHeight = meta->height * 2u == meta->width ? 32.0f : 64.0f;
     }
     std::vector<EditorVertex> verts;
     std::vector<uint32_t> indices;
-    build_character_geometry(skinHeight, verts, indices);
+    build_character_geometry(skinLayoutHeight, verts, indices);
     EditorMeshResource character;
     character.vertexCount = static_cast<uint32_t>(verts.size());
     character.ranges.push_back({ 0, static_cast<uint32_t>(indices.size()), 0, true });
@@ -10653,8 +11150,14 @@ void EditorApplication::ensure_character_mesh_resource(const UUID& texId) {
     create_buffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   character.ib.buffer, character.ib.memory);
-    safe_map_and_copy(m_device, character.vb.memory, 0, vbSize, verts.data());
-    safe_map_and_copy(m_device, character.ib.memory, 0, ibSize, indices.data());
+    if (!safe_map_and_copy(m_device, character.vb.memory, 0, vbSize, verts.data()) ||
+        !safe_map_and_copy(m_device, character.ib.memory, 0, ibSize, indices.data())) {
+        if (character.vb.buffer != VK_NULL_HANDLE) vkDestroyBuffer(m_device, character.vb.buffer, nullptr);
+        if (character.vb.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, character.vb.memory, nullptr);
+        if (character.ib.buffer != VK_NULL_HANDLE) vkDestroyBuffer(m_device, character.ib.buffer, nullptr);
+        if (character.ib.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, character.ib.memory, nullptr);
+        return;
+    }
     character.valid = true;
     m_meshResources[texId] = std::move(character);
 }
@@ -11458,6 +11961,13 @@ void EditorApplication::destroy_asset_thumbnails() {
         if (desc != VK_NULL_HANDLE) ImGui_ImplVulkan_RemoveTexture(desc);
     }
     m_asset3dThumbnails.clear();
+    for (auto& [id, thumb] : m_asset3dThumbnailImages) {
+        (void)id;
+        if (thumb.view != VK_NULL_HANDLE) vkDestroyImageView(m_device, thumb.view, nullptr);
+        if (thumb.image != VK_NULL_HANDLE) vkDestroyImage(m_device, thumb.image, nullptr);
+        if (thumb.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, thumb.memory, nullptr);
+    }
+    m_asset3dThumbnailImages.clear();
     m_asset3dThumbnailHashes.clear();
     m_assetThumbnailFailed.clear();
     {
@@ -11483,7 +11993,7 @@ void EditorApplication::init_thumbnail_target() {
     const VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
     // Resolve target (1x) — what ImGui shows as the thumbnail.
     create_image(m_thumbSize, m_thumbSize, colorFormat,
-                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_thumbImage, m_thumbMemory);
     m_thumbView = create_image_view(m_thumbImage, colorFormat, VK_IMAGE_ASPECT_COLOR_BIT);
     // Multisampled color + depth (same render pass as the viewport).
@@ -11506,6 +12016,10 @@ void EditorApplication::init_thumbnail_target() {
     fbInfo.height = m_thumbSize;
     fbInfo.layers = 1;
     vkCreateFramebuffer(m_device, &fbInfo, nullptr, &m_thumbFramebuffer);
+    VkCommandBuffer cmd = begin_single_time_commands();
+    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    end_single_time_commands(cmd);
 }
 
 void EditorApplication::destroy_thumbnail_target() {
@@ -11817,11 +12331,7 @@ void EditorApplication::pump_asset_thumbnails(int budget) {
         // keep showing its stale 3D thumbnail.
         const auto hashIt = m_asset3dThumbnailHashes.find(id);
         if (hashIt != m_asset3dThumbnailHashes.end() && hashIt->second != meta->contentHash) {
-            const auto thumbIt = m_asset3dThumbnails.find(id);
-            if (thumbIt != m_asset3dThumbnails.end()) {
-                if (thumbIt->second != VK_NULL_HANDLE) ImGui_ImplVulkan_RemoveTexture(thumbIt->second);
-                m_asset3dThumbnails.erase(thumbIt);
-            }
+            destroy_3d_thumbnail(id);
             m_asset3dThumbnailHashes.erase(hashIt);
         }
         if (meta->type == AssetType::Mesh) {
@@ -11838,7 +12348,11 @@ void EditorApplication::pump_asset_thumbnails(int budget) {
         } else if (meta->type == AssetType::Texture && is_block_texture(*meta)) {
             // The PNG is the block: its card shows the textured cube instead
             // of the flat image.
-            const VkDescriptorSet desc = get_block_descriptor(meta->id);
+            // The cube samples a 3-wide [top|side|bottom] atlas. Feeding the
+            // original single PNG made each face sample only one third of it.
+            const UUID blockId = create_block_asset(*meta);
+            const VkDescriptorSet desc = blockId.is_valid()
+                                       ? get_block_descriptor(blockId) : VK_NULL_HANDLE;
             if (desc == VK_NULL_HANDLE) { m_assetThumbnailFailed.insert(id); continue; }
             render_block_thumbnail(id, desc);
         } else if (meta->type == AssetType::Texture && is_character_texture(*meta)) {
@@ -11866,8 +12380,6 @@ void EditorApplication::render_mesh_thumbnail(const UUID& assetId, const EditorM
     const glm::mat4 view = glm::lookAt(center + glm::vec3(0.75f, 0.60f, 0.90f) * camDist, center, glm::vec3(0, 1, 0));
 
     VkCommandBuffer cmd = begin_single_time_commands();
-    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_UNDEFINED,
-                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
     VkRenderPassBeginInfo rp{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     rp.renderPass = m_offscreen.renderPass;
     rp.framebuffer = m_thumbFramebuffer;
@@ -11888,12 +12400,8 @@ void EditorApplication::render_mesh_thumbnail(const UUID& assetId, const EditorM
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
     draw_mesh_resource(cmd, proj * view, glm::vec4(0.62f, 0.66f, 0.75f, 1.0f), mesh);
     vkCmdEndRenderPass(cmd);
-    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    snapshot_rendered_thumbnail(cmd, assetId);
     end_single_time_commands(cmd);
-
-    m_asset3dThumbnails[assetId] =
-        ImGui_ImplVulkan_AddTexture(m_thumbView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (const auto meta = m_assetRegistry.find(assetId))
         m_asset3dThumbnailHashes[assetId] = meta->contentHash;
 }
@@ -11902,16 +12410,15 @@ void EditorApplication::render_mesh_thumbnail(const UUID& assetId, const EditorM
 // PNG face texture (block pipeline).
 void EditorApplication::render_block_thumbnail(const UUID& assetId, VkDescriptorSet textureDesc) {
     if (m_blockPipeline == VK_NULL_HANDLE) return;
-    // Frame the full character: look at its vertical center (the model spans
-    // y 0..2 with the feet at the origin) from a bit further out.
-    const glm::vec3 charCenter(0.0f, 1.0f, 0.0f);
+    // Unit block centered at the origin. The old character camera looked one
+    // metre above it from 4.5 m away, making every block a tiny cyan speck.
+    const glm::vec3 blockCenter(0.0f);
     const glm::mat4 proj = glm::perspective(glm::radians(45.0f), 1.0f, 0.01f, 50.0f);
-    const glm::mat4 view = glm::lookAt(charCenter + glm::vec3(2.6f, 2.2f, 3.0f), charCenter, glm::vec3(0, 1, 0));
+    const glm::mat4 view = glm::lookAt(glm::vec3(1.45f, 1.15f, 1.65f),
+                                      blockCenter, glm::vec3(0, 1, 0));
     const glm::mat4 mvp = proj * view;
 
     VkCommandBuffer cmd = begin_single_time_commands();
-    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_UNDEFINED,
-                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
     VkRenderPassBeginInfo rp{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     rp.renderPass = m_offscreen.renderPass;
     rp.framebuffer = m_thumbFramebuffer;
@@ -11937,12 +12444,8 @@ void EditorApplication::render_block_thumbnail(const UUID& assetId, VkDescriptor
     vkCmdBindIndexBuffer(cmd, m_blockCubeIB.buffer, 0, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(cmd, m_blockCubeIndexCount, 1, 0, 0, 0);
     vkCmdEndRenderPass(cmd);
-    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    snapshot_rendered_thumbnail(cmd, assetId);
     end_single_time_commands(cmd);
-
-    m_asset3dThumbnails[assetId] =
-        ImGui_ImplVulkan_AddTexture(m_thumbView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (const auto meta = m_assetRegistry.find(assetId))
         m_asset3dThumbnailHashes[assetId] = meta->contentHash;
 }
@@ -11964,8 +12467,6 @@ void EditorApplication::render_character_thumbnail(const UUID& assetId, const Ed
     const Rendering::MaterialPushConstants pc{ proj * view, glm::mat4(1.0f) };
 
     VkCommandBuffer cmd = begin_single_time_commands();
-    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_UNDEFINED,
-                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
     VkRenderPassBeginInfo rp{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     rp.renderPass = m_offscreen.renderPass;
     rp.framebuffer = m_thumbFramebuffer;
@@ -11996,14 +12497,53 @@ void EditorApplication::render_character_thumbnail(const UUID& assetId, const Ed
             vkCmdDraw(cmd, range.indexCount, 1, range.vertexOffset, 0);
     }
     vkCmdEndRenderPass(cmd);
-    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    snapshot_rendered_thumbnail(cmd, assetId);
     end_single_time_commands(cmd);
-
-    m_asset3dThumbnails[assetId] =
-        ImGui_ImplVulkan_AddTexture(m_thumbView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (const auto meta = m_assetRegistry.find(assetId))
         m_asset3dThumbnailHashes[assetId] = meta->contentHash;
+}
+
+void EditorApplication::destroy_3d_thumbnail(const UUID& assetId) {
+    const auto descriptor = m_asset3dThumbnails.find(assetId);
+    if (descriptor != m_asset3dThumbnails.end()) {
+        if (descriptor->second != VK_NULL_HANDLE) ImGui_ImplVulkan_RemoveTexture(descriptor->second);
+        m_asset3dThumbnails.erase(descriptor);
+    }
+    const auto image = m_asset3dThumbnailImages.find(assetId);
+    if (image != m_asset3dThumbnailImages.end()) {
+        if (image->second.view != VK_NULL_HANDLE) vkDestroyImageView(m_device, image->second.view, nullptr);
+        if (image->second.image != VK_NULL_HANDLE) vkDestroyImage(m_device, image->second.image, nullptr);
+        if (image->second.memory != VK_NULL_HANDLE) vkFreeMemory(m_device, image->second.memory, nullptr);
+        m_asset3dThumbnailImages.erase(image);
+    }
+}
+
+void EditorApplication::snapshot_rendered_thumbnail(VkCommandBuffer cmd, const UUID& assetId) {
+    destroy_3d_thumbnail(assetId);
+    AssetThumbnail snapshot;
+    create_image(m_thumbSize, m_thumbSize, VK_FORMAT_R8G8B8A8_UNORM,
+                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, snapshot.image, snapshot.memory);
+    snapshot.view = create_image_view(snapshot.image, VK_FORMAT_R8G8B8A8_UNORM,
+                                      VK_IMAGE_ASPECT_COLOR_BIT);
+    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    transition_image_layout(cmd, snapshot.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkImageCopy copy{};
+    copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    copy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    copy.extent = { m_thumbSize, m_thumbSize, 1 };
+    vkCmdCopyImage(cmd, m_thumbImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   snapshot.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    transition_image_layout(cmd, snapshot.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    transition_image_layout(cmd, m_thumbImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+    snapshot.imguiId = ImGui_ImplVulkan_AddTexture(snapshot.view,
+                                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    m_asset3dThumbnails[assetId] = snapshot.imguiId;
+    m_asset3dThumbnailImages[assetId] = snapshot;
 }
 
 // ---------------------------------------------------------------------------
@@ -13022,16 +13562,81 @@ void EditorApplication::destroy_voxel_editor_meshes() {
 bool EditorApplication::ensure_block_atlas(const UUID& blockId, GraphTexture& out) {
     const auto meta = m_assetRegistry.find(blockId);
     if (!meta || meta->type != AssetType::Block) return false;
+    BlockAssetData data;
+    if (!load_block_asset(blockId, data)) return false;
+
+    const auto validTexture = [&](const UUID& id) -> UUID {
+        if (!id.is_valid()) return UUID{ 0, 0 };
+        const auto candidate = m_assetRegistry.find(id);
+        return candidate && candidate->type == AssetType::Texture && !candidate->cookedPath.empty()
+             ? id : UUID{ 0, 0 };
+    };
+    const auto lowerStem = [](const std::filesystem::path& path) {
+        std::string stem = path.stem().string();
+        std::transform(stem.begin(), stem.end(), stem.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return stem;
+    };
+
+    // Sidecars survive registry rebuilds, therefore their UUIDs can be stale.
+    // Resolve semantic Minecraft face names against the current registry before
+    // falling back to still-valid UUIDs stored in the sidecar.
+    const std::string blockStem = lowerStem(meta->sourcePath);
+    std::unordered_map<std::string, UUID> textureByStem;
+    for (const AssetMetadata& candidate : m_assetRegistry.snapshot()) {
+        if (candidate.type == AssetType::Texture && !candidate.sourcePath.empty() &&
+            !candidate.cookedPath.empty()) {
+            textureByStem.emplace(lowerStem(candidate.sourcePath), candidate.id);
+        }
+    }
+    const auto named = [&](std::initializer_list<std::string> names) -> UUID {
+        for (const std::string& name : names) {
+            const auto found = textureByStem.find(name);
+            if (found != textureByStem.end()) return found->second;
+        }
+        return UUID{ 0, 0 };
+    };
+    const UUID exact = named({ blockStem });
+    const UUID namedTop = named({ blockStem + "_top", blockStem + "_up" });
+    const UUID namedSide = named({ blockStem + "_side" });
+    const UUID namedBottom = named({ blockStem + "_bottom", blockStem + "_down" });
+    UUID mainTex = validTexture(data.texture);
+    if (!mainTex.is_valid()) mainTex = exact;
+    if (!mainTex.is_valid()) mainTex = namedSide;
+    if (!mainTex.is_valid()) mainTex = namedTop;
+    if (!mainTex.is_valid()) mainTex = validTexture(data.side);
+    if (!mainTex.is_valid()) mainTex = validTexture(data.top);
+    if (!mainTex.is_valid()) mainTex = validTexture(data.bottom);
+    if (!mainTex.is_valid()) return false;
+    const auto texMeta = m_assetRegistry.find(mainTex);
+    if (!texMeta || texMeta->type != AssetType::Texture || texMeta->cookedPath.empty()) return false;
+
+    UUID topId = namedTop.is_valid() ? namedTop : validTexture(data.top);
+    if (!topId.is_valid()) topId = mainTex;
+    UUID sideId = namedSide.is_valid() ? namedSide : validTexture(data.side);
+    if (!sideId.is_valid()) sideId = mainTex;
+    UUID bottomId = namedBottom.is_valid() ? namedBottom : validTexture(data.bottom);
+    if (!bottomId.is_valid() && blockStem == "grass_block") bottomId = named({ "dirt" });
+    if (!bottomId.is_valid() && blockStem.ends_with("_log")) bottomId = topId;
+    if (!bottomId.is_valid()) bottomId = mainTex;
+
+    const auto textureHash = [&](const UUID& id) -> std::uint64_t {
+        const auto candidate = m_assetRegistry.find(id);
+        return candidate ? candidate->contentHash : 0u;
+    };
+    std::uint64_t atlasHash = meta->contentHash;
+    for (const UUID id : { mainTex, topId, sideId, bottomId }) {
+        atlasHash ^= textureHash(id) + 0x9e3779b97f4a7c15ull + (atlasHash << 6u) + (atlasHash >> 2u);
+    }
     const auto hashIt = m_blockAtlasHashes.find(blockId);
     if (hashIt != m_blockAtlasHashes.end()) {
-        if (hashIt->second == meta->contentHash) {
+        if (hashIt->second == atlasHash) {
             const auto texIt = m_blockAtlasTextures.find(blockId);
             if (texIt != m_blockAtlasTextures.end() && texIt->second.image != VK_NULL_HANDLE) {
                 out = texIt->second;
                 return true;
             }
         }
-        // Stale content (hot reload): rebuild from the new source pixels.
         const auto staleIt = m_blockAtlasTextures.find(blockId);
         if (staleIt != m_blockAtlasTextures.end()) {
             destroy_graph_texture(staleIt->second);
@@ -13039,40 +13644,33 @@ bool EditorApplication::ensure_block_atlas(const UUID& blockId, GraphTexture& ou
         }
         m_blockAtlasHashes.erase(hashIt);
     }
-    BlockAssetData data;
-    if (!load_block_asset(blockId, data)) return false;
-    const UUID mainTex = data.texture.is_valid() ? data.texture
-                       : (data.side.is_valid() ? data.side : data.top);
-    if (!mainTex.is_valid()) return false;
-    const auto texMeta = m_assetRegistry.find(mainTex);
-    if (!texMeta || texMeta->type != AssetType::Texture || texMeta->cookedPath.empty()) return false;
+
     std::string err;
     DecodedTexturePixels base;
     if (!decode_cooked_texture_pixels(texMeta->cookedPath, 256, base, err)) return false;
     const uint32_t w = base.width, h = base.height;
     if (w == 0 || h == 0) return false;
-    const uint32_t atlasW = w * 3;
-    std::vector<uint8_t> atlas(static_cast<size_t>(atlasW) * h * 4);
-    const auto blitFace = [&](const UUID& faceId, uint32_t region) {
-        uint8_t* dst = atlas.data() + static_cast<size_t>(region) * w * 4;
+    const auto facePixels = [&](const UUID& faceId) {
+        Editor::BlockFacePixels result{ w, h, base.rgba };
         const auto fm = m_assetRegistry.find(faceId);
         if (faceId.is_valid() && fm && fm->type == AssetType::Texture && !fm->cookedPath.empty()) {
             DecodedTexturePixels px;
             if (decode_cooked_texture_pixels(fm->cookedPath, 256, px, err) &&
                 px.width == w && px.height == h) {
-                std::memcpy(dst, px.rgba.data(), static_cast<size_t>(w) * h * 4);
-                return;
+                result.rgba = std::move(px.rgba);
             }
         }
-        std::memcpy(dst, base.rgba.data(), static_cast<size_t>(w) * h * 4);
+        return result;
     };
-    blitFace(data.top, 0);     // +Y
-    blitFace(data.side, 1);    // ±X/±Z
-    blitFace(data.bottom, 2);  // -Y
+    const Editor::BlockFacePixels top = facePixels(topId);
+    const Editor::BlockFacePixels side = facePixels(sideId);
+    const Editor::BlockFacePixels bottom = facePixels(bottomId);
+    Editor::BlockFacePixels atlas;
+    if (!Editor::compose_horizontal_block_atlas(top, side, bottom, atlas, &err)) return false;
     GraphTexture atlasTex;
-    if (!upload_texture_pixels(atlasW, h, atlas, 1, base.srgb, atlasTex, err)) return false;
+    if (!upload_texture_pixels(atlas.width, atlas.height, atlas.rgba, 1, base.srgb, atlasTex, err)) return false;
     m_blockAtlasTextures[blockId] = atlasTex;
-    m_blockAtlasHashes[blockId] = meta->contentHash;
+    m_blockAtlasHashes[blockId] = atlasHash;
     out = atlasTex;
     return true;
 }
