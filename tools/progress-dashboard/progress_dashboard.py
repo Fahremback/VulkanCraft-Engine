@@ -28,8 +28,6 @@ DONE_RE = re.compile(r"^\s*-\s*\[[xX]\]", re.MULTILINE)
 OPEN_RE = re.compile(r"^\s*-\s*\[(?:\s|~)\]", re.MULTILINE)
 SUCCESSOR_MARKER = "<!-- AUTO-SUCCESSOR:AGENT6-GAMEPLAY-AI -->"
 SUCCESSOR_TEMPLATE = AGENTS_ROOT / "agente6_integracao" / "successor_gameplay_ai.md"
-
-
 def activate_agent6_successor() -> bool:
     """Anexa a missão sucessora uma única vez quando o lote atual chega a 100%."""
     plan = AGENTS_ROOT / "agente6_integracao" / "task_plan.md"

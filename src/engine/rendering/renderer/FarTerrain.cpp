@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include "engine/core/logging/Log.hpp"
 #include <cstring>
 #include <iostream>
 
@@ -1163,10 +1164,7 @@ void FarTerrain::upload_ready(VkDevice device, VmaAllocator allocator,
         std::lock_guard lock(requestMutex);
         uploadedVersion = result->version;
     }
-    std::cout << "[FAR LOD] aplicado "
-              << (result->endpointQualityFraction * 100.0f) << "% | "
-              << result->clipmapLevels << " niveis | "
-              << result->surfaceInstances.size() << " celulas | "
+    VC_LOG_INFO("[FAR LOD] aplicado {}% | {} niveis | {} celulas", (result->endpointQualityFraction * 100.0f), result->clipmapLevels, result->surfaceInstances.size());
               << result->terrainVertices.size() << " vertices de vegetacao/transicao | "
               << (static_cast<double>(result->buildMicroseconds) / 1000.0)
               << " ms\n";

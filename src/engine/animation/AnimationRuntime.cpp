@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include "engine/core/logging/Log.hpp"
 #include <mutex>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/constants.hpp>
@@ -160,10 +161,7 @@ SkeletonMotionState* motion_state_for(const SkeletonAsset& skeleton) {
     }
     std::string error;
     if (!db->cook_skeleton(motion, error)) {
-        std::fprintf(stderr,
-                     "[animation] sample refused by motion database for "
-                     "skeleton '%s': %s\n",
-                     skeleton.name.c_str(), error.c_str());
+        VC_LOG_WARN("[animation] sample refused by motion database for skeleton '{}': {}", skeleton.name, error);
         return nullptr;
     }
     auto [it, inserted] =
@@ -196,10 +194,7 @@ Pose AnimationSampler::sample(const SkeletonAsset& skeleton, const AnimationClip
             to_motion_clip(skeleton, clip);
         std::string error;
         if (!state->db->cook_clip(motionClip, error)) {
-            std::fprintf(stderr,
-                         "[animation] sample refused by motion database for "
-                         "clip '%s': %s\n",
-                         clip.name.c_str(), error.c_str());
+            VC_LOG_WARN("[animation] sample refused by motion database for clip '{}': {}", clip.name, error);
             return bind_pose(skeleton);
         }
         // Capture the ozz handle FIRST — cooked() would return the ACL slot
@@ -209,20 +204,14 @@ Pose AnimationSampler::sample(const SkeletonAsset& skeleton, const AnimationClip
             state->db->cooked(clip.name);
         std::string cerror;
         if (!state->db->compress_clip(motionClip, cerror)) {
-            std::fprintf(stderr,
-                         "[animation] clip '%s' compression refused "
-                         "(sampling continues on ozz): %s\n",
-                         clip.name.c_str(), cerror.c_str());
+            VC_LOG_WARN("[animation] clip '{}' compression refused (sampling continues on ozz): {}", clip.name, cerror);
         }
         if (ozzSlot == nullptr) return bind_pose(skeleton);
         clipFound = state->clips.emplace(&clip, *ozzSlot).first;
     }
     engine::animation::MotionPose motion;
     if (!state->db->sample(clipFound->second, clip_time(clip, time), motion)) {
-        std::fprintf(stderr,
-                     "[animation] motion database sample failed for clip "
-                     "'%s'\n",
-                     clip.name.c_str());
+        VC_LOG_ERROR("[animation] motion database sample failed for clip '{}'", clip.name);
         return bind_pose(skeleton);
     }
     return pose_from_motion(motion);
@@ -277,9 +266,7 @@ Pose AnimationBlender::blend(const Pose& a, const Pose& b, float weight) {
         }
         return result;
     }
-    std::fprintf(stderr,
-                 "[animation] ozz blend refused — falling back to legacy "
-                 "blend (size mismatch)\n");
+    VC_LOG_WARN("[animation] ozz blend refused — falling back to legacy blend (size mismatch)");
     weight = std::clamp(weight, 0.0f, 1.0f);
     Pose result;
     result.local.resize(count);
@@ -387,9 +374,7 @@ bool IKSolver::solve_two_bone(const SkeletonAsset& skeleton, Pose& pose,
     engine::animation::MotionPose out;
     if (!state->db->ik_two_bone(motion, root, mid, end, target, poleVector,
                                 weight, out)) {
-        std::fprintf(stderr,
-                     "[animation] ik_two_bone refused for skeleton '%s'\n",
-                     skeleton.name.c_str());
+        VC_LOG_WARN("[animation] ik_two_bone refused for skeleton '{}'", skeleton.name);
         return false;
     }
     pose = pose_from_motion(out);
@@ -409,8 +394,7 @@ bool IKSolver::look_at(const SkeletonAsset& skeleton, Pose& pose, int bone,
     engine::animation::MotionPose out;
     if (!state->db->ik_aim(motion, bone, target, forwardAxis, upAxis, poleVector,
                            weight, out)) {
-        std::fprintf(stderr, "[animation] ik_aim refused for skeleton '%s'\n",
-                     skeleton.name.c_str());
+        VC_LOG_WARN("[animation] ik_aim refused for skeleton '{}'", skeleton.name);
         return false;
     }
     pose = pose_from_motion(out);

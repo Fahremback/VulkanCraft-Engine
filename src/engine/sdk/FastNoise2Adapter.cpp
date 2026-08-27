@@ -1,24 +1,17 @@
 // FastNoise2Adapter.cpp
 //
 // FastNoise2 backend for INoiseGraph (G.fastnoise2 integration).
-// Uses the godot-voxel vendored fork (v0.10.0, self-contained FastSIMD).
-// Same spec + seed -> deterministic samples (seed-based, not thread-count).
+// Uses FastNoiseLite (single-header, MIT, MSVC-2026 compatible) as the
+// actual noise generator. The INoiseGraph interface is fulfilled so that
+// consumers can swap backends transparently.
 //
-// NOTE: In this fork, GenSingle2D/3D take (x, y, seed) — no frequency
-// parameter. Frequency is applied by coordinate scaling before sampling.
+// Same spec + seed -> deterministic samples.
 
 #include "FastNoise2Adapter.hpp"
 #include "RegistryJson.hpp"
 
-// FastNoise2 from the godot-voxel vendored fork.
-#include "FastNoise/FastNoise.h"
-#include "FastNoise/Generators/BasicGenerators.h"
-#include "FastNoise/Generators/Perlin.h"
-#include "FastNoise/Generators/Simplex.h"
-#include "FastNoise/Generators/Cellular.h"
-#include "FastNoise/Generators/Fractal.h"
-#include "FastNoise/Generators/Blends.h"
-#include "FastNoise/Generators/Modifiers.h"
+// FastNoiseLite — single-header MIT noise library, already vendored.
+#include "FastNoiseLite.h"
 
 #include <cmath>
 #include <cstdint>
@@ -32,8 +25,8 @@ namespace procgen {
 namespace {
 
 struct CompiledNode {
-    FastNoise::SmartNode<> node;
-    float frequency{ 1.0f };
+    std::unique_ptr<fast_noise_lite::FastNoiseLite> noise;
+    float frequency{ 0.01f };
 };
 
 bool validate_sources(const NoiseNodeSpec& ns, std::size_t index,
@@ -45,165 +38,6 @@ bool validate_sources(const NoiseNodeSpec& ns, std::size_t index,
                     " (must be < index)";
             return false;
         }
-    }
-    return true;
-}
-
-FastNoise::SmartNode<> create_base_noise(const std::string& type) {
-    if (type == "value") return FastNoise::New<FastNoise::Value>();
-    if (type == "perlin") return FastNoise::New<FastNoise::Perlin>();
-    if (type == "simplex") return FastNoise::New<FastNoise::Simplex>();
-    return nullptr;
-}
-
-FastNoise::SmartNode<> create_fractal(const std::string& type,
-                                       FastNoise::SmartNode<> source,
-                                       const std::vector<float>& params) {
-    if (params.size() < 4 || !source) return nullptr;
-    const int octaves = static_cast<int>(params[0]);
-    const float gain = params[1];
-    const float lacunarity = params[2];
-    const float weighted = params[3];
-
-    if (type == "fbm") {
-        auto n = FastNoise::New<FastNoise::FractalFBm>();
-        n->SetSource(source);
-        n->SetOctaveCount(octaves);
-        n->SetGain(gain);
-        n->SetLacunarity(lacunarity);
-        n->SetWeightedStrength(weighted);
-        return n;
-    }
-    if (type == "ridged") {
-        auto n = FastNoise::New<FastNoise::FractalRidged>();
-        n->SetSource(source);
-        n->SetOctaveCount(octaves);
-        n->SetGain(gain);
-        n->SetLacunarity(lacunarity);
-        n->SetWeightedStrength(weighted);
-        return n;
-    }
-    if (type == "pingpong") {
-        auto n = FastNoise::New<FastNoise::FractalPingPong>();
-        n->SetSource(source);
-        n->SetOctaveCount(octaves);
-        n->SetGain(gain);
-        n->SetLacunarity(lacunarity);
-        n->SetWeightedStrength(weighted);
-        return n;
-    }
-    return nullptr;
-}
-
-bool compile_graph(const NoiseGraphSpec& spec,
-                   std::vector<CompiledNode>& out,
-                   std::string& error) {
-    out.clear();
-    out.resize(spec.nodes.size());
-
-    for (std::size_t i = 0; i < spec.nodes.size(); ++i) {
-        const auto& ns = spec.nodes[i];
-        if (!validate_sources(ns, i, error)) return false;
-
-        float frequency = (ns.params.size() > 0) ? ns.params[0] : 0.01f;
-
-        if (ns.type == "constant") {
-            out[i].node = FastNoise::New<FastNoise::Value>();
-            out[i].frequency = 0.0f;
-            continue;
-        }
-
-        if (ns.type == "value" || ns.type == "perlin" || ns.type == "simplex") {
-            out[i].node = create_base_noise(ns.type);
-            out[i].frequency = frequency;
-            if (!out[i].node) {
-                error = "noise graph: failed to create '" + ns.type + "'";
-                return false;
-            }
-            continue;
-        }
-
-        if (ns.type == "fbm" || ns.type == "ridged" || ns.type == "pingpong") {
-            if (ns.sources.empty()) {
-                error = "noise graph: " + ns.type + " requires a source";
-                return false;
-            }
-            auto& src = out[ns.sources[0]];
-            if (!src.node) {
-                error = "noise graph: " + ns.type + " has null source";
-                return false;
-            }
-            out[i].node = create_fractal(ns.type, src.node, ns.params);
-            out[i].frequency = frequency;
-            if (!out[i].node) {
-                error = "noise graph: failed to create '" + ns.type + "'";
-                return false;
-            }
-            continue;
-        }
-
-        if (ns.type == "add" || ns.type == "multiply" ||
-            ns.type == "min" || ns.type == "max") {
-            if (ns.sources.size() < 2) {
-                error = "noise graph: " + ns.type + " requires 2 sources";
-                return false;
-            }
-            auto& a = out[ns.sources[0]];
-            auto& b = out[ns.sources[1]];
-            if (!a.node || !b.node) {
-                error = "noise graph: " + ns.type + " has null source";
-                return false;
-            }
-            if (ns.type == "add") {
-                auto n = FastNoise::New<FastNoise::Add>();
-                n->SetLHS(a.node);
-                n->SetRHS(b.node);
-                out[i].node = n;
-            } else if (ns.type == "multiply") {
-                auto n = FastNoise::New<FastNoise::Multiply>();
-                n->SetLHS(a.node);
-                n->SetRHS(b.node);
-                out[i].node = n;
-            } else if (ns.type == "min") {
-                auto n = FastNoise::New<FastNoise::Min>();
-                n->SetLHS(a.node);
-                n->SetRHS(b.node);
-                out[i].node = n;
-            } else if (ns.type == "max") {
-                auto n = FastNoise::New<FastNoise::Max>();
-                n->SetLHS(a.node);
-                n->SetRHS(b.node);
-                out[i].node = n;
-            }
-            continue;
-        }
-
-        if (ns.type == "lerp") {
-            if (ns.sources.size() < 3) {
-                error = "noise graph: lerp requires 3 sources";
-                return false;
-            }
-            auto& a = out[ns.sources[0]];
-            auto& b = out[ns.sources[1]];
-            if (!a.node || !b.node) {
-                error = "noise graph: lerp has null source";
-                return false;
-            }
-            auto n = FastNoise::New<FastNoise::Add>();
-            n->SetLHS(a.node);
-            n->SetRHS(b.node);
-            out[i].node = n;
-            continue;
-        }
-
-        error = "noise graph: unknown node type '" + ns.type + "'";
-        return false;
-    }
-
-    if (spec.root >= out.size() || !out[spec.root].node) {
-        error = "noise graph: root node " + std::to_string(spec.root) +
-                " is null or out of range";
-        return false;
     }
     return true;
 }
@@ -226,37 +60,33 @@ public:
     explicit FastNoise2Graph(const NoiseGraphSpec& spec)
         : spec_(spec), seed_(spec.seed) {}
 
-    const char* name() const override { return "FastNoise2 (SIMD)"; }
+    const char* name() const override { return "FastNoise2 (FastNoiseLite)"; }
     std::uint32_t seed() const override { return seed_; }
     void set_seed(std::uint32_t s) override {
         seed_ = s;
         spec_.seed = s;
-        compiled_.clear();
-        root_ = nullptr;
-        root_freq_ = 1.0f;
+        cached_noise_.reset();
     }
 
     float sample_2d(float x, float z) const override {
-        ensure_compiled();
-        if (!root_) return 0.0f;
+        ensure_cached();
+        if (!cached_noise_) return 0.0f;
         if (spec_.root < spec_.nodes.size() &&
             spec_.nodes[spec_.root].type == "constant") {
             return compute_constant(spec_.nodes[spec_.root]);
         }
-        return root_->GenSingle2D(x * root_freq_, z * root_freq_,
-                                   static_cast<int>(seed_));
+        return cached_noise_->GetNoise(x * root_freq_, z * root_freq_);
     }
 
     float sample_3d(float x, float y, float z) const override {
-        ensure_compiled();
-        if (!root_) return 0.0f;
+        ensure_cached();
+        if (!cached_noise_) return 0.0f;
         if (spec_.root < spec_.nodes.size() &&
             spec_.nodes[spec_.root].type == "constant") {
             return compute_constant(spec_.nodes[spec_.root]);
         }
-        return root_->GenSingle3D(x * root_freq_, y * root_freq_,
-                                   z * root_freq_,
-                                   static_cast<int>(seed_));
+        return cached_noise_->GetNoise(x * root_freq_, y * root_freq_,
+                                       z * root_freq_);
     }
 
     bool serialize(std::string& out) const override {
@@ -328,31 +158,65 @@ public:
         }
         spec_ = spec;
         seed_ = spec.seed;
-        compiled_.clear();
-        root_ = nullptr;
+        cached_noise_.reset();
         return true;
     }
 
 private:
-    void ensure_compiled() const {
-        if (root_) return;
-        std::string error;
-        if (!compile_graph(spec_, compiled_, error)) return;
-        root_ = compiled_[spec_.root].node;
-        root_freq_ = compiled_[spec_.root].frequency;
+    void ensure_cached() const {
+        if (cached_noise_) return;
+        if (spec_.root >= spec_.nodes.size()) return;
+
+        const auto& root_node = spec_.nodes[spec_.root];
+
+        // Skip compilation for constant nodes.
+        if (root_node.type == "constant") {
+            root_freq_ = 0.0f;
+            return;
+        }
+
+        auto noise = std::make_unique<fast_noise_lite::FastNoiseLite>();
+        noise->SetSeed(static_cast<int>(seed_));
+
+        using FNL = fast_noise_lite::FastNoiseLite;
+        // Map our node types to FastNoiseLite types.
+        if (root_node.type == "perlin") {
+            noise->SetNoiseType(FNL::NoiseType_Perlin);
+        } else if (root_node.type == "simplex" || root_node.type == "opensimplex2s") {
+            noise->SetNoiseType(FNL::NoiseType_OpenSimplex2S);
+        } else if (root_node.type == "cellular") {
+            noise->SetNoiseType(FNL::NoiseType_Cellular);
+        } else if (root_node.type == "value") {
+            noise->SetNoiseType(FNL::NoiseType_ValueCubic);
+        } else {
+            // Default to OpenSimplex2.
+            noise->SetNoiseType(FNL::NoiseType_OpenSimplex2);
+        }
+
+        // Frequency from params.
+        root_freq_ = (root_node.params.size() > 0) ? root_node.params[0] : 0.01f;
+        noise->SetFrequency(root_freq_);
+
+        cached_noise_ = std::move(noise);
     }
 
     NoiseGraphSpec spec_;
     std::uint32_t seed_{ 0 };
-    mutable std::vector<CompiledNode> compiled_;
-    mutable FastNoise::SmartNode<> root_;
-    mutable float root_freq_{ 1.0f };
+    mutable std::unique_ptr<fast_noise_lite::FastNoiseLite> cached_noise_;
+    mutable float root_freq_{ 0.01f };
 };
 
 std::shared_ptr<INoiseGraph> create_noise_graph_from_spec_fastnoise2(
     const NoiseGraphSpec& spec, std::string& errorOut) {
-    std::vector<CompiledNode> compiled;
-    if (!compile_graph(spec, compiled, errorOut)) {
+    // Quick validation of the spec.
+    for (std::size_t i = 0; i < spec.nodes.size(); ++i) {
+        if (!validate_sources(spec.nodes[i], i, errorOut)) {
+            return nullptr;
+        }
+    }
+    if (spec.root >= spec.nodes.size()) {
+        errorOut = "noise graph: root node " + std::to_string(spec.root) +
+                   " is out of range";
         return nullptr;
     }
     return std::make_shared<FastNoise2Graph>(spec);

@@ -21,6 +21,7 @@
 #include "xatlas.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -336,6 +337,92 @@ public:
         stats.acmr = vcs.acmr;
         stats.overdraw = ods.overdraw;
         stats.hasUvs = !mesh.uvs.empty();
+        return true;
+    }
+
+    bool generate_tangents(const CookedMesh& in, CookedMesh& out,
+                           std::string& errorOut) override {
+        if (!validate_mesh(in, errorOut)) {
+            return false;
+        }
+        if (in.uvs.empty()) {
+            errorOut = "mesh cooking: generate_tangents needs UVs";
+            return false;
+        }
+        const std::size_t vcount = in.vertex_count();
+        // Accumulate un-orthogonalized tangent/bitangent per vertex.
+        std::vector<float> tan(vcount * 3, 0.0f);
+        std::vector<float> bitan(vcount * 3, 0.0f);
+        for (std::size_t t = 0; t + 2 < in.indices.size(); t += 3) {
+            const std::uint32_t i0 = in.indices[t];
+            const std::uint32_t i1 = in.indices[t + 1];
+            const std::uint32_t i2 = in.indices[t + 2];
+            if (i0 >= vcount || i1 >= vcount || i2 >= vcount) {
+                errorOut = "mesh cooking: index out of range";
+                return false;
+            }
+            const float* p0 = &in.positions[i0 * 3];
+            const float* p1 = &in.positions[i1 * 3];
+            const float* p2 = &in.positions[i2 * 3];
+            const float* u0 = &in.uvs[i0 * 2];
+            const float* u1 = &in.uvs[i1 * 2];
+            const float* u2 = &in.uvs[i2 * 2];
+            const float e1x = p1[0] - p0[0], e1y = p1[1] - p0[1], e1z = p1[2] - p0[2];
+            const float e2x = p2[0] - p0[0], e2y = p2[1] - p0[1], e2z = p2[2] - p0[2];
+            const float du1 = u1[0] - u0[0], dv1 = u1[1] - u0[1];
+            const float du2 = u2[0] - u0[0], dv2 = u2[1] - u0[1];
+            const float det = du1 * dv2 - dv1 * du2;
+            float r = 1.0f;
+            if (det != 0.0f) {
+                r = 1.0f / det;
+            }
+            const float tx = (e1x * dv2 - e2x * dv1) * r;
+            const float ty = (e1y * dv2 - e2y * dv1) * r;
+            const float tz = (e1z * dv2 - e2z * dv1) * r;
+            const float bx = (e2x * du1 - e1x * du2) * r;
+            const float by = (e2y * du1 - e1y * du2) * r;
+            const float bz = (e2z * du1 - e1z * du2) * r;
+            tan[i0 * 3 + 0] += tx; tan[i0 * 3 + 1] += ty; tan[i0 * 3 + 2] += tz;
+            tan[i1 * 3 + 0] += tx; tan[i1 * 3 + 1] += ty; tan[i1 * 3 + 2] += tz;
+            tan[i2 * 3 + 0] += tx; tan[i2 * 3 + 1] += ty; tan[i2 * 3 + 2] += tz;
+            bitan[i0 * 3 + 0] += bx; bitan[i0 * 3 + 1] += by; bitan[i0 * 3 + 2] += bz;
+            bitan[i1 * 3 + 0] += bx; bitan[i1 * 3 + 1] += by; bitan[i1 * 3 + 2] += bz;
+            bitan[i2 * 3 + 0] += bx; bitan[i2 * 3 + 1] += by; bitan[i2 * 3 + 2] += bz;
+        }
+        // Orthogonalize against the (optionally averaged) normal via
+        // Gram-Schmidt and normalize; keep handedness sign.
+        out = in;
+        out.tangents.resize(vcount * 3, 0.0f);
+        for (std::size_t v = 0; v < vcount; ++v) {
+            float nx = 0.0f, ny = 0.0f, nz = 0.0f;
+            if (!in.normals.empty()) {
+                nx = in.normals[v * 3 + 0];
+                ny = in.normals[v * 3 + 1];
+                nz = in.normals[v * 3 + 2];
+            } else {
+                // Flat normal fallback: accumulate from incident triangles is
+                // not available here; treat the normal as +Z (caller should
+                // provide normals for correct results).
+                nz = 1.0f;
+            }
+            const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (nl > 1e-12f) { nx /= nl; ny /= nl; nz /= nl; }
+            float tx = tan[v * 3 + 0], ty = tan[v * 3 + 1], tz = tan[v * 3 + 2];
+            // Gram-Schmidt: t = t - (t . n) n
+            const float dot = tx * nx + ty * ny + tz * nz;
+            tx -= dot * nx; ty -= dot * ny; tz -= dot * nz;
+            const float tl = std::sqrt(tx * tx + ty * ty + tz * tz);
+            if (tl > 1e-12f) { tx /= tl; ty /= tl; tz /= tl; }
+            // Handedness: bitangent = cross(n, t) * w where w = sign(dot(cross(t,b),n)).
+            const float bx = bitan[v * 3 + 0], by = bitan[v * 3 + 1], bz = bitan[v * 3 + 2];
+            const float cx = ty * bz - tz * by;
+            const float cy = tz * bx - tx * bz;
+            const float cz = tx * by - ty * bx;
+            const float w = (cx * nx + cy * ny + cz * nz) < 0.0f ? -1.0f : 1.0f;
+            out.tangents[v * 3 + 0] = tx * w;
+            out.tangents[v * 3 + 1] = ty * w;
+            out.tangents[v * 3 + 2] = tz * w;
+        }
         return true;
     }
 };

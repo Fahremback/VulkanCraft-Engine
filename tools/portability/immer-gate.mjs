@@ -10,6 +10,10 @@ import { spawnSync } from 'child_process';
 import { existsSync } from 'fs';
 import { join } from 'path';
 
+// Harden against PATH: discover MinGW and stage its DLLs next to the exe.
+const { buildEnv, stageDlls } = await import('./mingw-env.mjs');
+const env = buildEnv();
+
 const ROOT = process.cwd();
 const IMMER = join(ROOT, 'external', 'solutions', 'immer');
 const PROBE = join(ROOT, 'tools', 'portability', 'immer-probe.cpp');
@@ -20,13 +24,14 @@ if (!existsSync(join(IMMER, 'immer', 'vector.hpp'))) {
   process.exit(1);
 }
 
-const compiler = spawnSync('g++', ['-std=c++17', `-I${IMMER}`, PROBE, '-o', OUT], { encoding: 'utf8' });
+const compiler = spawnSync('g++', ['-std=c++17', `-I${IMMER}`, PROBE, '-o', OUT], { encoding: 'utf8', env });
 if (compiler.status !== 0) {
   console.error(`[immer-gate] FAIL — probe did not compile against the vendored headers:\n${compiler.stderr || compiler.stdout}`);
   process.exit(1);
 }
 
-const run = spawnSync(OUT, [], { encoding: 'utf8' });
+stageDlls(OUT); // loader searches exe dir for libstdc++/libwinpthread first
+const run = spawnSync(OUT, [], { encoding: 'utf8', env });
 if (run.status !== 0) {
   console.error(`[immer-gate] FAIL — probe exited ${run.status}: ${run.stderr || run.stdout}`);
   process.exit(1);

@@ -1547,7 +1547,7 @@ uint8_t World::light_absorption(RuntimeBlockId id) const {
         // FALTANTES §8 item 166: the light simulation reads the SIMULATION
         // table (BLOCK_SIM_PROPS) — never the visual material. air=0,
         // glass=0, water/lava/leaves=1, opaque=15 (see get_block_sim).
-        return get_block_sim(as_builtin_block(id)).lightAbsorption;
+        return get_block_sim(static_cast<BlockType>(id)).lightAbsorption;
     }
     const auto found = runtimeBlocks_.find(id);
     return found == runtimeBlocks_.end() ? 15 : found->second.lightAbsorption;

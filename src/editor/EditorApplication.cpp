@@ -200,6 +200,7 @@ EditorApplication::EditorApplication() {
     register_project_templates();
     m_uiDocJson = build_ui_doc_json();
     apply_layout_defaults();
+    load_layout_settings();
     build_message_catalog();
     build_shortcut_doc();
     build_command_index();
@@ -291,6 +292,7 @@ EditorApplication::EditorApplication() {
             m_fileWatcher->start_watch(sourceRoot.string(), true, watchErr);
         }
     }
+
 }
 
 EditorApplication::~EditorApplication() {
@@ -307,10 +309,74 @@ void EditorApplication::register_project_templates() {
 }
 
 void EditorApplication::apply_layout_defaults() {
-    // Safe reset: the shell layout is derived from the panel registry defaults
-    // (a fresh layout never depends on prior state). The real windows consume
-    // this model; GET /layout exposes it for observability.
     m_layoutModel.reset_from_registry(m_panelRegistry.panels());
+    m_showHierarchy = m_layoutModel.is_visible("hierarchy");
+    m_showInspector = m_layoutModel.is_visible("inspector");
+    m_showViewport = m_layoutModel.is_visible("viewport");
+    m_showContentBrowser = m_layoutModel.is_visible("content_browser");
+    m_showConsole = m_layoutModel.is_visible("console");
+}
+
+void EditorApplication::load_layout_settings() {
+    m_layoutSettingsPath = (std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "imgui.ini").string();
+    // ImGui owns the persisted dock geometry. The public model owns panel
+    // visibility and is restored from a compact sidecar, preserving unknown
+    // panels for forward-compatible plugins.
+    const std::filesystem::path modelPath =
+        std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "editor-layout.json";
+    std::ifstream in(modelPath);
+    if (!in) return;
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Engine::Editor::EditorLayoutSnapshot snapshot;
+    std::string error;
+    if (!snapshot.load_from_json(text, error) || !m_layoutModel.apply_snapshot(snapshot, error)) {
+        std::cerr << "[EditorLayout] Ignoring invalid layout: " << error << std::endl;
+        return;
+    }
+    m_showHierarchy = m_layoutModel.is_visible("hierarchy");
+    m_showInspector = m_layoutModel.is_visible("inspector");
+    m_showViewport = m_layoutModel.is_visible("viewport");
+    m_showContentBrowser = m_layoutModel.is_visible("content_browser");
+    m_showConsole = m_layoutModel.is_visible("console");
+}
+
+void EditorApplication::save_layout_settings() {
+    const std::filesystem::path path =
+        std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "editor-layout.json";
+    std::ofstream out(path, std::ios::trunc);
+    if (out) out << m_layoutModel.snapshot().to_json() << '\\n';
+}
+
+void EditorApplication::apply_layout_snapshot_to_imgui() {
+    const auto snap = m_layoutModel.snapshot();
+    m_layoutModel.set_active_panel("viewport");
+    m_layoutModel.set_gizmo_mode(m_gizmoMode == GizmoMode::Translate ? "translate" :
+        m_gizmoMode == GizmoMode::Rotate ? "rotate" :
+        m_gizmoMode == GizmoMode::Scale ? "scale" : "select");
+    (void)snap;
+}
+
+void EditorApplication::apply_layout_visibility_to_imgui() {
+    m_showHierarchy = m_layoutModel.is_visible("hierarchy");
+    m_showInspector = m_layoutModel.is_visible("inspector");
+    m_showViewport = m_layoutModel.is_visible("viewport");
+    m_showContentBrowser = m_layoutModel.is_visible("content_browser");
+    m_showConsole = m_layoutModel.is_visible("console");
+}
+
+void EditorApplication::update_ui_dpi_scale() {
+    if (!m_window) return;
+    float x = 1.0f, y = 1.0f;
+    glfwGetWindowContentScale(m_window, &x, &y);
+    const float scale = std::clamp((x + y) * 0.5f, 0.75f, 3.0f);
+    if (std::abs(scale - m_lastAppliedDpiScale) < 0.01f) return;
+    m_uiDpiScale = scale;
+    m_uiTextScale = scale;
+    ImGuiIO& io = ImGui::GetIO();
+    io.FontGlobalScale = m_uiTextScale;
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.ScaleAllSizes(m_uiDpiScale / std::max(m_lastAppliedDpiScale, 0.01f));
+    m_lastAppliedDpiScale = m_uiDpiScale;
 }
 
 void EditorApplication::build_message_catalog() {
@@ -1117,10 +1183,12 @@ int EditorApplication::run() {
         }
         // Persisted editor preferences (language, VSync, shadows, theme).
         load_settings();
+        load_layout_settings();
         // Reapply a persisted theme to the live ImGui style on boot (the
         // Theme Editor panel persists bg/panel colors to settings.json; they
         // used to only be applied when the user pressed "Aplicar Tema").
         m_wickedTools.apply_theme_to_style();
+        update_ui_dpi_scale();
 
         // VC_EDITOR_TEST_RENDERGRAPH=1: exercise the render graph executor on
         // the real device — a two-pass graph (Scene → Composite) is recorded
@@ -1157,6 +1225,17 @@ void EditorApplication::init_window() {
     // when the 3D view is hovered; io.MouseWheel alone is useless there because
     // ImGui clears it at the end of NewFrame, after the camera update.
     glfwSetWindowUserPointer(m_window, this);
+    glfwSetFramebufferSizeCallback(m_window, [](GLFWwindow* win, int width, int height) {
+        if (auto* app = static_cast<EditorApplication*>(glfwGetWindowUserPointer(win))) {
+            app->m_windowWidth = std::max(width, 1);
+            app->m_windowHeight = std::max(height, 1);
+            app->m_recreateSwapchain = true;
+        }
+    });
+    glfwSetWindowContentScaleCallback(m_window, [](GLFWwindow* win, float, float) {
+        if (auto* app = static_cast<EditorApplication*>(glfwGetWindowUserPointer(win)))
+            app->m_lastAppliedDpiScale = 0.0f;
+    });
     glfwSetScrollCallback(m_window, [](GLFWwindow* win, double /*xoff*/, double yoff) {
         if (auto* app = static_cast<EditorApplication*>(glfwGetWindowUserPointer(win))) {
             app->m_scrollAccum += yoff;
@@ -1727,6 +1806,7 @@ void EditorApplication::main_loop() {
     double lastTime = glfwGetTime();
     while (!glfwWindowShouldClose(m_window)) {
         glfwPollEvents();
+        update_ui_dpi_scale();
 
         double currentTime = glfwGetTime();
         float deltaTime = static_cast<float>(currentTime - lastTime);
@@ -2127,6 +2207,8 @@ void EditorApplication::render_frame() {
         if (m_showVoxelTools) draw_voxel_tool_panel();
 #endif
         if (m_showConsole) draw_console_panel();
+        if (m_showRenderDebugger) draw_render_debugger_panel();
+        if (m_showLayoutSettings) draw_layout_settings_panel();
         if (m_showScriptDebugger) draw_script_debugger_panel();
         if (m_showScriptCanvas) { if (!m_scriptCanvasLoaded) load_script_canvas(); draw_script_canvas_panel(); }
         {
@@ -2216,6 +2298,7 @@ void EditorApplication::render_frame() {
             });
             m_wickedTools.draw();
         }
+        draw_onboarding_overlay();
     }
 
     ImGui::Render();
@@ -2526,6 +2609,12 @@ void EditorApplication::draw_project_launcher() {
 void EditorApplication::draw_dockspace() {
     static bool firstTime = true;
     ImGuiID dockspace_id = ImGui::GetID("VulkanEngineStudioDockspace");
+    // Persisted layouts are applied only after the dockspace exists. This keeps
+    // ImGui's builder authoritative for the first frame and makes reset/load
+    // affect real dock nodes instead of only the JSON model.
+    if (firstTime) {
+        apply_layout_snapshot_to_imgui();
+    }
 
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     // Dock area starts below the main menu bar + the 56 px app bar. Base the
@@ -2582,7 +2671,9 @@ void EditorApplication::draw_dockspace() {
 
         ImGui::DockBuilderFinish(dockspace_id);
     }
-
+    // The public layout model is the source of truth for visibility. Apply it
+    // every frame so changes made by the Layout Settings panel affect the
+    // actual dock windows, not only the serialized model.
     ImGui::End();
 }
 
@@ -2718,12 +2809,23 @@ void EditorApplication::draw_menu_bar() {
 #if VC_ENABLE_VOXEL_PLUGIN
             ImGui::MenuItem(tr("Escultura de Blocos", "Voxel Sculpting Tools"), nullptr, &m_showVoxelTools);
 #endif
-            ImGui::MenuItem(tr("Console", "Console"), nullptr, &m_showConsole);
+                    ImGui::MenuItem(tr("Console", "Console"), nullptr, &m_showConsole);
+            ImGui::MenuItem(tr("Render Debugger", "Render Debugger"), nullptr, &m_showRenderDebugger);
+            ImGui::MenuItem(tr("Layout Settings", "Layout Settings"), nullptr, &m_showLayoutSettings);
             ImGui::MenuItem(tr("Debugger de Scripts", "Script Debugger"), nullptr, &m_showScriptDebugger);
             ImGui::MenuItem(tr("Canvas de Scripts", "Script Canvas"), nullptr, &m_showScriptCanvas);
             ImGui::Separator();
             ImGui::MenuItem(tr("Editores Especializados", "Specialized Editors"), nullptr, &m_specializedEditors.open);
             m_wickedTools.draw_tools_menu();
+            ImGui::Separator();
+            if (ImGui::MenuItem(tr("Salvar Layout", "Save Layout"))) save_layout_settings();
+            if (ImGui::MenuItem(tr("Restaurar Layout Padrão", "Reset Layout"))) {
+                apply_layout_defaults();
+                apply_layout_visibility_to_imgui();
+                ImGui::LoadIniSettingsFromDisk();
+                ImGui::DockBuilderRemoveNode(ImGui::GetID("VulkanEngineStudioDockspace"));
+                ImGui::DockBuilderMarkIniSettingsDirty();
+            }
             ImGui::EndMenu();
         }
 
@@ -10376,6 +10478,30 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
             m_controlData = path;
             std::cout << "[ControlApi] screenshot-ui saved: " << path << std::endl;
         }
+    } else if (cmd.rfind("window-resize", 0) == 0) {
+        // Redimensiona a janela em runtime (ex: "window-resize 1280x720").
+        // O swapchain fica OUT_OF_DATE e o frame loop recria (recreate_swapchain),
+        // permitindo validar a UI em múltiplas resoluções/aspectos por algoritmo
+        // (captura via /screenshot-ui + harness de pixels) sem inspeção humana.
+        std::string spec = (cmd.size() > 14) ? cmd.substr(14) : std::string();
+        while (!spec.empty() && spec.front() == ' ') spec.erase(spec.begin());
+        const std::size_t xpos = spec.find('x');
+        int w = 0, h = 0;
+        if (xpos != std::string::npos) {
+            w = std::atoi(spec.substr(0, xpos).c_str());
+            h = std::atoi(spec.substr(xpos + 1).c_str());
+        }
+        if (w < 320 || h < 240 || w > 7680 || h > 4320) {
+            m_controlResult = "window-resize: expected <width>x<height> (320..7680 x 240..4320)";
+        } else if (m_window) {
+            m_windowWidth = w;
+            m_windowHeight = h;
+            glfwSetWindowSize(m_window, w, h);
+            m_controlResult = "window-resize: " + std::to_string(w) + "x" + std::to_string(h);
+            std::cout << "[ControlApi] window-resize -> " << w << "x" << h << std::endl;
+        } else {
+            m_controlResult = "window-resize: no window";
+        }
     } else if (cmd.rfind("screenshot", 0) == 0) {
         // Save the current viewport to a PNG so an agent can SEE the result.
         // The path is absolute or relative to the engine root. Returns the
@@ -14856,9 +14982,10 @@ void EditorApplication::load_settings() {
     else if (vsync == "true") m_vsyncEnabled = true;
     const std::string quality = findString("shadowQuality");
     if (!quality.empty()) m_shadowQuality = std::clamp(std::atoi(quality.c_str()), 1, 4);
-    // Theme colors are parsed but NOT reapplied on boot: the Forge light
-    // design system is the base theme, and the Theme Editor panel tunes the
-    // live style during the session (persisting it is a TODO(frontend-port)).
+    // Theme colors are parsed here and reapplied to the live ImGui style on
+    // boot via m_wickedTools.apply_theme_to_style() (called right after
+    // load_settings() in the boot path) — the Theme Editor panel persists
+    // bg/panel colors to settings.json and they are honored on the next run.
     const glm::vec3 bg = findVec("themeBg");
     const glm::vec3 panel = findVec("themePanel");
     if (bg.x >= 0.0f && panel.x >= 0.0f) {

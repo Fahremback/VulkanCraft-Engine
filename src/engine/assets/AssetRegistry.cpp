@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include "engine/core/logging/Log.hpp"
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -1207,8 +1208,7 @@ ImportResult MeshImporter::import(const ImportRequest& request) const {
             }
             cookedV2 = GltfGeometryParser::write_cooked(asset.cookedPath, geometry, &parseError);
             if (!cookedV2) {
-                std::cerr << "[Cooker] v2 mesh cook failed (" << parseError
-                          << "), falling back to v1 for " << request.source.filename().string() << std::endl;
+                VC_LOG_WARN("[Cooker] v2 mesh cook failed ({}), falling back to v1 for {}", parseError, request.source.filename().string());
             }
         }
     }

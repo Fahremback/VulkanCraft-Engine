@@ -776,6 +776,13 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
         else if (path.rfind("/selftest/", 0) == 0) cmd = "selftest " + path.substr(10);
         else if (path == "/package") cmd = "package";
         else if (path == "/hot-reload") cmd = "hot-reload";
+        else if (path.rfind("/window-resize", 0) == 0) {
+            // /window-resize?size=1280x720 — redimensiona a janela em runtime
+            // (swapchain recria no frame loop); usado com /screenshot-ui para
+            // validar a UI em múltiplas resoluções por algoritmo.
+            const std::string s = query_value_after(path, "size");
+            cmd = s.empty() ? "window-resize" : "window-resize " + s;
+        }
         else if (path.rfind("/screenshot-ui", 0) == 0) {
             // /screenshot-ui?path=... — captures the FINAL FRAME (viewport + UI
             // ImGui/docks) from the UI snapshot; validar o visual por algoritmo.

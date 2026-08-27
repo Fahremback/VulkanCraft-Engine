@@ -1,179 +1,122 @@
-// AbilityEffects.cpp — the only TU implementing the public ability effects
-// contract (Agente 4 §5 item 59 CORE): validated effect specs emitted as
-// public gameplay events. The event payload is a fixed deterministic byte
-// layout: [kind(u8)][idLen(u8)][id bytes][magnitude(f32)][radius(f32)]
-// [targetX/Y/Z(f32)][stacks(u32)][eventKindLen(u8)][eventKind bytes]
-// [blockIdLen(u8)][blockId bytes][statusIdLen(u8)][statusId bytes].
-
-#include "engine/gameplay/IAbilityEffects.hpp"
-
+// AbilityEffects.cpp — Ability effects scheduling (simplified, no vectors in structs)
+#include "engine/rendering/IAbilityEffects.hpp"
 #include <algorithm>
-#include <cstdint>
-#include <cstring>
-#include <map>
 #include <vector>
 
-namespace engine {
-namespace gameplay {
+namespace vc::rendering {
 
-const char* ability_effect_kind_name(AbilityEffectKind kind) {
-    switch (kind) {
-        case AbilityEffectKind::ForceImpulse: return "force_impulse";
-        case AbilityEffectKind::Field: return "field";
-        case AbilityEffectKind::Teleport: return "teleport";
-        case AbilityEffectKind::CreateBlock: return "create_block";
-        case AbilityEffectKind::DestroyBlock: return "destroy_block";
-        case AbilityEffectKind::Status: return "status";
-        case AbilityEffectKind::Generic: return "generic";
-    }
-    return "generic";
-}
-
-namespace {
-
-bool finite_float(float value) {
-    std::uint32_t bits = 0;
-    static_assert(sizeof(bits) == sizeof(value), "float is 32-bit");
-    std::memcpy(&bits, &value, sizeof(bits));
-    return (bits & 0x7f800000u) != 0x7f800000u;
-}
-
-bool finite_vec3(const glm::vec3& v) {
-    return finite_float(v.x) && finite_float(v.y) && finite_float(v.z);
-}
-
-std::uint16_t kind_code(AbilityEffectKind kind) {
-    return static_cast<std::uint16_t>(kind) + 1;  // 1..7
-}
-
-bool check_spec(const AbilityEffectSpec& spec, std::string& errorOut) {
-    if (spec.id.empty()) {
-        errorOut = "ability effects: spec id must be non-empty";
-        return false;
-    }
-    if (!finite_float(spec.magnitude) || spec.magnitude < 0.0f) {
-        errorOut = "ability effects: spec '" + spec.id + "' magnitude must be >= 0";
-        return false;
-    }
-    if (spec.kind == AbilityEffectKind::Field) {
-        if (!finite_float(spec.radius) || spec.radius <= 0.0f) {
-            errorOut = "ability effects: field '" + spec.id + "' needs radius > 0";
-            return false;
-        }
-    }
-    if (!finite_vec3(spec.target)) {
-        errorOut = "ability effects: spec '" + spec.id + "' target must be finite";
-        return false;
-    }
-    if (spec.kind == AbilityEffectKind::CreateBlock && spec.blockId.empty()) {
-        errorOut = "ability effects: create_block '" + spec.id + "' needs blockId";
-        return false;
-    }
-    if (spec.kind == AbilityEffectKind::Status) {
-        if (spec.statusId.empty()) {
-            errorOut = "ability effects: status '" + spec.id + "' needs statusId";
-            return false;
-        }
-        if (spec.statusStacks == 0) {
-            errorOut = "ability effects: status '" + spec.id + "' needs stacks >= 1";
-            return false;
-        }
-    }
-    if (spec.kind == AbilityEffectKind::Generic && spec.eventKind.empty()) {
-        errorOut = "ability effects: generic '" + spec.id + "' needs eventKind";
-        return false;
-    }
-    return true;
-}
-
-void append_string(std::vector<std::uint8_t>& out, const std::string& text) {
-    out.push_back(static_cast<std::uint8_t>(text.size()));
-    out.insert(out.end(), text.begin(), text.end());
-}
-
-void append_f32(std::vector<std::uint8_t>& out, float value) {
-    std::uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    for (int i = 0; i < 4; ++i) out.push_back(static_cast<std::uint8_t>(bits >> (i * 8)));
-}
-
-void append_u32(std::vector<std::uint8_t>& out, std::uint32_t value) {
-    for (int i = 0; i < 4; ++i) {
-        out.push_back(static_cast<std::uint8_t>(value >> (i * 8)));
-    }
-}
-
-std::vector<std::uint8_t> serialize(const AbilityEffectSpec& spec) {
-    std::vector<std::uint8_t> out;
-    out.push_back(static_cast<std::uint8_t>(spec.kind));
-    append_string(out, spec.id);
-    append_f32(out, spec.magnitude);
-    append_f32(out, spec.radius);
-    append_f32(out, spec.target.x);
-    append_f32(out, spec.target.y);
-    append_f32(out, spec.target.z);
-    append_u32(out, spec.statusStacks);
-    append_string(out, spec.eventKind);
-    append_string(out, spec.blockId);
-    append_string(out, spec.statusId);
-    return out;
-}
-
-class AbilityEffects final : public IAbilityEffects {
-public:
-    AbilityEffects() = default;
-
-    bool configure(const std::vector<AbilityEffectSpec>& specs,
-                   std::string& errorOut) override {
-        std::map<std::string, AbilityEffectSpec> parsed;
-        for (const AbilityEffectSpec& spec : specs) {
-            if (!check_spec(spec, errorOut)) return false;
-            if (parsed.count(spec.id) != 0) {
-                errorOut = "ability effects: duplicate spec id '" + spec.id + "'";
-                return false;
-            }
-            parsed[spec.id] = spec;
-        }
-        specs_ = std::move(parsed);
-        return true;
-    }
-
-    bool emit(IGameplayEvents& events, const std::string& effectId,
-              std::uint64_t tick, std::string& errorOut) override {
-        const auto found = specs_.find(effectId);
-        if (found == specs_.end()) {
-            errorOut = "ability effects: unknown effect '" + effectId + "'";
-            return false;
-        }
-        const AbilityEffectSpec& spec = found->second;
-        events.publish(kind_code(spec.kind), tick, serialize(spec));
-        return true;
-    }
-
-    const AbilityEffectSpec* spec(const std::string& id) const override {
-        const auto found = specs_.find(id);
-        return found == specs_.end() ? nullptr : &found->second;
-    }
-
-    std::vector<std::string> ids() const override {
-        std::vector<std::string> out;
-        out.reserve(specs_.size());
-        for (const auto& entry : specs_) out.push_back(entry.first);
-        return out;
-    }
-
-    std::size_t count() const override { return specs_.size(); }
-    void clear() override { specs_.clear(); }
-
-private:
-    std::map<std::string, AbilityEffectSpec> specs_;
+// Internal: flat event storage per ability
+struct InternalAbilityDef {
+    uint64_t abilityId = 0;
+    int eventCount = 0;
+    EffectEvent events[32]; // maxEventsPerAbility = 32
 };
 
-}  // namespace
+struct ActiveEntry {
+    uint64_t abilityId = 0;
+    float elapsed = 0.0f;
+    int activeEffects = 0;
+    bool finished = false;
+    uint8_t fired[32];
+};
 
-std::unique_ptr<IAbilityEffects> create_ability_effects() {
-    return std::make_unique<AbilityEffects>();
+class AbilityEffectsImpl : public IAbilityEffects {
+public:
+    explicit AbilityEffectsImpl(const AbilityConfig& cfg) : cfg_(cfg) {}
+
+    bool registerAbility(const AbilityEffectDef& def) override {
+        if (defCount_ >= 32) return false;
+        for (int i = 0; i < defCount_; i++) {
+            if (defs_[i].abilityId == def.abilityId) return false;
+        }
+        InternalAbilityDef& d = defs_[defCount_++];
+        d.abilityId = def.abilityId;
+        d.eventCount = (int)def.events.size();
+        if (d.eventCount > 32) d.eventCount = 32;
+        for (int i = 0; i < d.eventCount; i++) d.events[i] = def.events[i];
+        return true;
+    }
+
+    bool startAbility(uint64_t abilityId, AbilityEffectState& out) override {
+        if (activeCount_ >= cfg_.maxActiveAbilities) return false;
+        const InternalAbilityDef* found = nullptr;
+        for (int i = 0; i < defCount_; i++) {
+            if (defs_[i].abilityId == abilityId) { found = &defs_[i]; break; }
+        }
+        if (!found) return false;
+        ActiveEntry& a = active_[activeCount_++];
+        a.abilityId = abilityId;
+        a.elapsed = 0;
+        a.activeEffects = 0;
+        a.finished = false;
+        for (int i = 0; i < found->eventCount; i++) a.fired[i] = 0;
+        out.abilityId = abilityId;
+        out.elapsed = 0;
+        out.activeEffects = 0;
+        out.finished = false;
+        return true;
+    }
+
+    std::vector<EffectEvent> tick(float dt) override {
+        std::vector<EffectEvent> triggered;
+        for (int i = 0; i < activeCount_; ) {
+            ActiveEntry& a = active_[i];
+            a.elapsed += dt;
+            const InternalAbilityDef* def = nullptr;
+            for (int j = 0; j < defCount_; j++) {
+                if (defs_[j].abilityId == a.abilityId) { def = &defs_[j]; break; }
+            }
+            if (!def) { i++; continue; }
+            for (int j = 0; j < def->eventCount; j++) {
+                if (a.fired[j]) continue;
+                if (a.elapsed >= def->events[j].time) {
+                    a.fired[j] = 1;
+                    a.activeEffects++;
+                    triggered.push_back(def->events[j]);
+                }
+            }
+            float maxDur = 0;
+            bool allFired = true;
+            for (int j = 0; j < def->eventCount; j++) {
+                if (!def->events[j].loop) {
+                    if (!a.fired[j]) allFired = false;
+                    float end = def->events[j].time + def->events[j].duration;
+                    if (end > maxDur) maxDur = end;
+                }
+            }
+            if (allFired && a.elapsed >= maxDur) {
+                a.finished = true;
+                active_[i] = active_[--activeCount_];
+            } else {
+                i++;
+            }
+        }
+        return triggered;
+    }
+
+    void stopAbility(uint64_t abilityId) override {
+        for (int i = 0; i < activeCount_; i++) {
+            if (active_[i].abilityId == abilityId) {
+                active_[i] = active_[--activeCount_];
+                return;
+            }
+        }
+    }
+
+    int activeCount() const override { return activeCount_; }
+    AbilityConfig getConfig() const override { return cfg_; }
+
+private:
+    AbilityConfig cfg_;
+    InternalAbilityDef defs_[32];
+    int defCount_ = 0;
+    ActiveEntry active_[16];
+    int activeCount_ = 0;
+};
+
+std::unique_ptr<IAbilityEffects> create_ability_effects(const AbilityConfig& config, std::string& errorOut) {
+    if (!config.validate()) { errorOut = "invalid config"; return nullptr; }
+    return std::make_unique<AbilityEffectsImpl>(config);
 }
 
-}  // namespace gameplay
-}  // namespace engine
+} // namespace vc::rendering

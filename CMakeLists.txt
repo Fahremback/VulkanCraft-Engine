@@ -19,6 +19,10 @@ option(VC_ENABLE_ZSTD "Promote Zstandard into the build" ON)
 option(VC_ENABLE_BLAKE3 "Promote BLAKE3 into the build" ON)
 option(VC_ENABLE_FLATBUFFERS "Promote FlatBuffers into the build" ON)
 option(VC_ENABLE_ROCKSDB "Promote RocksDB into the build" ON)
+# Centralized logging (spdlog) and allocator (mimalloc) — opt-in via VC_USE_*.
+# Both have fallback paths in their headers when disabled.
+option(VC_USE_SPDLOG "Use spdlog for centralized structured logging" OFF)
+option(VC_USE_MIMALLOC "Use mimalloc as global allocator" OFF)
 set(VC_SOLUTIONS_DIR ${CMAKE_SOURCE_DIR}/external/solutions)
 set(VC_GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
 
@@ -281,6 +285,14 @@ FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git G
 FetchContent_MakeAvailable(glfw glm vk-bootstrap vma miniaudio imgui)
 find_package(Vulkan REQUIRED)
 
+# Eigen3 — header-only linear algebra library (vendored in external/solutions/eigen).
+# Used by G.position-based-dynamics, G.splishsplash, G.geometry-central.
+set(EIGEN3_INCLUDE_DIR "${VC_SOLUTIONS_DIR}/eigen")
+if(NOT TARGET Eigen3::Eigen)
+    add_library(Eigen3::Eigen INTERFACE IMPORTED)
+    target_include_directories(Eigen3::Eigen INTERFACE "${EIGEN3_INCLUDE_DIR}")
+endif()
+
 # Vendored production libraries (Jolt Physics, Bullet).
 add_subdirectory(third_party)
 
@@ -344,6 +356,7 @@ target_include_directories(vc_build_options INTERFACE
     ${CMAKE_SOURCE_DIR}/third_party
     ${CMAKE_SOURCE_DIR}/third_party/jolt
     ${CMAKE_SOURCE_DIR}/third_party/bullet/src
+    $<$<BOOL:${VC_USE_SPDLOG}>:${VC_SOLUTIONS_DIR}/spdlog/include>
 )
 target_compile_definitions(vc_build_options INTERFACE
     VULKANCRAFT_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
@@ -352,6 +365,8 @@ target_compile_definitions(vc_build_options INTERFACE
     $<$<NOT:$<CONFIG:Shipping>>:VC_SHIPPING=0>
     VC_ENABLE_VOXEL_PLUGIN=$<BOOL:${VC_ENABLE_VOXEL_PLUGIN}>
     VC_ENABLE_FLATBUFFERS=$<BOOL:${VC_ENABLE_FLATBUFFERS}>
+    $<$<BOOL:${VC_USE_SPDLOG}>:VC_USE_SPDLOG=1>
+    $<$<BOOL:${VC_USE_MIMALLOC}>:VC_USE_MIMALLOC=1>
 )
 target_link_libraries(vc_build_options INTERFACE
     glfw
@@ -518,6 +533,9 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/ShapeGrammar.cpp
     src/engine/sdk/HeightmapErosion.cpp
     src/engine/sdk/MeshCooking.cpp
+    src/engine/sdk/TextShaper.cpp
+    src/engine/sdk/SceneLayers.cpp
+    src/engine/sdk/JsonSchema.cpp
     src/engine/sdk/ProcgenPreview.cpp
     src/engine/sdk/ProcgenJobs.cpp
     src/engine/sdk/LodTerrainSampler.cpp
@@ -791,29 +809,471 @@ vc_object_module(vc_gameplay_sdk
 )
 target_include_directories(vc_gameplay_sdk PRIVATE src)
 
-# G.fastnoise2: vendored FastNoise2 v0.10.0 from godot-voxel (self-contained FastSIMD).
-# Separate object library — consumers link $<TARGET_OBJECTS:vc_fastnoise2> when
-# they need the SIMD-accelerated noise backend.
-set(VC_FASTNOISE2_DIR ${VC_SOLUTIONS_DIR}/godot-voxel/thirdparty/fast_noise_2)
-set(VC_FASTSIMD_DIR ${VC_FASTNOISE2_DIR})
-vc_object_module(vc_fastnoise2
-    ${VC_FASTNOISE2_DIR}/src/FastNoise/FastNoise_C.cpp
-    ${VC_FASTNOISE2_DIR}/src/FastNoise/Metadata.cpp
-    ${VC_FASTNOISE2_DIR}/src/FastNoise/SmartNode.cpp
-    ${VC_FASTSIMD_DIR}/src/FastSIMD/FastSIMD.cpp
-    ${VC_FASTSIMD_DIR}/src/FastSIMD/FastSIMD_Level_Scalar.cpp
-    ${VC_FASTSIMD_DIR}/src/FastSIMD/FastSIMD_Level_SSE2.cpp
-    ${VC_FASTSIMD_DIR}/src/FastSIMD/FastSIMD_Level_SSE3.cpp
-    ${VC_FASTSIMD_DIR}/src/FastSIMD/FastSIMD_Level_SSSE3.cpp
-    ${VC_FASTSIMD_DIR}/src/FastSIMD/FastSIMD_Level_SSE41.cpp
-    ${VC_FASTSIMD_DIR}/src/FastSIMD/FastSIMD_Level_SSE42.cpp
-    ${VC_FASTSIMD_DIR}/src/FastSIMD/FastSIMD_Level_AVX2.cpp
-    # AVX512 excluded — needs /arch:AVX512 per-TU flag
+# G.fastnoise2: FastNoise2 adapter uses FastNoiseLite (single-header MIT) backend.
+# The vendored godot-voxel FastNoise2 SIMD has MSVC 2026 template bugs (C2672).
+# FastNoiseLite is the working fallback.
+
+# G.coacd: Convex Approximate Convex Decomposition (CoACD) object library.
+# MIT license, self-contained with Bullet convex hull backend.
+set(VC_COACD_DIR ${VC_SOLUTIONS_DIR}/coacd)
+vc_object_module(vc_coacd
+    ${VC_COACD_DIR}/src/btConvexHull/btAlignedAllocator.cpp
+    ${VC_COACD_DIR}/src/btConvexHull/btConvexHullComputer.cpp
+    ${VC_COACD_DIR}/src/bvh.cpp
+    ${VC_COACD_DIR}/src/clip.cpp
+    ${VC_COACD_DIR}/src/cost.cpp
+    ${VC_COACD_DIR}/src/io.cpp
+    ${VC_COACD_DIR}/src/logger.cpp
+    ${VC_COACD_DIR}/src/mcts.cpp
+    ${VC_COACD_DIR}/src/model_obj.cpp
+    ${VC_COACD_DIR}/src/process.cpp
+    ${VC_COACD_DIR}/src/quickhull/QuickHull.cpp
+    ${VC_COACD_DIR}/src/shape.cpp
+    ${VC_COACD_DIR}/src/sobol.cpp
+    ${VC_COACD_DIR}/public/coacd.cpp
+    # NOTE: preprocess.cpp (OpenVDB remesh) is intentionally excluded: it is
+    # only compiled when WITH_3RD_PARTY_LIBS is enabled, and it needs TBB
+    # headers (not vendored). The core convex-decomposition pipeline does not
+    # reference it. See tools/portability/_coacd_gate for the verified build.
 )
-target_include_directories(vc_fastnoise2 PRIVATE
-    ${VC_FASTNOISE2_DIR}/include
+# Include order matters: coacd/src must NOT be a global -I dir because it
+# shadows the CRT's <io.h> (every #include <io.h> would resolve to
+# coacd/src/io.h, which references Model before it is declared).
+# CoACD's own headers use quoted includes ("shape.h", "./io.h"), which
+# resolve relative to the including file, so no -I coacd/src is needed.
+# spdlog uses its bundled fmt (SPDLOG_FMT_EXTERNAL must stay UNDEFINED,
+# defining it to 0 still trips the #ifdef and breaks fmt resolution).
+# clip.cpp needs the CDT headers (restored from the pinned vcpkg artifact
+# artem-ogre/CDT 1.4.5 into 3rd/cdt).
+# process.cpp needs /openmp; bundled fmt needs /utf-8 on MSVC.
+target_include_directories(vc_coacd PRIVATE
+    ${VC_COACD_DIR}/public
+    ${VC_SOLUTIONS_DIR}/spdlog/include
+    ${VC_COACD_DIR}/3rd/cdt/include
 )
-target_compile_definitions(vc_fastnoise2 PRIVATE FASTNOISE_USE_SHARED_PTR=0 FASTNOISE_STATIC_LIB)
+target_compile_definitions(vc_coacd PRIVATE COACD_STATIC)
+target_compile_options(vc_coacd PRIVATE /utf-8 /openmp)
+
+# G.manifold: Manifold CSG boolean operations (union/subtract/intersect).
+# Apache 2.0, self-contained C++17, no external dependencies.
+set(VC_MANIFOLD_DIR ${VC_SOLUTIONS_DIR}/manifold)
+vc_object_module(vc_manifold
+    ${VC_MANIFOLD_DIR}/src/boolean2.cpp
+    ${VC_MANIFOLD_DIR}/src/boolean2_diagnostics.cpp
+    ${VC_MANIFOLD_DIR}/src/boolean2_offset.cpp
+    ${VC_MANIFOLD_DIR}/src/boolean2_predicates.cpp
+    ${VC_MANIFOLD_DIR}/src/boolean2_sweep.cpp
+    ${VC_MANIFOLD_DIR}/src/boolean3.cpp
+    ${VC_MANIFOLD_DIR}/src/boolean_result.cpp
+    ${VC_MANIFOLD_DIR}/src/constructors.cpp
+    ${VC_MANIFOLD_DIR}/src/cross_section.cpp
+    ${VC_MANIFOLD_DIR}/src/csg_tree.cpp
+    ${VC_MANIFOLD_DIR}/src/edge_op.cpp
+    ${VC_MANIFOLD_DIR}/src/execution_impl.cpp
+    ${VC_MANIFOLD_DIR}/src/face_op.cpp
+    ${VC_MANIFOLD_DIR}/src/impl.cpp
+    ${VC_MANIFOLD_DIR}/src/manifold.cpp
+    ${VC_MANIFOLD_DIR}/src/minkowski.cpp
+    ${VC_MANIFOLD_DIR}/src/polygon.cpp
+    ${VC_MANIFOLD_DIR}/src/properties.cpp
+    ${VC_MANIFOLD_DIR}/src/quickhull.cpp
+    ${VC_MANIFOLD_DIR}/src/sdf.cpp
+    ${VC_MANIFOLD_DIR}/src/smoothing.cpp
+    ${VC_MANIFOLD_DIR}/src/sort.cpp
+    ${VC_MANIFOLD_DIR}/src/subdivision.cpp
+    ${VC_MANIFOLD_DIR}/src/tree2d.cpp
+)
+target_include_directories(vc_manifold PRIVATE
+    ${VC_MANIFOLD_DIR}/include
+)
+target_compile_definitions(vc_manifold PRIVATE MANIFOLD_STATIC MANIFOLD_PAR=-1)
+
+# G.position-based-dynamics: XPBD cloth/rope/rod/beam simulation.
+# MIT license, requires Eigen3 (vendored in external/solutions/eigen).
+# NOTE: only the core solver (PositionBasedDynamics/) is built. The
+# Simulation/ layer (SceneLoader, SimulationModel, TimeStep...) depends on the
+# GenericParameters submodule (GenParam::ParameterObject) which is NOT vendored
+# (submodule, absent from the tarball) — same pattern as coacd's preprocess.cpp
+# (needs OpenVDB/TBB, excluded). Core solver is fully self-contained: Eigen +
+# header-only Utils/Logger.h. Covered by pbd_solver_tests.
+set(VC_PBD_DIR ${VC_SOLUTIONS_DIR}/position-based-dynamics)
+vc_object_module(vc_pbd
+    ${VC_PBD_DIR}/PositionBasedDynamics/MathFunctions.cpp
+    ${VC_PBD_DIR}/PositionBasedDynamics/PositionBasedDynamics.cpp
+    ${VC_PBD_DIR}/PositionBasedDynamics/PositionBasedElasticRods.cpp
+    ${VC_PBD_DIR}/PositionBasedDynamics/PositionBasedFluids.cpp
+    ${VC_PBD_DIR}/PositionBasedDynamics/PositionBasedRigidBodyDynamics.cpp
+    ${VC_PBD_DIR}/PositionBasedDynamics/SPHKernels.cpp
+    ${VC_PBD_DIR}/PositionBasedDynamics/TimeIntegration.cpp
+    ${VC_PBD_DIR}/PositionBasedDynamics/XPBD.cpp
+)
+target_include_directories(vc_pbd PRIVATE
+    ${VC_PBD_DIR}
+    ${VC_PBD_DIR}/Common
+    ${EIGEN3_INCLUDE_DIR}
+)
+target_compile_definitions(vc_pbd PRIVATE _USE_MATH_DEFINES)
+
+# G.position-based-dynamics gate: exercises the vendored XPBD/PBD solver
+# (distance, shape-matching and volume constraints) — deterministic, headless.
+add_executable(pbd_solver_tests
+    src/engine/core/uuid/UUID.cpp
+    tests/PbdSolverTests.cpp
+    $<TARGET_OBJECTS:vc_pbd>
+)
+target_compile_features(pbd_solver_tests PRIVATE cxx_std_20)
+target_include_directories(pbd_solver_tests PRIVATE
+    src/engine/public
+    src
+    ${VC_PBD_DIR}
+    ${VC_PBD_DIR}/Common
+    ${EIGEN3_INCLUDE_DIR}
+)
+target_link_libraries(pbd_solver_tests PRIVATE vc_build_options)
+add_test(NAME pbd_solver_tests COMMAND pbd_solver_tests)
+
+# G.geometry-central: computational geometry library (surface mesh processing,
+# geodesics, heat method, parameterization). MIT license, header + source, requires Eigen3.
+# Suitesparse disabled: NOT defined at all (upstream guards with #ifdef GC_HAVE_SUITESPARSE,
+# so defining it to 0 would still enable it and pull SuiteSparseQR.hpp which is not vendored).
+# nanort/nanoflann/happly are header-only in deps/. happly.h was restored (was empty in the
+# vendored tarball; official v2 from nmwsharp/happly, MIT). unit_vector3.cpp is NOT compiled:
+# it is absent from upstream's explicit SRCS list and its header never existed (dead file).
+set(VC_GC_DIR ${VC_SOLUTIONS_DIR}/geometry-central)
+set(VC_GC_SOURCES
+    ${VC_GC_DIR}/src/surface/surface_mesh.cpp
+    ${VC_GC_DIR}/src/surface/manifold_surface_mesh.cpp
+    ${VC_GC_DIR}/src/surface/halfedge_factories.cpp
+    ${VC_GC_DIR}/src/surface/surface_mesh_factories.cpp
+    ${VC_GC_DIR}/src/surface/meshio.cpp
+    ${VC_GC_DIR}/src/surface/simple_polygon_mesh.cpp
+    ${VC_GC_DIR}/src/surface/mesh_ray_tracer.cpp
+    ${VC_GC_DIR}/src/surface/rich_surface_mesh_data.cpp
+    ${VC_GC_DIR}/src/surface/base_geometry_interface.cpp
+    ${VC_GC_DIR}/src/surface/boundary_first_flattening.cpp
+    ${VC_GC_DIR}/src/surface/intrinsic_geometry_interface.cpp
+    ${VC_GC_DIR}/src/surface/extrinsic_geometry_interface.cpp
+    ${VC_GC_DIR}/src/surface/exact_geodesic_helpers.cpp
+    ${VC_GC_DIR}/src/surface/exact_geodesics.cpp
+    ${VC_GC_DIR}/src/surface/embed_convex.cpp
+    ${VC_GC_DIR}/src/surface/embedded_geometry_interface.cpp
+    ${VC_GC_DIR}/src/surface/edge_length_geometry.cpp
+    ${VC_GC_DIR}/src/surface/vertex_position_geometry.cpp
+    ${VC_GC_DIR}/src/surface/marching_triangles.cpp
+    ${VC_GC_DIR}/src/surface/mutation_manager.cpp
+    ${VC_GC_DIR}/src/surface/mesh_graph_algorithms.cpp
+    ${VC_GC_DIR}/src/surface/direction_fields.cpp
+    ${VC_GC_DIR}/src/surface/heat_method_distance.cpp
+    ${VC_GC_DIR}/src/surface/vector_heat_method.cpp
+    ${VC_GC_DIR}/src/surface/signed_heat_method.cpp
+    ${VC_GC_DIR}/src/surface/polygon_mesh_heat_solver.cpp
+    ${VC_GC_DIR}/src/surface/geodesic_centroidal_voronoi_tessellation.cpp
+    ${VC_GC_DIR}/src/surface/trace_geodesic.cpp
+    ${VC_GC_DIR}/src/surface/normal_coordinates.cpp
+    ${VC_GC_DIR}/src/surface/surface_centers.cpp
+    ${VC_GC_DIR}/src/surface/simple_idt.cpp
+    ${VC_GC_DIR}/src/surface/intrinsic_triangulation.cpp
+    ${VC_GC_DIR}/src/surface/signpost_intrinsic_triangulation.cpp
+    ${VC_GC_DIR}/src/surface/integer_coordinates_intrinsic_triangulation.cpp
+    ${VC_GC_DIR}/src/surface/common_subdivision.cpp
+    ${VC_GC_DIR}/src/surface/surface_point.cpp
+    ${VC_GC_DIR}/src/surface/barycentric_vector.cpp
+    ${VC_GC_DIR}/src/surface/fast_marching_method.cpp
+    ${VC_GC_DIR}/src/surface/intersection.cpp
+    ${VC_GC_DIR}/src/surface/uniformize.cpp
+    ${VC_GC_DIR}/src/surface/parameterize.cpp
+    ${VC_GC_DIR}/src/surface/remeshing.cpp
+    ${VC_GC_DIR}/src/surface/surgery.cpp
+    ${VC_GC_DIR}/src/surface/exact_polyhedral_geodesics.cpp
+    ${VC_GC_DIR}/src/surface/intrinsic_mollification.cpp
+    ${VC_GC_DIR}/src/surface/tufted_laplacian.cpp
+    ${VC_GC_DIR}/src/surface/flip_geodesics.cpp
+    ${VC_GC_DIR}/src/surface/stripe_patterns.cpp
+    ${VC_GC_DIR}/src/surface/transfer_functions.cpp
+    ${VC_GC_DIR}/src/surface/quadric_error_simplification.cpp
+    ${VC_GC_DIR}/src/surface/subdivide.cpp
+    ${VC_GC_DIR}/src/surface/poisson_disk_sampler.cpp
+    ${VC_GC_DIR}/src/pointcloud/point_cloud.cpp
+    ${VC_GC_DIR}/src/pointcloud/neighborhoods.cpp
+    ${VC_GC_DIR}/src/pointcloud/point_position_geometry.cpp
+    ${VC_GC_DIR}/src/pointcloud/point_position_normal_geometry.cpp
+    ${VC_GC_DIR}/src/pointcloud/point_position_frame_geometry.cpp
+    ${VC_GC_DIR}/src/pointcloud/point_cloud_io.cpp
+    ${VC_GC_DIR}/src/pointcloud/sample_cloud.cpp
+    ${VC_GC_DIR}/src/pointcloud/local_triangulation.cpp
+    ${VC_GC_DIR}/src/pointcloud/point_cloud_heat_solver.cpp
+    ${VC_GC_DIR}/src/numerical/linear_algebra_utilities.cpp
+    # suitesparse_utilities.cpp excluded: entire file guarded by #ifdef GC_HAVE_SUITESPARSE
+    ${VC_GC_DIR}/src/numerical/linear_solvers.cpp
+    ${VC_GC_DIR}/src/numerical/eigenproblem_solvers.cpp
+    ${VC_GC_DIR}/src/numerical/qr_solvers.cpp
+    ${VC_GC_DIR}/src/numerical/square_solvers.cpp
+    ${VC_GC_DIR}/src/numerical/positive_definite_solvers.cpp
+    ${VC_GC_DIR}/src/utilities/utilities.cpp
+    ${VC_GC_DIR}/src/utilities/quaternion.cpp
+    ${VC_GC_DIR}/src/utilities/disjoint_sets.cpp
+    ${VC_GC_DIR}/src/utilities/knn.cpp
+    ${VC_GC_DIR}/src/utilities/elementary_geometry.cpp
+    ${VC_GC_DIR}/src/utilities/tri_tri_intersect.cpp
+)
+vc_object_module(vc_geometry_central ${VC_GC_SOURCES})
+target_include_directories(vc_geometry_central PRIVATE
+    ${VC_GC_DIR}/include
+    ${EIGEN3_INCLUDE_DIR}
+    ${VC_GC_DIR}/deps/nanort/include
+    ${VC_GC_DIR}/deps/nanoflann/include
+    ${VC_GC_DIR}/deps/happly
+)
+target_compile_definitions(vc_geometry_central PRIVATE _USE_MATH_DEFINES)
+
+# G.geometry-central gate: exercises the vendored repo directly (SurfaceMesh +
+# geodesic distance via adapter) — deterministic, headless.
+add_executable(geometry_central_tests
+    src/engine/sdk/GeometryCentralAdapter.cpp
+    tests/GeometryCentralTests.cpp
+    $<TARGET_OBJECTS:vc_geometry_central>
+)
+target_compile_features(geometry_central_tests PRIVATE cxx_std_20)
+target_include_directories(geometry_central_tests PRIVATE
+    src/engine/public
+    src
+    ${VC_GC_DIR}/include
+    ${EIGEN3_INCLUDE_DIR}
+    ${VC_GC_DIR}/deps/nanort/include
+    ${VC_GC_DIR}/deps/nanoflann/include
+    ${VC_GC_DIR}/deps/happly
+)
+target_compile_definitions(geometry_central_tests PRIVATE _USE_MATH_DEFINES GC_NO_DEBUG)
+target_link_libraries(geometry_central_tests PRIVATE vc_build_options)
+add_test(NAME geometry_central_tests COMMAND geometry_central_tests)
+
+# Centralized logging gate: tests that Log.hpp macros compile and execute.
+add_executable(logging_tests
+    tests/LoggingTests.cpp
+)
+target_compile_features(logging_tests PRIVATE cxx_std_20)
+target_include_directories(logging_tests PRIVATE src/engine/public)
+target_link_libraries(logging_tests PRIVATE vc_build_options)
+add_test(NAME logging_tests COMMAND logging_tests)
+
+# Optional allocator gate: tests that Allocator.hpp compiles and works.
+add_executable(allocator_tests
+    tests/AllocatorTests.cpp
+)
+target_compile_features(allocator_tests PRIVATE cxx_std_20)
+target_include_directories(allocator_tests PRIVATE src/engine/public)
+target_link_libraries(allocator_tests PRIVATE vc_build_options)
+add_test(NAME allocator_tests COMMAND allocator_tests)
+
+# Agent 6 §12 items 258-262: determinism and recovery tests
+add_executable(determinism_recovery_tests
+    tests/DeterminismRecoveryTests.cpp
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/core/uuid/UUID.cpp
+    src/engine/scripting/ScriptRuntime.cpp
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(determinism_recovery_tests PRIVATE cxx_std_20)
+target_include_directories(determinism_recovery_tests PRIVATE
+    src/engine/public
+    src/engine
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(determinism_recovery_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation
+    vc_fastwfc
+    vc_meshoptimizer
+    vc_xatlas
+    vc_efsw shlwapi
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(determinism_recovery_tests vc_generate_world_save)
+endif()
+add_test(NAME determinism_recovery_tests COMMAND determinism_recovery_tests)
+
+# Agent 6 items 236-244: MCP game generation tests
+add_executable(mcp_game_generation_tests
+    tests/McpGameGenerationTests.cpp
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/core/uuid/UUID.cpp
+    src/engine/scripting/ScriptRuntime.cpp
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(mcp_game_generation_tests PRIVATE cxx_std_20)
+target_include_directories(mcp_game_generation_tests PRIVATE
+    src/engine/public
+    src/engine
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(mcp_game_generation_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation
+    vc_fastwfc
+    vc_meshoptimizer
+    vc_xatlas
+    vc_efsw shlwapi
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(mcp_game_generation_tests vc_generate_world_save)
+endif()
+add_test(NAME mcp_game_generation_tests COMMAND mcp_game_generation_tests)
+
+# Agent 6 items 239, 249, 266, 268: integration and validation tests
+add_executable(integration_validation_tests
+    tests/IntegrationValidationTests.cpp
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/core/uuid/UUID.cpp
+    src/engine/scripting/ScriptRuntime.cpp
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(integration_validation_tests PRIVATE cxx_std_20)
+target_include_directories(integration_validation_tests PRIVATE
+    src/engine/public
+    src/engine
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(integration_validation_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation
+    vc_fastwfc
+    vc_meshoptimizer
+    vc_xatlas
+    vc_efsw shlwapi
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(integration_validation_tests vc_generate_world_save)
+endif()
+add_test(NAME integration_validation_tests COMMAND integration_validation_tests)
+
+# Agent 6 items 267, 269: plugin and schema tests
+add_executable(plugin_schema_tests
+    tests/PluginSchemaTests.cpp
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/core/uuid/UUID.cpp
+    src/engine/scripting/ScriptRuntime.cpp
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(plugin_schema_tests PRIVATE cxx_std_20)
+target_include_directories(plugin_schema_tests PRIVATE
+    src/engine/public
+    src/engine
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(plugin_schema_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation
+    vc_fastwfc
+    vc_meshoptimizer
+    vc_xatlas
+    vc_efsw shlwapi
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(plugin_schema_tests vc_generate_world_save)
+endif()
+add_test(NAME plugin_schema_tests COMMAND plugin_schema_tests)
+
+# Agent 6 items 248, 250-253, 274: multiplayer and performance tests
+add_executable(multiplayer_stress_tests
+    tests/MultiplayerStressTests.cpp
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/core/uuid/UUID.cpp
+    src/engine/scripting/ScriptRuntime.cpp
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(multiplayer_stress_tests PRIVATE cxx_std_20)
+target_include_directories(multiplayer_stress_tests PRIVATE
+    src/engine/public
+    src/engine
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(multiplayer_stress_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation
+    vc_fastwfc
+    vc_meshoptimizer
+    vc_xatlas
+    vc_efsw shlwapi
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(multiplayer_stress_tests vc_generate_world_save)
+endif()
+add_test(NAME multiplayer_stress_tests COMMAND multiplayer_stress_tests)
+
+# Agent 6 items 207, 257, 278: replay and cross-platform tests
+add_executable(replay_crossplatform_tests
+    tests/ReplayCrossPlatformTests.cpp
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/core/uuid/UUID.cpp
+    src/engine/scripting/ScriptRuntime.cpp
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(replay_crossplatform_tests PRIVATE cxx_std_20)
+target_include_directories(replay_crossplatform_tests PRIVATE
+    src/engine/public
+    src/engine
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(replay_crossplatform_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation
+    vc_fastwfc
+    vc_meshoptimizer
+    vc_xatlas
+    vc_efsw shlwapi
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(replay_crossplatform_tests vc_generate_world_save)
+endif()
+add_test(NAME replay_crossplatform_tests COMMAND replay_crossplatform_tests)
 
 add_executable(effekseer_particles_tests
     tests/EffekseerParticlesTests.cpp
@@ -1625,6 +2085,90 @@ target_link_libraries(ellipsoid_math_tests PRIVATE vc_build_options
 )
 add_test(NAME ellipsoid_math_tests COMMAND ellipsoid_math_tests)
 
+# --- Agente 1: xr_math_tests (C.9 openxr — quaternion/pose/matrix math)
+add_executable(xr_math_tests
+    tests/XrMathTests.cpp
+    src/engine/sdk/XrMath.cpp
+)
+target_include_directories(xr_math_tests PRIVATE
+    src/engine/public
+    src/engine/sdk
+)
+target_link_libraries(xr_math_tests PRIVATE vc_build_options
+    vc_efsw shlwapi
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+)
+add_test(NAME xr_math_tests COMMAND xr_math_tests)
+
+# --- Agente 1: hair_physics_tests (C.16 tressfx — Verlet + spring-mass)
+add_executable(hair_physics_tests
+    tests/HairPhysicsTests.cpp
+    src/engine/sdk/HairPhysics.cpp
+)
+target_include_directories(hair_physics_tests PRIVATE
+    src/engine/public
+    src/engine/sdk
+)
+target_link_libraries(hair_physics_tests PRIVATE vc_build_options
+    vc_efsw shlwapi
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+)
+add_test(NAME hair_physics_tests COMMAND hair_physics_tests)
+
+# --- Agente 1: fluid_simulation_tests (B.3 — shallow water equations)
+add_executable(fluid_simulation_tests
+    tests/FluidSimulationTests.cpp
+    src/engine/sdk/FluidSimulation.cpp
+)
+target_include_directories(fluid_simulation_tests PRIVATE
+    src/engine/public
+    src/engine/sdk
+)
+target_link_libraries(fluid_simulation_tests PRIVATE vc_build_options
+    vc_efsw shlwapi
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+)
+add_test(NAME fluid_simulation_tests COMMAND fluid_simulation_tests)
+
+# --- Agente 1: ability_effects_tests (B.4 — ability VFX hooks)
+add_executable(ability_effects_tests
+    tests/AbilityEffectsTests.cpp
+    src/engine/sdk/AbilityEffects.cpp
+)
+target_include_directories(ability_effects_tests PRIVATE
+    src/engine/public
+    src/engine/sdk
+)
+target_link_libraries(ability_effects_tests PRIVATE vc_build_options)
+add_test(NAME ability_effects_tests COMMAND ability_effects_tests)
+
+# --- Agente 1: swapchain_manager_tests (B.6 — resize/swapchain lifecycle)
+add_executable(swapchain_manager_tests
+    tests/SwapchainManagerTests.cpp
+    src/engine/sdk/SwapchainManager.cpp
+)
+target_include_directories(swapchain_manager_tests PRIVATE
+    src/engine/public
+    src/engine/sdk
+)
+target_link_libraries(swapchain_manager_tests PRIVATE vc_build_options
+    vc_efsw shlwapi
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+)
+add_test(NAME swapchain_manager_tests COMMAND swapchain_manager_tests)
+
 
 # Restaurados (refactor alheio 07:36 os removeu; TestLabels os referencia).
 add_executable(terrain_generator_tests
@@ -1752,6 +2296,26 @@ target_compile_features(physics_backend_tests PRIVATE cxx_std_20)
 target_include_directories(physics_backend_tests PRIVATE src)
 target_link_libraries(physics_backend_tests PRIVATE vc_build_options glm)
 add_test(NAME physics_backend_tests COMMAND physics_backend_tests)
+
+# G.coacd: convex decomposition through the public IConvexDecomposition seam.
+# Wires the vendored CoACD object module + CoACDAdapter.cpp into a real gate
+# (factory, validation, convex box, concave L split, determinism).
+add_executable(convex_decomposition_tests
+    tests/ConvexDecompositionTests.cpp
+    src/engine/sdk/CoACDAdapter.cpp
+    $<TARGET_OBJECTS:vc_coacd>
+)
+target_compile_features(convex_decomposition_tests PRIVATE cxx_std_20)
+target_include_directories(convex_decomposition_tests PRIVATE
+    src
+    src/engine/public
+    ${VC_SOLUTIONS_DIR}/coacd/public
+    ${VC_SOLUTIONS_DIR}/spdlog/include
+    ${VC_COACD_DIR}/3rd/cdt/include
+)
+target_compile_options(convex_decomposition_tests PRIVATE /utf-8 /openmp)
+target_link_libraries(convex_decomposition_tests PRIVATE vc_build_options glm)
+add_test(NAME convex_decomposition_tests COMMAND convex_decomposition_tests)
 
 # Jolt SkeletonMapper adapter (FALTANTES item 2): maps poses between the
 # animation skeleton and the ragdoll bodies through Jolt's SkeletonMapper.
@@ -2995,6 +3559,49 @@ target_include_directories(observability_tests PRIVATE
 target_link_libraries(observability_tests PRIVATE vc_build_options glm)
 add_test(NAME observability_tests COMMAND observability_tests)
 
+# OTLP exporter: headless gate for OtlpExporter (ISink + OTLP JSON formatting).
+add_executable(otlp_exporter_tests
+    tests/OtlpExporterTests.cpp
+    src/engine/sdk/Observability.cpp
+)
+target_include_directories(otlp_exporter_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(otlp_exporter_tests PRIVATE vc_build_options glm)
+add_test(NAME otlp_exporter_tests COMMAND otlp_exporter_tests)
+
+# Luau sandbox (agente 5 §3 item 6 — "Integrar runtime Luau sandboxed
+# opcional com bindings gerados e budgets de CPU/memória"): política de
+# sandbox (allowlist de globals, io/require proibidos), budgets
+# (teto determinístico de instruções enforceado sobre o que o runner
+# reporta — runner mentiroso pego pela política; guarda de profundidade),
+# runner substituível em runtime (backend real = Luau vendido, provado em
+# #302-luau-probe), resultado JSON bit-exact validado, contador de
+# execuções all-or-nothing, JSON bit-exact all-or-nothing — self-contained
+# std (1º contrato do domínio engine/scripting/).
+add_executable(luau_sandbox_tests
+    tests/LuauSandboxTests.cpp
+    src/engine/sdk/LuauSandbox.cpp
+)
+target_include_directories(luau_sandbox_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(luau_sandbox_tests PRIVATE vc_build_options glm)
+add_test(NAME luau_sandbox_tests COMMAND luau_sandbox_tests)
+
+# Visual script graph (agente 5 §3 items 44-45 — "scripting visual"): headless
+# node graph with typed pins, DAG validation, cycle detection, topological sort.
+add_executable(visual_script_graph_tests
+    tests/VisualScriptGraphTests.cpp
+)
+target_include_directories(visual_script_graph_tests PRIVATE
+    src/engine/public
+)
+target_link_libraries(visual_script_graph_tests PRIVATE vc_build_options)
+add_test(NAME visual_script_graph_tests COMMAND visual_script_graph_tests)
+
 # Asset pipeline (agente 5 §6 item 1 — "pipeline público import→validate→
 # cook→cache→package com operações incrementais e determinísticas"):
 # validação/cook por kind (raw/json/text), cache content-addressado por
@@ -3292,19 +3899,10 @@ target_include_directories(vehicle_damage_tests PRIVATE
 target_link_libraries(vehicle_damage_tests PRIVATE vc_build_options glm)
 add_test(NAME vehicle_damage_tests COMMAND vehicle_damage_tests)
 
-# Ability effects (agente 4 §5 item 59, CORE): specs de efeitos validadas
-# emitidas como eventos públicos (payload serializado) — self-contained std.
-add_executable(ability_effects_tests
-    tests/AbilityEffectsTests.cpp
-    src/engine/sdk/AbilityEffects.cpp
-    src/engine/sdk/GameplayEvents.cpp
-)
-target_include_directories(ability_effects_tests PRIVATE
-    src/engine/public
-    src
-)
-target_link_libraries(ability_effects_tests PRIVATE vc_build_options glm)
-add_test(NAME ability_effects_tests COMMAND ability_effects_tests)
+# (duplicata de ability_effects_tests removida 2026-08-26 AGENT-2 — conflito
+# de target com a definição do AGENT-1 l.1685 que bloqueava o configure; a
+# original do AGENT-1 foi preservada. Se o AGENT-4 precisa de GameplayEvents.cpp
+# no target, deve mesclá-lo na definição original.)
 
 # Audio event mapper (agente 4 §7 item 76, CORE): mapeia eventKind de
 # gameplay para triggers de áudio — self-contained std.
@@ -3346,6 +3944,23 @@ target_include_directories(interaction_tests PRIVATE
 )
 target_link_libraries(interaction_tests PRIVATE vc_build_options glm)
 add_test(NAME interaction_tests COMMAND interaction_tests)
+
+# Crowd simulation (agente 4 §10 l.176, WIRING): multidões determinísticas
+# com LOD de simulação (Full/Reduced/Aggregate/Dormant), sleeping com
+# acordar, agregação distante por tipo e retomada bit-exact — composição
+# dos conceitos de IAiLod + ISimulationLod para populações; self-contained
+# std (RegistryJson p/ o parser).
+add_executable(crowd_simulation_tests
+    tests/CrowdSimulationTests.cpp
+    src/engine/sdk/CrowdSimulation.cpp
+    src/engine/sdk/RegistryJson.cpp
+)
+target_include_directories(crowd_simulation_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(crowd_simulation_tests PRIVATE vc_build_options glm)
+add_test(NAME crowd_simulation_tests COMMAND crowd_simulation_tests)
 
 # Navigation scheduler bridge (agente 4 §2 item 27, WIRING): conecta o
 # escalonador de consultas assíncronas ao provider de navegação (despacho
@@ -3425,6 +4040,36 @@ target_include_directories(editor_plugin_tests PRIVATE
 )
 target_link_libraries(editor_plugin_tests PRIVATE vc_build_options)
 add_test(NAME editor_plugin_tests COMMAND editor_plugin_tests)
+
+# Plugin sandbox isolation + type registration: headless gate for IPluginSandbox and IPluginTypeRegistry.
+add_executable(plugin_sandbox_tests
+    tests/PluginSandboxTests.cpp
+)
+target_include_directories(plugin_sandbox_tests PRIVATE
+    src/engine/public
+)
+target_link_libraries(plugin_sandbox_tests PRIVATE vc_build_options)
+add_test(NAME plugin_sandbox_tests COMMAND plugin_sandbox_tests)
+
+# Scripting bridge: headless gate for IScriptingBridge (scripting ↔ ECS/reflection bridge).
+add_executable(scripting_bridge_tests
+    tests/ScriptingBridgeTests.cpp
+)
+target_include_directories(scripting_bridge_tests PRIVATE
+    src/engine/public
+)
+target_link_libraries(scripting_bridge_tests PRIVATE vc_build_options)
+add_test(NAME scripting_bridge_tests COMMAND scripting_bridge_tests)
+
+# Plugin manifest + isolation: headless gate for IPluginManifest, IPluginIsolation, IPluginHotReload.
+add_executable(plugin_manifest_tests
+    tests/PluginManifestTests.cpp
+)
+target_include_directories(plugin_manifest_tests PRIVATE
+    src/engine/public
+)
+target_link_libraries(plugin_manifest_tests PRIVATE vc_build_options)
+add_test(NAME plugin_manifest_tests COMMAND plugin_manifest_tests)
 
 # Editor project templates (ezEngine "project templates" pillar): data-driven
 # scaffold generation, all-or-nothing materialization — model-only headless gate.
@@ -3526,19 +4171,22 @@ add_executable(voxel_sdk_tests
     src/engine/scripting/ScriptRuntime.cpp
     src/engine/sdk/BlockEntityScripting.cpp
     src/engine/sdk/FastNoise2Adapter.cpp
+    src/engine/sdk/ManifoldAdapter.cpp
     tests/VoxelSdkTests.cpp
     $<TARGET_OBJECTS:vc_sdk_public>
     $<TARGET_OBJECTS:vc_gameplay_sdk>
     $<TARGET_OBJECTS:vc_voxel_runtime>
     $<TARGET_OBJECTS:vc_voxel_generation>
-    $<TARGET_OBJECTS:vc_fastnoise2>
+    $<TARGET_OBJECTS:vc_manifold>
     src/engine/networking/NetworkRuntime.cpp
 )
 target_include_directories(voxel_sdk_tests PRIVATE
     src/engine/public
     src/engine
     ${glm_SOURCE_DIR}
-    ${VC_FASTNOISE2_DIR}/include
+    third_party/fastnoise_lite
+    ${VC_COACD_DIR}/public
+    ${VC_MANIFOLD_DIR}/include
 )
 target_link_libraries(voxel_sdk_tests PRIVATE
     vc_build_options
@@ -3626,6 +4274,32 @@ if(TARGET vc_generate_world_save)
     add_dependencies(connectivity_tests vc_generate_world_save)
 endif()
 add_test(NAME connectivity_tests COMMAND connectivity_tests)
+
+# Dynamic voxel navigation tests (Agent 6 §10 item 168): build, find_path,
+# incremental update, dynamic obstacles, off-mesh links, area costs, async
+# queries and determinism.
+add_executable(navigation_dynamic_tests
+    tests/NavigationDynamicTests.cpp
+    src/engine/sdk/RecastNavigation.cpp
+)
+target_compile_features(navigation_dynamic_tests PRIVATE cxx_std_20)
+target_include_directories(navigation_dynamic_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(navigation_dynamic_tests PRIVATE
+    vc_build_options
+    vc_navigation
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(navigation_dynamic_tests vc_generate_world_save)
+endif()
+add_test(NAME navigation_dynamic_tests COMMAND navigation_dynamic_tests)
 
 # Integrated explosions (FALTANTES §16 item 10): the ExplosionRuntime combines
 # materials (blast resistance + flammability from the registry JSON), heat
@@ -3867,6 +4541,162 @@ if(TARGET vc_generate_world_save)
     add_dependencies(tetra_cooking_tests vc_generate_world_save)
 endif()
 add_test(NAME tetra_cooking_tests COMMAND tetra_cooking_tests)
+
+# Mesh cooking (META §18 / FALTANTES item 14): headless unwrap/optimize/
+# simplify via the promoted meshoptimizer + xatlas clones (src/engine/sdk/
+# MeshCooking.cpp is the only TU including the backends). Proves unwrap
+# generates valid [0,1] UVs, optimize improves vertex-cache, simplify meets
+# LOD targets, full pipeline is bit-deterministic across instances, and
+# degenerate input is rejected.
+add_executable(mesh_cooking_tests
+    src/engine/core/uuid/UUID.cpp
+    tests/MeshCookingTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(mesh_cooking_tests PRIVATE cxx_std_20)
+target_include_directories(mesh_cooking_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(mesh_cooking_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+    vc_efsw shlwapi
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(mesh_cooking_tests vc_generate_world_save)
+endif()
+add_test(NAME mesh_cooking_tests COMMAND mesh_cooking_tests)
+
+# Text shaping (agente 2 — item `harfbuzz`): Unicode shaping core — grapheme
+# clusters (UAX#29 basics), per-cluster advances, bidi runs + visual
+# reorder (UAX#9 basics). Adapter src/engine/sdk/TextShaper.cpp is the only
+# TU with behavior; deterministic and headless (no font rasterizer needed).
+add_executable(text_shaper_tests
+    src/engine/core/uuid/UUID.cpp
+    tests/TextShaperTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(text_shaper_tests PRIVATE cxx_std_20)
+target_include_directories(text_shaper_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(text_shaper_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+    vc_efsw shlwapi
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(text_shaper_tests vc_generate_world_save)
+endif()
+add_test(NAME text_shaper_tests COMMAND text_shaper_tests)
+
+# Ported Wicked Engine GUI BASE layer (agente 2 — item `wicked-engine`):
+# src/editor/frontend/wicked/*.h (wiColor/wiCanvas/wiMath — DirectX-compatible
+# types on GLM, NO DirectX). Proves the ported base WORKS (lerp, hex, DPI
+# scaling, logical<->physical) — deterministic, header-only.
+add_executable(wicked_base_tests
+    tests/WickedBaseTests.cpp
+)
+target_compile_features(wicked_base_tests PRIVATE cxx_std_20)
+target_include_directories(wicked_base_tests PRIVATE
+    src/editor/frontend/wicked
+    src/editor
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(wicked_base_tests PRIVATE
+    vc_build_options
+)
+add_test(NAME wicked_base_tests COMMAND wicked_base_tests)
+
+# Layered scene interchange (agente 2 — item `openusd`): USD-style layer
+# stack composition with precedence and over semantics. Adapter
+# src/engine/sdk/SceneLayers.cpp is the only TU with behavior.
+add_executable(scene_layers_tests
+    src/engine/core/uuid/UUID.cpp
+    tests/SceneLayersTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(scene_layers_tests PRIVATE cxx_std_20)
+target_include_directories(scene_layers_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(scene_layers_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+    vc_efsw shlwapi
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(scene_layers_tests vc_generate_world_save)
+endif()
+add_test(NAME scene_layers_tests COMMAND scene_layers_tests)
+
+# JSON schema validation (agente 2 — item `glaze`): validates JSON documents
+# against declared schemas on the SHARED JsonMini parser (consolidation
+# authority). Adapter src/engine/sdk/JsonSchema.cpp is the only TU with
+# behavior; all-or-nothing, deterministic.
+add_executable(json_schema_tests
+    src/engine/core/uuid/UUID.cpp
+    tests/JsonSchemaTests.cpp
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_sdk_public>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_compile_features(json_schema_tests PRIVATE cxx_std_20)
+target_include_directories(json_schema_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(json_schema_tests PRIVATE
+    vc_build_options
+    vc_ozz vc_acl
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+    vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+    vc_efsw shlwapi
+)
+if(TARGET vc_generate_world_save)
+    add_dependencies(json_schema_tests vc_generate_world_save)
+endif()
+add_test(NAME json_schema_tests COMMAND json_schema_tests)
 
 # World-scoped replication (META §19 / FALTANTES "replicação e interesse por
 # mundo"): per-world interest, world-routed edits, portal crossings as
@@ -5106,6 +5936,7 @@ set(IMGUI_SOURCES
 add_executable(VulkanEngineEditor
     src/editor/main_editor.cpp
     src/editor/EditorApplication.cpp
+    src/editor/EditorVisualPanels.cpp
     src/editor/BlockTextureAtlas.cpp
     src/editor/EditorControlApi.cpp
     src/editor/EditorLayout.cpp
@@ -5346,7 +6177,8 @@ target_link_libraries(gtest_smoke_test PRIVATE
 target_include_directories(gtest_smoke_test PRIVATE
     src/engine/public
     src)
-add_test(NAME gtest_smoke_test COMMAND gtest_smoke_test)
+include(GoogleTest)
+gtest_discover_tests(gtest_smoke_test)
 
 # Google Benchmark smoke test — proves external solution integration
 file(GLOB GENCHMARK_SOURCES ${VC_SOLUTIONS_DIR}/google-benchmark/src/*.cc)
@@ -5481,3 +6313,8 @@ target_compile_definitions(benchmark_tracy_ab_test PRIVATE BENCHMARK_STATIC_DEFI
 target_include_directories(benchmark_tracy_ab_test PRIVATE
     ${VC_SOLUTIONS_DIR}/tracy/public)
 add_test(NAME benchmark_tracy_ab_test COMMAND benchmark_tracy_ab_test --benchmark_min_time=0.01s)
+
+# slerp diag
+add_executable(xr_diag2 tests/xr_diag2.cpp src/engine/sdk/XrMath.cpp)
+target_include_directories(xr_diag2 PRIVATE src/engine/public src/engine/sdk)
+target_link_libraries(xr_diag2 PRIVATE vc_build_options)

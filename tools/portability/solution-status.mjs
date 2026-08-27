@@ -38,11 +38,14 @@ function walk(dir, out, depth = 0) {
 walk(join(ROOT, 'cmake'), cmakeFiles);
 walk(join(ROOT, 'src'), srcFiles);
 walk(join(ROOT, 'tests'), testFiles);
+const portFiles = [];
+walk(join(ROOT, 'tools', 'portability'), portFiles);
 if (existsSync(join(ROOT, 'CMakeLists.txt'))) cmakeFiles.push(join(ROOT, 'CMakeLists.txt'));
 
 const cmakeText = cmakeFiles.map((f) => safeRead(f)).join('\n');
 const srcText = srcFiles.map((f) => safeRead(f)).join('\n');
 const testText = testFiles.map((f) => safeRead(f)).join('\n');
+const portText = portFiles.map((f) => safeRead(f)).join('\n');
 
 function safeRead(p) {
   try { return readFileSync(p, 'utf8'); } catch { return ''; }
@@ -58,7 +61,7 @@ for (const name of dirs) {
   const lower = name.toLowerCase();
   const inCmake = new RegExp(`(?:${lower}|solutions/${name})`, 'i');
   const level =
-    srcText.toLowerCase().includes(lower) ? 'usado' :
+    srcText.toLowerCase().includes(lower) || portText.toLowerCase().includes(lower) ? 'usado' :
     testText.toLowerCase().includes(lower) ? 'testado' :
     /target_link_libraries|add_library|add_executable|add_subdirectory|GLOB/.test(
       (cmakeText.match(new RegExp(`[^\\n]{0,60}${lower}[^\\n]{0,60}`, 'i')) || [''])[0]) ? 'integrado' :

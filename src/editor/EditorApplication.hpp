@@ -349,6 +349,9 @@ private:
     // material → entidade selecionada (se tiver MeshRenderer).
     void handle_asset_drop(const UUID& assetId);
     void draw_content_browser_panel();
+    void draw_onboarding_overlay();
+    void draw_layout_settings_panel();
+    void draw_render_debugger_panel();
     void draw_voxel_tool_panel();
     void draw_console_panel();
 
@@ -933,6 +936,13 @@ private:
     bool m_showContentBrowser{ true };
     bool m_contentBrowserDirty{ true }; // set when folder may have changed externally
     bool m_showConsole{ false };
+    bool m_showRenderDebugger{ false };
+    bool m_showLayoutSettings{ false };
+    bool m_showOnboardingOverlay{ true };
+    float m_uiDpiScale{ 1.0f };
+    float m_uiTextScale{ 1.0f };
+    float m_lastAppliedDpiScale{ 1.0f };
+    std::string m_layoutSettingsPath;
 
     // Editor panel plugin registry (ezEngine "tools as replaceable plugins"
     // pillar): the shell derives menus/palette/layout from this instead of
@@ -956,6 +966,11 @@ private:
     // Exposed via GET /layout; the shell applies it to its real windows.
     Engine::Editor::EditorLayoutModel m_layoutModel;
     void apply_layout_defaults();
+    void apply_layout_snapshot_to_imgui();
+    void apply_layout_visibility_to_imgui();
+    void save_layout_settings();
+    void load_layout_settings();
+    void update_ui_dpi_scale();
 
     // Message catalog (plano agente 2 §C): curated user-facing messages
     // (stable ids, severity, parameterized text, actionable hint). Built once

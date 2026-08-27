@@ -89,8 +89,14 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
         if (neighbor == kRuntimeAirId) return true;
         const bool currentFluid = is_fluid(current);
         const bool neighborFluid = is_fluid(neighbor);
-        const bool currentLeaf = is_leaf_block(as_builtin_block(current));
-        const bool neighborLeaf = is_leaf_block(as_builtin_block(neighbor));
+        const auto is_leaf_runtime = [&](RuntimeBlockId id) {
+            if (id == kRuntimeAirId) return false;
+            if (is_builtin_block(id)) return is_leaf_block(static_cast<BlockType>(id));
+            const RuntimeBlockInfo* info = snapshot.find_runtime_block(id);
+            return info != nullptr && !info->occludes && !info->solid;
+        };
+        const bool currentLeaf = is_leaf_runtime(current);
+        const bool neighborLeaf = is_leaf_runtime(neighbor);
         if (currentFluid && neighborFluid) return false;
         if (currentFluid && !neighborFluid) return true;
         if (!currentFluid && neighborFluid) return true;
@@ -182,7 +188,12 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
                 const float bSouth = snapshot.hasLightData
                     ? static_cast<float>(neighbor_light(0, 0, -1)) / 15.0f : 1.0f;
 
-                if (is_leaf_block(as_builtin_block(type))) {
+                const bool runtimeLeaf = [&] {
+                    if (is_builtin_block(type)) return is_leaf_block(static_cast<BlockType>(type));
+                    const RuntimeBlockInfo* info = snapshot.find_runtime_block(type);
+                    return info != nullptr && !info->occludes && !info->solid;
+                }();
+                if (runtimeLeaf) {
                     const bool exposed = topNeighbor == kRuntimeAirId || bottomNeighbor == kRuntimeAirId ||
                                          eastNeighbor == kRuntimeAirId || westNeighbor == kRuntimeAirId ||
                                          northNeighbor == kRuntimeAirId || southNeighbor == kRuntimeAirId;

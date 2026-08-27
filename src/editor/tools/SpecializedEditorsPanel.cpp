@@ -46,9 +46,12 @@ void SpecializedEditorsPanel::draw(){
    ImGui::EndTabItem();
   }
   if(ImGui::BeginTabItem("Timeline", nullptr, tab_flags("Timeline"))){
+   ImGui::TextColored(ImVec4(.32f,.55f,1,1), "ANIMATION TIMELINE");
+   ImGui::Separator();
    ImGui::DragFloat("Duration",&timeline_.duration,.1f,.01f,10000);ImGui::SliderFloat("Playhead",&timeline_.playhead,0,std::max(timeline_.duration,.01f));ImGui::Checkbox("Loop",&timeline_.loop);
    if(ImGui::Button("Add Animation Track"))timeline_.add_track({"Animation "+std::to_string(timeline_.tracks.size()+1),TimelineTrackType::Animation});
-   for(size_t i=0;i<timeline_.tracks.size();++i){auto&t=timeline_.tracks[i];ImGui::PushID(static_cast<int>(i));ImGui::Checkbox("Mute",&t.muted);ImGui::SameLine();ImGui::Text("%s (%zu keys)",t.name.c_str(),t.keys.size());ImGui::SameLine();if(ImGui::Button("Key"))timeline_.add_key(i,{timeline_.playhead,"value"});ImGui::PopID();}draw_validation(timeline_);
+   ImGui::SameLine(); ImGui::TextDisabled("%zu tracks", timeline_.tracks.size());
+   for(size_t i=0;i<timeline_.tracks.size();++i){auto&t=timeline_.tracks[i];ImGui::PushID(static_cast<int>(i));ImGui::Checkbox("Mute",&t.muted);ImGui::SameLine();ImGui::Text("%s (%zu keys)",t.name.c_str(),t.keys.size());ImGui::SameLine();if(ImGui::Button("Key"))timeline_.add_key(i,{timeline_.playhead,"value"});ImGui::SameLine(); ImGui::ProgressBar(timeline_.duration > 0 ? timeline_.playhead / timeline_.duration : 0.0f, ImVec2(-1, 0), ""); ImGui::PopID();}draw_validation(timeline_);
    // Panel -> scene integration: Apply writes the authored tracks as a real
    // TimelineComponent; the play world animates the entity transform from
    // Property tracks ("x y z"/"rx ry rz"/"sx sy sz" keys).
@@ -69,7 +72,11 @@ void SpecializedEditorsPanel::draw(){
    ImGui::EndTabItem();
   }
   if(ImGui::BeginTabItem("Retarget", nullptr, tab_flags("Retarget"))){
-   ImGui::Checkbox("Preserve Root Motion",&retarget_.preserveRootMotion);if(ImGui::Button("Auto-map Humanoid")){retarget_.map({"Root","Pelvis",1,{0,0,0}});retarget_.map({"Hand.L","Hand.L",1,{0,0,0}});}for(auto&m:retarget_.mapping){ImGui::Text("%s -> %s",m.sourceBone.c_str(),m.targetBone.c_str());ImGui::SameLine();ImGui::DragFloat("Scale",&m.translationScale,.01f,.01f,10);}draw_validation(retarget_);
+   ImGui::TextColored(ImVec4(.32f,.55f,1,1), "SKELETON RETARGETING");
+   ImGui::Separator();
+   ImGui::Checkbox("Preserve Root Motion",&retarget_.preserveRootMotion);if(ImGui::Button("Auto-map Humanoid")){retarget_.map({"Root","Pelvis",1,{0,0,0}});retarget_.map({"Hand.L","Hand.L",1,{0,0,0}});} 
+   ImGui::Text("Mappings: %zu", retarget_.mapping.size());
+   if(ImGui::BeginTable("##RetargetMap", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)){ImGui::TableSetupColumn("Source");ImGui::TableSetupColumn("Target");ImGui::TableSetupColumn("Translation");ImGui::TableSetupColumn("Rotation");ImGui::TableHeadersRow();for(auto&m:retarget_.mapping){ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextUnformatted(m.sourceBone.c_str());ImGui::TableNextColumn();ImGui::TextUnformatted(m.targetBone.c_str());ImGui::TableNextColumn();ImGui::PushID(&m);ImGui::DragFloat("##Scale",&m.translationScale,.01f,.01f,10);ImGui::PopID();ImGui::TableNextColumn();ImGui::Text("%.2f %.2f %.2f",m.rotationOffset.x,m.rotationOffset.y,m.rotationOffset.z);}ImGui::EndTable();}draw_validation(retarget_);
    // Panel -> scene integration: Apply writes the bone mapping as a real
    // RetargetComponent; the play world offsets target-bone transforms by the
    // authored scale/rotation while the source pose is played.

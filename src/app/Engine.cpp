@@ -82,6 +82,10 @@ void Engine::init() {
 
     textureManager.init(device, physicalDevice, allocator, graphicsQueue, graphicsQueueFamily, frames[0].commandPool);
     worldRenderer.configure(device, allocator);
+    // The radiance cache is renderer-owned GPU state. It is updated from the
+    // real camera/world frame and uploaded before scene shading consumes it.
+    radianceCache.init(device, allocator);
+    radianceCacheReady = true;
 
     mobRenderer.init(device, allocator);
     // Mobs are IEntityWorld entities (FALTANTES item 11): the legacy Mob/
@@ -557,13 +561,14 @@ void Engine::init_pipeline() {
     stageInfos[1].pName = "main";
 
     // Descriptor Set Layout para Texture Array Sampler
-    std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 7> bindings{};
     for (uint32_t index = 0; index < bindings.size(); ++index) {
         bindings[index].binding = index;
-        bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-
+        bindings[index].descriptorType = index == 6
+            ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+            : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings[index].descriptorCount = 1;
-        bindings[index].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        bindings[index].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
     }
 
     VkDescriptorSetLayoutCreateInfo descriptorLayoutInfo{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -576,10 +581,14 @@ void Engine::init_pipeline() {
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     poolSize.descriptorCount = 6;
+    VkDescriptorPoolSize radiancePoolSize{};
+    radiancePoolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    radiancePoolSize.descriptorCount = 1;
 
     VkDescriptorPoolCreateInfo poolInfo{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    poolInfo.poolSizeCount = 1;
-    poolInfo.pPoolSizes = &poolSize;
+    std::array<VkDescriptorPoolSize, 2> poolSizes{ poolSize, radiancePoolSize };
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
     poolInfo.maxSets = 1;
 
     VK_CHECK(vkCreateDescriptorPool(device, &poolInfo, nullptr, &textureManager.descriptorPool));
@@ -591,21 +600,27 @@ void Engine::init_pipeline() {
 
     VK_CHECK(vkAllocateDescriptorSets(device, &allocInfo, &textureManager.descriptorSet));
 
-    std::array<VkDescriptorImageInfo, 6> imageInfos{};
-    const std::array<VkImageView, 6> imageViews{
+    std::array<VkDescriptorImageInfo, 7> imageInfos{};
+    const std::array<VkImageView, 7> imageViews{
         textureManager.textureArrayImageView,
         textureManager.normalArrayImageView,
         textureManager.specularArrayImageView, shadowImageView,
-        opaqueSceneImageView, opaqueDepthImageView
+        opaqueSceneImageView, opaqueDepthImageView,
+        VK_NULL_HANDLE
     };
-    std::array<VkWriteDescriptorSet, 6> descriptorWrites{};
+    std::array<VkWriteDescriptorSet, 7> descriptorWrites{};
     for (uint32_t index = 0; index < descriptorWrites.size(); ++index) {
         imageInfos[index].imageLayout = index == 3
             ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
             : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         imageInfos[index].imageView = imageViews[index];
         imageInfos[index].sampler = index == 3 ? shadowSampler
-            : (index >= 4 ? waterSceneSampler : textureManager.textureSampler);
+            : (index >= 4 && index < 6 ? waterSceneSampler : textureManager.textureSampler);
+        if (index == 6) {
+            // The radiance cache is a storage buffer, not an image. Its
+            // descriptor is written immediately after the image descriptors.
+            continue;
+        }
         descriptorWrites[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         descriptorWrites[index].dstSet = textureManager.descriptorSet;
         descriptorWrites[index].dstBinding = index;
@@ -614,7 +629,8 @@ void Engine::init_pipeline() {
         descriptorWrites[index].pImageInfo = &imageInfos[index];
     }
 
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+    vkUpdateDescriptorSets(device, 6, descriptorWrites.data(), 0, nullptr);
+    if (radianceCacheReady) radianceCache.write_descriptor(textureManager.descriptorSet, 6);
 
     VkPushConstantRange pushConstantRange{};
     pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -1144,6 +1160,14 @@ void Engine::draw() {
     const glm::vec3 daylightColor = glm::mix(glm::vec3(1.34f, 0.48f, 0.16f), glm::vec3(1.18f, 1.10f, 0.94f), 1.0f - horizonWarmth);
     currentLightColor = glm::mix(glm::vec3(0.12f, 0.18f, 0.34f), daylightColor, currentDaylight);
     currentExposure = glm::mix(1.32f, 0.86f, currentDaylight);
+    if (radianceCacheReady) {
+        radianceCache.update(player.camera.position, currentSunDirection,
+                             currentLightColor);
+    }
+    // Advance the renderer-owned upload/retirement epoch before recording this
+    // frame. Simulation publishes completed chunk snapshots through this same
+    // real Vulkan renderer seam.
+    worldRenderer.begin_frame();
 
     VkCommandBuffer cmd = get_current_frame().mainCommandBuffer;
     VK_CHECK(vkResetCommandBuffer(cmd, 0));
@@ -1153,6 +1177,11 @@ void Engine::draw() {
     cmdBeginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
     VK_CHECK(vkBeginCommandBuffer(cmd, &cmdBeginInfo));
+
+    // Make the current probe clipmap visible to the real fragment passes. This
+    // is intentionally recorded on the same command buffer as the world draw,
+    // not in a headless/test-only path.
+    if (radianceCacheReady) radianceCache.record_uploads(cmd);
 
     VkImageMemoryBarrier2 shadowWrite{.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     shadowWrite.srcStageMask=frameNumber==0?VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT:VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;

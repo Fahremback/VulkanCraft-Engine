@@ -17,6 +17,8 @@
 #include <engine/voxel/IVoxelBlockEntity.hpp>
 #include <engine/voxel/IBlockEntityScripting.hpp>
 #include "engine/sdk/FastNoise2Adapter.hpp"
+#include "engine/physics/IConvexDecomposition.hpp"
+#include "engine/physics/ICSGOperation.hpp"
 #include <engine/registry/BlockRegistry.hpp>
 #include <engine/registry/FluidRegistry.hpp>
 #include <engine/registry/ItemRegistry.hpp>
@@ -10873,6 +10875,76 @@ void test_graph_generator_world() {
                  "terrain, non-flat) OK\n";
 }
 
+// G.manifold: Manifold CSG boolean operations.
+// Validates: compile, union/subtract/intersect of two boxes, deterministic.
+void test_manifold_csg() {
+    using namespace engine::physics;
+
+    std::string error;
+    auto csg = create_csg_operation("manifold", error);
+    CHECK(csg != nullptr);
+    CHECK(error.empty());
+    CHECK(std::string(csg->name()) == "Manifold");
+
+    // Create two overlapping boxes.
+    // Box A: -1..1 on all axes (center at origin)
+    CSGMesh boxA;
+    boxA.positions = {
+        -1,-1,-1, 1,-1,-1, 1,1,-1, -1,1,-1,
+        -1,-1, 1, 1,-1, 1, 1,1, 1, -1,1, 1
+    };
+    boxA.indices = {
+        0,1,2, 0,2,3, 4,6,5, 4,7,6,
+        0,4,5, 0,5,1, 2,6,7, 2,7,3,
+        0,3,7, 0,7,4, 1,5,6, 1,6,2
+    };
+
+    // Box B: 0..2 on all axes (shifted +1, overlaps with A)
+    CSGMesh boxB;
+    boxB.positions = {
+         0, 0, 0, 2, 0, 0, 2,2, 0, 0,2, 0,
+         0, 0, 2, 2, 0, 2, 2,2, 2, 0,2, 2
+    };
+    boxB.indices = {
+        0,1,2, 0,2,3, 4,6,5, 4,7,6,
+        0,4,5, 0,5,1, 2,6,7, 2,7,3,
+        0,3,7, 0,7,4, 1,5,6, 1,6,2
+    };
+
+    // Union: two overlapping boxes -> merged shape.
+    CSGMesh resultUnion;
+    bool ok = csg->operate(boxA, boxB, CSGOp::Union, resultUnion, error);
+    CHECK(ok);
+    CHECK(error.empty());
+    CHECK(resultUnion.positions.size() >= 24);
+    CHECK(resultUnion.indices.size() >= 12);
+
+    // Subtract: A \ B -> should remove the overlap.
+    CSGMesh resultSub;
+    ok = csg->operate(boxA, boxB, CSGOp::Subtract, resultSub, error);
+    CHECK(ok);
+    CHECK(error.empty());
+    CHECK(resultSub.positions.size() >= 24);
+
+    // Intersect: A ∩ B -> only the overlapping region.
+    CSGMesh resultInter;
+    ok = csg->operate(boxA, boxB, CSGOp::Intersect, resultInter, error);
+    CHECK(ok);
+    CHECK(error.empty());
+    CHECK(resultInter.positions.size() >= 24);
+
+    // Determinism: same input -> same output.
+    CSGMesh resultUnion2;
+    ok = csg->operate(boxA, boxB, CSGOp::Union, resultUnion2, error);
+    CHECK(ok);
+    CHECK(resultUnion.positions.size() == resultUnion2.positions.size());
+    CHECK(resultUnion.indices == resultUnion2.indices);
+
+    std::cout << "[sdk] G.manifold: Manifold CSG union/subtract/intersect OK ("
+              << resultUnion.positions.size() / 3 << " union verts, "
+              << resultInter.positions.size() / 3 << " intersect verts)\n";
+}
+
 // G.fastnoise2: FastNoise2 SIMD backend for INoiseGraph.
 // Validates: compile, determinism (same spec+seed -> same samples),
 // and basic 2D/3D sampling.
@@ -13539,6 +13611,7 @@ int main(int argc, char** argv) {
         test_noise_graph_nodes();
         test_noise_graph_serialization();
         test_graph_generator_world();
+        test_manifold_csg();
         test_fastnoise2_backend();
         test_climate_registry();
         test_climate_sampler();

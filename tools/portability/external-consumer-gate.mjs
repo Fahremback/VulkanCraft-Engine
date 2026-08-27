@@ -134,16 +134,25 @@ function main() {
     log(`engine root: ${ENGINE_ROOT}`);
     log(`install prefix: ${prefix}`);
 
-    // 0. Reconfigure the main build so the new install rules (vc_sdk archive,
-    // dependency libs, package config) are in the install manifest.
-    log("reconfiguring main build (picks up install rules)");
-    let result = run("cmake", ["-S", ".", "-B", "build"], { cwd: ENGINE_ROOT });
-    if (result.status !== 0) {
-      fail(`main reconfigure exited ${result.status}`);
-      return;
-    }
+  // 0. Reconfigure the main build so the new install rules (vc_sdk archive,
+  // dependency libs, package config) are in the install manifest.
+  log("reconfiguring main build (picks up install rules)");
+  let result = run("cmake", ["-S", ".", "-B", "build"], { cwd: ENGINE_ROOT });
+  if (result.status !== 0) {
+    fail(`main reconfigure exited ${result.status}`);
+    return;
+  }
 
-    // 1. Install into the fresh prefix.
+  // 0b. Build Release targets so .lib files exist for install.
+  log("building Release targets");
+  result = run("cmake", ["--build", "build", "--config", "Release"],
+    { cwd: ENGINE_ROOT, timeout: 600_000 });
+  if (result.status !== 0) {
+    fail(`main build exited ${result.status}`);
+    return;
+  }
+
+  // 1. Install into the fresh prefix.
     log("cmake --install into prefix");
     result = run("cmake", ["--install", BUILD_DIR, "--config", "Release",
       "--prefix", prefix]);

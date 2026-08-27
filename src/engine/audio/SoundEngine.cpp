@@ -3,6 +3,7 @@
 #include "World.hpp"
 #include <algorithm>
 #include <cmath>
+#include "engine/core/logging/Log.hpp"
 #include <iostream>
 #include <filesystem>
 
@@ -24,7 +25,7 @@ void SoundEngine::start_loop(const std::string& name, const std::string& path) {
     const std::string fullPath = asset(path.c_str());
     if (ma_sound_init_from_file(engine, fullPath.c_str(), MA_SOUND_FLAG_STREAM, nullptr, nullptr, sound) != MA_SUCCESS) {
         delete sound;
-        std::cerr << "[Audio] Failed to load ambience: " << fullPath << '\n';
+        VC_LOG_ERROR("[Audio] Failed to load ambience: {}", fullPath);
         return;
     }
     ma_sound_set_looping(sound, MA_TRUE);
@@ -38,7 +39,7 @@ void SoundEngine::init() {
     engine = new ma_engine{};
     if (ma_engine_init(nullptr, engine) != MA_SUCCESS) {
         delete engine; engine = nullptr;
-        std::cerr << "[Audio] Could not initialize audio device.\n";
+        VC_LOG_ERROR("[Audio] Could not initialize audio device.");
         return;
     }
     register_sound("step", "step.wav"); register_sound("water_splash", "water_splash.wav");
@@ -49,9 +50,7 @@ void SoundEngine::init() {
     start_loop("wind", "forest_wind.wav"); start_loop("birds", "birds_chirping.wav");
     start_loop("water", "river_flow.wav"); start_loop("night", "crickets_night.wav");
     start_loop("leaves", "leaves_rustle.wav");
-    std::cout << "[Audio] Multichannel soundscape initialized: "
-              << loops.size() << " ambient loops, "
-              << soundFiles.size() << " sound effects.\n";
+    VC_LOG_INFO("[Audio] Multichannel soundscape initialized: {} ambient loops, {} sound effects.", loops.size(), soundFiles.size());
 }
 
 void SoundEngine::shutdown() {

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <fstream>
 #include <stdexcept>
+#include "engine/core/logging/Log.hpp"
 #include <iostream>
 #include <sstream>
 
@@ -495,18 +496,21 @@ VMStatus ScriptVM::execute_one(float deltaTime, bool ignoreBreakpoint) {
             ip_ = inst.target;
             break;
         case OpCode::Log:
-            std::cout << "[Script] " << inst.text << ": ";
             if (!stack_.empty()) {
                 const ScriptValue& value = stack_.back();
-                if (const double* d = std::get_if<double>(&value)) std::cout << *d;
-                else if (const int64_t* i = std::get_if<int64_t>(&value)) std::cout << *i;
-                else if (const bool* b = std::get_if<bool>(&value)) std::cout << (*b ? "true" : "false");
-                else if (const std::string* s = std::get_if<std::string>(&value)) std::cout << *s;
-                else std::cout << "?";
+                if (const double* d = std::get_if<double>(&value))
+                    VC_LOG_INFO("[Script] {}: {}", inst.text, *d);
+                else if (const int64_t* i = std::get_if<int64_t>(&value))
+                    VC_LOG_INFO("[Script] {}: {}", inst.text, *i);
+                else if (const bool* b = std::get_if<bool>(&value))
+                    VC_LOG_INFO("[Script] {}: {}", inst.text, *b ? "true" : "false");
+                else if (const std::string* s = std::get_if<std::string>(&value))
+                    VC_LOG_INFO("[Script] {}: {}", inst.text, *s);
+                else
+                    VC_LOG_INFO("[Script] {}: ?", inst.text);
             } else {
-                std::cout << "(empty stack)";
+                VC_LOG_INFO("[Script] {}: (empty stack)", inst.text);
             }
-            std::cout << '\n';
             break;
         case OpCode::Return:
             if (!callStack_.empty()) {

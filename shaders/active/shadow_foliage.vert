@@ -6,7 +6,7 @@ const vec2 C[6]=vec2[6](vec2(0,0),vec2(1,0),vec2(1,1),vec2(0,0),vec2(1,1),vec2(0
 float hash12(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
 vec3 projectShadow(vec3 worldPosition){
  vec3 lightDir=normalize(push.environment.y>.03?push.sunDirection.xyz:-push.sunDirection.xyz);vec3 referenceUp=abs(lightDir.y)>.96?vec3(0,0,1):vec3(0,1,0);
- vec3 right=normalize(cross(referenceUp,lightDir));vec3 up=normalize(cross(lightDir,right));const float snap=.125;
+ vec3 right=normalize(cross(referenceUp,lightDir));vec3 up=normalize(cross(lightDir,right));const float snap=.5;
  vec2 center=floor(vec2(dot(push.cameraPos.xyz,right),dot(push.cameraPos.xyz,up))/snap+.5)*snap;
  vec2 projected=(vec2(dot(worldPosition,right),dot(worldPosition,up))-center)/512.0;float distortion=.16+.84*clamp(length(projected),0.0,1.0);
  return vec3(projected/distortion,clamp(.5-dot(worldPosition-push.cameraPos.xyz,lightDir)/1280.0,0.0,1.0));

@@ -151,6 +151,44 @@ run('node tools/portability/curl-gate.mjs');
 log('Step 7f9: Vendored python-tuf probe (secure-update flow usable)');
 run('node tools/portability/tuf-gate.mjs');
 
+// task_plan Agente 5 §7 (luau): the vendored scripting runtime must be
+// USABLE — the probe compiles+runs against the MSVC static libs (source →
+// bytecode via luau_compile, VM load/run via luau_load/lua_pcall, runtime
+// errors propagated, table/function C API), proving the vendored tree is
+// consumable for the §3 sandboxed scripting runtime without engine CMake
+// wiring.
+log('Step 7f10: Vendored luau probe (compile + VM run usable)');
+run('node tools/portability/luau-gate.mjs');
+
+// task_plan Agente 5 §3 item 6: the REAL wiring — the ILuauSandbox contract
+// (engine/scripting/) with the concrete LuauRunner (vendored Luau #302)
+// end-to-end: attach real runner, evaluate a real Luau script through the
+// policy adapter, real JSON value back, real runtime errors with stable tags,
+// sandbox by construction (io/require absent), bit-exact persistence.
+log('Step 7f11: ILuauSandbox + vendored Luau E2E (real scripting wiring)');
+run('node tools/portability/luau-sandbox-e2e-gate.mjs');
+
+// task_plan Agente 5 §7 (sentry-native): the vendored crash reporting lib
+// must be USABLE — the probe compiles+runs against the MSVC static lib
+// (inproc backend: init, custom transport capturing the envelope with no
+// network, event capture with tags/release, shutdown flush), proving the
+// vendored tree is consumable for crash reporting without engine wiring
+// (the real backend behind the IObservability ISink, §6 item 6).
+log('Step 7f12: Vendored sentry-native probe (crash reporting usable)');
+run('node tools/portability/sentry-gate.mjs');
+
+// task_plan Agente 5 §6 item 6: the REAL wiring — IObservability contract
+// with the concrete SentrySink (vendored sentry-native #306) end-to-end:
+// attach the replaceable sink, route logs/spans/counters as real sentry
+// events (custom transport, no network), opt-in respected, crash context
+// preserved, bit-exact persistence.
+log('Step 7f13: IObservability + sentry-native E2E (real crash-reporting wiring)');
+run('node tools/portability/observability-sentry-e2e-gate.mjs');
+
+// Step 7f14: opentelemetry-cpp (OTLP file exporter — trace+log+metric)
+log('Step 7f14: Vendored opentelemetry-cpp probe (OTLP file exporter usable)');
+run('node tools/portability/otel-gate.mjs');
+
 log('Step 7g: Aggregate §11 platform gate');
 run('node tools/portability/platform-gate.mjs');
 
@@ -172,7 +210,25 @@ run('node tools/portability/sbom-gen.mjs');
 log('Step 7m: Build-dir usage (evidence for safe cleanup gating)');
 run('node tools/portability/build-dir-usage.mjs');
 
-log('Step 7n: Benchmark regression gate (median-of-3 vs baseline)');
+log('Step 7n: ConcurrentQueue correctness gate (lock-free MPMC)');
+run('node tools/portability/concurrentqueue-gate.mjs');
+
+log('Step 7o: spdlog structured logging gate');
+run('node tools/portability/spdlog-gate.mjs');
+
+log('Step 7p: Taskflow parallelism gate');
+run('node tools/portability/taskflow-gate.mjs');
+
+log('Step 7q: Benchmark regression gate (median-of-3 vs baseline)');
 run('node tools/portability/benchmark-gate.mjs');
+
+log('Step 7r: Wasmtime C API gate (WebAssembly sandboxed runtime)');
+run('node tools/portability/wasmtime-gate.mjs');
+
+log('Step 7s: Nakama multiplayer backend gate (Go build + run)');
+run('node tools/portability/nakama-gate.mjs');
+
+log('Step 7t: Agones game server orchestration gate (Go SDK server build + run)');
+run('node tools/portability/agones-gate.mjs');
 
 log(`CI matrix PASSED on ${platform} with preset ${preset}`);

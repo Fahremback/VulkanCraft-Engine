@@ -93,8 +93,27 @@ def analyze(path):
     return 0 if ok else 1
 
 
+def analyze_multi(paths):
+    """Valida a UI em VÁRIAS resoluções (ex: capturas /screenshot-ui após
+    /window-resize em 1280x720, 1600x900, 1920x1080). Reporta um resumo por
+    arquivo + um veredito global: TODAS as resoluções devem ter estrutura de
+    UI (charcoal de painel, contraste, linhas com conteúdo) — prova
+    algorítmica de que a UI funciona em resoluções/aspectos diferentes."""
+    import os
+    results = []
+    for p in paths:
+        print("=" * 60)
+        print(f"RESOLUÇÃO: {os.path.basename(p)}")
+        rc = analyze(p)
+        results.append((p, rc))
+    print("=" * 60)
+    ok_all = all(rc == 0 for _, rc in results)
+    print(f"MULTIRESOLUÇÃO: {'TODAS AS RESOLUÇÕES OK' if ok_all else 'FALHA EM ALGUMA'} ({sum(1 for _, rc in results if rc == 0)}/{len(results)})")
+    return 0 if ok_all else 1
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(2)
-    sys.exit(analyze(sys.argv[1]))
+    sys.exit(analyze_multi(sys.argv[1:]))

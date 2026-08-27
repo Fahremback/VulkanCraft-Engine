@@ -125,4 +125,5 @@ if (apply) {
   fs.writeFileSync(path.join(agentsRoot, "AUDITORIA_CONCLUSOES_ULTIMA_EXECUCAO.md"), report.join("\n"), "utf8");
 }
 
-console.log(JSON.stringify({ apply, checkedBefore, reopened: reopened.length, preserved: checkedBefore - reopened.length, byAgent: Object.fromEntries(byAgent) }, null, 2));
+const details = process.argv.includes("--details");
+console.log(JSON.stringify({ apply, checkedBefore, reopened: reopened.length, preserved: checkedBefore - reopened.length, byAgent: Object.fromEntries(byAgent), ...(details ? { items: reopened } : {}) }, null, 2));

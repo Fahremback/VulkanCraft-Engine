@@ -23,8 +23,15 @@ for (const dir of agentDirs) {
     const tp = join(dir, 'task_plan.md');
     try {
         const content = readFileSync(tp, 'utf8');
-        const done = (content.match(/\[x\]/g) || []).length;
-        const remaining = (content.match(/\[ \]/g) || []).length;
+        // Count ONLY line-leading checklist checkboxes (`- [x]` / `- [ ]`).
+        // Matching /\[x\]/ on the whole file over-counts "[x]" written inside
+        // annotation paragraphs/docs/tables, inflating done/remaining.
+        const lines = content.split('\n');
+        let done = 0, remaining = 0;
+        for (const l of lines) {
+            if (/^\s*[-*] \[x\]\s/i.test(l)) done++;
+            else if (/^\s*[-*] \[ \]\s/i.test(l)) remaining++;
+        }
         const total = done + remaining;
         const pct = total > 0 ? Math.round(done / total * 100) : 0;
         const name = dir.split('/').pop().replace('agente', 'Agent ').replace(/_/g, ' ');
@@ -51,10 +58,15 @@ for (const dir of agentDirs) {
         const content = readFileSync(bugsFile, 'utf8');
         const lines = content.split('\n').filter(l => l.startsWith('| BUG-'));
         for (const line of lines) {
+            // Canonical row layout (agentes/**/bugs.md):
+            //   | BUG-0NN | <STATUS> | <SEVERITY> | <item> | <sintoma> ... |
+            //   parts[0]=ID, parts[1]=Status, parts[2]=Severity, parts[3..]=rest.
             const parts = line.split('|').map(s => s.trim()).filter(Boolean);
-            if (parts.length >= 4 && (parts[2] === 'ABERTO' || parts[2] === 'BLOQUEADO')) {
+            const status = (parts[1] || '').toUpperCase();
+            if (parts.length >= 4 && (status === 'ABERTO' || status === 'BLOQUEADO')) {
                 const agent = dir.split('/').pop().replace('agente', 'A').replace(/_.*/, '');
-                console.log(`| ${agent} | ${parts[0]} | ${parts[1]} | ${parts[2]} | ${parts[3].substring(0, 60)} |`);
+                const desc = parts.slice(3).join(' · ').replace(/\|/g, ' ').substring(0, 60);
+                console.log(`| ${agent} | ${parts[0]} | ${parts[2]} | ${parts[1]} | ${desc} |`);
             }
         }
     } catch (e) { /* skip */ }

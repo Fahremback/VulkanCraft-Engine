@@ -65,8 +65,9 @@ void main() {
     }
 
     if (isWater && normal.y > 0.5) {
-        float distanceLod = smoothstep(45.0, 260.0, length(pos.xz - push.cameraPos.xz));
-        float sampleDistance = mix(0.08, 0.55, distanceLod);
+        // Fixed sample distance eliminates camera-dependent normal jitter
+        // that caused water to visually vibrate on orbit.
+        const float sampleDistance = 0.15;
         float center = blissWaterHeight(pos.xz);
         float right = blissWaterHeight(pos.xz + vec2(sampleDistance, 0.0));
         float forward = blissWaterHeight(pos.xz + vec2(0.0, sampleDistance));

@@ -8,6 +8,14 @@
 #include "MobRenderer.hpp"
 #include "SoundEngine.hpp"
 #include "RadianceCache.hpp"
+#include "engine/rendering/RenderGraph.hpp"
+#include "engine/rendering/vulkan/MaterialPipeline.hpp"
+#include "engine/rendering/lighting/RadianceCache.hpp"
+#include "engine/rendering/lighting/RadianceCacheMath.hpp"
+#include "WorldRenderer.hpp"
+#include "simulation/voxel/streaming/WorldRenderBridge.hpp"
+#include "simulation/voxel/meshing/ChunkMeshResult.hpp"
+#include "engine/rendering/lighting/RadianceCache.hpp"
 #include "engine/entity/IEntityWorld.hpp"
 #include "engine/entity/IMobBehavior.hpp"
 #include <memory>
@@ -163,6 +171,7 @@ public:
     Player player;
     TextureManager textureManager;
     RadianceCache radianceCache;
+    bool radianceCacheReady{ false };
 
     float deltaTime{ 0.0f };
     float lastFrameTime{ 0.0f };

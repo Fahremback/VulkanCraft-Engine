@@ -5,6 +5,7 @@
 
 #include <glm/gtc/matrix_transform.hpp>
 #include <cmath>
+#include "engine/core/logging/Log.hpp"
 #include <cstring>
 #include <iostream>
 #include <vector>
@@ -149,7 +150,7 @@ void MobRenderer::build_mob_limb_meshes(VkDevice device, VmaAllocator allocator)
 
 void MobRenderer::init(VkDevice device, VmaAllocator allocator) {
     build_mob_limb_meshes(device, allocator);
-    std::cout << "[MobRenderer] Entity-layer mob rendering initialized (legacy MobManager track removed)\n";
+    VC_LOG_INFO("[MobRenderer] Entity-layer mob rendering initialized (legacy MobManager track removed)");
 }
 
 // Parses the renderer-relevant fields of a mob component blob (JSON MobSpec).

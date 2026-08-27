@@ -427,7 +427,7 @@ void Chunk::generate_terrain(const FastNoiseLite& noise, engine::voxel::IVoxelGe
                     }
                     const RuntimeBlockId current = blocks[lx][ly][lz];
                     if (current != kRuntimeAirId &&
-                        !is_leaf_block(as_builtin_block(current))) {
+                        !(is_builtin_block(current) ? is_leaf_block(static_cast<BlockType>(current)) : current == kRuntimeAirId)) {
                         return false;
                     }
                     blocks[lx][ly][lz] = static_cast<RuntimeBlockId>(blockId);
@@ -475,7 +475,9 @@ void Chunk::generate_terrain(const FastNoiseLite& noise, engine::voxel::IVoxelGe
                     const int bx = x + direction[0] * step;
                     const int bz = z + direction[1] * step;
                     const int by = branchY + (step > 1 ? 1 : 0);
-                    if (blocks[bx][by][bz] == kRuntimeAirId || is_leaf_block(as_builtin_block(blocks[bx][by][bz])))
+                    if (blocks[bx][by][bz] == kRuntimeAirId ||
+                        (is_builtin_block(blocks[bx][by][bz]) &&
+                         is_leaf_block(static_cast<BlockType>(blocks[bx][by][bz]))))
                         blocks[bx][by][bz] = woodType;
                 }
             }

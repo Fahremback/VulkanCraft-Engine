@@ -31,6 +31,8 @@ struct CookedMesh {
     std::vector<float> normals;
     std::vector<float> uvs;
     std::vector<std::uint32_t> indices;
+    std::vector<float> tangents;  // xyz per vertex (MikkTSpace-style, orthogonal
+                                  // to the normal); empty until generated
 
     std::size_t vertex_count() const { return positions.size() / 3; }
     std::size_t index_count() const { return indices.size(); }
@@ -88,6 +90,14 @@ public:
     // Analyzes vertex-cache and overdraw statistics.
     virtual bool analyze(const CookedMesh& mesh, CookStats& stats,
                          std::string& errorOut) const = 0;
+
+    // Generates MikkTSpace-style tangents (xyz per vertex) for a mesh that
+    // has UVs. Tangents are orthogonalized against the normals (Gram-Schmidt)
+    // and handedness-aware (right-handed TBN). Deterministic — a pure
+    // function of (positions, uvs, indices, normals). Rejects meshes without
+    // UVs. Output carries the input streams plus `tangents`.
+    virtual bool generate_tangents(const CookedMesh& in, CookedMesh& out,
+                                   std::string& errorOut) = 0;
 };
 
 // Factory (implemented by the SDK adapter — the only TU that includes the

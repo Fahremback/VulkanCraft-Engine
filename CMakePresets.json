@@ -25,10 +25,12 @@
       "hidden": true,
       "inherits": "default",
       "generator": "Ninja",
-      "description": "Ninja + MSVC cl.exe. Pinned to cl so MinGW GCC on PATH is never selected (BUG-008: MinGW-built flatc segfaults on any schema, exit 139). Configure from a VS Developer prompt (vcvars64) so INCLUDE/LIB are set.",
+      "description": "Ninja + MSVC cl.exe + sccache. Pinned to cl so MinGW GCC on PATH is never selected (BUG-008). Configure from a VS Developer prompt (vcvars64) so INCLUDE/LIB are set.",
       "cacheVariables": {
         "CMAKE_C_COMPILER": "cl",
-        "CMAKE_CXX_COMPILER": "cl"
+        "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_C_COMPILER_LAUNCHER": "${sourceDir}/tools/portability/sccache",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "${sourceDir}/tools/portability/sccache"
       }
     },
     {

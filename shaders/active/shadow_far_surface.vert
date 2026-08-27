@@ -21,7 +21,7 @@ vec3 projectShadow(vec3 worldPosition) {
     vec3 referenceUp = abs(lightDir.y) > 0.96 ? vec3(0, 0, 1) : vec3(0, 1, 0);
     vec3 right = normalize(cross(referenceUp, lightDir));
     vec3 up = normalize(cross(lightDir, right));
-    const float snap = 0.125;
+    const float snap = 0.5;
     vec2 center = floor(vec2(dot(push.cameraPos.xyz, right),
                              dot(push.cameraPos.xyz, up)) / snap + 0.5) * snap;
     vec2 plane = vec2(dot(worldPosition, right), dot(worldPosition, up)) - center;

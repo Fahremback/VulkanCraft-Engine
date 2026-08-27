@@ -1,5 +1,6 @@
 #include "EditorGUI.hpp"
 #include <iostream>
+#include "engine/core/logging/Log.hpp"
 #include <imgui.h>
 #include "../../core/reflection/Reflection.hpp"
 
@@ -8,7 +9,7 @@ namespace Engine {
 void EditorGUI::init(Scene* scene, UndoSystem* undoSystem) {
     m_activeScene = scene;
     m_undoSystem = undoSystem;
-    std::cout << "[EditorGUI] Visual Engine GUI initialized successfully." << std::endl;
+    VC_LOG_INFO("[EditorGUI] Visual Engine GUI initialized successfully.");
 }
 
 void EditorGUI::update(float deltaTime) {

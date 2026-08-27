@@ -26,9 +26,13 @@ endforeach()
 add_library(vulkan_jolt STATIC ${JOLT_CPP_SOURCES})
 target_include_directories(vulkan_jolt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/jolt)
 target_compile_features(vulkan_jolt PRIVATE cxx_std_17)
+# Jolt checks JPH_ENABLE_ASSERTS with #ifdef, so defining it to 0 still
+# enables asserts (and changes FixedSizeFreeList layout -> ABI mismatch with
+# consumers that compile without the define). Match Jolt's own Jolt.cmake
+# convention: define it (no value) for Debug only, leave it undefined for
+# non-Debug so asserts are off and the layout matches consumers.
 target_compile_definitions(vulkan_jolt PRIVATE
-    $<$<CONFIG:Debug>:JPH_ENABLE_ASSERTS=1>
-    $<$<NOT:$<CONFIG:Debug>>:JPH_ENABLE_ASSERTS=0>
+    $<$<CONFIG:Debug>:JPH_ENABLE_ASSERTS>
 )
 if(MSVC)
     target_compile_options(vulkan_jolt PRIVATE /w)

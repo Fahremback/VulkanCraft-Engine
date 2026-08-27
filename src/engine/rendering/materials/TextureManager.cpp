@@ -3,6 +3,7 @@
 #include <random>
 #include <algorithm>
 #include <filesystem>
+#include "engine/core/logging/Log.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -471,7 +472,7 @@ void TextureManager::init(VkDevice device, VkPhysicalDevice physicalDevice, VmaA
     const fs::path realisticGrassDir = fs::path(VULKANCRAFT_SOURCE_DIR) /
         L"assets/textures/grass/assets/minecraft/textures/block";
     activePackName = pack.empty() ? "procedural" : pack.filename().string();
-    std::cout << "[Textures] Minecraft LabPBR pack: " << activePackName << '\n';
+    VC_LOG_INFO("[Textures] Minecraft LabPBR pack: {}", activePackName);
 
     for (uint32_t layer = 0; layer < layerCount; ++layer) {
         const TextureIndex index = static_cast<TextureIndex>(layer);
