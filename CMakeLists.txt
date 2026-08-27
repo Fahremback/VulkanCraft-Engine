@@ -635,6 +635,8 @@ vc_object_module(vc_sdk_public
     src/engine/sdk/NetworkRpc.cpp
     src/engine/sdk/NetworkInterest.cpp
     src/engine/sdk/NetworkDiscovery.cpp
+    src/engine/sdk/Transport.cpp
+    src/engine/sdk/AssetFormats.cpp
     src/engine/sdk/AssetPipeline.cpp
     src/engine/sdk/Observability.cpp
     src/engine/sdk/PackageManager.cpp
@@ -3476,6 +3478,14 @@ target_include_directories(network_replication_tests PRIVATE
 target_link_libraries(network_replication_tests PRIVATE vc_build_options glm)
 add_test(NAME network_replication_tests COMMAND network_replication_tests)
 
+add_executable(transport_tests
+    tests/TransportTests.cpp
+    src/engine/sdk/Transport.cpp
+)
+target_include_directories(transport_tests PRIVATE src/engine/public src)
+target_link_libraries(transport_tests PRIVATE vc_build_options)
+add_test(NAME transport_tests COMMAND transport_tests)
+
 # Network RPC (agente 5 §6 item 4): RPC determinístico — registro de
 # procedimentos all-or-nothing, fila com id global estritamente crescente,
 # drain destrutivo em ordem de enqueue com ack, JSON bit-exact —
@@ -3617,6 +3627,11 @@ target_include_directories(asset_pipeline_tests PRIVATE
 )
 target_link_libraries(asset_pipeline_tests PRIVATE vc_build_options glm)
 add_test(NAME asset_pipeline_tests COMMAND asset_pipeline_tests)
+
+add_executable(asset_formats_tests tests/AssetFormatsTests.cpp src/engine/sdk/AssetFormats.cpp)
+target_include_directories(asset_formats_tests PRIVATE src/engine/public src)
+target_link_libraries(asset_formats_tests PRIVATE vc_build_options)
+add_test(NAME asset_formats_tests COMMAND asset_formats_tests)
 
 # Character controller (agente 4 §4 item 54, CORE): resolução cinemática de
 # movimento sobre terreno — step-up/step-down/snap, projeção de inclinação,

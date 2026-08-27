@@ -8,7 +8,7 @@ import { execSync } from 'child_process';
 import { existsSync } from 'fs';
 
 const label = process.argv[2] || 'unit';
-const buildDir = 'build';
+const buildDir = process.env.VC_BUILD_DIR || 'build';
 
 function log(msg) { console.log(`[fast-gate] ${msg}`); }
 function fail(msg) { console.error(`[fast-gate] FAIL: ${msg}`); process.exit(1); }

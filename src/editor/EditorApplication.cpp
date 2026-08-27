@@ -345,6 +345,10 @@ void EditorApplication::save_layout_settings() {
         std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "editor-layout.json";
     std::ofstream out(path, std::ios::trunc);
     if (out) out << m_layoutModel.snapshot().to_json() << '\\n';
+    // Persist the actual ImGui dock geometry alongside the public model.
+    // Visibility is synchronized through the model before flushing.
+    apply_layout_visibility_to_imgui();
+    ImGui::SaveIniSettingsToDisk();
 }
 
 void EditorApplication::apply_layout_snapshot_to_imgui() {
@@ -1409,7 +1413,9 @@ void EditorApplication::init_imgui() {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    io.IniFilename = "imgui.ini";
     io.FontGlobalScale = 1.0f; // Forge design system: roomy, not oversized
 
     // Frontend port (Wicked Editor, MIT): the base UI font is Liberation Sans
@@ -2674,6 +2680,15 @@ void EditorApplication::draw_dockspace() {
     // The public layout model is the source of truth for visibility. Apply it
     // every frame so changes made by the Layout Settings panel affect the
     // actual dock windows, not only the serialized model.
+    const auto setWindowVisible = [](const char* name, bool visible) {
+        if (ImGuiWindow* window = ImGui::FindWindowByName(name))
+            window->Hidden = !visible;
+    };
+    setWindowVisible(tr("Cena", "Scene"), m_showHierarchy);
+    setWindowVisible(tr("Inspector", "Inspector"), m_showInspector);
+    setWindowVisible(tr("Viewport", "Viewport"), m_showViewport);
+    setWindowVisible(tr("Assets", "Assets"), m_showContentBrowser);
+    setWindowVisible(tr("Console", "Console"), m_showConsole);
     ImGui::End();
 }
 

@@ -1609,9 +1609,6 @@ void WickedToolsPanel::draw_tools_menu() {
 
 void WickedToolsPanel::draw() {
     if (!m_scene) return;
-    // Tool windows are real dockable ImGui windows; derive their default
-    // geometry from the current viewport so high-DPI and small monitors do not
-    // open panels off-screen.
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     const float scale = std::clamp(vp->DpiScale, 0.75f, 3.0f);
     ImGui::SetNextWindowSizeConstraints(ImVec2(240.0f * scale, 120.0f * scale),

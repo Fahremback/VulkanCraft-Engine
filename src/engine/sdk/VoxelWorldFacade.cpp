@@ -2500,6 +2500,10 @@ public:
             errorOut.clear();
             return true;
         }
+        // Keep the operation pinned while waiting. finish_async_op clears the
+        // facade slot before notifying, so a caller that waits immediately
+        // after dispatch must still observe the completed operation and its
+        // callback, rather than racing with a null slot.
         return wait_async_op(op, errorOut);
     }
 
@@ -2679,7 +2683,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(op->mutex);
             op->finished = true;
-            onDone = std::move(op->onDone);
+            onDone = op->onDone;
         }
         op->cv.notify_all();
         if (onDone) onDone(op->ok, op->error);

@@ -11,6 +11,7 @@ import { readdirSync, statSync, existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
 const ROOT = process.cwd();
+const buildDir = process.env.VC_BUILD_DIR || 'build';
 const problems = [];
 
 // Outputs that must be at least as new as the newest source under their dep
@@ -64,7 +65,7 @@ for (const out of OUTPUTS) {
 // Built exes vs newest source in the tree (bounded scan of src/).
 const srcRoot = join(ROOT, 'src');
 let newestSrc = newestSource(['src']);
-for (const exe of ['build/Release/VulkanEngineGame.exe', 'build/Release/VulkanEngineServer.exe',
+for (const exe of [`${buildDir}/Release/VulkanEngineGame.exe`, `${buildDir}/Release/VulkanEngineServer.exe`,
                     'out/release/VulkanEngineGame.exe', 'out/release/Release/VulkanEngineGame.exe']) {
   if (!existsSync(join(ROOT, exe))) continue;
   const t = statSync(join(ROOT, exe)).mtimeMs;

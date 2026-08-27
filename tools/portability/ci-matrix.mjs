@@ -6,6 +6,7 @@ import { existsSync, mkdirSync } from 'fs';
 
 const platform = process.platform === 'win32' ? 'windows' : 'linux';
 const preset = process.argv[2] || 'release';
+const buildDir = process.env.VC_BUILD_DIR || 'build';
 
 function log(msg) { console.log(`[ci-matrix] ${msg}`); }
 function fail(msg) { console.error(`[ci-matrix] FAIL: ${msg}`); process.exit(1); }
@@ -26,12 +27,12 @@ log(`Platform: ${platform}, Preset: ${preset}`);
 // (preset 'release' -> out/release, Ninja; build/ is the MSVC multi-config
 // tree the gates install from).
 log('Step 1: Configure (build/)');
-if (!existsSync('build')) mkdirSync('build', { recursive: true });
-run(`cmake -S . -B build`);
+if (!existsSync(buildDir)) mkdirSync(buildDir, { recursive: true });
+run(`cmake -S . -B ${buildDir}`);
 
 // Step 2: Build
 log('Step 2: Build (build/ Release)');
-run(`cmake --build build --config Release`);
+run(`cmake --build ${buildDir} --config Release`);
 
 // Step 3: Unit tests (fast gate)
 log('Step 3: Unit tests');

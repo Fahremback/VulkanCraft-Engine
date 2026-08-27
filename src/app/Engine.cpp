@@ -600,15 +600,14 @@ void Engine::init_pipeline() {
 
     VK_CHECK(vkAllocateDescriptorSets(device, &allocInfo, &textureManager.descriptorSet));
 
-    std::array<VkDescriptorImageInfo, 7> imageInfos{};
-    const std::array<VkImageView, 7> imageViews{
+    std::array<VkDescriptorImageInfo, 6> imageInfos{};
+    const std::array<VkImageView, 6> imageViews{
         textureManager.textureArrayImageView,
         textureManager.normalArrayImageView,
         textureManager.specularArrayImageView, shadowImageView,
-        opaqueSceneImageView, opaqueDepthImageView,
-        VK_NULL_HANDLE
+        opaqueSceneImageView, opaqueDepthImageView
     };
-    std::array<VkWriteDescriptorSet, 7> descriptorWrites{};
+    std::array<VkWriteDescriptorSet, 6> descriptorWrites{};
     for (uint32_t index = 0; index < descriptorWrites.size(); ++index) {
         imageInfos[index].imageLayout = index == 3
             ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
@@ -616,11 +615,6 @@ void Engine::init_pipeline() {
         imageInfos[index].imageView = imageViews[index];
         imageInfos[index].sampler = index == 3 ? shadowSampler
             : (index >= 4 && index < 6 ? waterSceneSampler : textureManager.textureSampler);
-        if (index == 6) {
-            // The radiance cache is a storage buffer, not an image. Its
-            // descriptor is written immediately after the image descriptors.
-            continue;
-        }
         descriptorWrites[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         descriptorWrites[index].dstSet = textureManager.descriptorSet;
         descriptorWrites[index].dstBinding = index;
@@ -630,6 +624,9 @@ void Engine::init_pipeline() {
     }
 
     vkUpdateDescriptorSets(device, 6, descriptorWrites.data(), 0, nullptr);
+    // The probe buffer is bound after the six image descriptors. This write is
+    // intentionally performed only after allocation, keeping the descriptor
+    // set valid during pipeline creation.
     if (radianceCacheReady) radianceCache.write_descriptor(textureManager.descriptorSet, 6);
 
     VkPushConstantRange pushConstantRange{};
