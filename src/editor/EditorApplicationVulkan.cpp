@@ -1320,8 +1320,12 @@ glm::mat4 editor_face_view_proj(int face, const glm::vec3& position, float range
     return remap * proj * editor_face_view(face, position);
 }
 
+} // namespace
+
 // Depth-only render pass + comparison sampler, mirroring the sun map exactly
 // (final layout SHADER_READ_ONLY so the viewport can sample without barriers).
+// Defined at Engine scope to match the forward declarations at the top of this
+// file (they are called from other split TUs, e.g. create_point_shadow_map).
 void make_editor_depth_render_pass(VkDevice device, VkFormat depthFormat, VkRenderPass& out) {
     VkAttachmentDescription depthAttachment{};
     depthAttachment.format = depthFormat;
@@ -1329,7 +1333,7 @@ void make_editor_depth_render_pass(VkDevice device, VkFormat depthFormat, VkRend
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    depthAttachment.stencilStoreOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     depthAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkAttachmentReference depthRef{ 0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
@@ -1359,6 +1363,8 @@ VkSampler make_editor_shadow_sampler(VkDevice device) {
     if (vkCreateSampler(device, &samplerInfo, nullptr, &sampler) != VK_SUCCESS) return VK_NULL_HANDLE;
     return sampler;
 }
+
+namespace {
 
 void draw_line_list(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb, uint32_t vertexCount,
                     const glm::mat4& mvp, const glm::vec4& color) {
@@ -2519,11 +2525,6 @@ void EditorApplication::perform_pick_readback() {
 // ===========================================================================
 namespace {
 
-// Voxel grid dims (shared with the sculpting section below).
-constexpr int kVoxelSizeX = 32;
-constexpr int kVoxelSizeY = 24;
-constexpr int kVoxelSizeZ = 32;
-
 // Deterministic terrain height used by BOTH the visual sheet generation
 // (generate_terrain_mesh) and play-mode world collision so colliders match
 // exactly what is drawn. Hash-based value noise + fBm octaves, seeded.
@@ -2572,8 +2573,5 @@ float terrain_surface_height(uint32_t seed, float scale, int octaves,
 // boxes (Engine::Physics::merge_solid_voxels) positioned by the volume's
 // transform, and the procedural terrain becomes sampled column boxes sharing
 // the exact height function of the visual sheet. Bodies land on what they see.
-void EditorApplication::build_play_world_collision() {
-
-}
 
 } // namespace Engine

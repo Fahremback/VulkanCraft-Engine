@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -177,6 +178,9 @@ private:
 
     MessageHandler messageHandler_;
     StatusHandler statusHandler_;
+
+    // Thread-safe RNG for jitter calculation (replaces std::rand()).
+    std::mt19937 rng_{std::random_device{}()};
 };
 
 } // namespace Engine::Networking

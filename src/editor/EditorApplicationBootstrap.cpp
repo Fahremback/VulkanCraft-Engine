@@ -1,4 +1,12 @@
 #include "EditorApplication.hpp"
+#include "EditorInternalHelpers.hpp"
+#include "frontend/ForgeTheme.hpp"
+#include "frontend/IconsFontAwesome6.h"
+#include "frontend/FontAwesomeV6.h"
+#include "frontend/liberation_sans.h"
+#include "../engine/public/engine/compression/ICompressionProvider.hpp"
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_vulkan.h>
 
 namespace Engine {
 // Assinatura restaurada: o split havia cortado o cabeçalho de run()

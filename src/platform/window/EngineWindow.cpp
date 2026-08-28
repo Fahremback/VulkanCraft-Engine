@@ -1,11 +1,11 @@
-#include "Engine.hpp"
+#include "VulkanEngineApp.hpp"
 
 #include <GLFW/glfw3.h>
 #include <algorithm>
 #include <stdexcept>
 
-void Engine::mouse_callback(GLFWwindow* window, double xpos, double ypos) {
-    auto* instancePtr = static_cast<Engine*>(glfwGetWindowUserPointer(window));
+void VulkanEngineApp::mouse_callback(GLFWwindow* window, double xpos, double ypos) {
+    auto* instancePtr = static_cast<VulkanEngineApp*>(glfwGetWindowUserPointer(window));
     if (!instancePtr || instancePtr->isPaused) return;
     float xPosF = static_cast<float>(xpos);
     float yPosF = static_cast<float>(ypos);
@@ -25,8 +25,8 @@ void Engine::mouse_callback(GLFWwindow* window, double xpos, double ypos) {
     instancePtr->player.camera.process_mouse_movement(xoffset, yoffset);
 }
 
-void Engine::mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
-    auto* instancePtr = static_cast<Engine*>(glfwGetWindowUserPointer(window));
+void VulkanEngineApp::mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
+    auto* instancePtr = static_cast<VulkanEngineApp*>(glfwGetWindowUserPointer(window));
     if (!instancePtr || action != GLFW_PRESS) return;
 
     if (instancePtr->isPaused) {
@@ -84,21 +84,21 @@ void Engine::mouse_button_callback(GLFWwindow* window, int button, int action, i
     }
 }
 
-void Engine::framebuffer_size_callback(GLFWwindow* window, int width, int height) {
-    auto* instancePtr = static_cast<Engine*>(glfwGetWindowUserPointer(window));
+void VulkanEngineApp::framebuffer_size_callback(GLFWwindow* window, int width, int height) {
+    auto* instancePtr = static_cast<VulkanEngineApp*>(glfwGetWindowUserPointer(window));
     if (!instancePtr || width <= 0 || height <= 0) return;
     instancePtr->framebufferResized = true;
 }
 
 
-void Engine::init_window() {
+void VulkanEngineApp::init_window() {
     if (!glfwInit()) {
         throw std::runtime_error("Failed to initialize GLFW");
     }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
-    window = glfwCreateWindow(windowExtent.width, windowExtent.height, "VulkanCraft - Minecraft Engine C++", nullptr, nullptr);
+    window = glfwCreateWindow(windowExtent.width, windowExtent.height, "VulkanCraft - Minecraft VulkanEngineApp C++", nullptr, nullptr);
     if (!window) {
 
         throw std::runtime_error("Failed to create GLFW Window");
@@ -114,7 +114,7 @@ void Engine::init_window() {
 }
 
 
-void Engine::toggle_fullscreen() {
+void VulkanEngineApp::toggle_fullscreen() {
     if (!fullscreen) {
         glfwGetWindowPos(window, &windowedX, &windowedY);
         glfwGetWindowSize(window, &windowedWidth, &windowedHeight);

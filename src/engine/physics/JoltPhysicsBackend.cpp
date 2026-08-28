@@ -559,6 +559,12 @@ void JoltPhysicsBackend::add_force(BodyHandle body, const glm::vec3& force) {
     impl_->physicsSystem->GetBodyInterface().AddForce(it->second.id, to_jolt(force));
 }
 
+void JoltPhysicsBackend::add_torque(BodyHandle body, const glm::vec3& torque) {
+    const auto it = impl_->bodies_.find(body);
+    if (it == impl_->bodies_.end()) return;
+    impl_->physicsSystem->GetBodyInterface().AddTorque(it->second.id, to_jolt(torque));
+}
+
 void JoltPhysicsBackend::apply_impulse(BodyHandle body, const glm::vec3& impulse) {
     const auto it = impl_->bodies_.find(body);
     if (it == impl_->bodies_.end()) return;

@@ -1,5 +1,6 @@
-#define VMA_IMPLEMENTATION
-#include "Engine.hpp"
+// VMA implementation lives in vc_material_pipeline (VmaImplementation.cpp);
+// defining VMA_IMPLEMENTATION here too causes duplicate-symbol link errors.
+#include "VulkanEngineApp.hpp"
 #include "TextureManager.hpp"
 #include "engine/rendering/lighting/RadianceCache.hpp"
 
@@ -66,7 +67,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     return VK_FALSE;
 }
 
-void Engine::init() {
+void VulkanEngineApp::init() {
     std::ofstream clearLog("vulkan_validation_log.txt", std::ios::trunc);
     clearLog.close();
 
@@ -116,15 +117,15 @@ void Engine::init() {
     init_arm_mesh();
 
     isInitialized = true;
-    std::cout << "[Engine] Vulkan 1.3 AAA Texture Engine Initialized Successfully!\n" << std::endl;
+    std::cout << "[VulkanEngineApp] Vulkan 1.3 AAA Texture VulkanEngineApp Initialized Successfully!\n" << std::endl;
 }
 
-void Engine::init_gpu_feature_binding() {
+void VulkanEngineApp::init_gpu_feature_binding() {
     Engine::Rendering::create_gpu_feature_binding(device, allocator, gpuFeatureBinding);
     gpuFeaturesReady = gpuFeatureBinding.mapped != nullptr;
 }
 
-void Engine::refresh_gpu_features() {
+void VulkanEngineApp::refresh_gpu_features() {
     gpuFeatures.gi = glm::vec4(radianceCacheReady ? 1.0f : 0.0f,
                                radianceCacheReady ? 0.42f : 0.0f,
                                restirDi ? 1.0f : 0.0f,
@@ -181,22 +182,22 @@ void Engine::refresh_gpu_features() {
     }
 }
 
-void Engine::destroy_gpu_feature_binding() {
+void VulkanEngineApp::destroy_gpu_feature_binding() {
     Engine::Rendering::destroy_gpu_feature_binding(device, allocator, gpuFeatureBinding);
     gpuFeaturesReady = false;
 }
 
-void Engine::init_gpu_feature_passes() {
+void VulkanEngineApp::init_gpu_feature_passes() {
     gpuFeaturePasses = {};
     gpuFeaturePasses.initialized = Engine::Rendering::create_gpu_feature_passes(
         device, allocator, VK_FORMAT_R16G16B16A16_SFLOAT, swapchainExtent, gpuFeaturePasses);
 }
 
-void Engine::destroy_gpu_feature_passes() {
+void VulkanEngineApp::destroy_gpu_feature_passes() {
     Engine::Rendering::destroy_gpu_feature_passes(device, allocator, gpuFeaturePasses);
 }
 
-void Engine::init_vulkan() {
+void VulkanEngineApp::init_vulkan() {
     vkb::InstanceBuilder builder;
     auto inst_ret = builder.set_app_name("VulkanCraft")
         .request_validation_layers(true)
@@ -266,11 +267,11 @@ void Engine::init_vulkan() {
     VK_CHECK(vmaCreateAllocator(&allocatorInfo, &allocator));
 }
 
-void Engine::init_swapchain() {
+void VulkanEngineApp::init_swapchain() {
     create_swapchain(VK_NULL_HANDLE);
 }
 
-void Engine::create_swapchain(VkSwapchainKHR oldSwapchain) {
+void VulkanEngineApp::create_swapchain(VkSwapchainKHR oldSwapchain) {
     int framebufferWidth = 0;
     int framebufferHeight = 0;
     glfwGetFramebufferSize(window, &framebufferWidth, &framebufferHeight);
@@ -312,7 +313,7 @@ void Engine::create_swapchain(VkSwapchainKHR oldSwapchain) {
     }
 }
 
-void Engine::destroy_screen_targets() {
+void VulkanEngineApp::destroy_screen_targets() {
     if (depthImageView != VK_NULL_HANDLE) vkDestroyImageView(device, depthImageView, nullptr);
     if (depthImage != VK_NULL_HANDLE) vmaDestroyImage(allocator, depthImage, depthAllocation);
     if (opaqueDepthImageView != VK_NULL_HANDLE) vkDestroyImageView(device, opaqueDepthImageView, nullptr);
@@ -336,7 +337,7 @@ void Engine::destroy_screen_targets() {
     opaqueSceneImageView = VK_NULL_HANDLE;
 }
 
-void Engine::initialize_screen_target_layouts() {
+void VulkanEngineApp::initialize_screen_target_layouts() {
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo allocateInfo{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocateInfo.commandPool = frames[0].commandPool;
@@ -388,7 +389,7 @@ void Engine::initialize_screen_target_layouts() {
     vkFreeCommandBuffers(device, frames[0].commandPool, 1, &commandBuffer);
 }
 
-void Engine::update_screen_descriptors() {
+void VulkanEngineApp::update_screen_descriptors() {
     std::array<VkDescriptorImageInfo, 2> sceneImages{};
     sceneImages[0] = { waterSceneSampler, opaqueSceneImageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     sceneImages[1] = { waterSceneSampler, opaqueDepthImageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
@@ -418,7 +419,7 @@ void Engine::update_screen_descriptors() {
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(postWrites.size()), postWrites.data(), 0, nullptr);
 }
 
-bool Engine::recreate_swapchain() {
+bool VulkanEngineApp::recreate_swapchain() {
     int framebufferWidth = 0;
     int framebufferHeight = 0;
     glfwGetFramebufferSize(window, &framebufferWidth, &framebufferHeight);
@@ -459,7 +460,7 @@ bool Engine::recreate_swapchain() {
     return true;
 }
 
-void Engine::init_depth_buffer() {
+void VulkanEngineApp::init_depth_buffer() {
     VkImageCreateInfo depthImageInfo{.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     depthImageInfo.imageType = VK_IMAGE_TYPE_2D;
     depthImageInfo.format = VK_FORMAT_D32_SFLOAT;
@@ -496,7 +497,7 @@ void Engine::init_depth_buffer() {
     VK_CHECK(vkCreateImageView(device, &viewInfo, nullptr, &opaqueDepthImageView));
 }
 
-void Engine::init_shadow_map() {
+void VulkanEngineApp::init_shadow_map() {
     VkImageCreateInfo info{.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.imageType=VK_IMAGE_TYPE_2D; info.format=VK_FORMAT_D32_SFLOAT; info.extent={2048,2048,1};
     info.mipLevels=1; info.arrayLayers=1; info.samples=VK_SAMPLE_COUNT_1_BIT; info.tiling=VK_IMAGE_TILING_OPTIMAL;
@@ -513,7 +514,7 @@ void Engine::init_shadow_map() {
     VK_CHECK(vkCreateSampler(device,&si,nullptr,&shadowSampler));
 }
 
-void Engine::init_minimap() {
+void VulkanEngineApp::init_minimap() {
     auto createImage = [&](VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
                            VkImage& image, VmaAllocation& allocation, VkImageView& view) {
         VkImageCreateInfo info{.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO}; info.imageType=VK_IMAGE_TYPE_2D;
@@ -534,7 +535,7 @@ void Engine::init_minimap() {
     VK_CHECK(vkCreateSampler(device,&si,nullptr,&minimapSampler));
 }
 
-void Engine::init_hdr_target() {
+void VulkanEngineApp::init_hdr_target() {
     VkImageCreateInfo imageInfo{.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
     imageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -576,7 +577,7 @@ void Engine::init_hdr_target() {
     }
 }
 
-void Engine::init_commands() {
+void VulkanEngineApp::init_commands() {
     VkCommandPoolCreateInfo commandPoolInfo = {};
     commandPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     commandPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -595,7 +596,7 @@ void Engine::init_commands() {
     }
 }
 
-void Engine::init_sync_structures() {
+void VulkanEngineApp::init_sync_structures() {
     VkFenceCreateInfo fenceCreateInfo = {};
     fenceCreateInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
@@ -609,7 +610,7 @@ void Engine::init_sync_structures() {
     }
 }
 
-VkShaderModule Engine::load_shader_module(const std::string& filePath) {
+VkShaderModule VulkanEngineApp::load_shader_module(const std::string& filePath) {
     std::ifstream file(filePath, std::ios::ate | std::ios::binary);
     if (!file.is_open()) {
         throw std::runtime_error("Failed to open shader file: " + filePath);
@@ -629,7 +630,7 @@ VkShaderModule Engine::load_shader_module(const std::string& filePath) {
     return shaderModule;
 }
 
-void Engine::init_pipeline() {
+void VulkanEngineApp::init_pipeline() {
     VkShaderModule vertShader = load_shader_module(VULKANCRAFT_SHADER_DIR "/voxel.vert.spv");
     VkShaderModule farSurfaceVertShader = load_shader_module(VULKANCRAFT_SHADER_DIR "/far_surface.vert.spv");
     VkShaderModule fragShader = load_shader_module(VULKANCRAFT_SHADER_DIR "/voxel.frag.spv");
@@ -1005,7 +1006,7 @@ void Engine::init_pipeline() {
     vkDestroyShaderModule(device, shadowGrassVertShader, nullptr);
 }
 
-void Engine::init_arm_mesh() {
+void VulkanEngineApp::init_arm_mesh() {
     constexpr float skinLayer = static_cast<float>(TextureIndex::PlayerSkin);
     struct PartUV { float u, v, w, h, d; };
 
@@ -1086,7 +1087,7 @@ void Engine::init_arm_mesh() {
     upload(body, characterBuffer, characterVertexCount);
 }
 
-void Engine::draw_arm(VkCommandBuffer cmd, const glm::mat4& view, const glm::mat4& proj) {
+void VulkanEngineApp::draw_arm(VkCommandBuffer cmd, const glm::mat4& view, const glm::mat4& proj) {
     if (armVertexCount == 0 || armBuffer.buffer == VK_NULL_HANDLE) return;
 
     glm::mat4 invView = glm::inverse(view);
@@ -1141,7 +1142,7 @@ void Engine::draw_arm(VkCommandBuffer cmd, const glm::mat4& view, const glm::mat
     }
 }
 
-void Engine::draw_character(VkCommandBuffer cmd, const glm::mat4& view, const glm::mat4& proj) {
+void VulkanEngineApp::draw_character(VkCommandBuffer cmd, const glm::mat4& view, const glm::mat4& proj) {
     if (characterVertexCount == 0 || characterBuffer.buffer == VK_NULL_HANDLE) return;
     glm::mat4 model = glm::translate(glm::mat4(1.0f), player.position);
     model = glm::rotate(model, glm::radians(90.0f - player.camera.yaw), glm::vec3(0,1,0));
@@ -1156,7 +1157,7 @@ void Engine::draw_character(VkCommandBuffer cmd, const glm::mat4& view, const gl
     vkCmdDraw(cmd,characterVertexCount,1,0,0);
 }
 
-void Engine::draw() {
+void VulkanEngineApp::draw() {
     VK_CHECK(vkWaitForFences(device, 1, &get_current_frame().renderFence, VK_TRUE, 1000000000));
 
     uint32_t swapchainImageIndex;
@@ -1331,7 +1332,7 @@ void Engine::draw() {
         featureUpload.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         featureUpload.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
         featureUpload.buffer = gpuFeaturePasses.featureBuffer;
-        featureUpload.size = sizeof(GpuRenderFeatures);
+        featureUpload.size = sizeof(Engine::Rendering::GpuRenderFeatures);
         VkDependencyInfo uploadDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
         uploadDependency.bufferMemoryBarrierCount = 1;
         uploadDependency.pBufferMemoryBarriers = &featureUpload;

@@ -51,6 +51,8 @@ struct PluginVersion {
     bool operator==(const PluginVersion& other) const noexcept { return compare(other) == 0; }
     bool operator!=(const PluginVersion& other) const noexcept { return !(*this == other); }
     bool operator<(const PluginVersion& other) const noexcept { return compare(other) < 0; }
+    bool operator>(const PluginVersion& other) const noexcept { return compare(other) > 0; }
+    bool operator<=(const PluginVersion& other) const noexcept { return compare(other) <= 0; }
     bool operator>=(const PluginVersion& other) const noexcept { return compare(other) >= 0; }
 };
 

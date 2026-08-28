@@ -56,7 +56,7 @@ struct FrameData {
     VkSemaphore swapchainSemaphore;
 };
 
-class Engine {
+class VulkanEngineApp {
 public:
     bool isInitialized{ false };
     bool isPaused{ false };
@@ -188,8 +188,8 @@ public:
     float deltaTime{ 0.0f };
     float lastFrameTime{ 0.0f };
 
-    Engine() = default;
-    ~Engine() = default;
+    VulkanEngineApp() = default;
+    ~VulkanEngineApp() = default;
 
     void init();
     void run();

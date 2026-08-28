@@ -239,6 +239,8 @@ struct Parser {
     const std::string& text;
     std::size_t pos{0};
     std::string error;
+    std::size_t depth_{0};
+    static constexpr std::size_t kMaxDepth = 128;
 
     explicit Parser(const std::string& source) : text(source) {}
 
@@ -360,10 +362,11 @@ struct Parser {
     }
 
     Value parse_array() {
+        if (++depth_ > kMaxDepth) { fail("maximum nesting depth exceeded"); return Value(); }
         Value array = Value::make_array();
         ++pos; // '['
         skip_whitespace();
-        if (consume(']')) return array;
+        if (consume(']')) { --depth_; return array; }
         while (true) {
             skip_whitespace();
             array.push(parse_value());
@@ -371,14 +374,16 @@ struct Parser {
             if (consume(']')) break;
             if (!consume(',')) { fail("expected ',' or ']' in array"); break; }
         }
+        --depth_;
         return array;
     }
 
     Value parse_object() {
+        if (++depth_ > kMaxDepth) { fail("maximum nesting depth exceeded"); return Value(); }
         Value object = Value::make_object();
         ++pos; // '{'
         skip_whitespace();
-        if (consume('}')) return object;
+        if (consume('}')) { --depth_; return object; }
         while (true) {
             skip_whitespace();
             if (peek() != '"') { fail("expected object key string"); break; }
@@ -391,6 +396,7 @@ struct Parser {
             if (consume('}')) break;
             if (!consume(',')) { fail("expected ',' or '}' in object"); break; }
         }
+        --depth_;
         return object;
     }
 

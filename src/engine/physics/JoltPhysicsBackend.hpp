@@ -31,6 +31,7 @@ public:
     void set_linear_damping(BodyHandle body, float damping) override;
 
     void add_force(BodyHandle body, const glm::vec3& force) override;
+    void add_torque(BodyHandle body, const glm::vec3& torque) override;
     void apply_impulse(BodyHandle body, const glm::vec3& impulse) override;
     void apply_impulse_at_point(BodyHandle body, const glm::vec3& impulse, const glm::vec3& worldPoint) override;
     void wake(BodyHandle body) override;

@@ -3,6 +3,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace {
 std::string read(const std::filesystem::path& path) {
@@ -28,24 +29,39 @@ int main() {
     const auto worldSource = read(root / "src/simulation/voxel/streaming/World.cpp");
     const auto playerHeader = read(root / "src/features/player/Player.hpp");
     const auto playerSource = read(root / "src/features/player/Player.cpp");
-    const auto editorSource = read(root / "src/editor/EditorApplication.cpp");
 
 #ifdef _WIN32
     // Play mode is in-process via PlayModeManager (engine/editor/play_mode),
-    // NOT a subprocess that embeds the legacy 1.5 game window. Guard both
-    // directions so nobody reintroduces the external-process embed.
-    const bool legacyEmbed =
-        editorSource.find("1.5/build/Release/vulkan_craft.exe") != std::string::npos ||
-        editorSource.find("SetParent") != std::string::npos ||
-        editorSource.find("MoveWindow") != std::string::npos ||
-        editorSource.find("WS_CHILD") != std::string::npos ||
-        editorSource.find("ScreenToClient") != std::string::npos;
+    // NOT a subprocess that embeds the legacy 1.5 game window. The editor was
+    // split into modular TUs (EditorApplicationPlay/Panels/Bootstrap/...), so
+    // scan every editor source file for the embed patterns (none may appear)
+    // and require the in-process start/stop orchestration to be present across
+    // the module set (it is wired in EditorApplicationPanels/Bootstrap/etc).
+    const std::vector<std::string> embedPatterns{
+        "1.5/build/Release/vulkan_craft.exe", "SetParent", "MoveWindow",
+        "WS_CHILD", "ScreenToClient"};
+    bool anyPlayStart = false;
+    bool anyPlayStop = false;
+    bool legacyEmbed = false;
+    for (const auto& entry : std::filesystem::directory_iterator(root / "src/editor")) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() != ".cpp") continue;
+        const auto source = read(entry.path());
+        for (const auto& pat : embedPatterns) {
+            if (source.find(pat) != std::string::npos) {
+                legacyEmbed = true;
+                std::cerr << "Legacy 1.5 game-embed pattern '" << pat
+                          << "' found in " << entry.path() << "\n";
+            }
+        }
+        if (source.find("m_playMode.start_play(") != std::string::npos) anyPlayStart = true;
+        if (source.find("m_playMode.stop_play(") != std::string::npos) anyPlayStop = true;
+    }
     if (legacyEmbed) {
         std::cerr << "Windows editor play mode must not embed the legacy 1.5 game (use in-process PlayModeManager)\n";
         return 1;
     }
-    if (editorSource.find("m_playMode.start_play(") == std::string::npos ||
-        editorSource.find("m_playMode.stop_play(") == std::string::npos) {
+    if (!anyPlayStart || !anyPlayStop) {
         std::cerr << "Windows editor play mode must run through PlayModeManager (in-process start/stop)\n";
         return 1;
     }

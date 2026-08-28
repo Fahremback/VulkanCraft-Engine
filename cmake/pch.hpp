@@ -1,5 +1,6 @@
 #pragma once
 
+// ── Standard library (parsed once for all TUs) ──
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -35,3 +36,10 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+// ── GLM — used by 80% of engine TUs (physics, animation, rendering, scene) ──
+// Parsing these headers from scratch in every TU costs ~2-5s each.
+#include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/constants.hpp>

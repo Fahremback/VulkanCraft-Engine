@@ -5,6 +5,9 @@
 
 #include "EditorInternalHelpers.hpp"
 #include "BlockTextureAtlas.hpp"
+
+// build_cube is implemented in EditorApplicationPanels.cpp; this declaration
+// is exposed by EditorInternalHelpers.hpp so the current split stays modular.
 #include <cmath>
 #include <cstring>
 #include <fstream>

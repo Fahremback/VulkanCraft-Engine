@@ -1,4 +1,16 @@
 #include "EditorApplication.hpp"
+#include "EditorInternalHelpers.hpp"
+#include "../engine/animation/AnimationAssets.hpp"
+#include "../engine/animation/AnimationRuntime.hpp"
+#include "../engine/audio/OggDecoder.hpp"
+#include "../engine/physics/VoxelBoxMerger.hpp"
+#include <Unknwn.h>
+#include <objbase.h>
+#include <objidl.h>
+#include <wincodec.h>
+#include <wrl/client.h>
+
+using Microsoft::WRL::ComPtr;
 
 namespace Engine {
 

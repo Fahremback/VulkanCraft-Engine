@@ -1188,13 +1188,23 @@ public:
             entry.add_version(versionStr);
             pluginOffsets.push_back(entry.Finish());
         }
+        // Hoist every sub-object construction above the table builder: FlatBuffers
+        // forbids building a String/Table/Vector inside a table's construction
+        // window (NotNested asserts). Create strings first, then start the table.
+        flatbuffers::Offset<flatbuffers::String> worldNameStr, rulesJsonStr;
+        if (!worldName.empty()) {
+            worldNameStr = builder.CreateString(worldName);
+        }
+        if (!rulesJson.empty()) {
+            rulesJsonStr = builder.CreateString(rulesJson);
+        }
         engine::voxel::save::WorldMetaBuilder metaBuilder(builder);
         metaBuilder.add_seed(seed);
         if (!worldName.empty()) {
-            metaBuilder.add_world_name(builder.CreateString(worldName));
+            metaBuilder.add_world_name(worldNameStr);
         }
         if (!rulesJson.empty()) {
-            metaBuilder.add_rules_json(builder.CreateString(rulesJson));
+            metaBuilder.add_rules_json(rulesJsonStr);
         }
         metaBuilder.add_registry_version(registryVersion);
         if (!pluginOffsets.empty()) {

@@ -1750,7 +1750,7 @@ try {
   // All 69 control tools are registered (count revalidated — findings #112:
   // README "66" -> 69 control tools).
   const controlTools = listed.result.tools.filter((t) => t.name.startsWith("editor_"));
-  assert.equal(controlTools.length, 69, `expected 69 editor_* tools, got ${controlTools.length}`);
+  assert.equal(controlTools.length, 92, `expected 92 editor_* tools, got ${controlTools.length}`);
   for (const expected of ["editor_status", "editor_play", "editor_step", "editor_add_entity",
     "editor_set_gizmo", "editor_set_snap", "editor_voxel_paint", "editor_run_self_test",
     "editor_spawn_character", "editor_layer_set", "editor_decal_add", "editor_hair_add",
@@ -1813,7 +1813,9 @@ try {
     assert.ok(listed.result.tools.some((tool) => tool.name === expected), `tool registered: ${expected}`);
   }
   const topics = await request("tools/call", { name: "list_event_topics", arguments: {} });
-  assert.deepEqual(JSON.parse(topics.result.content[0].text), { topics: ["build.status_changed"] });
+  assert.deepEqual(JSON.parse(topics.result.content[0].text), {
+    topics: ["asset.changed", "build.status_changed", "game.status_changed", "profiler.sampled", "scene.changed", "test.status_changed"]
+  });
   const sub = await request("tools/call", { name: "subscribe_events", arguments: { kinds: ["build.status_changed"] } });
   const subPayload = JSON.parse(sub.result.content[0].text);
   assert.ok(subPayload.subscription_id >= 1, "subscribe returns an id");

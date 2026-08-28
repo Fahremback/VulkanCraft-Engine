@@ -10,9 +10,32 @@
 #include <memory>
 #include <vector>
 
+// The vendored embree4 build does not honor per-ray cull flags in its
+// kernels (it is a stripped subset). We therefore upload triangles double-sided
+// and apply single-sided semantics (cull when dot(winding_normal, dir) >= 0)
+// manually in the adapter, matching the gate's brute-force Möller–Trumbore.
 namespace vc::rendering {
 
 namespace {
+
+struct Vec3f { float x, y, z; };
+Vec3f vsub(Vec3f a, Vec3f b) { return {a.x-b.x, a.y-b.y, a.z-b.z}; }
+Vec3f vcross(Vec3f a, Vec3f b) { return {a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x}; }
+float vdot(Vec3f a, Vec3f b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+
+// Single-sided test: returns true when the hit triangle's winding normal
+// faces the ray (dot(normal, dir) < 0), i.e. a valid front-face hit.
+bool front_facing(const float* v0, const float* v1, const float* v2,
+                  const RayTracerRay& ray) {
+    const Vec3f a{v0[0], v0[1], v0[2]};
+    const Vec3f b{v1[0], v1[1], v1[2]};
+    const Vec3f c{v2[0], v2[1], v2[2]};
+    const Vec3f n = vcross(vsub(b, a), vsub(c, a));
+    const Vec3f d{ray.dx, ray.dy, ray.dz};
+    // Cull back face: dot(normal, dir) > 0.  (>= 0 matches the reference; a
+    // grazing dot==0 hit is numerically ambiguous so we treat it as outside.)
+    return vdot(n, d) < 0.0f;
+}
 
 // RAII do estado Embree (device + scene + geometry por instância do tracer).
 class EmbreeRayTracerImpl final : public IRayTracer {
@@ -28,6 +51,8 @@ public:
 
         RTCDevice device = rtcNewDevice(nullptr);
         if (device == nullptr) return false;
+
+
 
         RTCScene scene = rtcNewScene(device);
         RTCGeometry geometry = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_TRIANGLE);
@@ -67,6 +92,7 @@ public:
         geometry_ = geometry;
         vertices_ = std::move(vertices);
         indices_ = std::move(indices);
+        vertex_index_count_ = static_cast<std::uint32_t>(count);
         return true;
     }
 
@@ -88,10 +114,20 @@ public:
         rh.hit.primID = RTC_INVALID_GEOMETRY_ID;
         rtcIntersect1(scene_, &rh);
 
+        // Single-sided cull: accept the closest hit only if it is a front face
+        // (dot(normal, dir) < 0). The vendored embree does not cull back faces
+        // itself, so we apply the semantics here.
         if (rh.hit.geomID != RTC_INVALID_GEOMETRY_ID) {
-            out.hit = true;
-            out.t = rh.ray.tfar;
-            out.primitiveIndex = static_cast<int32_t>(rh.hit.primID);
+            const std::uint32_t p = rh.hit.primID;
+            if (p < vertex_index_count_ &&
+                front_facing(&vertices_[static_cast<size_t>(indices_[p*3u])*3u],
+                             &vertices_[static_cast<size_t>(indices_[p*3u+1u])*3u],
+                             &vertices_[static_cast<size_t>(indices_[p*3u+2u])*3u],
+                             ray)) {
+                out.hit = true;
+                out.t = rh.ray.tfar;
+                out.primitiveIndex = static_cast<int32_t>(p);
+            }
         }
         return out;
     }
@@ -107,7 +143,8 @@ public:
         r.flags = 0;
         rtcOccluded1(scene_, &r);
         // rtcOccluded1 sinaliza occlusion com tfar NEGATIVO (RTCRay não tem geomID).
-        return r.tfar < 0.0f;
+        // Single-sided: exclude back-face hits, so run closestHit and reuse it.
+        return closestHit(ray).hit;
     }
 
 private:
@@ -124,6 +161,7 @@ private:
     RTCGeometry geometry_ = nullptr;
     std::vector<float> vertices_;
     std::vector<std::uint32_t> indices_;
+    std::uint32_t vertex_index_count_ = 0;  // number of triangles
 };
 
 }  // namespace

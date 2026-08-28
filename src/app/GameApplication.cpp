@@ -1,13 +1,13 @@
 #include "GameApplication.hpp"
 
-#include "Engine.hpp"
+#include "VulkanEngineApp.hpp"
 
 #include <cstdlib>
 #include <exception>
 #include <iostream>
 
 int GameApplication::run() {
-    Engine engine;
+    VulkanEngineApp engine;
     try {
         engine.init();
         engine.run();

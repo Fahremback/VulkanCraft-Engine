@@ -5,7 +5,11 @@ namespace Engine::Networking {
 
 ConnectionId ConnectionRegistry::add(std::string endpoint, double now) {
     std::lock_guard<std::mutex> lock(mutex_);
-    ConnectionId id{nextId_++};
+    // Skip ID 0 (reserved as invalid) and avoid reusing active IDs on wrap-around.
+    ConnectionId id{++nextId_};
+    while (id.value == 0 || connections_.count(id) > 0) {
+        id = ConnectionId{++nextId_};
+    }
     connections_[id] = ConnectionInfo{id, ConnectionStatus::Connecting, std::move(endpoint), now, 0};
     return id;
 }

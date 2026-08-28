@@ -132,6 +132,25 @@ async function callEditor(name, endpoint, extra = {}) {
   }
 }
 
+// GET variant for the observability endpoints (read-only state snapshots).
+async function callEditorGet(name, endpoint, extra = {}) {
+  try {
+    const res = await controlGet(endpoint);
+    if (res.status !== 200) {
+      throw new Error(`Control API returned HTTP ${res.status} for ${endpoint}`);
+    }
+    return wrapped(name, endpoint, res.body, extra);
+  } catch (error) {
+    if (error.code === "ECONNREFUSED") {
+      throw new Error(
+        "Editor not reachable on 127.0.0.1:8321 — start VulkanEngineEditor first. " +
+        "Use run_game (exe=VulkanEngineEditor, seconds>=15) or launch the editor manually."
+      );
+    }
+    throw error;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Argument helpers
 // ---------------------------------------------------------------------------
@@ -881,6 +900,130 @@ export function controlApiToolDefinitions() {
       name: "editor_hot_reload",
       description: "Force the asset hot-reload watcher to check and reimport changed sources now.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+
+    // ---- Observability (read-only state snapshots, GET /<endpoint>) -------
+    // Each mirrors one Control API observability route (EditorControlApi.cpp).
+    // These are the UI/editor state surfaces that MCP-driven agents query
+    // (BUG-011: the UI surface existed only as HTTP, not as MCP tools).
+    {
+      name: "editor_ui_doc",
+      description: "Composed UI document (GET /ui-doc): layout+widgets+viewport+confirmations of the running editor.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_panels",
+      description: "Registered editor panels (GET /panels) from the plugin registry.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_layout",
+      description: "Persistent editor layout snapshot (GET /layout): visibility, active panel, gizmo mode.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_messages",
+      description: "Message catalog of the running editor (GET /messages): stable ids, severity, text, suggested action.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_shortcuts",
+      description: "Documented keyboard shortcuts of the current action map (GET /shortcuts), post-rebind, UNBOUND visible.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_play_mode",
+      description: "Play mode state machine snapshot (GET /play-mode): Edit/Play/Pause/Simulate and validity.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_commands_search",
+      description: "Global command palette search (GET /commands/search?q=…): ranked deterministic matches.",
+      inputSchema: {
+        type: "object",
+        properties: { q: { type: "string", default: "", description: "search query" } },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_profiler",
+      description: "Frame profiler snapshot (GET /profiler): frame time, heap, spikes, p95/p99 stats.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_undo",
+      description: "Undo history snapshot (GET /undo): stack depth, merge state, JSON deterministic.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_content_browser",
+      description: "Content browser index (GET /content-browser): assets and folder tree from the real AssetRegistry.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_window_mode",
+      description: "Window mode machine snapshot (GET /window-mode): Windowed/Borderless/Fullscreen + geometry.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_camera",
+      description: "Editor camera state (GET /camera): orbit yaw/pitch, distance, target, position.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_gizmo",
+      description: "Gizmo controller state (GET /gizmo): mode, space, snap, delta formulas.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_publish",
+      description: "Publish pipeline model (GET /publish): Idle/Cooking/Packaging/Publishing/Done/Failed with counters.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_inspector",
+      description: "Inspector document (GET /inspector): semantic groups + typed property descriptors of the selected entity.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_hierarchy",
+      description: "Scene hierarchy snapshot (GET /hierarchy): flat deterministic DFS list with depth + search.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_onboarding",
+      description: "Onboarding tour state (GET /onboarding): first-run tour steps over real editor surfaces.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_timeline_editor",
+      description: "Animation timeline editor state (GET /timeline-editor): tracks, keys, playhead, loop.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_project_launcher",
+      description: "Project launcher state (GET /launcher): launcher_mode, scene path, dirty, recent projects.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_retargeting",
+      description: "Animation retargeting state (GET /retargeting): skeletons, bone mapping, root motion.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_qt_doc",
+      description: "Qt editor shell document (GET /qt-doc): docks, actions, menus, toolbars, status of the Qt port.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_qt_theme",
+      description: "Qt theme model (GET /qt-theme): QPalette roles + QSS derived from the same charcoal base colors as ImGui.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_templates",
+      description: "Project templates registry (GET /templates): built-in templates for new projects.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
     }
   ];
 }
@@ -1242,6 +1385,34 @@ export async function callControlApiTool(name, args = {}) {
     }
     case "editor_package_assets": return callEditor(name, "/package");
     case "editor_hot_reload": return callEditor(name, "/hot-reload");
+
+    // ---- Observability (read-only GET snapshots) ---------------------------
+    case "editor_ui_doc": return callEditorGet(name, "/ui-doc");
+    case "editor_panels": return callEditorGet(name, "/panels");
+    case "editor_layout": return callEditorGet(name, "/layout");
+    case "editor_messages": return callEditorGet(name, "/messages");
+    case "editor_shortcuts": return callEditorGet(name, "/shortcuts");
+    case "editor_play_mode": return callEditorGet(name, "/play-mode");
+    case "editor_profiler": return callEditorGet(name, "/profiler");
+    case "editor_undo": return callEditorGet(name, "/undo");
+    case "editor_content_browser": return callEditorGet(name, "/content-browser");
+    case "editor_window_mode": return callEditorGet(name, "/window-mode");
+    case "editor_camera": return callEditorGet(name, "/camera");
+    case "editor_gizmo": return callEditorGet(name, "/gizmo");
+    case "editor_publish": return callEditorGet(name, "/publish");
+    case "editor_inspector": return callEditorGet(name, "/inspector");
+    case "editor_hierarchy": return callEditorGet(name, "/hierarchy");
+    case "editor_onboarding": return callEditorGet(name, "/onboarding");
+    case "editor_timeline_editor": return callEditorGet(name, "/timeline-editor");
+    case "editor_project_launcher": return callEditorGet(name, "/launcher");
+    case "editor_retargeting": return callEditorGet(name, "/retargeting");
+    case "editor_qt_doc": return callEditorGet(name, "/qt-doc");
+    case "editor_qt_theme": return callEditorGet(name, "/qt-theme");
+    case "editor_templates": return callEditorGet(name, "/templates");
+    case "editor_commands_search": {
+      const q = queryEscape(String(args.q ?? ""));
+      return callEditorGet(name, `/commands/search?q=${q}`);
+    }
 
     default:
       return undefined;

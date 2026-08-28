@@ -59,7 +59,7 @@ using Engine::UI::endCard;
 // Forward-declare the Engine namespace and key types so entityIcon's
 // signature can reference them without dragging Scene.hpp (which would
 // reintroduce the brace-mismatch).
-namespace Engine { class Scene; struct UUID; }
+namespace Engine { class Scene; class UUID; }
 const char* entityIcon(Engine::Scene* scene, const Engine::UUID& id);
 
 #include "EditorApplication.hpp"
@@ -2912,11 +2912,11 @@ VkShaderModule make_module(VkDevice device, const std::vector<uint32_t>& spirv) 
 VkPipeline create_scene_pipeline(VkDevice device, VkRenderPass renderPass, VkPipelineLayout layout,
                                  VkShaderModule vert, VkShaderModule frag,
                                  VkSampleCountFlagBits samples,
-                                 bool wireframe, bool depthTest, bool cull, bool withUv = false,
-                                 bool noVertexInput = false, bool blend = false,
-                                 bool lessOrEqualDepth = false, bool depthBias = false,
-                                 bool depthWrite = true,
-                                 VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) {
+                                 bool wireframe, bool depthTest, bool cull, bool withUv,
+                                 bool noVertexInput, bool blend,
+                                 bool lessOrEqualDepth, bool depthBias,
+                                 bool depthWrite,
+                                 VkPrimitiveTopology topology) {
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -3147,62 +3147,6 @@ void append_character_box(std::vector<EditorVertex>& verts, std::vector<uint32_t
     append_character_face(verts, indices, { x0, y0, z0 }, { x1, y0, z0 }, { x1, y0, z1 },
                           { x0, y0, z1 }, uv(bottom, 0, 1), uv(bottom, 1, 1),
                           uv(bottom, 1, 0), uv(bottom, 0, 0), { 0, -1, 0 });
-}
-
-void build_character_geometry(float skinHeight, std::vector<EditorVertex>& verts,
-                              std::vector<uint32_t>& indices) {
-    // Skin layout rects in the 64x64 coordinate grid (authoritative: the
-    // reference implementation used by mineatar.io). v is normalized by
-    // skinHeight so legacy 64x32 skins work too.
-    const CharacterUVRect headTop{ 8, 0, 16, 8 }, headBottom{ 16, 0, 24, 8 },
-        headRight{ 0, 8, 8, 16 }, headFront{ 8, 8, 16, 16 },
-        headLeft{ 16, 8, 24, 16 }, headBack{ 24, 8, 32, 16 };
-    const CharacterUVRect bodyTop{ 20, 16, 28, 20 }, bodyBottom{ 28, 16, 36, 20 },
-        bodyRight{ 16, 20, 20, 32 }, bodyFront{ 20, 20, 28, 32 },
-        bodyLeft{ 28, 20, 32, 32 }, bodyBack{ 32, 20, 40, 32 };
-    const CharacterUVRect rightArmTop{ 44, 16, 48, 20 }, rightArmBottom{ 48, 16, 52, 20 },
-        rightArmRight{ 40, 20, 44, 32 }, rightArmFront{ 44, 20, 48, 32 },
-        rightArmLeft{ 48, 20, 52, 32 }, rightArmBack{ 52, 20, 56, 32 };
-    const CharacterUVRect rightLegTop{ 4, 16, 8, 20 }, rightLegBottom{ 8, 16, 12, 20 },
-        rightLegRight{ 0, 20, 4, 32 }, rightLegFront{ 4, 20, 8, 32 },
-        rightLegLeft{ 8, 20, 12, 32 }, rightLegBack{ 12, 20, 16, 32 };
-    CharacterUVRect leftArmTop = rightArmTop, leftArmBottom = rightArmBottom,
-        leftArmRight = rightArmRight, leftArmFront = rightArmFront,
-        leftArmLeft = rightArmLeft, leftArmBack = rightArmBack;
-    CharacterUVRect leftLegTop = rightLegTop, leftLegBottom = rightLegBottom,
-        leftLegRight = rightLegRight, leftLegFront = rightLegFront,
-        leftLegLeft = rightLegLeft, leftLegBack = rightLegBack;
-    if (skinHeight > 32.5f) {
-        // 64x64: dedicated left arm/leg regions.
-        leftArmTop = { 36, 48, 40, 52 }; leftArmBottom = { 40, 48, 44, 52 };
-        leftArmRight = { 32, 52, 36, 64 }; leftArmFront = { 36, 52, 40, 64 };
-        leftArmLeft = { 40, 52, 44, 64 }; leftArmBack = { 44, 52, 48, 64 };
-        leftLegTop = { 20, 48, 24, 52 }; leftLegBottom = { 24, 48, 28, 52 };
-        leftLegRight = { 16, 52, 20, 64 }; leftLegFront = { 20, 52, 24, 64 };
-        leftLegLeft = { 24, 52, 28, 64 }; leftLegBack = { 28, 52, 32, 64 };
-    }
-    verts.clear();
-    indices.clear();
-    // Right leg (+X), left leg (-X): 0.25 x 0.75 x 0.25 m.
-    append_character_box(verts, indices, 0.0f, 0.0f, -0.125f, 0.25f, 0.75f, 0.125f, skinHeight,
-                         rightLegRight, rightLegLeft, rightLegFront, rightLegBack,
-                         rightLegTop, rightLegBottom);
-    append_character_box(verts, indices, -0.25f, 0.0f, -0.125f, 0.0f, 0.75f, 0.125f, skinHeight,
-                         leftLegRight, leftLegLeft, leftLegFront, leftLegBack,
-                         leftLegTop, leftLegBottom);
-    // Body: 0.5 x 0.75 x 0.25 m.
-    append_character_box(verts, indices, -0.25f, 0.75f, -0.125f, 0.25f, 1.5f, 0.125f, skinHeight,
-                         bodyRight, bodyLeft, bodyFront, bodyBack, bodyTop, bodyBottom);
-    // Right arm (+X), left arm (-X): 0.25 x 0.75 x 0.25 m.
-    append_character_box(verts, indices, 0.25f, 0.75f, -0.125f, 0.5f, 1.5f, 0.125f, skinHeight,
-                         rightArmRight, rightArmLeft, rightArmFront, rightArmBack,
-                         rightArmTop, rightArmBottom);
-    append_character_box(verts, indices, -0.5f, 0.75f, -0.125f, -0.25f, 1.5f, 0.125f, skinHeight,
-                         leftArmRight, leftArmLeft, leftArmFront, leftArmBack,
-                         leftArmTop, leftArmBottom);
-    // Head: 0.5 x 0.5 x 0.5 m.
-    append_character_box(verts, indices, -0.25f, 1.5f, -0.25f, 0.25f, 2.0f, 0.25f, skinHeight,
-                         headRight, headLeft, headFront, headBack, headTop, headBottom);
 }
 
 // ─── Material-graph pipelines (README §16-18: graph → GLSL → Vulkan) ───

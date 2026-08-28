@@ -1,11 +1,11 @@
-#include "Engine.hpp"
+#include "VulkanEngineApp.hpp"
 
 #include <GLFW/glfw3.h>
 #include <cmath>
 #include <format>
 #include <string>
 
-void Engine::run() {
+void VulkanEngineApp::run() {
     lastFrameTime = static_cast<float>(glfwGetTime());
     double statsStart = glfwGetTime();
     int statsFrames = 0;
@@ -144,7 +144,7 @@ void Engine::run() {
     }
 }
 
-void Engine::cleanup() {
+void VulkanEngineApp::cleanup() {
     if (isInitialized) {
         vkDeviceWaitIdle(device);
 

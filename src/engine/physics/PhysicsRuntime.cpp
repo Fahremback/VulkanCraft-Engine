@@ -371,7 +371,7 @@ void PhysicsRuntime::add_force(BodyHandle handle, const glm::vec3& force) {
 
 void PhysicsRuntime::add_torque(BodyHandle handle, const glm::vec3& torque) {
     if (RigidBody* value = body(handle); value && value->dynamic()) {
-        if (external_) external_->add_force(to_backend_handle(handle), torque);
+        if (external_) external_->add_torque(to_backend_handle(handle), torque);
         value->accumulatedTorque += torque; wake(handle);
     }
 }
@@ -387,6 +387,9 @@ void PhysicsRuntime::apply_impulse_at_point(BodyHandle handle, const glm::vec3& 
     if (RigidBody* value = body(handle); value && value->dynamic()) {
         if (external_) external_->apply_impulse_at_point(to_backend_handle(handle), impulse, worldPoint);
         value->linearVelocity += impulse * value->inverseMass;
+        // NOTE: Angular impulse uses inverseMass as a simplification. For proper
+        // non-uniform inertia, the backend (Jolt/Bullet) handles the real tensor.
+        // The builtin solver approximates with scalar inverseMass.
         value->angularVelocity += glm::cross(worldPoint - value->position, impulse) * value->inverseMass;
         wake(handle);
     }

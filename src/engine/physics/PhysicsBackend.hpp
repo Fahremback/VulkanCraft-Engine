@@ -56,6 +56,13 @@ public:
     virtual void set_linear_damping(BodyHandle body, float damping) = 0;
 
     virtual void add_force(BodyHandle body, const glm::vec3& force) = 0;
+    // Optional angular-force seam. Backends that do not expose torque yet keep
+    // the runtime's mirrored accumulator without silently changing backend
+    // motion; concrete backends can override when supported.
+    virtual void add_torque(BodyHandle body, const glm::vec3& torque) {
+        (void)body;
+        (void)torque;
+    }
     virtual void apply_impulse(BodyHandle body, const glm::vec3& impulse) = 0;
     virtual void apply_impulse_at_point(BodyHandle body, const glm::vec3& impulse, const glm::vec3& worldPoint) = 0;
     virtual void wake(BodyHandle body) = 0;

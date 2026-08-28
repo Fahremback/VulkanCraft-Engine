@@ -1,7 +1,6 @@
 #include "ReliableTransport.hpp"
 
 #include <algorithm>
-#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -96,17 +95,27 @@ bool ReliableTransport::send(const std::byte* data, std::size_t size) {
         // the fragment instead of resending it.
         packet.lastSent = std::chrono::steady_clock::now();
         // First retry deadline gets the same jitter treatment as the rest.
-        packet.retryJitterMs = static_cast<std::uint32_t>(
-            std::rand() % (config_.retransmitTimeout.count() / 2 + 1));
+        std::uniform_int_distribution<std::uint32_t> jitterDist(0, static_cast<std::uint32_t>(config_.retransmitTimeout.count() / 2));
+        packet.retryJitterMs = jitterDist(rng_);
+
+        // Compress the fragment. If compression expands the data (or fails),
+        // send uncompressed and clear the FLAG_COMPRESSED bit so the receiver
+        // does not attempt decompression on raw data.
+        std::vector<std::byte> compressedBuf(config_.maxPayload * 2);
+        const std::size_t compressedSize = compress(packet.payload.data(), packet.payload.size(),
+                                                    compressedBuf.data(), compressedBuf.size());
+        const bool useCompression = compressedSize > 0 && compressedSize < packet.payload.size();
+        const std::byte* sendPayload = useCompression ? compressedBuf.data() : packet.payload.data();
+        const std::size_t sendSize = useCompression ? compressedSize : packet.payload.size();
 
         PacketHeader header{};
         header.seq = seq;
         header.ack = nextInSeq_;
-        header.flags = FLAG_DATA | FLAG_COMPRESSED;
+        header.flags = useCompression ? (FLAG_DATA | FLAG_COMPRESSED) : FLAG_DATA;
         header.fragmentIndex = index++;
         header.fragmentCount = count;
-        header.payloadSize = static_cast<std::uint16_t>(chunk);
-        send_packet(header, packet.payload.data(), packet.payload.size());
+        header.payloadSize = static_cast<std::uint16_t>(sendSize);
+        send_packet(header, sendPayload, sendSize);
 
         sendQueue_.push_back(std::move(packet));
         offset += chunk;
@@ -393,8 +402,8 @@ void ReliableTransport::retransmit(std::chrono::steady_clock::time_point now) {
             ++packet.retries;
             ++retransmits_;
             packet.lastSent = now;
-            packet.retryJitterMs = static_cast<std::uint32_t>(
-                std::rand() % (config_.retransmitTimeout.count() / 2 + 1));
+            std::uniform_int_distribution<std::uint32_t> jitterDist(0, static_cast<std::uint32_t>(config_.retransmitTimeout.count() / 2));
+            packet.retryJitterMs = jitterDist(rng_);
             PacketHeader header{};
             header.seq = packet.seq;
             header.ack = nextInSeq_;

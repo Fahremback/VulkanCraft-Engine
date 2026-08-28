@@ -1,9 +1,16 @@
 #include "EditorApplication.hpp"
 #include "EditorInternalHelpers.hpp"
-// Importação de textura via WIC (iwicimagingfactory/ComPtr) — includes do
-// monólito original que o split havia perdido.
+#include "BlockTextureAtlas.hpp"
+#include "../engine/audio/OggDecoder.hpp"
+#include <imgui_impl_vulkan.h>
+#include <Unknwn.h>
+#include <objbase.h>
+#include <objidl.h>
 #include <wincodec.h>
 #include <wrl/client.h>
+#include <miniaudio.h>
+
+using Microsoft::WRL::ComPtr;
 
 namespace Engine {
 
@@ -132,39 +139,6 @@ void build_character_geometry(float skinHeight, std::vector<EditorVertex>& verts
                          headRight, headLeft, headFront, headBack, headTop, headBottom);
 }
 
-uint64_t hash_material_graph(const Rendering::MaterialGraph& graph) {
-    uint64_t h = 14695981039346656037ull;
-    const auto mix = [&h](const void* data, size_t size) {
-        const auto* bytes = static_cast<const unsigned char*>(data);
-        for (size_t i = 0; i < size; ++i) {
-            h ^= bytes[i];
-            h *= 1099511628211ull;
-        }
-    };
-    for (const auto& node : graph.nodes()) {
-        mix(&node.id, sizeof(node.id));
-        const auto kind = static_cast<uint8_t>(node.kind);
-        mix(&kind, 1);
-        const auto outputType = static_cast<uint8_t>(node.outputType);
-        mix(&outputType, 1);
-        mix(node.label.data(), node.label.size());
-        mix(node.parameter.data(), node.parameter.size());
-        std::visit([&](const auto& v) {
-            if constexpr (std::is_same_v<std::decay_t<decltype(v)>, std::string>) {
-                mix(v.data(), v.size());
-            } else {
-                mix(&v, sizeof(v));
-            }
-        }, node.value);
-    }
-    for (const auto& p : graph.parameters()) {
-        mix(p.name.data(), p.name.size());
-        const auto type = static_cast<uint8_t>(p.type);
-        mix(&type, 1);
-        mix(&p.exposed, 1);
-    }
-    return h;
-}
 
 void EditorApplication::ensure_block_cube_resource(const UUID& blockId) {
     const auto cached = m_meshResources.find(blockId);
@@ -3342,7 +3316,7 @@ void EditorApplication::init_scene_light_resources() {
                   m_sceneLightBuffer, m_sceneLightMemory);
     create_buffer(sizeof(EditorShadowUbo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                  m_editorShadowUbo, m_editorShadowUboMemory);
+                  m_editorShadowUbo.buffer, m_editorShadowUboMemory);
 
     VkDescriptorPoolSize poolSizes[2]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;

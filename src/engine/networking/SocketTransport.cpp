@@ -22,9 +22,13 @@ constexpr SOCKET_T kBadSocket = INVALID_SOCKET;
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 using SOCKET_T = int;
 constexpr SOCKET_T kBadSocket = -1;
 #define SOCKET_ERROR (-1)
@@ -220,8 +224,13 @@ bool SocketTransport::send_to(const std::string& peer, const std::byte* data, st
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) return false;
+    const int flags = 0
+#if defined(__linux__)
+        | MSG_NOSIGNAL
+#endif
+        ;
     const int n = static_cast<int>(::sendto(static_cast<SOCKET_T>(socket_), reinterpret_cast<const char*>(data),
-                                            size, 0, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)));
+                                            size, flags, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)));
     return n >= 0;
 }
 

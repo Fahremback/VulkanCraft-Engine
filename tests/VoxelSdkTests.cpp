@@ -6327,7 +6327,7 @@ void test_block_registry() {
     engine::registry::BlockRegistry reordered;
     std::string errA;
     CHECK(reordered.load_from_json(
-        R"([{"name":"sapphire","namespace":"test"},{"name":"ruby","namespace":"test","id":")" + ruby->uuid + "\"}]", errA));
+        R"([{"name":"sapphire","namespace":"test"},{"name":"ruby","namespace":"test","id":")" + ruby->uuid + R"("}]))", errA));
     const engine::registry::BlockDefinition* rubyReordered =
         reordered.find_by_name("test:ruby");
     CHECK(rubyReordered != nullptr);

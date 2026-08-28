@@ -404,7 +404,15 @@ double ScriptVM::float_variable(const std::string& name) const {
     auto* val = variable(name);
     if (val) {
         if (const double* d = std::get_if<double>(val)) return *d;
-        if (const int64_t* i = std::get_if<int64_t>(val)) return static_cast<double>(*i);
+        if (const int64_t* i = std::get_if<int64_t>(val)) {
+            // NOTE: int64_t values above 2^53 lose precision when converted
+            // to double. For exact integer arithmetic, use int64_t operations.
+            if (*i >= -9007199254740992LL && *i <= 9007199254740992LL) {
+                return static_cast<double>(*i);
+            }
+            // Values outside safe integer range: clamp to nearest representable double.
+            return static_cast<double>(*i);
+        }
     }
     return 0.0;
 }
@@ -437,7 +445,11 @@ VMStatus ScriptVM::execute_one(float deltaTime, bool ignoreBreakpoint) {
                 const auto local = it->find(inst.text);
                 if (local != it->end()) { found = &local->second; break; }
             }
-            stack_.push_back(found ? *found : variables_[inst.text]);
+            if (!found) {
+                const auto it = variables_.find(inst.text);
+                if (it != variables_.end()) found = &it->second;
+            }
+            stack_.push_back(found ? *found : ScriptValue{});
             break;
         }
         case OpCode::StoreVariable: {
@@ -480,6 +492,10 @@ VMStatus ScriptVM::execute_one(float deltaTime, bool ignoreBreakpoint) {
             }
             break;
         case OpCode::Jump:
+            if (inst.target >= program_.instructions.size()) {
+                error_ = "Jump target out of bounds";
+                return VMStatus::Error;
+            }
             ip_ = inst.target;
             break;
         case OpCode::Wait:
@@ -492,6 +508,10 @@ VMStatus ScriptVM::execute_one(float deltaTime, bool ignoreBreakpoint) {
             emittedEvents_.push_back(inst.text);
             break;
         case OpCode::Call:
+            if (inst.target >= program_.instructions.size()) {
+                error_ = "Call target out of bounds";
+                return VMStatus::Error;
+            }
             callStack_.push_back(ip_);
             ip_ = inst.target;
             break;

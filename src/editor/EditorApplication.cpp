@@ -355,23 +355,4 @@ bool EditorApplication::pick_file_dialog(std::string& outPath, const wchar_t* fi
     return true;
 }
 
-// Helpers compartilhados restaurados (git 408c2d3) após o split: os corpos
-// haviam sido apagados; as declarações ficam no header e todos os TUs do
-// editor os usam. Não duplicar em outros arquivos do split.
-void push_constants(VkCommandBuffer cmd, VkPipelineLayout layout, const glm::mat4& mvp,
-                    const glm::vec4& color, const glm::mat4& model) {
-    const Engine::ScenePushConstants pc{ mvp, color, Engine::g_fogParams, Engine::g_fogColor, model };
-    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                       static_cast<uint32_t>(sizeof(pc)), &pc);
-}
-
-bool safe_map_and_copy(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset,
-                       VkDeviceSize size, const void* source) {
-    void* data = nullptr;
-    if (!safe_vkMapMemory(device, memory, offset, size, 0, &data)) return false;
-    std::memcpy(data, source, static_cast<size_t>(size));
-    vkUnmapMemory(device, memory);
-    return true;
-}
-
 } // namespace Engine

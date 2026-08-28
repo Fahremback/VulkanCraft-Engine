@@ -80,7 +80,12 @@ function normalizeRelative(input = ".") {
   if (typeof input !== "string" || input.includes("\0")) {
     throw new Error("path must be a valid string");
   }
-  const absolute = path.resolve(ENGINE_ROOT, input.replaceAll("/", path.sep));
+  // Reject path traversal BEFORE resolution to prevent encoded bypasses.
+  const normalized = input.replace(/\\/g, "/");
+  if (normalized.includes("..") || normalized.includes("%2e") || normalized.includes("%2E")) {
+    throw new Error("path must not contain '..' or encoded traversals");
+  }
+  const absolute = path.resolve(ENGINE_ROOT, normalized.replaceAll("/", path.sep));
   const relative = path.relative(ENGINE_ROOT, absolute);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     throw new Error("path escapes the engine root");
@@ -379,12 +384,18 @@ function createFile(args) {
 // capturados em Projects/.runs/<exe>-<timestamp>.log; as ferramentas de log
 // permitem olhar a saída depois, sem manter janela aberta.
 const GAME_RUN_ROOT = path.join(ENGINE_ROOT, "Projects", ".runs");
+// Build root is repo-relative and overridable via VC_BUILD_DIR — the same
+// convention used by fast-gate.mjs / freshness-gate.mjs / ci-matrix.mjs /
+// build-shared.ps1, so the server works against any agent's tree (default
+// `build/`, the legacy main tree). Multi-config generators put binaries in
+// <root>/Release/...; single-config trees keep them at the root.
+const BUILD_REL = process.env.VC_BUILD_DIR || "build";
 const RUNNABLE_EXES = new Map([
-  ["VulkanEngineGame", "build/Release/VulkanEngineGame.exe"],
-  ["VulkanEngineEditor", "build/Release/VulkanEngineEditor.exe"],
-  ["VulkanEngineServer", "build/Release/VulkanEngineServer.exe"],
-  ["VulkanEngineCooker", "build/Release/VulkanEngineCooker.exe"],
-  ["vulkan_craft", "build/Release/vulkan_craft.exe"]
+  ["VulkanEngineGame", `${BUILD_REL}/Release/VulkanEngineGame.exe`],
+  ["VulkanEngineEditor", `${BUILD_REL}/Release/VulkanEngineEditor.exe`],
+  ["VulkanEngineServer", `${BUILD_REL}/Release/VulkanEngineServer.exe`],
+  ["VulkanEngineCooker", `${BUILD_REL}/Release/VulkanEngineCooker.exe`],
+  ["vulkan_craft", `${BUILD_REL}/Release/vulkan_craft.exe`]
 ]);
 
 function tailLines(filePath, count) {
@@ -463,7 +474,7 @@ function packageGameTool(args) {
   const logPath = path.join(GAME_RUN_ROOT, `${name}.log`);
   const output = path.join(projectRoot, "Package");
   const stream = fs.createWriteStream(logPath, { flags: "a" });
-  const child = spawn(path.join(ENGINE_ROOT, "build/Release/VulkanPackageBuilder.exe"),
+  const child = spawn(path.join(ENGINE_ROOT, BUILD_REL, "Release", "VulkanPackageBuilder.exe"),
     [exePath, contentDir, output, platform, configuration],
     { cwd: ENGINE_ROOT, windowsHide: true });
   child.stdout.on("data", (chunk) => stream.write(chunk));
@@ -519,8 +530,15 @@ function readGameLogTool(args) {
   if (!/^[A-Za-z0-9._-]+\.log$/.test(name)) {
     throw new Error("log must match [A-Za-z0-9._-]+.log");
   }
+  if (name.includes("..")) {
+    throw new Error("log name must not contain path separators");
+  }
   const logPath = path.join(GAME_RUN_ROOT, name);
-  if (!fs.existsSync(logPath)) throw new Error(`log not found: ${name} (veja list_game_logs)`);
+  const resolvedLog = path.resolve(logPath);
+  if (!resolvedLog.startsWith(path.resolve(GAME_RUN_ROOT))) {
+    throw new Error("log path escapes the runs directory");
+  }
+  if (!fs.existsSync(resolvedLog)) throw new Error(`log not found: ${name} (veja list_game_logs)`);
   const lines = fs.readFileSync(logPath, "utf8").split(/\r?\n/);
   const last = Math.min(Math.max(Number(args.lines ?? 100), 1), 2000);
   return {
@@ -538,13 +556,13 @@ function buildGameTool(args) {
     "VulkanEngineCooker", "vulkan_craft", "ALL_BUILD"]);
   if (!known.has(exe)) throw new Error(`unknown target '${exe}'`);
   const config = String(args.config ?? "Release");
-  const buildRoot = path.join(ENGINE_ROOT, "build");
+  const buildRoot = path.join(ENGINE_ROOT, BUILD_REL);
   if (!fs.existsSync(buildRoot)) throw new Error(`build dir not found: ${buildRoot}`);
 
   fs.mkdirSync(GAME_RUN_ROOT, { recursive: true });
   const name = `build-${exe}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
   const logPath = path.join(GAME_RUN_ROOT, name);
-  const argsList = ["--build", "build", "--config", config];
+  const argsList = ["--build", BUILD_REL, "--config", config];
   if (exe !== "ALL_BUILD") argsList.push("--target", exe);
   // Bounded: a hung build must never wedge the MCP server forever.
   const result = spawnSync("cmake", argsList, { cwd: ENGINE_ROOT, encoding: "utf8", windowsHide: true, maxBuffer: 32 * 1024 * 1024, timeout: 15 * 60 * 1000 });
@@ -666,14 +684,14 @@ function startBuildTool(args) {
     "VulkanEngineCooker", "vulkan_craft", "ALL_BUILD"]);
   if (!known.has(exe)) throw new Error(`unknown target '${exe}'`);
   const config = String(args.config ?? "Release");
-  const buildRoot = path.join(ENGINE_ROOT, "build");
+  const buildRoot = path.join(ENGINE_ROOT, BUILD_REL);
   if (!fs.existsSync(buildRoot)) throw new Error(`build dir not found: ${buildRoot}`);
 
   fs.mkdirSync(GAME_RUN_ROOT, { recursive: true });
   const jobId = nextBuildJobId++;
   const name = `build-${exe}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
   const logPath = path.join(GAME_RUN_ROOT, name);
-  const argsList = ["--build", "build", "--config", config];
+  const argsList = ["--build", BUILD_REL, "--config", config];
   if (exe !== "ALL_BUILD") argsList.push("--target", exe);
 
   const job = {
@@ -725,7 +743,7 @@ function startBuildTool(args) {
 function jobArtifacts(job) {
   const artifacts = { log: job.log, binaries: [], bytes_total: 0 };
   if (job.status === "succeeded" && job.exe !== "ALL_BUILD") {
-    const exePath = path.join(ENGINE_ROOT, "build", job.config, `${job.exe}.exe`);
+    const exePath = path.join(ENGINE_ROOT, BUILD_REL, job.config, `${job.exe}.exe`);
     if (fs.existsSync(exePath)) {
       const rel = path.relative(ENGINE_ROOT, exePath).replaceAll(path.sep, "/");
       const bytes = fs.statSync(exePath).size;
@@ -822,7 +840,6 @@ function listBuildJobsTool() {
 
 const TOOLS = [
   ...semanticToolDefinitions(),
-  ...publicContractTools(),
   ...controlApiToolDefinitions(),
   {
     name: "asset_cooker",
@@ -1591,7 +1608,7 @@ async function handleRequest(message) {
         // tests of the current build tree. ctest -N lists without executing
         // (fast, deterministic per configured tree). If the tree is not
         // configured, the resource reports it instead of failing hard.
-        const ctest = spawnSync("ctest", ["-N", "-C", "Release"], { cwd: path.join(ENGINE_ROOT, "build"), encoding: "utf8", windowsHide: true, timeout: 15000 });
+        const ctest = spawnSync("ctest", ["-N", "-C", "Release"], { cwd: path.join(ENGINE_ROOT, BUILD_REL), encoding: "utf8", windowsHide: true, timeout: 15000 });
         const tests = [];
         if (ctest.status === 0) {
           for (const m of ctest.stdout.matchAll(/Test\s+#\d+:\s+([^\r\n]+)/g)) tests.push(m[1].trim());

@@ -16,6 +16,10 @@
 
 namespace Engine {
 
+inline constexpr int kVoxelSizeX = 32;
+inline constexpr int kVoxelSizeY = 24;
+inline constexpr int kVoxelSizeZ = 32;
+
 // ── Math / transform ──────────────────────────────────────────────────────
 glm::mat4 model_from_transform(const TransformComponent& t);
 glm::mat3 rotation_axis_from_y(const glm::vec3& axis);
@@ -64,6 +68,11 @@ VkPipeline create_scene_pipeline(VkDevice device, VkRenderPass renderPass, VkPip
                                  bool lessOrEqualDepth = false, bool depthBias = false,
                                  bool depthWrite = true,
                                  VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+
+// ── Terrain ───────────────────────────────────────────────────────────────
+float terrain_surface_height(uint32_t seed, float scale, int octaves,
+                              float amount, float falloffParam,
+                              float halfExtent, float x, float z);
 
 // ── Material-graph helpers ────────────────────────────────────────────────
 uint64_t hash_material_graph(const Rendering::MaterialGraph& graph);

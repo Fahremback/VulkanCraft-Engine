@@ -10,7 +10,7 @@
 #include "engine/plugins/IPluginSandbox.hpp"
 #include "engine/plugins/IPluginTypeRegistry.hpp"
 
-using namespace Engine::Plugins;
+using namespace engine::plugins;
 
 static int g_checks = 0;
 static int g_fails = 0;
