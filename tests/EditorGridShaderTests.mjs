@@ -40,4 +40,17 @@ assert.doesNotMatch(
   "viewport grid must not replace its scale family according to camera distance"
 );
 
+// BUG-EDITOR-GRID-003: coplanar surfaces (terrain falloff ring at Y=0, entity
+// bottom faces) tie the analytic grid depth to the rasterized mesh depth up
+// to ~3 fp32 ULPs; without a deterministic advantage the LEQUAL outcome is a
+// per-pixel coin flip that re-rolls on every camera rotation (the "dancing
+// grid"). The fragment shader must keep the relative ULP nudge toward the
+// camera, because the rasterizer depth bias never reaches a gl_FragDepth
+// written by the shader.
+assert.match(
+  shader,
+  /gridDepth\s*-=\s*gridDepth\s*\*\s*1\.2e-6\s*;/,
+  "grid depth must keep the ~10 ULP coplanar tie-break nudge toward the camera"
+);
+
 console.log("editor_grid_shader_tests: PASS");

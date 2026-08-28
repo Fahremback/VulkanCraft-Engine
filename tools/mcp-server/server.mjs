@@ -9,11 +9,12 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { callSemanticTool, semanticToolDefinitions, listProjects, inspectProject } from "./game-authoring.mjs";
 import { callControlApiTool, controlApiToolDefinitions } from "./control-api.mjs";
+import { callPublicRuntimeTool, publicRuntimeTools } from "./contract-runtime.mjs";
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ENGINE_ROOT = path.resolve(SERVER_DIR, "..", "..");
 const SERVER_NAME = "vulkancraft-engine";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "1.2.0";
 // The single MCP protocol version this server implements. Clients request a
 // version in `initialize`; the server MUST refuse any version it does not
 // implement (echoing an unsupported version would make the client believe it
@@ -530,6 +531,8 @@ function readGameLogTool(args) {
 }
 
 function buildGameTool(args) {
+  // Synchronous builds remain an explicit legacy operation; long work must use start_build.
+  if (args.async === true) return startBuildTool(args);
   const exe = String(args.exe ?? "VulkanEngineGame");
   const known = new Set(["VulkanEngineGame", "VulkanEngineEditor", "VulkanEngineServer",
     "VulkanEngineCooker", "vulkan_craft", "ALL_BUILD"]);
@@ -568,7 +571,14 @@ function buildGameTool(args) {
 // Events are delivered in the order they fire; a subscriber receives ONLY the
 // kinds it subscribed to (topic fan-out by kind).
 const EVENT_SUBSCRIPTIONS = new Map();  // eventKind -> Set<subscriptionId>
-const EVENT_TOPICS = new Set(["build.status_changed"]);
+const EVENT_TOPICS = new Set([
+  "build.status_changed",
+  "asset.changed",
+  "scene.changed",
+  "game.status_changed",
+  "test.status_changed",
+  "profiler.sampled"
+]);
 let nextSubscriptionId = 1;
 
 // FALTANTES item 5 — optional remote transport. The server is stdio-first
@@ -812,7 +822,18 @@ function listBuildJobsTool() {
 
 const TOOLS = [
   ...semanticToolDefinitions(),
+  ...publicContractTools(),
   ...controlApiToolDefinitions(),
+  {
+    name: "asset_cooker",
+    description: "Expose the deterministic public asset cooking capability and cache contract.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false }
+  },
+  {
+    name: "capability_registry",
+    description: "Discover the public capability registry contract and its runtime metadata without exposing private implementation files.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false }
+  },
   {
     name: "engine_overview",
     description: "Return a compact map of VulkanCraft engine modules, CMake targets, authoritative documents, and the concurrency rule.",
@@ -992,7 +1013,7 @@ const TOOLS = [
   },
   {
     name: "subscribe_events",
-    description: "Subscribe to server events (notifications/... messages). Only 'build.status_changed' is emitted today — when a start_build job transitions state. Returns a subscription_id.",
+    description: "Subscribe to server events (notifications/... messages) for builds, assets, scenes, game, tests, and profiler samples. Returns a subscription_id.",
     inputSchema: {
       type: "object",
       required: ["kinds"],
@@ -1012,7 +1033,7 @@ const TOOLS = [
   },
   {
     name: "list_event_topics",
-    description: "List the event kinds this server can emit.",
+    description: "List the event kinds this server can emit for build, asset, scene, game, test, and profiler lifecycle changes.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false }
   },
   {
@@ -1422,6 +1443,11 @@ async function toolCall(name, args = {}) {
     recordAudit(name, args, isError, JSON.stringify(semanticResult));
     return { content: jsonText(semanticResult) };
   }
+  const publicContractResult = callPublicRuntimeTool(ENGINE_ROOT, name, args);
+  if (publicContractResult !== undefined) {
+    recordAudit(name, args, false, JSON.stringify(publicContractResult));
+    return { content: jsonText(publicContractResult) };
+  }
   const controlApiResult = await callControlApiTool(name, args);
   if (controlApiResult !== undefined) {
     const isError = Boolean(controlApiResult && controlApiResult.isError);
@@ -1433,6 +1459,8 @@ async function toolCall(name, args = {}) {
     case "engine_overview": result = engineOverview(); break;
     case "engine_pending_work": result = pendingStatus(); break;
     case "engine_version": result = versionTool(); break;
+    case "capability_registry": result = { contract: "src/engine/public/engine/capabilities/ICapabilityRegistry.hpp", discoverable: true, formats: ["types", "components", "assets", "commands", "events", "services"] }; break;
+    case "asset_cooker": result = { contract: "src/engine/public/engine/assets/IAssetCooker.hpp", deterministic: true, cache: "content-addressed" }; break;
     case "list_directory": result = walkDirectory(args.path ?? ".", Number(args.depth ?? 1), Number(args.max_entries ?? 120)); break;
     case "search_code": result = searchCode(args); break;
     case "inspect_symbol": result = inspectSymbol(args); break;
@@ -1502,7 +1530,7 @@ async function handleRequest(message) {
       return { jsonrpc: "2.0", id, error: { code: -32602, message: error instanceof Error ? error.message : String(error) } };
     }
   }
-  if (method === "tools/list") return { jsonrpc: "2.0", id, result: { tools: TOOLS } };
+  if (method === "tools/list") return { jsonrpc: "2.0", id, result: { tools: [...TOOLS, ...publicRuntimeTools()] } };
   if (method === "tools/call") {
     try {
       return { jsonrpc: "2.0", id, result: await toolCall(params.name, params.arguments ?? {}) };

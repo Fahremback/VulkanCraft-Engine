@@ -36,7 +36,9 @@ set(_unit_tests
     offline_farm_tests
 )
 foreach(_t ${_unit_tests})
-    set_tests_properties(${_t} PROPERTIES LABELS "unit")
+    if(TEST ${_t})
+        set_tests_properties(${_t} PROPERTIES LABELS "unit")
+    endif()
 endforeach()
 
 # --- voxel: world state, streaming, meshing, save/load ---
@@ -52,7 +54,9 @@ set(_voxel_tests
     multiscale_streaming_tests
 )
 foreach(_t ${_voxel_tests})
-    set_tests_properties(${_t} PROPERTIES LABELS "voxel")
+    if(TEST ${_t})
+        set_tests_properties(${_t} PROPERTIES LABELS "voxel")
+    endif()
 endforeach()
 
 # --- physics: collision, destruction, vehicles ---
@@ -66,7 +70,9 @@ set(_physics_tests
     fracture_tests
 )
 foreach(_t ${_physics_tests})
-    set_tests_properties(${_t} PROPERTIES LABELS "physics")
+    if(TEST ${_t})
+        set_tests_properties(${_t} PROPERTIES LABELS "physics")
+    endif()
 endforeach()
 
 # --- vehicle: vehicle subsystem ---
@@ -82,7 +88,9 @@ set(_vehicle_tests
     vehicle_provider_tests
 )
 foreach(_t ${_vehicle_tests})
-    set_tests_properties(${_t} PROPERTIES LABELS "vehicle")
+    if(TEST ${_t})
+        set_tests_properties(${_t} PROPERTIES LABELS "vehicle")
+    endif()
 endforeach()
 
 # --- skeleton: ragdoll, skeleton mapping ---
@@ -91,7 +99,9 @@ set(_skeleton_tests
     active_ragdoll_tests
 )
 foreach(_t ${_skeleton_tests})
-    set_tests_properties(${_t} PROPERTIES LABELS "skeleton")
+    if(TEST ${_t})
+        set_tests_properties(${_t} PROPERTIES LABELS "skeleton")
+    endif()
 endforeach()
 
 # --- rendering: GPU-dependent ---
@@ -101,7 +111,9 @@ set(_rendering_tests
     visual_authoring_tests
 )
 foreach(_t ${_rendering_tests})
-    set_tests_properties(${_t} PROPERTIES LABELS "rendering")
+    if(TEST ${_t})
+        set_tests_properties(${_t} PROPERTIES LABELS "rendering")
+    endif()
 endforeach()
 
 # --- integration: multi-system, connectivity, replication ---
@@ -113,7 +125,9 @@ set(_integration_tests
     local_space_tests
 )
 foreach(_t ${_integration_tests})
-    set_tests_properties(${_t} PROPERTIES LABELS "integration")
+    if(TEST ${_t})
+        set_tests_properties(${_t} PROPERTIES LABELS "integration")
+    endif()
 endforeach()
 
 # --- gameplay: gameplay framework, runtime, MCP ---
@@ -123,7 +137,9 @@ set(_gameplay_tests
     mcp_registry_gate_tests
 )
 foreach(_t ${_gameplay_tests})
-    set_tests_properties(${_t} PROPERTIES LABELS "gameplay")
+    if(TEST ${_t})
+        set_tests_properties(${_t} PROPERTIES LABELS "gameplay")
+    endif()
 endforeach()
 
 # --- architecture: boundary, empty project ---
@@ -132,8 +148,12 @@ set(_arch_tests
     empty_project_tests
 )
 foreach(_t ${_arch_tests})
-    set_tests_properties(${_t} PROPERTIES LABELS "architecture")
+    if(TEST ${_t})
+        set_tests_properties(${_t} PROPERTIES LABELS "architecture")
+    endif()
 endforeach()
 
 # --- benchmark: performance measurement ---
-set_tests_properties(far_terrain_sampling_benchmark PROPERTIES LABELS "benchmark;far-terrain")
+if(TEST far_terrain_sampling_benchmark)
+    set_tests_properties(far_terrain_sampling_benchmark PROPERTIES LABELS "benchmark;far-terrain")
+endif()

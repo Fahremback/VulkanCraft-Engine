@@ -27,7 +27,7 @@ layout (location = 0) out vec4 outColor;
 
 layout (push_constant) uniform PushConstants {
     mat4 invViewProj;
-    vec4 cameraPos;
+    mat4 viewProj;
 } pc;
 
 const float MINOR_GRID_STEP = 1.0;
@@ -36,19 +36,43 @@ const float MAJOR_GRID_STEP = 10.0;
 // One family of parallel grid lines with a constant screen-space width.
 // fwidth(coord) is the cell size in pixels; below ~1.5 px/cell the frequency
 // is explicitly killed (Nyquist), which eliminates shimmer / dots / moiré.
+//
+// BUG-EDITOR-GRID-004 (motion throb / "samba"): a ~1.5 px line that translates
+// ~1 px per frame (ANY camera drag — the pattern speed in px/frame is
+// independent of distance for orbit rotations) re-rolls its subpixel phase
+// every frame, so every discrete line shimmered during motion. Two mitigations
+// that keep the static look intact:
+//  1. Wider analytic AA (0.50..1.50 px instead of 0.35..1.15) — the intensity
+//     of a wider profile changes less when its phase shifts by a fraction of
+//     a pixel.
+//  2. Fade-to-mean: once the cell drops below ~6 px/cell the line profile
+//     converges to its exact cell-average coverage (inner+outer), so the dense
+//     far field becomes a STABLE gradient with no discrete structure left to
+//     alias. The average brightness is unchanged versus the discrete lines
+//     (same coverage), and the existing frequency retirement still fades the
+//     mean out below 1.5 px/cell.
 float gridLine1D(float worldCoord, float step, float pixelWidth) {
     float coord = worldCoord / step;
     float fw = max(fwidth(coord), 1e-6);
+
+    float d = abs(fract(coord + 0.5) - 0.5);
+    float inner = fw * 0.50;
+    float outer = fw * 1.50;
+    float line = 1.0 - smoothstep(inner, outer, d);
+
+    // Converge to the cell-average coverage (inner+outer, derived by
+    // integrating the profile over one cell) as cells become dense. Beyond
+    // ~6 px/cell the lines stay crisp; below ~2 px/cell the output is the
+    // pure mean — motion-stable by construction.
+    float mean = clamp(inner + outer, 0.0, 1.0);
+    float toMean = smoothstep(0.15, 0.45, fw);
+    line = mix(line, mean, toMean);
 
     // Pixels per cell: 1.0 / fw. Subpixel frequencies simply do not exist —
     // smooth fade between 1.5 and 4 px/cell, hard zero below.
     float pixelsPerCell = 1.0 / fw;
     float frequencyVisibility = smoothstep(1.5, 4.0, pixelsPerCell);
 
-    float d = abs(fract(coord + 0.5) - 0.5);
-    float inner = fw * pixelWidth * 0.35;
-    float outer = fw * pixelWidth * 1.15;
-    float line = 1.0 - smoothstep(inner, outer, d);
     return line * frequencyVisibility;
 }
 
@@ -69,12 +93,14 @@ float cellVisibility(float step, float worldPerPixel) {
 }
 
 // Constant screen-width world axis (width in pixels, not meters), so the axis
-// stays elegant at any distance.
+// stays elegant at any distance. Wider AA than the grid lines because the
+// axes pivot around the orbit target during yaw — the same motion-throb
+// mitigation as gridLine1D (BUG-EDITOR-GRID-004).
 float axisLine(float worldDistance, float pixelWidth) {
     float fw = max(fwidth(worldDistance), 1e-6);
     float d = abs(worldDistance);
-    float inner = fw * pixelWidth * 0.30;
-    float outer = fw * pixelWidth * 1.10;
+    float inner = fw * pixelWidth * 0.45;
+    float outer = fw * pixelWidth * 1.45;
     return 1.0 - smoothstep(inner, outer, d);
 }
 
@@ -161,13 +187,35 @@ void main() {
     alpha = max(alpha, 0.0);
 
     // ----------------------------------------------------------------------
-    // Exact depth of the intersection point, remapped from GL [-1, 1] clip
-    // space to the Vulkan depth attachment [0, 1]. nearPoint sits at clipZ=-1
-    // and farPoint at clipZ=+1, so along the ray ndcZ = -1 + 2t and Vulkan
-    // depth = ndcZ * 0.5 + 0.5 = t. (The pipeline tests depth but does not
-    // write it, so this is test-only.)
+    // Exact depth of the world-space intersection.  The previous version
+    // wrote the ray parameter `t` as depth; t is measured in world units and
+    // is not clip-space depth, so it caused z-fighting/shimmer whenever the
+    // camera moved slowly.  Project the actual point with the same matrix as
+    // the scene.  Vulkan raster depth is already clip.z / clip.w (0..1).
     // ----------------------------------------------------------------------
-    gl_FragDepth = clamp(t, 0.0, 1.0);
+    vec4 clipPoint = pc.viewProj * vec4(p, 1.0);
+    float safeClipW = abs(clipPoint.w) > 1e-6 ? clipPoint.w : 1.0;
+    float gridDepth = clipPoint.z / safeClipW;
+    if (!valid || isnan(gridDepth) || isinf(gridDepth)) gridDepth = 1.0;
+
+    // ----------------------------------------------------------------------
+    // BUG-EDITOR-GRID-003 (coplanar tie dance): geometry that lies EXACTLY on
+    // the grid plane (terrain falloff ring at Y=0, entity bottom faces) and
+    // the analytic grid depth agree only to ~2-3 fp32 ULPs — they come from
+    // different rounding chains (vertex chain + raster interpolation vs the
+    // per-pixel ray chain here). With LEQUAL every such pixel is a coin flip
+    // whose pattern re-rolls on every camera rotation: the grid visibly
+    // "dances" over flat ground while meshes stay stable. The rasterizer
+    // depth bias CANNOT fix this (it is applied to the interpolated depth,
+    // which gl_FragDepth overrides), so the nudge lives here instead: pull
+    // the grid depth toward the camera by ~10 ULPs of its own magnitude.
+    // That is far above the tie noise (~3 ULPs), so the grid wins every
+    // coplanar contact deterministically, while in world units the offset is
+    // sub-millimeter near the camera and stays inside the depth-tie band at
+    // any range — never visible against geometry that is actually in front.
+    // ----------------------------------------------------------------------
+    gridDepth -= gridDepth * 1.2e-6;
+    gl_FragDepth = clamp(gridDepth, 0.0, 1.0);
 
     // Premultiplied alpha — matches the grid pipeline blend
     // (srcColor = ONE, dstColor = ONE_MINUS_SRC_ALPHA).

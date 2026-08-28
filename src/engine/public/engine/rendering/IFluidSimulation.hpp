@@ -8,6 +8,7 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <cstring>
 
 namespace vc::rendering {
 

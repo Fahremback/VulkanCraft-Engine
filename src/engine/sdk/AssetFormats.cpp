@@ -1,37 +1,128 @@
 #include "engine/assets/IAssetFormats.hpp"
+
 #include <algorithm>
+#include <utility>
 
 namespace engine::assets {
 namespace {
+
 class Registry final : public IAssetFormatRegistry {
+    std::vector<FormatDocument> documents_;
+
+    static bool known(AssetFormat format) noexcept {
+        return static_cast<std::uint8_t>(format) <= static_cast<std::uint8_t>(AssetFormat::Font);
+    }
+
+    static bool valid(const FormatDocument& document, std::string& error) {
+        if (!known(document.format)) {
+            error = "unsupported_format";
+            return false;
+        }
+        if (document.source_name.empty()) {
+            error = "empty_source_name";
+            return false;
+        }
+        if (document.bytes.empty()) {
+            error = "empty_document";
+            return false;
+        }
+        for (const auto& dependency : document.dependencies) {
+            if (dependency.path.empty() || dependency.kind.empty()) {
+                error = "invalid_dependency";
+                return false;
+            }
+        }
+        return true;
+    }
+
 public:
-    Registry() {
-        for (auto format : {AssetFormat::Gltf, AssetFormat::Usd, AssetFormat::MaterialX,
-                            AssetFormat::Ktx, AssetFormat::Text, AssetFormat::Font})
-            caps_.push_back({format, true, true, true});
+    std::vector<FormatCapabilities> capabilities() const override {
+        return {
+            {AssetFormat::Gltf, true, true, true, ".gltf/.glb"},
+            {AssetFormat::Usd, true, true, true, ".usd/.usda/.usdc"},
+            {AssetFormat::MaterialX, true, true, true, ".mtlx"},
+            {AssetFormat::Ktx, true, true, true, ".ktx/.ktx2"},
+            {AssetFormat::Text, true, true, true, ".txt"},
+            {AssetFormat::Font, true, true, true, ".ttf/.otf"}
+        };
     }
-    std::vector<FormatCapabilities> capabilities() const override { return caps_; }
-    bool import_document(const FormatDocument& doc, std::string& error) override {
-        if (doc.source_name.empty() || doc.bytes.empty()) { error = "invalid_document"; return false; }
-        auto it = std::find_if(docs_.begin(), docs_.end(), [&](const auto& d) { return d.format == doc.format; });
-        if (it == docs_.end()) docs_.push_back(doc); else *it = doc;
+
+    bool import_document(const FormatDocument& document, std::string& error) override {
+        if (!valid(document, error)) return false;
+        const auto it = std::find_if(documents_.begin(), documents_.end(), [&](const auto& item) {
+            return item.format == document.format;
+        });
+        if (it != documents_.end()) {
+            error = "document_exists_use_reimport";
+            return false;
+        }
+        auto copy = document;
+        copy.revision = 1;
+        documents_.push_back(std::move(copy));
         return true;
     }
+
+    bool reimport_document(const FormatDocument& document, std::string& error) override {
+        if (!valid(document, error)) return false;
+        const auto it = std::find_if(documents_.begin(), documents_.end(), [&](const auto& item) {
+            return item.format == document.format;
+        });
+        if (it == documents_.end()) {
+            error = "document_not_found";
+            return false;
+        }
+        auto copy = document;
+        copy.revision = it->revision + 1;
+        *it = std::move(copy);
+        return true;
+    }
+
+    FormatValidation validate(AssetFormat format) const override {
+        FormatValidation result;
+        const auto* item = document(format);
+        if (!item) {
+            result.errors.push_back("document_not_found");
+            return result;
+        }
+        std::string error;
+        if (!valid(*item, error)) {
+            result.errors.push_back(error);
+            return result;
+        }
+        result.valid = true;
+        result.dependencies = item->dependencies;
+        return result;
+    }
+
     bool export_document(AssetFormat format, std::vector<std::uint8_t>& bytes, std::string& error) const override {
-        const auto* doc = document(format);
-        if (!doc) { error = "document_not_found"; return false; }
-        bytes = doc->bytes;
+        const auto* item = document(format);
+        if (!item) {
+            error = "document_not_found";
+            return false;
+        }
+        bytes = item->bytes;
         return true;
     }
+
     const FormatDocument* document(AssetFormat format) const override {
-        auto it = std::find_if(docs_.begin(), docs_.end(), [&](const auto& d) { return d.format == format; });
-        return it == docs_.end() ? nullptr : &*it;
+        const auto it = std::find_if(documents_.begin(), documents_.end(), [&](const auto& item) {
+            return item.format == format;
+        });
+        return it == documents_.end() ? nullptr : &*it;
     }
-    void clear() override { docs_.clear(); }
-private:
-    std::vector<FormatCapabilities> caps_;
-    std::vector<FormatDocument> docs_;
+
+    std::vector<FormatDependency> dependencies(AssetFormat format) const override {
+        const auto* item = document(format);
+        return item ? item->dependencies : std::vector<FormatDependency>{};
+    }
+
+    void clear() override { documents_.clear(); }
 };
+
+} // namespace
+
+std::unique_ptr<IAssetFormatRegistry> create_asset_format_registry() {
+    return std::make_unique<Registry>();
 }
-std::unique_ptr<IAssetFormatRegistry> create_asset_format_registry() { return std::make_unique<Registry>(); }
-}
+
+} // namespace engine::assets

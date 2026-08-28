@@ -3,6 +3,7 @@
 #include "RegistryJson.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 

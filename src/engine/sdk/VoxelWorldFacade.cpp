@@ -31,6 +31,9 @@
 
 namespace {
 
+// VoxelWorldFacade implementation sections are kept private to this adapter;
+// public contracts remain in engine/voxel and engine/entity headers.
+
 // Derives the world's dynamic block table from the registry. Catalog entries
 // (no builtin mapping) receive dynamic runtime ids (>= BlockType::Count) in
 // UUID-sorted order — deterministic, so ids never depend on JSON load order

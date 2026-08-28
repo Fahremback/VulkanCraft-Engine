@@ -17,7 +17,7 @@
         "VC_ENABLE_BLAKE3": "ON",
         "VC_ENABLE_FLATBUFFERS": "ON",
         "VC_ENABLE_ROCKSDB": "ON",
-        "FETCHCONTENT_FULLY_DISCONNECTED": "ON"
+        "FETCHCONTENT_FULLY_DISCONNECTED": "OFF"
       }
     },
     {
@@ -29,8 +29,11 @@
       "cacheVariables": {
         "CMAKE_C_COMPILER": "cl",
         "CMAKE_CXX_COMPILER": "cl",
-        "CMAKE_C_COMPILER_LAUNCHER": "${sourceDir}/tools/portability/sccache",
-        "CMAKE_CXX_COMPILER_LAUNCHER": "${sourceDir}/tools/portability/sccache"
+        "CMAKE_C_COMPILER_LAUNCHER": "${sourceDir}/tools/portability/sccache.exe",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "${sourceDir}/tools/portability/sccache.exe",
+        "SCCACHE_CACHE_TYPE": "local",
+        "SCCACHE_DIR": "$env{LOCALAPPDATA}/VulkanCraft/sccache",
+        "SCCACHE_IGNORE_SERVER_IO_ERROR": "1"
       }
     },
     {
@@ -66,6 +69,16 @@
       "displayName": "RelWithDebInfo (Ninja)",
       "description": "Release with debug info for profiling",
       "inherits": "ninja-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "dev-shared",
+      "displayName": "Shared development build (Ninja)",
+      "description": "Single incremental build cache shared by every agent. Always invoke through tools/maintenance/build-shared.ps1 so configure/build access is serialized.",
+      "inherits": "ninja-base",
+      "binaryDir": "${sourceDir}/out/dev-shared",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -120,6 +133,10 @@
     {
       "name": "relwithdebinfo",
       "configurePreset": "relwithdebinfo"
+    },
+    {
+      "name": "dev-shared",
+      "configurePreset": "dev-shared"
     },
     {
       "name": "msvc-release",

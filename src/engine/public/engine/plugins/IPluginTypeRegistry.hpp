@@ -1,11 +1,12 @@
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-namespace Engine::Plugins {
+namespace engine::plugins {
 
 /// What kind of thing a plugin is registering.
 enum class PluginRegistrationKind {
@@ -144,4 +145,4 @@ private:
     std::vector<std::string> order_;  ///< insertion order for determinism
 };
 
-} // namespace Engine::Plugins
+} // namespace engine::plugins

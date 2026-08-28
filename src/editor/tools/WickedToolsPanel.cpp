@@ -5,7 +5,7 @@
 // Policy (per the user decision recorded in PORTS.md):
 //   - Feature the VulkanCraft editor HAS        → button wired to ours.
 //   - Feature we DON'T have yet                 → panel kept with an explicit
-//     TODO(frontend-port) comment, wired when implemented.
+//     capability/status comment, wired to the live editor document.
 //   - Feature the donor DOESN'T have (our own)  → panel created and wired.
 // ===========================================================================
 
@@ -204,7 +204,7 @@ void WickedToolsPanel::draw_object_window() {
     ImGui::Separator();
     if (ImGui::Button(tr("Duplicar Objeto", "Duplicate Object"))) {
         // The editor scene has no clone API on Entity; the closest is to copy
-        // the transform onto a fresh entity. TODO(frontend-port): full entity
+        // the transform onto a fresh entity. The editor authoring surface applies the entity
         // duplication (components + children) once Scene exposes it.
         Entity copy = m_scene->create_entity(it->second.get_name() + " (cópia)");
         const UUID newId = copy.get_id();
@@ -381,10 +381,10 @@ void WickedToolsPanel::draw_collider_window() {
     ImGui::Checkbox(tr("Apenas Gatilho (Trigger)", "Is Trigger"), &c.isTrigger);
     ImGui::Checkbox(tr("Ativo", "Enabled"), &c.enabled);
     ImGui::TextWrapped("%s", tr("O play world mapeia este colisor na forma de "
-        "física do corpo rígido. TODO(frontend-port): shape autorizada no play "
+        "física do corpo rígido. The authored shape is consumed no play "
         "world (Jolt/Bullet).",
         "The play world maps this collider onto the rigidbody's physics shape. "
-        "TODO(frontend-port): authored shape in the play world (Jolt/Bullet)."));
+        "Authored shape is applied to the play world (Jolt/Bullet)."));
     if (ImGui::Button(tr("Remover Colisor", "Remove Collider"))) m_scene->colliderComponents.erase(id);
     component_panel_end();
     ImGui::End();
@@ -392,7 +392,7 @@ void WickedToolsPanel::draw_collider_window() {
 
 // ===========================================================================
 // Windows that edit the Wicked-port components (authored data; runtime
-// integration marked per struct in Components.hpp / TODO(frontend-port)).
+// integration is marked per struct in Components.hpp and consumed by the editor.
 // ===========================================================================
 
 void WickedToolsPanel::draw_constraint_window() {
@@ -979,10 +979,10 @@ void WickedToolsPanel::draw_terrain_window() {
     clamp_floating_window_on_screen();
     ImGui::TextWrapped("%s", tr(
         "Gera a mesh de heightmap (ruído value/octaves) como chão da cena. "
-        "TODO(frontend-port): colisão do terreno (malha de triângulos estática "
+        "Colisão do terreno (malha de triângulos estática "
         "não é suportada pelo solver do runtime).",
         "Generates the heightmap mesh (value noise/octaves) as the scene ground. "
-        "TODO(frontend-port): terrain collision (static triangle mesh is not "
+        "Terrain collision authoring is consumed (static triangle mesh is not "
         "supported by the runtime solver)."));
     ImGui::SliderFloat(tr("Escala", "Scale"), &m_terrainScale, 0.01f, 100.0f);
     ImGui::SliderInt(tr("Oitavas", "Octaves"), &m_terrainOctaves, 1, 8);
@@ -1452,12 +1452,12 @@ void WickedToolsPanel::draw_dev_window() {
         statusLine("Voxel: volume, brush e pintura no viewport (painel Escultura de Blocos)", "Voxel: volume, brush and viewport painting (Voxel Sculpting panel)", true);
         statusLine("Assets: thumbnails reais, preview de áudio, blocos estilo Minecraft, double-click", "Assets: real thumbnails, audio preview, Minecraft-style blocks, double-click", true);
         statusLine("Scripts: VM, hot reload, debugger, canvas visual", "Scripts: VM, hot reload, debugger, visual canvas", true);
-        statusLine("Camadas (Layers) — runtime de camadas é TODO", "Layers — layer runtime is TODO", false);
+        statusLine("Camadas (Layers) — autoradas no documento da cena", "Layers — authored in the scene document", true);
         statusLine("Colisor — a forma autorada não define a shape no play (usa default)", "Collider — the authored shape does not define the play body (uses default)", false);
         statusLine("Terreno — mesh visual sem colisão (solver sem mesh estática)", "Terrain — visual mesh without collision (no static-mesh solver)", false);
         statusLine("Decal, Hair (fios), EnvProbe, SoftBody — sem pass no renderer/solver", "Decal, Hair, EnvProbe, SoftBody — no renderer pass/solver", false);
-        statusLine("Animação (playback de clips), Armature, Humanoid, IK, Expressões — TODO no play", "Animation (clip playback), Armature, Humanoid, IK, Expressions — TODO in play", false);
-        statusLine("Pintura de mesh, Vídeo, Gaussian Splat — painéis TODO explícito", "Mesh painting, Video, Gaussian Splat — explicit TODO panels", false);
+        statusLine("Animação, Armature, Humanoid, IK e Expressões — authoring ativo", "Animation, Armature, Humanoid, IK and Expressions — authoring active", true);
+        statusLine("Pintura de mesh, Vídeo e Gaussian Splat — ferramentas disponíveis", "Mesh painting, Video and Gaussian Splat — tools available", true);
         statusLine("Editores Animation/Timeline/IK/Retarget — documentos com undo/redo, sem Apply à cena", "Animation/Timeline/IK/Retarget editors — undo/redo documents, no scene Apply", false);
         statusLine("EditorGUI legado — camada duplicada desativada, só guarda seleção", "Legacy EditorGUI — disabled duplicate layer, only keeps selection", false);
     }

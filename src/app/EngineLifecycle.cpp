@@ -161,6 +161,9 @@ void Engine::cleanup() {
         }
 
         worldRenderer.cleanup(true);
+        destroy_gpu_feature_passes();
+        destroy_gpu_feature_binding();
+        radianceCache.cleanup();
 
         vkDestroyPipeline(device, voxelPipeline, nullptr);
         vkDestroyPipeline(device, farSurfacePipeline, nullptr);

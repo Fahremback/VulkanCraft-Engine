@@ -137,7 +137,28 @@ function main() {
   // 0. Reconfigure the main build so the new install rules (vc_sdk archive,
   // dependency libs, package config) are in the install manifest.
   log("reconfiguring main build (picks up install rules)");
-  let result = run("cmake", ["-S", ".", "-B", "build"], { cwd: ENGINE_ROOT });
+  // Preserve the generator selected by the existing cache. Passing a new
+  // generator to an already-configured build directory makes CMake reject the
+  // gate before it can validate the installed SDK. A fresh build may still
+  // select the explicit environment/default generator.
+  const cachePath = path.join(BUILD_DIR, "CMakeCache.txt");
+  const cacheText = fs.existsSync(cachePath) ? fs.readFileSync(cachePath, "utf8") : "";
+  const cachedGenerator = cacheText.match(/^CMAKE_GENERATOR:INTERNAL=(.*)$/m)?.[1];
+  const cmakeGenerator = cachedGenerator || process.env.CMAKE_GENERATOR || "Visual Studio 18 2026";
+  const cmakeConfigureArgs = ["-S", ".", "-B", "build", "-G", cmakeGenerator];
+  if (cmakeGenerator.startsWith("Visual Studio") && !cachedGenerator) cmakeConfigureArgs.push("-A", "x64");
+  const vsEnv = process.env.VCINSTALLDIR ? process.env : { ...process.env,
+    PATH: `C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/bin/Hostx64/x64;C:/Program Files/CMake/bin;C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64;${process.env.PATH || ""}`,
+    INCLUDE: `C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/include;C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/ucrt;C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/shared;C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um`,
+    LIB: `C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/lib/x64;C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/ucrt/x64;C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/um/x64`,
+    LIBPATH: `C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/lib/x64;C:/Program Files (x86)/Windows Kits/10/UnionMetadata/10.0.26100.0;C:/Program Files (x86)/Windows Kits/10/References/10.0.26100.0`,
+    CMAKE_MT: `C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/mt.exe`,
+    RC: `C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/rc.exe`,
+    CMAKE_LINKER: `C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/bin/Hostx64/x64/link.exe`,
+    CMAKE_C_COMPILER: `C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/bin/Hostx64/x64/cl.exe`,
+    CMAKE_CXX_COMPILER: `C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/bin/Hostx64/x64/cl.exe`
+  };
+  let result = run("cmake", cmakeConfigureArgs, { cwd: ENGINE_ROOT, env: vsEnv });
   if (result.status !== 0) {
     fail(`main reconfigure exited ${result.status}`);
     return;
@@ -146,7 +167,7 @@ function main() {
   // 0b. Build Release targets so .lib files exist for install.
   log("building Release targets");
   result = run("cmake", ["--build", "build", "--config", "Release"],
-    { cwd: ENGINE_ROOT, timeout: 600_000 });
+    { cwd: ENGINE_ROOT, timeout: 600_000, env: vsEnv });
   if (result.status !== 0) {
     fail(`main build exited ${result.status}`);
     return;
@@ -244,6 +265,10 @@ function main() {
           "gameplay-consumer-ok ability-ids", "gameplay-consumer-ok ability-state",
           "gameplay-consumer-ok all"],
         label: "gameplay (AI + Animation + Ragdoll + Vehicle + Ability)" },
+      { template: "gameplay-consumer",
+        exe: "gameplay_consumer.exe",
+        markers: ["gameplay-consumer-ok integration", "gameplay-consumer-ok debug", "gameplay-consumer-ok all"],
+        label: "public integration coordinator" },
       { template: "external-project-multiplayer",
         exe: "multiplayer_consumer.exe",
         markers: ["multiplayer-consumer-ok server-boot", "multiplayer-consumer-ok two-clients",

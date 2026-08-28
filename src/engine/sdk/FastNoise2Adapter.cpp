@@ -10,14 +10,15 @@
 #include "FastNoise2Adapter.hpp"
 #include "RegistryJson.hpp"
 
-// FastNoiseLite — single-header MIT noise library, already vendored.
-#include "FastNoiseLite.h"
+// FastNoiseLite — vendored, dependency-free MIT backend.
+#include "fastnoise_lite/FastNoiseLite.h"
 
 #include <cmath>
 #include <cstdint>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace engine {
@@ -75,7 +76,7 @@ public:
             spec_.nodes[spec_.root].type == "constant") {
             return compute_constant(spec_.nodes[spec_.root]);
         }
-        return cached_noise_->GetNoise(x * root_freq_, z * root_freq_);
+        return cached_noise_->GetNoise(x, z);
     }
 
     float sample_3d(float x, float y, float z) const override {
@@ -85,8 +86,7 @@ public:
             spec_.nodes[spec_.root].type == "constant") {
             return compute_constant(spec_.nodes[spec_.root]);
         }
-        return cached_noise_->GetNoise(x * root_freq_, y * root_freq_,
-                                       z * root_freq_);
+        return cached_noise_->GetNoise(x, y, z);
     }
 
     bool serialize(std::string& out) const override {
@@ -168,6 +168,15 @@ private:
         if (spec_.root >= spec_.nodes.size()) return;
 
         const auto& root_node = spec_.nodes[spec_.root];
+        if (root_node.type != "constant" && root_node.type != "perlin" &&
+            root_node.type != "simplex" && root_node.type != "value") {
+            return;
+        }
+        if (root_node.type != "constant" &&
+            (root_node.params.empty() || !std::isfinite(root_node.params[0]) ||
+             root_node.params[0] <= 0.0f)) {
+            return;
+        }
 
         // Skip compilation for constant nodes.
         if (root_node.type == "constant") {
@@ -175,28 +184,20 @@ private:
             return;
         }
 
+        root_freq_ = (root_node.params.size() > 0) ? root_node.params[0] : 0.01f;
+        const int seed = static_cast<int>(seed_) +
+                         (root_node.params.size() > 1 ? static_cast<int>(root_node.params[1]) : 0);
         auto noise = std::make_unique<fast_noise_lite::FastNoiseLite>();
-        noise->SetSeed(static_cast<int>(seed_));
-
+        noise->SetSeed(seed);
         using FNL = fast_noise_lite::FastNoiseLite;
-        // Map our node types to FastNoiseLite types.
         if (root_node.type == "perlin") {
             noise->SetNoiseType(FNL::NoiseType_Perlin);
-        } else if (root_node.type == "simplex" || root_node.type == "opensimplex2s") {
-            noise->SetNoiseType(FNL::NoiseType_OpenSimplex2S);
-        } else if (root_node.type == "cellular") {
-            noise->SetNoiseType(FNL::NoiseType_Cellular);
-        } else if (root_node.type == "value") {
-            noise->SetNoiseType(FNL::NoiseType_ValueCubic);
-        } else {
-            // Default to OpenSimplex2.
+        } else if (root_node.type == "simplex") {
             noise->SetNoiseType(FNL::NoiseType_OpenSimplex2);
+        } else {
+            noise->SetNoiseType(FNL::NoiseType_Value);
         }
-
-        // Frequency from params.
-        root_freq_ = (root_node.params.size() > 0) ? root_node.params[0] : 0.01f;
         noise->SetFrequency(root_freq_);
-
         cached_noise_ = std::move(noise);
     }
 

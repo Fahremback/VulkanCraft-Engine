@@ -64,6 +64,10 @@ void RadianceCache::destroy_buffer(GpuBuffer& buffer) {
     buffer = {};
 }
 
+void RadianceCache::init(VkDevice device, VmaAllocator allocator) {
+    init(device, allocator, Config{});
+}
+
 void RadianceCache::init(VkDevice device, VmaAllocator allocator, const Config& requestedConfig) {
     if (initialized()) cleanup();
     if (device == VK_NULL_HANDLE || allocator == VK_NULL_HANDLE) {

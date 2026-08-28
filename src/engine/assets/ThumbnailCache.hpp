@@ -31,7 +31,8 @@ public:
         bool persist{true};
     };
 
-    explicit ThumbnailCache(Options options = {});
+    ThumbnailCache();
+    explicit ThumbnailCache(Options options);
 
     // Renders (or returns cached) a thumbnail for `assetKey`.
     // `generator` produces RGBA at the requested size; it is only invoked on

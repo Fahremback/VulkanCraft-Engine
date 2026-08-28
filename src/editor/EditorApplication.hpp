@@ -28,6 +28,7 @@
 #include "../engine/rendering/materials/Material.hpp"
 #include "../engine/rendering/MaterialGraph.hpp"
 #include "../engine/rendering/vulkan/MaterialPipeline.hpp"
+#include "../engine/public/engine/rendering/IProbeGrid.hpp"
 #include "../engine/scene/Entity.hpp"
 #include "../engine/editor/play_mode/PlayMode.hpp"
 #include "../engine/editor/undo/UndoSystem.hpp"
@@ -201,6 +202,90 @@ struct EditorShadowMap {
     bool enabled{ false };
 };
 
+// ---------------------------------------------------------------------------
+// BUG-EDITOR-SHADOWS-002: spot shadow atlas — one 90° perspective depth tile
+// per spot light slot (Rendering::kMaxSpotLights tiles on a single row). The
+// viewport shader samples it with a sampler2DShadow using the per-slot view
+// projection from EditorShadowUbo. Kept OUT of Rendering::LightUboData (shared
+// with the material-graph/game paths) so that shared layout never moves.
+// ---------------------------------------------------------------------------
+struct EditorSpotShadowMap {
+    VkImage image{ VK_NULL_HANDLE };
+    VkDeviceMemory memory{ VK_NULL_HANDLE };
+    VkImageView view{ VK_NULL_HANDLE };
+    VkRenderPass renderPass{ VK_NULL_HANDLE };
+    VkFramebuffer framebuffer{ VK_NULL_HANDLE };
+    VkSampler sampler{ VK_NULL_HANDLE };   // compare LEQUAL → sampler2DShadow
+    uint32_t size{ 512 };                  // per-tile resolution (row = 4 tiles)
+    bool enabled{ false };
+};
+
+// ---------------------------------------------------------------------------
+// BUG-EDITOR-SHADOWS-002: point light shadow — depth for ONE point light
+// (slot 0) stored as a 6-tile 2D atlas (one 90° face per tile) with LINEAR
+// depth (distance / range) written by gl_FragDepth, so the shader can compare
+// radial distance directly. A 2D atlas with an explicit per-face basis (built
+// by the SAME formula in C++ and GLSL — see face_basis_for_dir) replaces a
+// cube map: no samplerCubeShadow face-convention risk.
+// ---------------------------------------------------------------------------
+struct EditorPointShadowMap {
+    VkImage image{ VK_NULL_HANDLE };
+    VkDeviceMemory memory{ VK_NULL_HANDLE };
+    VkImageView view{ VK_NULL_HANDLE };
+    VkRenderPass renderPass{ VK_NULL_HANDLE };
+    VkFramebuffer framebuffer{ VK_NULL_HANDLE };
+    VkSampler sampler{ VK_NULL_HANDLE };   // compare LEQUAL → sampler2DShadow
+    VkShaderModule vertShader{ VK_NULL_HANDLE };
+    VkShaderModule fragShader{ VK_NULL_HANDLE };
+    VkPipelineLayout pipelineLayout{ VK_NULL_HANDLE };
+    VkPipeline pipeline{ VK_NULL_HANDLE };
+    uint32_t size{ 512 };                  // per-face tile (atlas = 6 tiles wide)
+    bool enabled{ false };
+};
+
+// ---------------------------------------------------------------------------
+// BUG-EDITOR-GI-001: editor-only shadow + GI metadata for the basic viewport
+// path (binding 4 of the scene light set). Spot tiles, point slot 0 and the
+// dense probe-irradiance grid (Agente 1 IProbeGrid state, toroidal window
+// wrapped to the resolution) travel together in one small UBO.
+// ---------------------------------------------------------------------------
+inline constexpr uint32_t kEditorSpotShadowSlots = 4;                                  // = Rendering::kMaxSpotLights
+inline constexpr uint32_t kEditorProbeResolution = 8;                                  // 8^3 = 512 probes
+inline constexpr uint32_t kEditorProbeCount = kEditorProbeResolution * kEditorProbeResolution * kEditorProbeResolution;
+
+struct EditorShadowUbo {
+    glm::mat4 spotViewProj[kEditorSpotShadowSlots]; // tile i projection (depth remapped to [0,1])
+    glm::vec4 spotEnabled;                          // per-slot 0/1
+    glm::vec4 pointLight;                           // xyz = light position, w = range
+    glm::vec4 pointParams;                          // x = enabled, y = near, z = far, w = unused
+    glm::vec4 probeOrigin;                          // xyz = window min CELL index, w = cellSize
+    glm::vec4 probeParams;                          // x = resolution, y = enabled, z/w unused
+    glm::vec4 probeIrradiance[kEditorProbeCount];   // rgb = irradiance, wrapped cell lookup
+};
+static_assert(sizeof(EditorShadowUbo) == 64 * kEditorSpotShadowSlots + 16 * 5 + 16 * kEditorProbeCount,
+              "EditorShadowUbo must stay within the guaranteed uniform range");
+
+// Slot layout shared by the shadow passes and the UBO writer so tile i always
+// belongs to the same light in the same frame (castShadows respected).
+struct EditorShadowLightSlots {
+    bool sun{ false };
+    glm::vec3 sunDir{ 0.0f, -1.0f, 0.0f };
+    struct Spot {
+        bool enabled{ false };
+        bool castShadows{ true };
+        glm::vec3 position{ 0.0f };
+        glm::vec3 direction{ 0.0f, -1.0f, 0.0f };
+        float range{ 50.0f };
+    } spots[kEditorSpotShadowSlots]{};
+    struct Point {
+        bool enabled{ false };
+        bool castShadows{ true };
+        glm::vec3 position{ 0.0f };
+        float range{ 50.0f };
+    } point0{};
+};
+void collect_editor_shadow_lights(const Scene* scene, EditorShadowLightSlots& out);
+
 // -----------------------------------------------------------------------
 // GPU buffer for procedural geometry
 // -----------------------------------------------------------------------
@@ -226,13 +311,14 @@ struct ScenePushConstants {
 };
 
 // -----------------------------------------------------------------------
-// Push constant for the analytic infinite grid (80 bytes, no VBO). The CPU
-// hands the inverse view-projection (ray unprojection) and the camera
-// position, so the shader never inverts matrices per vertex.
+// Push constant for the analytic infinite grid (128 bytes, no VBO). The CPU
+// hands the inverse view-projection (ray unprojection) plus the exact scene
+// view-projection used to recover a Vulkan-correct fragment depth.
+// Keep this at the Vulkan-guaranteed 128-byte limit: cameraPos was unused.
 // -----------------------------------------------------------------------
 struct GridPushConstants {
     glm::mat4 invViewProj;
-    glm::vec4 cameraPos;
+    glm::mat4 viewProj;
 };
 
 class EditorApplication {
@@ -265,8 +351,21 @@ private:
     void create_shadow_map();
     void destroy_shadow_map();
     // Records the sun shadow pass (depth-only) before the scene pass; also
-    // computes m_shadowMap.viewProj consumed by write_light_ubo.
+    // computes m_shadowMap.viewProj consumed by write_light_ubo. The same
+    // function records the spot atlas (BUG-EDITOR-SHADOWS-002) and the point
+    // slot-0 face atlas; terrain, primitive placeholders and voxel volumes are
+    // casters on every shadow pass.
     void record_shadow_pass(VkCommandBuffer cmd, const Scene* scene);
+    void record_spot_shadow_pass(VkCommandBuffer cmd, const Scene* scene);
+    void record_point_shadow_pass(VkCommandBuffer cmd, const Scene* scene);
+    void update_shadow_ubo(const Scene* scene);
+    void init_gi_probes();
+    void update_gi_probes(const Scene* scene);
+    // Shared caster enumeration for the sun/spot/point shadow passes.
+    void draw_shadow_casters(VkCommandBuffer cmd, VkPipelineLayout layout, VkPipeline pipeline,
+                             VkShaderStageFlags pushStages, uint32_t pushSize,
+                             const glm::mat4& viewProj, const glm::vec4* extraPush,
+                             const Scene* scene);
     void init_scene_pipeline();
     void init_geometry_buffers();
     void cleanup_offscreen_target();
@@ -349,6 +448,7 @@ private:
     // material → entidade selecionada (se tiver MeshRenderer).
     void handle_asset_drop(const UUID& assetId);
     void draw_content_browser_panel();
+    void draw_gameplay_ui_panel();
     void draw_onboarding_overlay();
     void draw_layout_settings_panel();
     void draw_render_debugger_panel();
@@ -402,6 +502,13 @@ private:
     // ---- Offscreen Viewport Rendering ----
     OffscreenTarget m_offscreen;
     EditorShadowMap m_shadowMap;
+    EditorSpotShadowMap m_spotShadow;
+    EditorPointShadowMap m_pointShadow;
+    GPUBuffer m_editorShadowUbo;
+    VkDeviceMemory m_editorShadowUboMemory{ VK_NULL_HANDLE };
+    std::unique_ptr<Engine::Rendering::IProbeGrid> m_probeGrid;
+    bool m_giEnabled{ true };
+    EditorShadowUbo m_shadowUboData{};
     VkPipeline m_scenePipeline{ VK_NULL_HANDLE };
     VkPipeline m_wireframePipeline{ VK_NULL_HANDLE };
     VkPipeline m_gizmoPipeline{ VK_NULL_HANDLE };
@@ -423,6 +530,19 @@ private:
     VkShaderModule m_gridFragShader{ VK_NULL_HANDLE };
     VkPipeline m_gridPipeline{ VK_NULL_HANDLE };
     VkPipelineLayout m_gridPipelineLayout{ VK_NULL_HANDLE };
+
+    // Scene light UBO (BUG-EDITOR-LIGHTS-001): the basic mesh path
+    // (editor_viewport.frag) consumes the same Rendering::LightUboData the
+    // material-graph pipelines already receive, so scene lights (sun +
+    // point/spot/area) actually shade terrain and entities in real time.
+    VkBuffer m_sceneLightBuffer{ VK_NULL_HANDLE };
+    VkDeviceMemory m_sceneLightMemory{ VK_NULL_HANDLE };
+    VkDescriptorSetLayout m_sceneLightSetLayout{ VK_NULL_HANDLE };
+    VkDescriptorPool m_sceneLightPool{ VK_NULL_HANDLE };
+    VkDescriptorSet m_sceneLightSet{ VK_NULL_HANDLE };
+    void init_scene_light_resources();
+    void destroy_scene_light_resources();
+    void update_scene_light_ubo(const class Scene* scene);
 
     // Runtime-wired Wicked-port rendering (frontend port): hair strands,
     // gaussian splat clouds, env-probe reflective sphere and the decal quad.
@@ -939,6 +1059,8 @@ private:
     bool m_showRenderDebugger{ false };
     bool m_showLayoutSettings{ false };
     bool m_showOnboardingOverlay{ true };
+    bool m_showGameplayUi{ false };
+    bool m_uiHighContrast{ false };
     float m_uiDpiScale{ 1.0f };
     float m_uiTextScale{ 1.0f };
     float m_lastAppliedDpiScale{ 1.0f };
@@ -1189,7 +1311,7 @@ private:
     // Play-world vehicles: one VehicleRuntime per VehicleComponent entity with
     // a chassis body in the play physics; driven with the arrow keys.
     std::unordered_map<UUID, Engine::Gameplay::VehicleRuntime> m_playVehicles;
-    // Wicked-port runtime (formerly TODO(frontend-port)): constraints run as
+    // Wicked-port runtime: constraints run as
     // soft force-based constraints (the runtime solver has no rigid-joint API),
     // springs hold a rest anchor, spline followers keep their progress; the
     // sky pass is driven by WeatherComponent.

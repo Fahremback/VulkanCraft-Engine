@@ -1,0 +1,8 @@
+{
+  "name": "example.external.luau",
+  "version": "1.0.0",
+  "abi": "luau",
+  "entry": "plugin.luau",
+  "permissions": ["assets:read"],
+  "capabilities": ["types", "nodes", "events"]
+}

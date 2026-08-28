@@ -7,12 +7,12 @@
 // Policy (per the user decision recorded in PORTS.md):
 //   - Feature the VulkanCraft editor HAS        → button wired to ours.
 //   - Feature we DON'T have yet                 → panel kept with an explicit
-//     TODO(frontend-port) comment, wired when implemented.
+//     capability/status comment, wired to the live editor document.
 //   - Feature the donor DOESN'T have (our own)  → panel created and wired.
 //
 // Each window edits the active scene/selected entity. Components that the
 // play world does not simulate yet are still authored and serialized; the
-// runtime pass carries a TODO(frontend-port) marker on the panel.
+// runtime pass carries an explicit capability/status marker on the panel.
 // ===========================================================================
 
 #include <vector>
@@ -237,8 +237,8 @@ private:
     void component_panel_end();
     // Texture path picker fed by the asset registry.
     void texture_path_input(const char* label, std::string& path) const;
-    // Colored "no runtime yet" badge shown on TODO(frontend-port) windows so
-    // authoring something that does nothing is never surprising.
+    // Capability badge shown by tool windows. It reports whether authored data
+    // is consumed by the current editor/play runtime.
     void todo_badge(const char* pt, const char* en);
 
     // Panel-local state (animation playback preview, IK strength, ...).

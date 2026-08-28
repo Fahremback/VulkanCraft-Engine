@@ -1,0 +1,8 @@
+{
+  "name": "example.external.wasm",
+  "version": "1.0.0",
+  "abi": "wasm",
+  "entry": "plugin.wasm",
+  "permissions": [],
+  "capabilities": ["types", "events"]
+}

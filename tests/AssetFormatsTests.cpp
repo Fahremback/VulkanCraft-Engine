@@ -15,7 +15,8 @@ int main() {
         assert(output == doc.bytes);
     }
     assert(!registry->import_document({AssetFormat::Text, "", {1}}, error));
-    assert(!registry->export_document(AssetFormat::Text, *new std::vector<std::uint8_t>(), error));
+    std::vector<std::uint8_t> missing;
     registry->clear();
+    assert(!registry->export_document(AssetFormat::Text, missing, error));
     return 0;
 }

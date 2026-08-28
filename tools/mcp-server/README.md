@@ -104,6 +104,7 @@ Observações honestas do contrato atual:
 - `inspect_symbol`: declarações e usos de símbolos C/C++.
 - `read_file`: leitura parcial com SHA-256.
 - `apply_text_edits`: substituições exatas, atômicas e protegidas contra concorrência.
+- `public_contracts` / `read_public_contract`: catálogo dinâmico e leitura somente dos headers públicos instaláveis, incluindo reflection, jobs, assets, networking, plugins e scripting visual.
 - `create_file`: criação atômica de arquivos textuais.
 
 ### Validação sem janela (run + logs)

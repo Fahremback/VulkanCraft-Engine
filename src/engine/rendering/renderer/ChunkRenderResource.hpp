@@ -17,4 +17,10 @@ struct ChunkRenderResource {
     uint32_t waterVertexCount{0};
     uint32_t grassInstanceCount{0};
     uint32_t foliageInstanceCount{0};
+    uint32_t materialVariantCount{0};
+    uint32_t dynamicMaterialVertexCount{0};
+    uint32_t emissiveVertexCount{0};
+    VkBuffer materialBuffer{VK_NULL_HANDLE};
+    VmaAllocation materialAllocation{VK_NULL_HANDLE};
+    uint32_t materialRecordCount{0};
 };

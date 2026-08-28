@@ -12,7 +12,8 @@ import { join } from 'node:path';
 const ROOT = process.cwd();
 const ARTIFACTS = join(ROOT, 'out', 'artifacts', 'benchmarks');
 const BASELINE = join(ARTIFACTS, 'benchmark_engine_baseline.json');
-const EXE = join(ROOT, 'build', 'Release', 'benchmark_engine_test.exe');
+const buildDir = process.env.VC_BUILD_DIR ?? 'build';
+const EXE = join(ROOT, buildDir, 'benchmark_engine_test.exe');
 const UPDATE = process.argv.includes('--update');
 // Tolerance is configurable (BENCH_TOLERANCE) because on a shared dev machine
 // with concurrent builds, consecutive runs of the same binary vary by ~±25%
@@ -35,9 +36,9 @@ const map = new Map(baseline.benchmarks.map((b) => [b.name, b.real_time]));
 // run on a shared/hot machine cannot flip the gate. On dedicated CI runners
 // the aggregate median is stable well within the default tolerance.
 const run = spawnSync(EXE, [
-  '--benchmark_min_time=0.05s', '--benchmark_repetitions=3',
+  '--benchmark_min_time=0.05s', '--benchmark_repetitions=3', '--benchmark_enable_random_interleaving=false',
   '--benchmark_report_aggregates_only=true', '--benchmark_format=json',
-], { cwd: ROOT, encoding: 'utf8', timeout: 180000, windowsHide: true });
+], { cwd: ROOT, encoding: 'utf8', timeout: 180000, windowsHide: true, env: { ...process.env, PATH: `${join(ROOT, buildDir)};${process.env.PATH ?? ''}` } });
 if (run.status !== 0) {
   console.error('[benchmark-gate] FAIL: benchmark run exited ' + run.status);
   process.exit(1);

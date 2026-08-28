@@ -64,7 +64,8 @@ public:
     RadianceCache& operator=(const RadianceCache&) = delete;
     ~RadianceCache() = default;
 
-    void init(VkDevice device, VmaAllocator allocator, const Config& config = {});
+    void init(VkDevice device, VmaAllocator allocator, const Config& config);
+    void init(VkDevice device, VmaAllocator allocator);
     void cleanup();
 
     // Updates camera origins, schedules only missing toroidal cells, and spends

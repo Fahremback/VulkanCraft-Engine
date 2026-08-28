@@ -7,15 +7,17 @@
 #include "TextureManager.hpp"
 #include "MobRenderer.hpp"
 #include "SoundEngine.hpp"
-#include "RadianceCache.hpp"
-#include "engine/rendering/RenderGraph.hpp"
-#include "engine/rendering/vulkan/MaterialPipeline.hpp"
+#include "engine/rendering/vulkan/GpuRenderFeatures.hpp"
+#include "engine/rendering/vulkan/GpuFeaturePasses.hpp"
+#include "engine/rendering/IRenderingDebugView.hpp"
+#include "engine/rendering/IProbeGrid.hpp"
+#include "engine/rendering/IReSTIRDI.hpp"
+#include "engine/rendering/ITemporalDenoiser.hpp"
+#include "engine/rendering/IFluidSimulation.hpp"
+#include "engine/rendering/IBlockMaterialResolver.hpp"
 #include "engine/rendering/lighting/RadianceCache.hpp"
-#include "engine/rendering/lighting/RadianceCacheMath.hpp"
-#include "WorldRenderer.hpp"
 #include "simulation/voxel/streaming/WorldRenderBridge.hpp"
 #include "simulation/voxel/meshing/ChunkMeshResult.hpp"
-#include "engine/rendering/lighting/RadianceCache.hpp"
 #include "engine/entity/IEntityWorld.hpp"
 #include "engine/entity/IMobBehavior.hpp"
 #include <memory>
@@ -172,6 +174,16 @@ public:
     TextureManager textureManager;
     RadianceCache radianceCache;
     bool radianceCacheReady{ false };
+    Engine::Rendering::GpuFeatureBinding gpuFeatureBinding{};
+    Engine::Rendering::GpuRenderFeatures gpuFeatures{};
+    Engine::Rendering::GpuFeaturePasses gpuFeaturePasses{};
+    std::unique_ptr<Engine::Rendering::IProbeGrid> probeGrid;
+    std::unique_ptr<Engine::Rendering::IReSTIRDI> restirDi;
+    std::unique_ptr<Engine::Rendering::ITemporalDenoiser> temporalDenoiser;
+    std::unique_ptr<Engine::Rendering::IRenderingDebugView> renderingDebugView;
+    std::unique_ptr<vc::rendering::IFluidSimulation> fluidSimulation;
+    bool gpuFeaturesReady{ false };
+    void refresh_gpu_features();
 
     float deltaTime{ 0.0f };
     float lastFrameTime{ 0.0f };
@@ -200,6 +212,10 @@ private:
     void init_commands();
     void init_sync_structures();
     void init_pipeline();
+    void init_gpu_feature_binding();
+    void destroy_gpu_feature_binding();
+    void init_gpu_feature_passes();
+    void destroy_gpu_feature_passes();
     void init_arm_mesh();
     void draw_arm(VkCommandBuffer cmd, const glm::mat4& view, const glm::mat4& proj);
     void draw_character(VkCommandBuffer cmd, const glm::mat4& view, const glm::mat4& proj);

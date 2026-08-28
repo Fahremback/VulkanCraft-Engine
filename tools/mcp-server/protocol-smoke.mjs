@@ -9,6 +9,7 @@ const directory = path.dirname(fileURLToPath(import.meta.url));
 const smokeRelativePath = "tools/mcp-server/mcp-smoke-temp.txt";
 const smokeAbsolutePath = path.join(directory, "mcp-smoke-temp.txt");
 const smokeProject = `McpSmoke${Date.now()}`;
+const collator = new Intl.Collator("en", { sensitivity: "variant" });
 const smokeProjectPath = path.resolve(directory, "..", "..", "Projects", smokeProject);
 const child = spawn(process.execPath, [path.join(directory, "server.mjs")], {
   cwd: directory,
@@ -227,7 +228,7 @@ try {
   const projects = JSON.parse(projectsRead.result.contents[0].text);
   assert.ok(Array.isArray(projects.projects), "projects resource carries the list");
   const names = projects.projects.map((p) => p.name);
-  assert.deepEqual(names, [...names].sort(), "projects sorted by name");
+  assert.deepEqual(names, [...names].sort((a, b) => a < b ? -1 : a > b ? 1 : 0), "projects sorted by name");
   for (const p of projects.projects) {
     assert.equal(typeof p.name, "string") && assert.equal(typeof p.managed, "boolean") && assert.equal(typeof p.path, "string");
   }

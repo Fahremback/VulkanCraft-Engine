@@ -92,7 +92,11 @@ namespace wi::platform
 	inline void GetWindowProperties(window_type window, WindowProperties* dest)
 	{
 #ifdef PLATFORM_WINDOWS_DESKTOP
+#if defined(__MINGW32__)
+		dest->dpi = 96.0f;
+#else
 		dest->dpi = (float)GetDpiForWindow(window);
+#endif
 #endif // WINDOWS_DESKTOP
 
 #ifdef PLATFORM_XBOX

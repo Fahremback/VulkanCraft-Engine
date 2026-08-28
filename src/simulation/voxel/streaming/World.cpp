@@ -98,6 +98,9 @@ World::World(size_t workerThreads)
             static_cast<float>(cell.x), static_cast<float>(cell.y),
             static_cast<float>(cell.z))));
         if (!params) return;
+        // Keep periodic cells pending between due ticks. run_phase iterates a
+        // snapshot, so re-inserting here cannot execute the same cell twice in
+        // this tick; it remains available for the next cadence boundary.
         if (params->tickEveryTicks > 1 &&
             scheduler_.current_tick() % params->tickEveryTicks != 0) {
             scheduler_.schedule_fluid_tick(cell);
@@ -927,6 +930,10 @@ void World::update_fluid_physics(const glm::vec3& playerPos) {
         }
 
         if (!fed) {
+            // Retain an unfed cell for fluids that pool. It must remain active
+            // so future source edits/neighborhood changes can re-evaluate it;
+            // evaporation/solidification below may remove its block.
+            // (The active queue is separate from scheduler pending work.)
             // Unfed non-source cell: it cools into the fluid's declared solid
             // form (task D.3), else evaporates (current water behavior), else
             // keeps its level when the fluid declares no evaporation (pooled).

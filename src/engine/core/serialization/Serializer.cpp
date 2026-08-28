@@ -7,6 +7,7 @@
 #include "../../physics/Physics.hpp"
 #include "../../scripting/VisualScriptGraph.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cctype>
 #include <fstream>

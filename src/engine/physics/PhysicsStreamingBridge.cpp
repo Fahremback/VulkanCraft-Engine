@@ -26,6 +26,10 @@ PhysicsStreamingBridge::chunk_of(const glm::vec3& position,
 }
 
 PhysicsStreamingBridge::PhysicsStreamingBridge(
+    engine::voxel::IVoxelWorld& world, PhysicsRuntime& physics)
+    : PhysicsStreamingBridge(world, physics, Config{}) {}
+
+PhysicsStreamingBridge::PhysicsStreamingBridge(
     engine::voxel::IVoxelWorld& world, PhysicsRuntime& physics, Config config)
     : world_(world), physics_(physics), config_(config) {}
 

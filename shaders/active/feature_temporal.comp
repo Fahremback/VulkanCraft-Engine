@@ -1,0 +1,43 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform FeatureParams {
+    vec4 gi;
+    vec4 reflections;
+    vec4 atmosphere;
+    vec4 temporal;
+    vec4 debug;
+    vec4 fluids;
+    vec4 vfx;
+    vec4 material;
+    vec4 debugCounts;
+} features;
+
+layout(set = 0, binding = 0, std430) readonly buffer FeatureBuffer { vec4 values[]; } featureBuffer;
+layout(set = 0, binding = 1, std430) buffer TemporalHistory { vec4 values[]; } history;
+layout(set = 0, binding = 2, std430) buffer ReSTIRReservoirs { vec4 values[]; } reservoirs;
+layout(set = 0, binding = 3, std430) readonly buffer ProbeGrid { vec4 values[]; } probes;
+
+void main() {
+    const uint historyWidth = 8192u;
+    const uint index = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * historyWidth;
+    if (index >= history.values.length()) return;
+
+    const vec4 previous = history.values[index];
+    const vec4 featureSeed = featureBuffer.values.length() > 0 ? featureBuffer.values[0] : vec4(0.0);
+    const vec4 reservoir = reservoirs.values.length() > 0 ? reservoirs.values[index % reservoirs.values.length()] : vec4(0.0);
+    const vec4 probe = probes.values.length() > 0 ? probes.values[index % probes.values.length()] : vec4(0.0);
+    const float valid = clamp(features.temporal.x, 0.0, 1.0);
+    const float disocclusion = clamp(features.temporal.w, 0.0, 1.0);
+    const float motion = clamp(length(features.temporal.yz), 0.0, 1.0);
+    const float historyWeight = clamp(valid * (1.0 - disocclusion) * (1.0 - 0.5 * motion), 0.0, 1.0);
+
+    vec3 current = featureSeed.rgb;
+    current += probe.rgb * clamp(features.gi.y, 0.0, 1.0);
+    current += reservoir.rgb * clamp(features.gi.z, 0.0, 1.0);
+    current += vec3(features.reflections.x, features.reflections.y, features.reflections.w) * 0.25;
+    current += vec3(features.atmosphere.x, features.atmosphere.y, features.atmosphere.z) * 0.1;
+    current += vec3(features.fluids.x, features.vfx.y, features.material.y) * 0.05;
+    current += features.debugCounts.xyz * (1.0 / 65536.0);
+    history.values[index] = vec4(mix(current, previous.rgb, historyWeight), min(previous.a + 1.0, 65535.0));
+}

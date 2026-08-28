@@ -1,10 +1,11 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <unordered_set>
 #include <vector>
 
-namespace Engine::Plugins {
+namespace engine::plugins {
 
 /// Defines what a plugin is allowed to do. Each permission is a string
 /// (e.g. "filesystem:read", "network:connect", "process:spawn") that the
@@ -107,4 +108,4 @@ private:
     PluginPermissions perms_;
 };
 
-} // namespace Engine::Plugins
+} // namespace engine::plugins

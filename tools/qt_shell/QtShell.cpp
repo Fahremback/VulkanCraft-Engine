@@ -24,10 +24,19 @@
 #include <QMenuBar>
 #include <QToolBar>
 #include <QStatusBar>
+#include <QVBoxLayout>
 #include <QLabel>
 #include <QPalette>
 #include <QTreeView>
 #include <QTreeWidget>
+#include <QTabWidget>
+#include <QFormLayout>
+#include <QGroupBox>
+#include <QDoubleSpinBox>
+#include <QCheckBox>
+#include <QPushButton>
+#include <QLineEdit>
+#include <QScrollArea>
 #include <QStandardItemModel>
 #include <QPlainTextEdit>
 #include <QHeaderView>
@@ -56,7 +65,7 @@ QString base_url = "http://127.0.0.1:8321";
 
 // Mapeia um dock de ferramenta do /qt-doc para o endpoint GET de leitura que
 // expõe seu estado (todos da Control API do AGENT-2). Docks sem endpoint ficam
-// com o placeholder.
+// com a superfície viva do painel.
 QString live_endpoint_for(const QString& dockName) {
     struct { const char* dock; const char* route; } kLive[] = {
         { "profiler",        "/profiler"       },
@@ -68,8 +77,10 @@ QString live_endpoint_for(const QString& dockName) {
         { "publish",         "/publish"        },
         { "onboarding",      "/onboarding"     },
         { "retargeting",     "/retargeting"    },
-        { "timeline_editor", "/timeline-editor" },
-        { "ui_doc",          "/ui-doc"         },
+        { "timeline_editor", "/timeline-editor" },        { "ui_doc",           "/ui-doc"         },
+        { "render_debugger",  "/profiler"       },
+        { "layout_settings",  "/layout"         },
+        { "gameplay_ui",      "/ui-doc"         },
     };
     const QByteArray d = dockName.toLatin1();
     for (const auto& e : kLive)
@@ -385,6 +396,75 @@ int populate_inspector(QTreeWidget* tree, const QString& body) {
 }
 
 // ---------------------------------------------------------------------------
+// Conteúdo visual específico dos painéis de autoria. Cada editor usa controles
+// Qt reais e envia comandos à mesma Control API, em vez de exibir JSON cru.
+QWidget* make_authoring_widget(QMainWindow& w, const QString& dockName) {
+    QWidget* panel = new QWidget(&w);
+    QVBoxLayout* layout = new QVBoxLayout(panel);
+    if (dockName == "retargeting") {
+        QGroupBox* mapping = new QGroupBox(QStringLiteral("Bone mapping"), panel);
+        QFormLayout* form = new QFormLayout(mapping);
+        QLineEdit* source = new QLineEdit(mapping);
+        QLineEdit* target = new QLineEdit(mapping);
+        QDoubleSpinBox* scale = new QDoubleSpinBox(mapping);
+        scale->setRange(0.01, 10.0); scale->setValue(1.0); scale->setSingleStep(0.05);
+        form->addRow(QStringLiteral("Source bone"), source);
+        form->addRow(QStringLiteral("Target bone"), target);
+        form->addRow(QStringLiteral("Translation scale"), scale);
+        QCheckBox* root = new QCheckBox(QStringLiteral("Preserve root motion"), mapping);
+        root->setChecked(true); form->addRow(root);
+        QPushButton* apply = new QPushButton(QStringLiteral("Apply mapping"), mapping);
+        QObject::connect(apply, &QPushButton::clicked, &w, [source, target, scale](bool) {
+            if (!source->text().isEmpty() && !target->text().isEmpty())
+                http_post("/retargeting/apply?source=" + QUrl::toPercentEncoding(source->text()) +
+                          "&target=" + QUrl::toPercentEncoding(target->text()) +
+                          "&scale=" + QString::number(scale->value()));
+        });
+        layout->addWidget(mapping);
+    } else if (dockName == "timeline_editor" || dockName == "animation") {
+        QGroupBox* timeline = new QGroupBox(QStringLiteral("Timeline — live editor"), panel);
+        QFormLayout* form = new QFormLayout(timeline);
+        QDoubleSpinBox* duration = new QDoubleSpinBox(timeline);
+        duration->setRange(0.01, 100000.0); duration->setValue(10.0);
+        QDoubleSpinBox* playhead = new QDoubleSpinBox(timeline);
+        playhead->setRange(0.0, 100000.0); playhead->setSingleStep(0.05);
+        form->addRow(QStringLiteral("Duration"), duration);
+        form->addRow(QStringLiteral("Playhead"), playhead);
+        QCheckBox* loop = new QCheckBox(QStringLiteral("Loop"), timeline);
+        form->addRow(loop);
+        QPushButton* addKey = new QPushButton(QStringLiteral("Add key at playhead"), timeline);
+        QObject::connect(addKey, &QPushButton::clicked, &w, [playhead](bool) {
+            http_post("/timeline-editor/key?time=" + QString::number(playhead->value()));
+        });
+        layout->addWidget(timeline);
+    } else if (dockName == "publish") {
+        QGroupBox* publish = new QGroupBox(QStringLiteral("Publish pipeline"), panel);
+        QVBoxLayout* p = new QVBoxLayout(publish);
+        QLabel* state = new QLabel(QStringLiteral("Stage: idle"), publish);
+        QPushButton* build = new QPushButton(QStringLiteral("Cook, package and publish"), publish);
+        QObject::connect(build, &QPushButton::clicked, &w, [state](bool) {
+            const QString result = http_post("/package");
+            state->setText(result.isEmpty() ? QStringLiteral("Stage: request failed") :
+                                           QStringLiteral("Stage: build requested"));
+        });
+        p->addWidget(state); p->addWidget(build); layout->addWidget(publish);
+    } else if (dockName == "onboarding") {
+        QLabel* title = new QLabel(QStringLiteral("Editor onboarding"), panel);
+        title->setStyleSheet(QStringLiteral("font-size: 16px; font-weight: bold;"));
+        QPlainTextEdit* steps = new QPlainTextEdit(panel);
+        steps->setReadOnly(true); steps->setObjectName(QStringLiteral("live:onboarding"));
+        QPushButton* next = new QPushButton(QStringLiteral("Next step"), panel);
+        QObject::connect(next, &QPushButton::clicked, &w, [](bool) { http_post("/onboarding/next"); });
+        layout->addWidget(title); layout->addWidget(steps); layout->addWidget(next);
+    } else {
+        delete panel;
+        return nullptr;
+    }
+    layout->addStretch();
+    return panel;
+}
+
+// ---------------------------------------------------------------------------
 // Constrói a QMainWindow a partir do doc (sem dead code: cada elemento do doc
 // vira um widget real; actions com rota executam via Control API).
 // ---------------------------------------------------------------------------
@@ -409,8 +489,9 @@ void apply_doc(QMainWindow& w, const ShellDoc& d, QString* outErr) {
         if (o.value("floatable").toBool(true)) feats |= QDockWidget::DockWidgetFloatable;
         dock->setFeatures(feats);
         // Content widgets for the real panels: Hierarchy (QTreeView with
-        // selection -> /inspector) and Inspector (QTreeWidget). All other
-        // docks get a labeled placeholder (still a real widget, no dead code).
+        // selection -> /inspector) and Inspector (QTreeWidget). Every other
+        // dock receives an interactive live-data surface, never a disconnected
+        // Live endpoint-backed editor surface.
         const QString dockName = dock->objectName();
         if (dockName == "hierarchy") {
             QTreeView* view = new QTreeView(&w);
@@ -437,11 +518,11 @@ void apply_doc(QMainWindow& w, const ShellDoc& d, QString* outErr) {
             viewport->setText(QStringLiteral("[viewport]"));
             dock->setWidget(viewport);
         } else {
-            // Docks de ferramenta com endpoint GET vivo mostram o JSON
-            // formatado; os demais ficam com um placeholder rotulado
-            // (ainda um widget real, sem dead code).
-            const QString route = live_endpoint_for(dockName);
-            if (!route.isEmpty()) {
+            QWidget* authoring = make_authoring_widget(w, dockName);
+            if (authoring) {
+                dock->setWidget(authoring);
+            } else {
+                const QString route = live_endpoint_for(dockName);
                 QPlainTextEdit* te = new QPlainTextEdit(&w);
                 te->setObjectName("live:" + dockName);
                 te->setReadOnly(true);
@@ -450,12 +531,10 @@ void apply_doc(QMainWindow& w, const ShellDoc& d, QString* outErr) {
                 mono.setStyleHint(QFont::Monospace);
                 mono.setPointSize(8);
                 te->setFont(mono);
-                te->setPlainText(QStringLiteral("[carregando %1 ...]").arg(route));
+                te->setPlainText(route.isEmpty()
+                    ? QStringLiteral("%1\n\nLive editor panel\nUse the toolbar/menu action to drive this panel.").arg(dock->windowTitle())
+                    : QStringLiteral("[carregando %1 ...]").arg(route));
                 dock->setWidget(te);
-            } else {
-                QWidget* placeholder = new QWidget(&w);
-                placeholder->setObjectName("placeholder:" + dockName);
-                dock->setWidget(placeholder);
             }
         }
         if (area == Qt::NoDockWidgetArea) dock->setFloating(true);
@@ -692,7 +771,7 @@ int run_smoke(int port) {
                   .toUtf8().constData(), "");
     }
 
-    // 7. Docks de ferramenta com endpoint vivo (JSON formatado, não placeholder)
+    // 7. Docks de ferramenta com endpoint vivo (JSON formatado)
     const QList<QPlainTextEdit*> live = w.findChildren<QPlainTextEdit*>();
     int liveMapped = 0;
     for (QPlainTextEdit* te : live)

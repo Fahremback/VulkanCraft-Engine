@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "plugin": "example.external.visual",
+  "nodes": [
+    {
+      "type_name": "ExternalEvent",
+      "category": "Example",
+      "description": "Emits an external event",
+      "inputs": [],
+      "outputs": [{ "name": "event", "type": "Event", "required": true }],
+      "reflection_type": "example.external.event"
+    }
+  ]
+}

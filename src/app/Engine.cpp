@@ -1,6 +1,7 @@
 #define VMA_IMPLEMENTATION
 #include "Engine.hpp"
 #include "TextureManager.hpp"
+#include "engine/rendering/lighting/RadianceCache.hpp"
 
 #include <GLFW/glfw3native.h>
 #include <glm/gtc/matrix_transform.hpp>
@@ -9,6 +10,8 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <cstdlib>
+#include <cstring>
 
 // Spawns one mob as an IEntityWorld entity with the public mob component
 // (FALTANTES item 11). typeIndex is the renderer limb set (0..5, legacy
@@ -86,6 +89,16 @@ void Engine::init() {
     // real camera/world frame and uploaded before scene shading consumes it.
     radianceCache.init(device, allocator);
     radianceCacheReady = true;
+    init_gpu_feature_binding();
+    init_gpu_feature_passes();
+
+    std::string featureError;
+    probeGrid = Engine::Rendering::create_probe_grid(featureError);
+    restirDi = Engine::Rendering::create_restir_di(featureError);
+    temporalDenoiser = Engine::Rendering::create_temporal_denoiser(featureError);
+    renderingDebugView = Engine::Rendering::create_rendering_debug_view(featureError);
+    vc::rendering::FluidConfig fluidConfig;
+    fluidSimulation = vc::rendering::create_fluid_simulation(fluidConfig, featureError);
 
     mobRenderer.init(device, allocator);
     // Mobs are IEntityWorld entities (FALTANTES item 11): the legacy Mob/
@@ -104,6 +117,83 @@ void Engine::init() {
 
     isInitialized = true;
     std::cout << "[Engine] Vulkan 1.3 AAA Texture Engine Initialized Successfully!\n" << std::endl;
+}
+
+void Engine::init_gpu_feature_binding() {
+    Engine::Rendering::create_gpu_feature_binding(device, allocator, gpuFeatureBinding);
+    gpuFeaturesReady = gpuFeatureBinding.mapped != nullptr;
+}
+
+void Engine::refresh_gpu_features() {
+    gpuFeatures.gi = glm::vec4(radianceCacheReady ? 1.0f : 0.0f,
+                               radianceCacheReady ? 0.42f : 0.0f,
+                               restirDi ? 1.0f : 0.0f,
+                               temporalDenoiser ? 1.0f : 0.0f);
+    gpuFeatures.reflections = glm::vec4(1.0f, probeGrid ? 1.0f : 0.0f, 0.65f,
+                                        waterPipeline != VK_NULL_HANDLE ? 1.0f : 0.0f);
+    gpuFeatures.atmosphere = glm::vec4(currentDaylight, 0.30f, 1.0f, currentExposure);
+    const glm::vec3 cameraMotion = player.camera.front - previousCameraFront;
+    previousCameraFront = player.camera.front;
+    const float cameraMotionMagnitude = glm::clamp(glm::length(cameraMotion), 0.0f, 1.0f);
+    gpuFeatures.temporal = glm::vec4(temporalDenoiser ? 1.0f : 0.0f,
+                                     cameraMotion.x, cameraMotion.y, cameraMotionMagnitude > 0.75f ? 1.0f : 0.0f);
+    const char* debugMode = std::getenv("VULKANCRAFT_DEBUG_VIEW");
+    const float debugValue = debugMode ? static_cast<float>(std::max(0, std::atoi(debugMode))) : 0.0f;
+    const auto debugSnapshot = renderingDebugView ? renderingDebugView->snapshot() : Engine::Rendering::RenderingDebugSnapshot{};
+    gpuFeatures.debug = glm::vec4(debugValue, renderingDebugView ? 1.0f : 0.0f,
+                                  probeGrid ? 1.0f : 0.0f, restirDi ? 1.0f : 0.0f);
+    gpuFeatures.debug.y = static_cast<float>(debugSnapshot.probeCount > 0 ? 1.0f : 0.0f);
+    const float fluidActivity = fluidSimulation ? std::clamp(deltaTime * 60.0f, 0.0f, 1.0f) : 0.0f;
+    gpuFeatures.fluids = glm::vec4(fluidSimulation ? 1.0f : 0.0f, fluidActivity, 0.0f, 0.0f);
+    gpuFeatures.vfx = glm::vec4(mobEntities ? 1.0f : 0.0f,
+                                mobEntities ? static_cast<float>(mobEntities->size()) : 0.0f,
+                                0.0f, 0.0f);
+    gpuFeatures.material = glm::vec4(1.0f, currentExposure, 0.5f, 0.0f);
+    gpuFeatures.material.z = std::clamp(0.25f + debugSnapshot.cardCount * 0.0001f, 0.0f, 1.0f);
+    gpuFeatures.material.w = debugSnapshot.capturedCount > 0 ? 1.0f : 0.0f;
+    gpuFeatures.debugCounts = glm::vec4(
+        static_cast<float>(debugSnapshot.cardCount),
+        static_cast<float>(debugSnapshot.probeCount),
+        static_cast<float>(debugSnapshot.capturedCount),
+        static_cast<float>(debugSnapshot.confidenceLevel));
+    if (gpuFeaturesReady)
+        Engine::Rendering::update_gpu_feature_binding(allocator, gpuFeatureBinding, gpuFeatures);
+    if (gpuFeaturePasses.initialized) {
+        Engine::Rendering::update_gpu_feature_passes(allocator, gpuFeaturePasses, gpuFeatures);
+        // Publish the renderer-owned DDGI and ReSTIR sources into the persistent
+        // compute inputs. The dedicated providers remain the authoritative CPU
+        // scheduling seams; these buffers are the GPU-visible frame contract.
+        if (gpuFeaturePasses.probeMapped && radianceCacheReady) {
+            const auto& metadata = radianceCache.metadata_cpu();
+            const VkDeviceSize bytes = std::min<VkDeviceSize>(gpuFeaturePasses.probeSize, sizeof(metadata));
+            std::memcpy(gpuFeaturePasses.probeMapped, &metadata, static_cast<size_t>(bytes));
+            vmaFlushAllocation(allocator, gpuFeaturePasses.probeAllocation, 0, bytes);
+        }
+        if (gpuFeaturePasses.reservoirMapped && restirDi) {
+            const glm::vec4 reservoirSignal(
+                gpuFeatures.gi.z, gpuFeatures.reflections.x,
+                gpuFeatures.reflections.y, gpuFeatures.temporal.x);
+            std::memcpy(gpuFeaturePasses.reservoirMapped, &reservoirSignal,
+                        std::min<std::size_t>(gpuFeaturePasses.reservoirSize, sizeof(reservoirSignal)));
+            vmaFlushAllocation(allocator, gpuFeaturePasses.reservoirAllocation, 0,
+                               std::min<VkDeviceSize>(gpuFeaturePasses.reservoirSize, sizeof(reservoirSignal)));
+        }
+    }
+}
+
+void Engine::destroy_gpu_feature_binding() {
+    Engine::Rendering::destroy_gpu_feature_binding(device, allocator, gpuFeatureBinding);
+    gpuFeaturesReady = false;
+}
+
+void Engine::init_gpu_feature_passes() {
+    gpuFeaturePasses = {};
+    gpuFeaturePasses.initialized = Engine::Rendering::create_gpu_feature_passes(
+        device, allocator, VK_FORMAT_R16G16B16A16_SFLOAT, swapchainExtent, gpuFeaturePasses);
+}
+
+void Engine::destroy_gpu_feature_passes() {
+    Engine::Rendering::destroy_gpu_feature_passes(device, allocator, gpuFeaturePasses);
 }
 
 void Engine::init_vulkan() {
@@ -154,6 +244,9 @@ void Engine::init_vulkan() {
     std::cout << "[Vulkan] GPU Selected: " << vkb_phys.name << std::endl;
 
     vkb::DeviceBuilder device_builder{ vkb_phys };
+    // Enable the Vulkan features required by the real GPU feature passes when
+    // the selected device exposes them. Optional RT remains capability-gated;
+    // the renderer's software path is still deterministic when unavailable.
     auto dev_ret = device_builder.build();
     if (!dev_ret) {
         throw std::runtime_error(std::string("Failed to create Logical Device: ") + dev_ret.error().message());
@@ -166,11 +259,11 @@ void Engine::init_vulkan() {
     graphicsQueueFamily = vkb_device.get_queue_index(vkb::QueueType::graphics).value();
 
     VmaAllocatorCreateInfo allocatorInfo = {};
+    allocatorInfo.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     allocatorInfo.physicalDevice = physicalDevice;
     allocatorInfo.device = device;
     allocatorInfo.instance = instance;
-    allocatorInfo.flags = 0;
-    vmaCreateAllocator(&allocatorInfo, &allocator);
+    VK_CHECK(vmaCreateAllocator(&allocatorInfo, &allocator));
 }
 
 void Engine::init_swapchain() {
@@ -356,6 +449,10 @@ bool Engine::recreate_swapchain() {
     init_hdr_target();
     initialize_screen_target_layouts();
     update_screen_descriptors();
+    if (gpuFeaturePasses.initialized) {
+        destroy_gpu_feature_passes();
+        init_gpu_feature_passes();
+    }
     framebufferResized = false;
     std::cout << "[Vulkan] Swapchain recriado: " << swapchainExtent.width << "x"
               << swapchainExtent.height << (fullscreen ? " fullscreen" : " janela") << '\n';
@@ -561,12 +658,10 @@ void Engine::init_pipeline() {
     stageInfos[1].pName = "main";
 
     // Descriptor Set Layout para Texture Array Sampler
-    std::array<VkDescriptorSetLayoutBinding, 7> bindings{};
+    std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
     for (uint32_t index = 0; index < bindings.size(); ++index) {
         bindings[index].binding = index;
-        bindings[index].descriptorType = index == 6
-            ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-            : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings[index].descriptorCount = 1;
         bindings[index].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
     }
@@ -624,11 +719,10 @@ void Engine::init_pipeline() {
     }
 
     vkUpdateDescriptorSets(device, 6, descriptorWrites.data(), 0, nullptr);
-    // The probe buffer is bound after the six image descriptors. This write is
-    // intentionally performed only after allocation, keeping the descriptor
-    // set valid during pipeline creation.
     if (radianceCacheReady) radianceCache.write_descriptor(textureManager.descriptorSet, 6);
 
+    // ReSTIR/DDGI data is consumed in dedicated GPU passes; the legacy voxel
+    // material set remains image-only and keeps its established ABI.
     VkPushConstantRange pushConstantRange{};
     pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pushConstantRange.offset = 0;
@@ -881,8 +975,9 @@ void Engine::init_pipeline() {
     postPushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     postPushRange.size = sizeof(PostPushData);
     VkPipelineLayoutCreateInfo postPipelineLayoutInfo{.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    postPipelineLayoutInfo.setLayoutCount = 1;
-    postPipelineLayoutInfo.pSetLayouts = &postDescriptorLayout;
+    std::array<VkDescriptorSetLayout, 2> postSetLayouts{ postDescriptorLayout, gpuFeatureBinding.layout };
+    postPipelineLayoutInfo.setLayoutCount = gpuFeaturesReady ? 2u : 1u;
+    postPipelineLayoutInfo.pSetLayouts = postSetLayouts.data();
     postPipelineLayoutInfo.pushConstantRangeCount = 1;
     postPipelineLayoutInfo.pPushConstantRanges = &postPushRange;
     VK_CHECK(vkCreatePipelineLayout(device, &postPipelineLayoutInfo, nullptr, &postPipelineLayout));
@@ -1157,10 +1252,60 @@ void Engine::draw() {
     const glm::vec3 daylightColor = glm::mix(glm::vec3(1.34f, 0.48f, 0.16f), glm::vec3(1.18f, 1.10f, 0.94f), 1.0f - horizonWarmth);
     currentLightColor = glm::mix(glm::vec3(0.12f, 0.18f, 0.34f), daylightColor, currentDaylight);
     currentExposure = glm::mix(1.32f, 0.86f, currentDaylight);
+    refresh_gpu_features();
+
+    // Advance the real renderer-facing feature providers before their GPU
+    // state is uploaded. Their results are consumed by the passes below and
+    // are also exposed to the debug snapshot, rather than remaining SDK-only.
+    if (probeGrid) {
+        std::string providerError;
+        const auto sampler = [this](const glm::vec3& position, const glm::vec3& direction) {
+            Engine::Rendering::ProbeCaptureSample sample;
+            const glm::vec3 dir = glm::length(direction) > 1.0e-5f
+                ? glm::normalize(direction) : glm::vec3(0.0f, 1.0f, 0.0f);
+            const float sunTerm = std::max(glm::dot(dir, glm::normalize(currentSunDirection)), 0.0f);
+            const float terrainTerm = std::clamp(0.015f + 0.0004f * std::max(position.y, 0.0f), 0.0f, 0.12f);
+            sample.radiance = glm::vec3(0.012f, 0.020f, 0.040f) + terrainTerm +
+                               sunTerm * currentLightColor * 0.16f;
+            const RuntimeBlockId cell = world.get_block_at(position + dir * 0.5f);
+            sample.backface = world.is_solid_block_id(cell) && glm::dot(dir, glm::vec3(0.0f, 1.0f, 0.0f)) < -0.25f;
+            return sample;
+        };
+        probeGrid->update(player.camera.position, sampler, 0, &providerError);
+    }
+    if (fluidSimulation) {
+        // Keep the generic fluid provider on the same fixed simulation cadence
+        // as the world; this state is the source for future stream renderables.
+        static auto fluidState = fluidSimulation->createState();
+        fluidSimulation->simulate(fluidState, fluidSimulation->getConfig());
+    }
+    if (renderingDebugView) {
+        std::vector<Engine::Rendering::DebugProbe> probes;
+        if (probeGrid) {
+            const std::uint32_t count = std::min<std::uint32_t>(probeGrid->probe_count(), 256u);
+            probes.reserve(count);
+            for (std::uint32_t slot = 0; slot < count; ++slot) {
+                Engine::Rendering::ProbeGridProbe probe{};
+                if (!probeGrid->probe(slot, probe)) continue;
+                Engine::Rendering::DebugProbe debug{};
+                debug.radianceVisibility = glm::vec4(probe.irradiance, probe.age > 0 ? 1.0f : 0.0f);
+                debug.worldCellCascade = glm::ivec4(probe.cell, static_cast<int>(probe.slot));
+                probes.push_back(debug);
+            }
+            renderingDebugView->bind_probes(probes, 0, 0);
+        }
+        renderingDebugView->bind_capture(radianceCache.total_probe_count() -
+                                              std::min(radianceCache.total_probe_count(), radianceCache.pending_probe_count()),
+                                          radianceCache.pending_probe_count(),
+                                          static_cast<std::uint64_t>(radianceCache.total_probe_count()) * sizeof(RadianceCache::ProbeGpu));
+        renderingDebugView->bind_disocclusion(0, temporalDenoiser ? 1u : 0u);
+        renderingDebugView->refresh();
+    }
     if (radianceCacheReady) {
         radianceCache.update(player.camera.position, currentSunDirection,
                              currentLightColor);
     }
+    refresh_gpu_features();
     // Advance the renderer-owned upload/retirement epoch before recording this
     // frame. Simulation publishes completed chunk snapshots through this same
     // real Vulkan renderer seam.
@@ -1179,6 +1324,31 @@ void Engine::draw() {
     // is intentionally recorded on the same command buffer as the world draw,
     // not in a headless/test-only path.
     if (radianceCacheReady) radianceCache.record_uploads(cmd);
+    if (gpuFeaturePasses.initialized) {
+        VkBufferMemoryBarrier2 featureUpload{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+        featureUpload.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+        featureUpload.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT;
+        featureUpload.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        featureUpload.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        featureUpload.buffer = gpuFeaturePasses.featureBuffer;
+        featureUpload.size = sizeof(GpuRenderFeatures);
+        VkDependencyInfo uploadDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        uploadDependency.bufferMemoryBarrierCount = 1;
+        uploadDependency.pBufferMemoryBarriers = &featureUpload;
+        vkCmdPipelineBarrier2(cmd, &uploadDependency);
+        Engine::Rendering::record_gpu_feature_passes(cmd, gpuFeaturePasses, hdrImage,
+                                                       hdrImageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                                       swapchainExtent, gpuFeatures);
+        VkMemoryBarrier2 featureBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        featureBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        featureBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        featureBarrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        featureBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        VkDependencyInfo featureDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        featureDependency.memoryBarrierCount = 1;
+        featureDependency.pMemoryBarriers = &featureBarrier;
+        vkCmdPipelineBarrier2(cmd, &featureDependency);
+    }
 
     VkImageMemoryBarrier2 shadowWrite{.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     shadowWrite.srcStageMask=frameNumber==0?VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT:VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
@@ -1581,6 +1751,8 @@ void Engine::draw() {
     vkCmdBeginRendering(cmd, &postRenderingInfo);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, postPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, postPipelineLayout, 0, 1, &postDescriptorSet, 0, nullptr);
+    if (gpuFeaturesReady)
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, postPipelineLayout, 1, 1, &gpuFeatureBinding.set, 0, nullptr);
 
     const bool moonIsActive = currentDaylight <= 0.03f;
     const glm::vec3 activeCelestialDirection = moonIsActive ? -currentSunDirection : currentSunDirection;

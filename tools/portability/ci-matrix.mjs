@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// ci-matrix.mjs — Agent 6 §5.80: CI matrix for Windows/Linux
+// ci-matrix.mjs — Agent 6 §5.80: CI matrix for Windows
 // Runs: configure → build → unit tests → voxel tests → consumer gate → package
 import { execSync } from 'child_process';
 import { existsSync, mkdirSync } from 'fs';
 
 const platform = process.platform === 'win32' ? 'windows' : 'linux';
 const preset = process.argv[2] || 'release';
-const buildDir = process.env.VC_BUILD_DIR || 'build';
+const buildDir = process.env.VC_BUILD_DIR || 'out/agent-6';
 
 function log(msg) { console.log(`[ci-matrix] ${msg}`); }
 function fail(msg) { console.error(`[ci-matrix] FAIL: ${msg}`); process.exit(1); }
@@ -19,6 +19,13 @@ function run(cmd, opts = {}) {
 }
 
 log(`Platform: ${platform}, Preset: ${preset}`);
+
+// Static integration audit is intentionally the only pre-build step here.
+// Build/test/package execution remains the final validation phase.
+log('Step 0: Integration lint');
+run('node tools/portability/integration-lint.mjs');
+log('Step 0a: Checklist audit (must be clean before final validation)');
+run('node tools/portability/checklist-audit.mjs --strict');
 
 // Step 1: Configure — the canonical build/ tree (not the out/<preset> tree):
 // every downstream step (fast-gate ctest, external-consumer/moved-prefix/
@@ -36,11 +43,11 @@ run(`cmake --build ${buildDir} --config Release`);
 
 // Step 3: Unit tests (fast gate)
 log('Step 3: Unit tests');
-run('node tools/portability/fast-gate.mjs unit');
+run('node tools/portability/fast-gate.mjs unit', { env: { ...process.env, VC_BUILD_DIR: buildDir } });
 
 // Step 4: Voxel tests
 log('Step 4: Voxel tests');
-run('node tools/portability/fast-gate.mjs voxel');
+run('node tools/portability/fast-gate.mjs voxel', { env: { ...process.env, VC_BUILD_DIR: buildDir } });
 
 // Step 5: External consumer gate
 log('Step 5: External consumer gate');
@@ -221,7 +228,7 @@ log('Step 7p: Taskflow parallelism gate');
 run('node tools/portability/taskflow-gate.mjs');
 
 log('Step 7q: Benchmark regression gate (median-of-3 vs baseline)');
-run('node tools/portability/benchmark-gate.mjs');
+run('node tools/portability/benchmark-gate.mjs', { env: { ...process.env, VC_BUILD_DIR: buildDir } });
 
 log('Step 7r: Wasmtime C API gate (WebAssembly sandboxed runtime)');
 run('node tools/portability/wasmtime-gate.mjs');

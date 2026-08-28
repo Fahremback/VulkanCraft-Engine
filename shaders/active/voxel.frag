@@ -16,12 +16,6 @@ layout (binding = 3) uniform sampler2DShadow shadowMap;
 layout (binding = 4) uniform sampler2D opaqueSceneSampler;
 layout (binding = 5) uniform sampler2D opaqueDepthSampler;
 
-// Renderer-owned toroidal probe clipmap. Binding 6 is optional at the API
-// level, but the real game always binds it after RadianceCache::init().
-layout (binding = 6, std430) readonly buffer RadianceCacheBuffer {
-    vec4 radianceData[];
-} radianceCache;
-
 layout (push_constant) uniform PushConstants {
     mat4 mvp;
     vec4 cameraPos;
@@ -317,18 +311,9 @@ void main() {
     if (texel.a < alphaCutoff) discard;
 
     vec3 baseColor = texel.rgb * fragColor.rgb;
-    // Low-frequency multi-scale GI from the GPU-visible radiance cache. The
-    // metadata occupies 8 vec4s; each probe is 3 vec4s. Sample a deterministic
-    // camera-relative slot and attenuate by normal-facing visibility so this
-    // complements (rather than replaces) direct sun/shadow lighting.
     if (!isViewModel && !isWater && !isFarProxy) {
-        uint probeCount = uint(max(radianceCache.radianceData.length() - 8, 1));
-        uint probeIndex = uint(abs(int(floor(fragWorldPos.x + fragWorldPos.y * 3.0 + fragWorldPos.z * 7.0)))) % probeCount;
-        uint probeBase = 8u + probeIndex * 3u;
-        vec4 probeRadiance = radianceCache.radianceData[probeBase];
-        vec4 probeDirection = radianceCache.radianceData[probeBase + 1u];
-        float giVisibility = clamp(probeRadiance.a * (0.35 + 0.65 * max(dot(geometricNormal, normalize(probeDirection.xyz)), 0.0)), 0.0, 1.0);
-        baseColor *= 1.0 + probeRadiance.rgb * giVisibility * 0.42;
+        vec3 cachedGi = sample_radiance_cache(fragWorldPos, geometricNormal);
+        baseColor *= 1.0 + cachedGi * 0.42;
     }
     if (isFarProxy && abs(fragUV.z) < 0.25) {
         // Preserve a grass-scale silhouette after anisotropic minification has

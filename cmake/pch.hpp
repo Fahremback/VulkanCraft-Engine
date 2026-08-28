@@ -1,31 +1,37 @@
 #pragma once
-// Precompiled header for VulkanCraft engine OBJECT libraries.
-// Covers the most frequently included standard library headers across src/engine/.
-// Adding/removing headers here affects all targets using vc_object_module().
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
-#include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <functional>
-#include <iomanip>
-#include <iostream>
+#include <future>
+#include <initializer_list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <random>
+#include <set>
+#include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>

@@ -46,9 +46,9 @@ if (!existsSync(CI)) {
     }
   });
 
-  // 5. Both jobs (windows + linux) present — the workflow must actually run the gates.
+  // 5. Windows is the supported certification platform. Linux is intentionally
+  // not part of this product gate.
   if (!/windows-latest/.test(text)) problems.push('no windows job');
-  if (!/ubuntu-latest/.test(text)) problems.push('no linux job');
   if (!/platform-gate\.mjs/.test(text)) problems.push('platform-gate.mjs not wired into CI');
 }
 
@@ -57,4 +57,4 @@ if (problems.length) {
   problems.forEach((p) => console.error(`  - ${p}`));
   process.exit(1);
 }
-console.log(`[ci-lint] PASS — ${CI} valid YAML (no tabs, quoted names), gates exist, windows+linux jobs wired.`);
+console.log(`[ci-lint] PASS — ${CI} valid YAML (no tabs, quoted names), gates exist, Windows job wired.`);

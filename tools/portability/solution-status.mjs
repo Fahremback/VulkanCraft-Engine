@@ -1,83 +1,72 @@
 #!/usr/bin/env node
-// solution-status.mjs — AGENT-6 §9: classifies every external/solutions clone
-// by REAL usage, distinguishing clonado / compilado / integrado / testado /
-// usado. Fights false [x] marks made on mere presence. Pure node.
-//
-//   node tools/portability/solution-status.mjs [--json]
-//
-// Levels per solution:
-//   clonado    — present in external/solutions only
-//   compilado  — referenced by CMakeLists/cmake/ (built or globbed)
-//   integrado  — linked into a target via target_link_libraries or add_*
-//   testado    — has a CTest entry or test file referencing it
-//   usado      — referenced by src/engine or tests source code
-import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+// Classifies external solutions by observable repository evidence.
+// This report is intentionally static; execution gates remain authoritative.
+import { readdirSync, readFileSync, existsSync } from 'node:fs';
+import { join, relative } from 'node:path';
 
 const ROOT = process.cwd();
 const SOLUTIONS = join(ROOT, 'external', 'solutions');
-const JSON_OUT = process.argv.includes('--json');
+const json = process.argv.includes('--json');
 
-const cmakeFiles = [];
-const srcFiles = [];
-const testFiles = [];
-
-function walk(dir, out, depth = 0) {
-  if (depth > 5) return;
-  let entries;
-  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
-  for (const e of entries) {
-    const p = join(dir, e.name);
-    if (e.isDirectory()) {
-      if (/node_modules|_deps|\.git/.test(p)) continue;
-      walk(p, out, depth + 1);
-    } else if (/\.(cmake|txt)$/.test(e.name) && /cmake|CMakeLists/.test(p)) out.push(p);
-    else if (/\.(cpp|hpp|h|cc|mjs|ts)$/.test(e.name)) out.push(p);
+function walk(dir, result = []) {
+  if (!existsSync(dir)) return result;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const file = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (!/node_modules|_deps|\.git/.test(file)) walk(file, result);
+    } else if (/\.(cmake|txt|cpp|cc|c|hpp|h|mjs|json)$/.test(entry.name)) {
+      result.push(file);
+    }
   }
+  return result;
 }
-walk(join(ROOT, 'cmake'), cmakeFiles);
-walk(join(ROOT, 'src'), srcFiles);
-walk(join(ROOT, 'tests'), testFiles);
-const portFiles = [];
-walk(join(ROOT, 'tools', 'portability'), portFiles);
-if (existsSync(join(ROOT, 'CMakeLists.txt'))) cmakeFiles.push(join(ROOT, 'CMakeLists.txt'));
-
-const cmakeText = cmakeFiles.map((f) => safeRead(f)).join('\n');
-const srcText = srcFiles.map((f) => safeRead(f)).join('\n');
-const testText = testFiles.map((f) => safeRead(f)).join('\n');
-const portText = portFiles.map((f) => safeRead(f)).join('\n');
-
-function safeRead(p) {
-  try { return readFileSync(p, 'utf8'); } catch { return ''; }
+function text(files) {
+  return files.map((file) => { try { return readFileSync(file, 'utf8'); } catch { return ''; } }).join('\n');
 }
+const cmakeFiles = [...walk(join(ROOT, 'cmake')), ...walk(ROOT).filter((f) => /CMakeLists\.txt$/.test(f))];
+const sourceFiles = walk(join(ROOT, 'src'));
+const testFiles = walk(join(ROOT, 'tests'));
+const toolFiles = walk(join(ROOT, 'tools'));
+const cmake = text(cmakeFiles);
+const source = text(sourceFiles);
+const tests = text(testFiles);
+const tools = text(toolFiles);
+const solutionEvidence = new Map([
+  ['concurrentqueue', { source: /concurrentqueue/i }],
+  ['spdlog', { source: /spdlog/i }],
+  ['mimalloc', { source: /mimalloc/i }],
+  ['taskflow', { source: /taskflow/i }],
+  ['tracy', { source: /tracy/i }],
+  ['google-benchmark', { source: /benchmark/i }],
+  ['googletest', { source: /gtest|googletest/i }],
+  ['fuzztest', { source: /fuzz/i }],
+  ['vcpkg', { source: /vcpkg/i }]
+]);
 
-const dirs = readdirSync(SOLUTIONS, { withFileTypes: true })
-  .filter((e) => e.isDirectory())
-  .map((e) => e.name)
-  .sort();
-
-const rows = [];
-for (const name of dirs) {
-  const lower = name.toLowerCase();
-  const inCmake = new RegExp(`(?:${lower}|solutions/${name})`, 'i');
-  const level =
-    srcText.toLowerCase().includes(lower) || portText.toLowerCase().includes(lower) ? 'usado' :
-    testText.toLowerCase().includes(lower) ? 'testado' :
-    /target_link_libraries|add_library|add_executable|add_subdirectory|GLOB/.test(
-      (cmakeText.match(new RegExp(`[^\\n]{0,60}${lower}[^\\n]{0,60}`, 'i')) || [''])[0]) ? 'integrado' :
-    inCmake.test(cmakeText) ? 'compilado' :
-    'clonado';
-  rows.push({ solution: name, level });
-}
-
-const counts = rows.reduce((acc, r) => ((acc[r.level] = (acc[r.level] || 0) + 1), acc), {});
-if (JSON_OUT) {
-  console.log(JSON.stringify({ total: rows.length, counts, rows }, null, 2));
-} else {
+const rows = readdirSync(SOLUTIONS, { withFileTypes: true })
+  .filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort()
+  .map((solution) => {
+    const escaped = solution.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const ref = new RegExp(`(?:${escaped}|external[/\\\\]solutions[/\\\\]${escaped})`, 'i');
+    const cmakeRef = ref.test(cmake);
+    const evidence = solutionEvidence.get(solution);
+    const sourceRef = ref.test(source) || (evidence?.source?.test(source) ?? false);
+    const testRef = ref.test(tests) || (evidence?.source?.test(tests) ?? false);
+    const toolRef = ref.test(tools) || (evidence?.source?.test(tools) ?? false);
+    const configured = cmakeRef && /add_(?:library|executable|subdirectory)|target_link_libraries|FetchContent/i.test(cmake);
+    const tested = testRef || toolRef;
+    const used = sourceRef;
+    const level = used ? 'usado' : tested ? 'testado' : configured ? 'integrado' : cmakeRef ? 'compilado' : 'clonado';
+    return { solution, level, evidence: { cmake: cmakeRef, source: sourceRef, tests: testRef, tooling: toolRef } };
+  });
+const counts = Object.fromEntries([...new Set(rows.map((row) => row.level))].map((level) => [level, rows.filter((row) => row.level === level).length]));
+const report = { generatedAt: new Date().toISOString(), total: rows.length, counts, rows };
+if (json) console.log(JSON.stringify(report, null, 2));
+else {
   console.log(`# external/solutions status (${rows.length} clones)`);
-  for (const c of ['usado', 'testado', 'integrado', 'compilado', 'clonado']) {
-    const list = rows.filter((r) => r.level === c).map((r) => r.solution);
-    if (list.length) console.log(`\n${c.toUpperCase()} (${list.length}): ${list.join(', ')}`);
+  for (const level of ['usado', 'testado', 'integrado', 'compilado', 'clonado']) {
+    const list = rows.filter((row) => row.level === level).map((row) => row.solution);
+    if (list.length) console.log(`\n${level.toUpperCase()} (${list.length}): ${list.join(', ')}`);
   }
   console.log(`\nSummary: ${JSON.stringify(counts)}`);
 }

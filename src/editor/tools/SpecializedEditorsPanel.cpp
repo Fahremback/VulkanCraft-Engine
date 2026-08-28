@@ -49,6 +49,10 @@ void SpecializedEditorsPanel::draw(){
    ImGui::TextColored(ImVec4(.32f,.55f,1,1), "ANIMATION TIMELINE");
    ImGui::Separator();
    ImGui::DragFloat("Duration",&timeline_.duration,.1f,.01f,10000);ImGui::SliderFloat("Playhead",&timeline_.playhead,0,std::max(timeline_.duration,.01f));ImGui::Checkbox("Loop",&timeline_.loop);
+   ImGui::Separator();
+   ImGui::TextDisabled("Procedural authoring");
+   ImGui::SameLine();
+   ImGui::Text("%s", (timeline_.tracks.empty() ? "Add a track to begin" : "Live scene document"));
    if(ImGui::Button("Add Animation Track"))timeline_.add_track({"Animation "+std::to_string(timeline_.tracks.size()+1),TimelineTrackType::Animation});
    ImGui::SameLine(); ImGui::TextDisabled("%zu tracks", timeline_.tracks.size());
    for(size_t i=0;i<timeline_.tracks.size();++i){auto&t=timeline_.tracks[i];ImGui::PushID(static_cast<int>(i));ImGui::Checkbox("Mute",&t.muted);ImGui::SameLine();ImGui::Text("%s (%zu keys)",t.name.c_str(),t.keys.size());ImGui::SameLine();if(ImGui::Button("Key"))timeline_.add_key(i,{timeline_.playhead,"value"});ImGui::SameLine(); ImGui::ProgressBar(timeline_.duration > 0 ? timeline_.playhead / timeline_.duration : 0.0f, ImVec2(-1, 0), ""); ImGui::PopID();}draw_validation(timeline_);
@@ -75,6 +79,9 @@ void SpecializedEditorsPanel::draw(){
    ImGui::TextColored(ImVec4(.32f,.55f,1,1), "SKELETON RETARGETING");
    ImGui::Separator();
    ImGui::Checkbox("Preserve Root Motion",&retarget_.preserveRootMotion);if(ImGui::Button("Auto-map Humanoid")){retarget_.map({"Root","Pelvis",1,{0,0,0}});retarget_.map({"Hand.L","Hand.L",1,{0,0,0}});} 
+   ImGui::SameLine();
+   if(ImGui::Button("Clear Mapping")){ retarget_.mapping.clear(); }
+   ImGui::TextDisabled("Drag values below to author the live retarget document");
    ImGui::Text("Mappings: %zu", retarget_.mapping.size());
    if(ImGui::BeginTable("##RetargetMap", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)){ImGui::TableSetupColumn("Source");ImGui::TableSetupColumn("Target");ImGui::TableSetupColumn("Translation");ImGui::TableSetupColumn("Rotation");ImGui::TableHeadersRow();for(auto&m:retarget_.mapping){ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextUnformatted(m.sourceBone.c_str());ImGui::TableNextColumn();ImGui::TextUnformatted(m.targetBone.c_str());ImGui::TableNextColumn();ImGui::PushID(&m);ImGui::DragFloat("##Scale",&m.translationScale,.01f,.01f,10);ImGui::PopID();ImGui::TableNextColumn();ImGui::Text("%.2f %.2f %.2f",m.rotationOffset.x,m.rotationOffset.y,m.rotationOffset.z);}ImGui::EndTable();}draw_validation(retarget_);
    // Panel -> scene integration: Apply writes the bone mapping as a real

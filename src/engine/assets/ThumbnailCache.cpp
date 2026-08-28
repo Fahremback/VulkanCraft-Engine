@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <utility>
 
 namespace Engine::Assets {
 
@@ -19,7 +20,9 @@ std::uint64_t fnv1a64(const std::string& value) noexcept {
 }
 } // namespace
 
-ThumbnailCache::ThumbnailCache(Options options) : options_(options) {}
+ThumbnailCache::ThumbnailCache() : ThumbnailCache(Options{}) {}
+
+ThumbnailCache::ThumbnailCache(Options options) : options_(std::move(options)) {}
 
 std::optional<ThumbnailCache::Thumbnail> ThumbnailCache::get(
     const std::string& assetKey, std::uint64_t sourceHash,

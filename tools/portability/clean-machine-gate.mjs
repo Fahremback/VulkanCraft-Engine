@@ -131,6 +131,7 @@ function collectTextFiles(directory, relativePrefix = "") {
 const argv = process.argv.slice(2);
 const args = new Set(argv);
 const skipBuild = args.has("--no-build");
+const compiler = process.env.CXX ?? "cl";
 const keep = args.has("--keep");
 const seedIndex = argv.indexOf("--seed-deps");
 const seedDeps = seedIndex >= 0 && argv[seedIndex + 1] ? path.resolve(argv[seedIndex + 1]) : null;

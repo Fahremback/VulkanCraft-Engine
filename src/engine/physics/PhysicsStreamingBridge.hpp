@@ -51,8 +51,10 @@ public:
 
     // Does not take ownership; both references must outlive the bridge.
     PhysicsStreamingBridge(engine::voxel::IVoxelWorld& world,
+                           PhysicsRuntime& physics);
+    PhysicsStreamingBridge(engine::voxel::IVoxelWorld& world,
                            PhysicsRuntime& physics,
-                           Config config = Config{});
+                           Config config);
 
     // Reconciles the loaded-chunk set around `focus` (plus every tracked
     // chunk, so focus moves evict correctly) with physics bodies. Newly

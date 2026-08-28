@@ -6,6 +6,16 @@ layout (binding = 0) uniform sampler2D hdrScene;
 layout (binding = 1) uniform sampler2D sceneDepth;
 layout (binding = 2) uniform sampler2D minimapScene;
 layout (binding = 3) uniform sampler2DArray blockTextures;
+layout (set = 1, binding = 0) uniform RenderFeatureParams {
+    vec4 gi;
+    vec4 reflections;
+    vec4 atmosphere;
+    vec4 temporal;
+    vec4 debug;
+    vec4 fluids;
+    vec4 vfx;
+    vec4 material;
+} features;
 
 layout (push_constant) uniform PostPushConstants {
     vec4 sunScreen;
@@ -30,6 +40,27 @@ float linearViewDepth(float deviceDepth) {
 vec3 aces(vec3 color) {
     const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+}
+
+vec3 featureComposite(vec3 hdr) {
+    // GPU feature contract: GI and probe energy are added before tone mapping;
+    // temporal confidence suppresses unstable history, while debug flags can
+    // replace the final signal with readable per-pixel diagnostics.
+    float giWeight = clamp(features.gi.y + features.gi.z * 0.35, 0.0, 1.0);
+    float temporalConfidence = clamp(features.temporal.x, 0.0, 1.0);
+    vec3 lit = hdr * (1.0 + giWeight * 0.18);
+    // Material/emissive controls are supplied by the renderer feature UBO;
+    // retain HDR values until the final ACES stage below.
+    lit *= max(features.material.x, 0.0);
+    lit *= mix(0.82, 1.0, temporalConfidence);
+    lit *= max(features.atmosphere.w, 0.001);
+    if (features.debug.x > 0.5) {
+        if (features.debug.x < 1.5) return vec3(giWeight, temporalConfidence, features.reflections.y);
+        if (features.debug.x < 2.5) return vec3(features.atmosphere.x, features.atmosphere.y, 0.0);
+        if (features.debug.x < 3.5) return vec3(features.temporal.x, features.temporal.w, features.debug.w);
+        return vec3(features.fluids.x, features.fluids.y, features.vfx.y);
+    }
+    return lit;
 }
 
 float roundedBox(vec2 point, vec2 halfSize, float radius) {
@@ -306,7 +337,14 @@ void main() {
     vec3 west = texture(hdrScene, fragUV - vec2(texel.x, 0)).rgb;
     if (cinematic) color += (color * 4.0 - north - south - east - west) * 0.026;
 
-    color *= push.sunScreen.w;
+    // FidelityFX/NRD-style temporal controls are explicit GPU inputs. The
+    // current post pass uses them to gate sharpening and denoiser confidence
+    // without changing the public material ABI.
+    if (features.temporal.x > 0.5) {
+        float sharpen = clamp(features.gi.w, 0.0, 1.0) * 0.018;
+        color += (color * 4.0 - north - south - east - west) * sharpen;
+    }
+    color *= push.sunScreen.w * max(features.atmosphere.w, 0.001);
     color = aces(max(color, vec3(0.0)));
     color = pow(color, vec3(1.0 / 2.2));
     // Grade cinematográfico analítico (LUT equivalente sem lookup extra).
@@ -665,5 +703,6 @@ void main() {
             color = mix(color, hover ? vec3(1.0) : vec3(0.80, 0.87, 0.92), text);
         }
     }
+    color = featureComposite(color);
     outColor = vec4(clamp(color, 0.0, 1.0), 1.0);
 }

@@ -2216,6 +2216,7 @@ export function listProjects(engineRoot) {
       const manifest = path.join(root, entry.name, "project.json");
       return { name: entry.name, managed: fs.existsSync(manifest), path: `Projects/${entry.name}` };
     });
+  projects.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
   return { projects };
 }
 

@@ -35,7 +35,9 @@ target_compile_definitions(vulkan_jolt PRIVATE
     $<$<CONFIG:Debug>:JPH_ENABLE_ASSERTS>
 )
 if(MSVC)
-    target_compile_options(vulkan_jolt PRIVATE /w)
+    # Jolt has many translation units and MSVC can compile them in parallel;
+    # /FS serializes writes to the shared program database and prevents C1041.
+    target_compile_options(vulkan_jolt PRIVATE /w /FS)
 endif()
 
 # ---- Bullet (amalgamated) ----
