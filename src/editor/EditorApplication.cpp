@@ -1,4 +1,5 @@
 #include "EditorApplication.hpp"
+#include "EditorInternalHelpers.hpp"
 #include "BlockTextureAtlas.hpp"
 // Frontend port from the Wicked Engine Editor (MIT, commit 2aa9fdf…): Font
 // Awesome 6 icon font + codepoint macros, and the Liberation Sans UI font
@@ -40,86 +41,10 @@
 #include <imgui_internal.h>
 #include <imgui_impl_glfw.h>
 
-// Local copies of the file-scope render helpers (the originals live in a
-// nested anonymous namespace inside `namespace Engine`, later in this TU, so
-// they are not visible to the runtime-wired Wicked-port code below). These
-// global-scope versions share the same implementations.
-namespace {
-glm::mat4 model_from_transform(const Engine::TransformComponent& t) {
-    const auto finite = [](float v) { return std::isfinite(v); };
-    if (!finite(t.position.x) || !finite(t.position.y) || !finite(t.position.z) ||
-        !finite(t.rotation.x) || !finite(t.rotation.y) || !finite(t.rotation.z) ||
-        !finite(t.scale.x) || !finite(t.scale.y) || !finite(t.scale.z)) {
-        // NaN/inf guard: a non-finite transform would poison the MVP matrix and
-        // black out the viewport. Draw this entity at the origin instead.
-        return glm::mat4(1.0f);
-    }
-    glm::mat4 model(1.0f);
-    model = glm::translate(model, t.position);
-    model = glm::rotate(model, glm::radians(t.rotation.z), glm::vec3(0, 0, 1));
-    model = glm::rotate(model, glm::radians(t.rotation.y), glm::vec3(0, 1, 0));
-    model = glm::rotate(model, glm::radians(t.rotation.x), glm::vec3(1, 0, 0));
-    model = glm::scale(model, t.scale);
-    return model;
-}
-// Current fog state (set per-frame from WeatherComponent)
-static glm::vec4 g_fogParams{ 0.001f, 100.0f, 0.0f, 0.0f };
-static glm::vec4 g_fogColor{ 0.5f, 0.6f, 0.7f, 1.0f };
-void push_constants(VkCommandBuffer cmd, VkPipelineLayout layout, const glm::mat4& mvp,
-                    const glm::vec4& color, const glm::mat4& model = glm::mat4(1.0f)) {
-    const Engine::ScenePushConstants pc{ mvp, color, g_fogParams, g_fogColor, model };
-    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                       static_cast<uint32_t>(sizeof(pc)), &pc);
-}
-void set_viewport_scissor(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
-    VkViewport viewport{ 0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h), 0.0f, 1.0f };
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    VkRect2D scissor{ { 0, 0 }, { w, h } };
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-}
-void draw_indexed_cube(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb, const VkBuffer& ib,
-                       uint32_t indexCount, const glm::mat4& mvp, const glm::vec4& color,
-                       const glm::mat4& model = glm::mat4(1.0f)) {
-    const VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
-    vkCmdBindIndexBuffer(cmd, ib, 0, VK_INDEX_TYPE_UINT32);
-    push_constants(cmd, layout, mvp, color, model);
-    vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
-}
-void draw_indexed_editor_mesh(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb,
-                              const VkBuffer& ib, uint32_t indexCount, const glm::mat4& mvp,
-                              const glm::vec4& color, const glm::mat4& model = glm::mat4(1.0f)) {
-    draw_indexed_cube(cmd, layout, vb, ib, indexCount, mvp, color, model);
-}
-
-} // namespace
-
 #include <imgui_impl_vulkan.h>
 #include <VkBootstrap.h>
 #include <miniaudio.h>
 #include <thread>
-
-// ---------------------------------------------------------------------------
-// Safe Vulkan helpers (avoid null-pointer dereferences on mapping failure)
-// ---------------------------------------------------------------------------
-static bool safe_vkMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset,
-                             VkDeviceSize size, VkFlags flags, void** ppData) {
-    *ppData = nullptr;
-    const VkResult result = vkMapMemory(device, memory, offset, size, flags, ppData);
-    if (result != VK_SUCCESS) {
-        std::cerr << "[Vulkan] vkMapMemory failed (" << result << ")" << std::endl;
-        return false;
-    }
-    return true;
-}
-static bool safe_map_and_copy(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset,
-                              VkDeviceSize size, const void* source) {
-    void* data = nullptr;
-    if (!safe_vkMapMemory(device, memory, offset, size, 0, &data)) return false;
-    std::memcpy(data, source, static_cast<size_t>(size));
-    vkUnmapMemory(device, memory);
-    return true;
-}
 
 // PlayNavAgent — the public provider's path follower (mirrors the legacy
 // NavigationAgent stepping so the Fase 8 behavior is preserved).
@@ -178,8 +103,17 @@ void EditorApplication::register_project_templates() {
     // Built-in project templates for the wizard (ezEngine pillar). The wizard
     // lists these; create_project_from_template materializes the scaffold.
     Engine::Editor::register_builtin_templates(m_templateRegistry);
-            if (playScene) {
-                const auto tit = playScene->transformComponents.find(m_playTestEntityId);
+}
+
+// -----------------------------------------------------------------------
+// ORPHANED CODE (from restructure) — the play-test, material-test and
+// autosave blocks below were left from the old monolithic run() when the
+// file was split into Play/Assets/Panels/Vulkan. They now live in
+// EditorApplicationPlay.cpp and are safe to remove.
+// -----------------------------------------------------------------------
+#if 0 // ORPHANED — see note above
+    if (playScene) {
+        const auto tit = playScene->transformComponents.find(m_playTestEntityId);
                 if (tit != playScene->transformComponents.end()) {
                     y = tit->second.position.y;
                     fell = y < 4.0f;
@@ -255,17 +189,14 @@ void EditorApplication::register_project_templates() {
 
     vkDeviceWaitIdle(m_device);
 }
+#endif // ORPHANED
 
-
-
-
-
-
-
-} // namespace
-
-
-
+// -----------------------------------------------------------------------
+// BUG-RESTRUCTURE: the destructor body was left orphaned after the namespace
+// closing brace during the build-friendly split. The cleanup below was
+// supposed to live inside ~EditorApplication().
+// -----------------------------------------------------------------------
+EditorApplication::~EditorApplication() {
         destroy_mesh_resources();
         destroy_graph_material_pipelines();
         destroy_asset_thumbnails();
@@ -396,8 +327,8 @@ void EditorApplication::register_project_templates() {
             glfwDestroyWindow(m_window);
             glfwTerminate();
         }
-    }
 }
+
 
 // ===========================================================================
 // File/folder pickers + scene loading (Abrir Jogo / Procurar Pasta).
@@ -423,3 +354,24 @@ bool EditorApplication::pick_file_dialog(std::string& outPath, const wchar_t* fi
     outPath = path;
     return true;
 }
+
+// Helpers compartilhados restaurados (git 408c2d3) após o split: os corpos
+// haviam sido apagados; as declarações ficam no header e todos os TUs do
+// editor os usam. Não duplicar em outros arquivos do split.
+void push_constants(VkCommandBuffer cmd, VkPipelineLayout layout, const glm::mat4& mvp,
+                    const glm::vec4& color, const glm::mat4& model) {
+    const Engine::ScenePushConstants pc{ mvp, color, Engine::g_fogParams, Engine::g_fogColor, model };
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       static_cast<uint32_t>(sizeof(pc)), &pc);
+}
+
+bool safe_map_and_copy(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset,
+                       VkDeviceSize size, const void* source) {
+    void* data = nullptr;
+    if (!safe_vkMapMemory(device, memory, offset, size, 0, &data)) return false;
+    std::memcpy(data, source, static_cast<size_t>(size));
+    vkUnmapMemory(device, memory);
+    return true;
+}
+
+} // namespace Engine

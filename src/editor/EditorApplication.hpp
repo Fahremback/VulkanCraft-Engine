@@ -321,6 +321,15 @@ struct GridPushConstants {
     glm::mat4 viewProj;
 };
 
+// -----------------------------------------------------------------------
+// BUG-RESTRUCTURE: fog state shared between the Vulkan pass (writer), the
+// scene pass (push constants) and the fog UI panel. The monolith had these
+// as file-scope statics; the split into separate TUs requires a single
+// shared definition (inline in the header).
+// -----------------------------------------------------------------------
+inline glm::vec4 g_fogParams{ 0.001f, 100.0f, 0.0f, 0.0f };
+inline glm::vec4 g_fogColor{ 0.5f, 0.6f, 0.7f, 1.0f };
+
 class EditorApplication {
 public:
     EditorApplication();
@@ -349,6 +358,12 @@ private:
     void init_offscreen_target();
     void create_offscreen_buffers(uint32_t w, uint32_t h);
     void create_shadow_map();
+    // BUG-EDITOR-SHADOWS-002: atlas spot e face-0 point compartilham o ciclo
+    // de vida do mapa solar (declarações perdidas no split, restauradas).
+    void create_spot_shadow_map();
+    void create_point_shadow_map();
+    void destroy_spot_shadow_map();
+    void destroy_point_shadow_map();
     void destroy_shadow_map();
     // Records the sun shadow pass (depth-only) before the scene pass; also
     // computes m_shadowMap.viewProj consumed by write_light_ubo. The same
@@ -366,6 +381,9 @@ private:
                              VkShaderStageFlags pushStages, uint32_t pushSize,
                              const glm::mat4& viewProj, const glm::vec4* extraPush,
                              const Scene* scene);
+    // Re-writes the shadow image bindings (1-3) of the scene light set —
+    // called after the shadow targets are (re)created, e.g. on resize.
+    void refresh_shadow_descriptors();
     void init_scene_pipeline();
     void init_geometry_buffers();
     void cleanup_offscreen_target();
@@ -1581,5 +1599,12 @@ private:
     float m_frameTimeMs{ 16.6f };
     size_t m_ramUsageMb{ 240 };
 };
+
+// Helpers de material/shader compartilhados entre os arquivos do split
+// (definidos em EditorApplicationPanels.cpp, usados por ...Vulkan.cpp).
+VkShaderModule make_module(VkDevice device, const std::vector<uint32_t>& spirv);
+std::vector<uint32_t> compile_material_glsl(VkShaderStageFlagBits stage, const std::string& source);
+void build_character_geometry(float skinHeight, std::vector<EditorVertex>& verts,
+                              std::vector<uint32_t>& indices);
 
 } // namespace Engine

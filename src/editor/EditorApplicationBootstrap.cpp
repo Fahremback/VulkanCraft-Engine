@@ -1,6 +1,13 @@
 #include "EditorApplication.hpp"
 
 namespace Engine {
+// Assinatura restaurada: o split havia cortado o cabeçalho de run()
+// (run/try/init_window/init_vulkan/init_imgui) — ver git 408c2d3.
+int EditorApplication::run() {
+    try {
+        init_window();
+        init_vulkan();
+        init_imgui();
         init_offscreen_target();
         init_scene_pipeline();
         init_geometry_buffers();
@@ -866,5 +873,19 @@ void EditorApplication::main_loop() {
             Scene* playScene = m_playMode.get_active_scene();
             bool fell = false;
             float y = -1.0f;
+            if (playScene) {
+                const auto tit = playScene->transformComponents.find(m_playTestEntityId);
+                if (tit != playScene->transformComponents.end()) {
+                    y = tit->second.position.y;
+                    fell = y < 4.0f;
+                }
+            }
+            std::cout << "[Editor] PLAY_TEST " << (fell ? "PASS" : "FAIL")
+                      << " (cube y=" << y << ")" << std::endl;
+            vkDeviceWaitIdle(m_device);
+            std::exit(fell ? 0 : 1);
+        }
+    }
+}
 
 } // namespace Engine

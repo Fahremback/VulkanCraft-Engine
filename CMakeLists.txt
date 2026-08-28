@@ -1,5 +1,33 @@
 cmake_minimum_required(VERSION 3.20)
+# CMake 3.25+ can model MSVC debug information without a shared compile PDB.
+# Set the policy before project()/language initialization so Ninja and sccache
+# do not declare a non-existent /Fd output when targets use embedded /Z7 data.
+if(POLICY CMP0141)
+    cmake_policy(SET CMP0141 NEW)
+endif()
 project(vulkan_craft_1_5 LANGUAGES C CXX)
+if(MSVC)
+    # Existing build trees may have cached CMake's legacy /Zi defaults before
+    # CMP0141 was enabled.  Replace them before any promoted subproject creates
+    # targets.  Merely appending /Z7 leaves sccache expecting the stale /Fd PDB.
+    foreach(_vc_early_cfg DEBUG RELWITHDEBINFO)
+        foreach(_vc_flags_var CMAKE_C_FLAGS_${_vc_early_cfg} CMAKE_CXX_FLAGS_${_vc_early_cfg})
+            string(REPLACE "/Zi" "/Z7" _vc_clean_flags "${${_vc_flags_var}}")
+            set(${_vc_flags_var} "${_vc_clean_flags}" CACHE STRING "MSVC flags without shared compile PDB" FORCE)
+        endforeach()
+    endforeach()
+    set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>:Embedded>")
+
+    # A stale cache can retain MinGW's ar.exe after an earlier configure.
+    # MSVC static libraries must be archived by lib.exe; derive it from the
+    # compiler location so this remains valid for every installed toolset.
+    get_filename_component(VC_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    find_program(VC_LIB_EXECUTABLE lib.exe HINTS "${VC_BIN_DIR}" NO_DEFAULT_PATH)
+    if(VC_LIB_EXECUTABLE)
+        set(CMAKE_AR "${VC_LIB_EXECUTABLE}" CACHE FILEPATH "MSVC static library archiver" FORCE)
+        set(CMAKE_RANLIB "" CACHE FILEPATH "MSVC does not use ranlib" FORCE)
+    endif()
+endif()
 # Guard against in-source builds (Agent 6 §1.31)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
     message(FATAL_ERROR "In-source builds are not allowed. Use cmake --preset <name> or cmake -B build.")
@@ -39,6 +67,13 @@ if(VC_ENABLE_ZSTD)
         # are not part of this source glob and otherwise remain unresolved.
         target_compile_definitions(vc_zstd PRIVATE ZSTD_DISABLE_ASM=1)
     endif()
+    if(MSVC)
+        target_compile_options(vc_zstd PRIVATE /FS)
+        # sccache parallelizes C translation units sharing one PDB; the
+        # vendored Zstd target uses a single program database, so serialize
+        # this small C target through the native MSVC compiler.
+        set_property(TARGET vc_zstd PROPERTY C_COMPILER_LAUNCHER "")
+    endif()
 endif()
 
 if(VC_ENABLE_BLAKE3)
@@ -64,6 +99,10 @@ if(VC_ENABLE_FLATBUFFERS)
     set(FLATBUFFERS_BUILD_SHAREDLIB OFF CACHE BOOL "" FORCE)
     set(FLATBUFFERS_INSTALL OFF CACHE BOOL "" FORCE)
     add_subdirectory(${VC_SOLUTIONS_DIR}/flatbuffers flatbuffers_build)
+    if(MSVC AND TARGET flatc)
+        target_compile_options(flatc PRIVATE /FS)
+        set_property(TARGET flatc PROPERTY CXX_COMPILER_LAUNCHER "")
+    endif()
     add_library(vc_flatbuffers ALIAS flatbuffers)
 
     # Schema → C++ generation (v5 world save container).
@@ -289,6 +328,12 @@ FetchContent_Declare(miniaudio GIT_REPOSITORY https://github.com/mackron/miniaud
 # otherwise identical builds resolve to different source trees over time.
 FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG 83f668625ad45364de71d385aeb6a5dd04bee02e)
 FetchContent_MakeAvailable(glfw glm vk-bootstrap vma miniaudio imgui)
+# sccache 0.10 não tolera /Fd em TUs /Z7 (vk-bootstrap mantém /Fd mesmo com
+# /Z7 e o PDB nunca existe): compila esses 2 TUs direto, sem launcher.
+if(TARGET vk-bootstrap)
+    set_property(TARGET vk-bootstrap PROPERTY CXX_COMPILER_LAUNCHER "")
+    set_property(TARGET vk-bootstrap PROPERTY C_COMPILER_LAUNCHER "")
+endif()
 find_package(Vulkan REQUIRED)
 
 # Eigen3 — header-only linear algebra library (vendored in external/solutions/eigen).
@@ -465,7 +510,18 @@ set(EMBREE_STATIC_LIB ON CACHE BOOL "" FORCE)
 set(EMBREE_ZIP_MODE OFF CACHE BOOL "" FORCE)
 add_subdirectory(${VC_SOLUTIONS_DIR}/embree ${CMAKE_BINARY_DIR}/embree-build EXCLUDE_FROM_ALL)
 set_property(DIRECTORY ${VC_SOLUTIONS_DIR}/embree PROPERTY VS_GLOBAL_UseMultiToolTask false)
-set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT ProgramDatabase)
+if(MSVC)
+    # REGRESSION GUARD (C1041): Embree adds /MP and RelWithDebInfo adds /Zi,
+    # so all Ninja workers write the same per-target PDB through sccache.  /FS
+    # is not sufficient in that launcher topology.  Keep debug records inside
+    # each .obj (/Z7) and let Ninja own parallelism (/MP1) for vendor targets.
+    # Do not restore /Zi or remove this block without a parallel clean build.
+    foreach(_vc_embree_target sys math simd tasking lexers embree)
+        if(TARGET ${_vc_embree_target})
+            target_compile_options(${_vc_embree_target} PRIVATE /Z7 /MP1 /FS)
+        endif()
+    endforeach()
+endif()
 target_link_libraries(vc_build_options INTERFACE embree)
 
 set(VC_EMBREE_ADAPTER_TUS
@@ -6060,6 +6116,7 @@ add_test(NAME block_texture_atlas_tests COMMAND block_texture_atlas_tests)
 add_executable(VulkanEngineGame
     src/app/main_game.cpp
     src/app/VulkanGameBootstrap.cpp
+    src/app/VulkanGameRuntime.cpp
     src/app/VulkanGameWorld.cpp
     src/app/VulkanGameRender.cpp
     src/app/VulkanGameGameplay.cpp
@@ -6134,6 +6191,7 @@ set(IMGUI_SOURCES
 add_executable(VulkanEngineEditor
     src/editor/main_editor.cpp
     src/editor/EditorApplication.cpp
+    src/editor/EditorInternalHelpers.cpp
     src/editor/EditorApplicationPanels.cpp
     src/editor/EditorApplicationVulkan.cpp
     src/editor/EditorApplicationPlay.cpp
@@ -6561,3 +6619,49 @@ add_executable(gameplay_system_wiring_tests
 target_include_directories(gameplay_system_wiring_tests PRIVATE src/engine/public src)
 target_link_libraries(gameplay_system_wiring_tests PRIVATE vc_build_options)
 add_test(NAME gameplay_system_wiring_tests COMMAND gameplay_system_wiring_tests)
+
+# PLANO_BUILD_RAPIDA.md Fase 4 — build de desenvolvimento rápida.
+# Executado no FIM do arquivo para capturar também as flags que subdiretórios
+# promovidos (embree, glfw, rocksdb, ...) sobrescrevem depois do topo:
+# - /Z7 no lugar de /Zi: CodeView fica no .obj → compilações cacheáveis no
+#   sccache e sem PDB central (elimina corrida C1041 em /MP).
+# - Link de dev com /DEBUG:FASTLINK + /INCREMENTAL. Release/CI mantêm o
+#   link final otimizado.
+if(MSVC)
+    foreach(_vc_cfg Debug RelWithDebInfo)
+        # CMake's configuration variables are uppercase (for example,
+        # CMAKE_CXX_FLAGS_RELWITHDEBINFO).  Using the display-case name here
+        # silently edited a different empty variable and left /Zi active.
+        string(TOUPPER "${_vc_cfg}" _vc_cfg_upper)
+        string(REPLACE "/Zi" "/Z7" CMAKE_C_FLAGS_${_vc_cfg_upper} "${CMAKE_C_FLAGS_${_vc_cfg_upper}}")
+        string(REPLACE "/Zi" "/Z7" CMAKE_CXX_FLAGS_${_vc_cfg_upper} "${CMAKE_CXX_FLAGS_${_vc_cfg_upper}}")
+        string(APPEND CMAKE_EXE_LINKER_FLAGS_${_vc_cfg_upper} " /DEBUG:FASTLINK /INCREMENTAL")
+    endforeach()
+
+    # Some promoted projects overwrite the configuration flags inside their
+    # own directory (FlatBuffers is one example).  Apply /Z7 at target level
+    # after the complete graph exists so no current or future subproject can
+    # reintroduce a shared compile PDB and the parallel-build C1041 race.
+    function(vc_force_embedded_msvc_debug directory)
+        get_property(_vc_directory_targets DIRECTORY "${directory}" PROPERTY BUILDSYSTEM_TARGETS)
+        foreach(_vc_target IN LISTS _vc_directory_targets)
+            get_target_property(_vc_target_type ${_vc_target} TYPE)
+            if(NOT _vc_target_type STREQUAL "INTERFACE_LIBRARY" AND
+               NOT _vc_target_type STREQUAL "UTILITY")
+                set_property(TARGET ${_vc_target} PROPERTY
+                    MSVC_DEBUG_INFORMATION_FORMAT
+                    "$<$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>:Embedded>"
+                )
+                target_compile_options(${_vc_target} PRIVATE
+                    $<$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>:/Z7>
+                    /FS
+                )
+            endif()
+        endforeach()
+        get_property(_vc_subdirectories DIRECTORY "${directory}" PROPERTY SUBDIRECTORIES)
+        foreach(_vc_subdirectory IN LISTS _vc_subdirectories)
+            vc_force_embedded_msvc_debug("${_vc_subdirectory}")
+        endforeach()
+    endfunction()
+    vc_force_embedded_msvc_debug("${CMAKE_SOURCE_DIR}")
+endif()

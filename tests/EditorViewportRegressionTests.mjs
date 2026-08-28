@@ -5,7 +5,12 @@ import { dirname, resolve } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (relative) => readFileSync(resolve(here, relative), "utf8");
+// After the build-friendly restructure the editor implementation is split per
+// concern; guards read the file that actually owns each behavior.
 const app = read("../src/editor/EditorApplication.cpp");
+const panels = read("../src/editor/EditorApplicationPanels.cpp");
+const vulkanImplEarly = read("../src/editor/EditorApplicationVulkan.cpp");
+const assetsImplEarly = read("../src/editor/EditorApplicationAssets.cpp");
 const header = read("../src/editor/EditorApplication.hpp");
 const gridVertex = read("../shaders/active/editor_grid.vert");
 const gridFragment = read("../shaders/active/editor_grid.frag");
@@ -55,7 +60,7 @@ assert.match(
   "pick shader must declare SceneLights to keep the shared pipeline layout compatible"
 );
 assert.match(
-  app,
+  vulkanImplEarly,
   /update_scene_light_ubo\s*\(\s*renderScene\s*\)/,
   "the viewport pass must refresh the scene light UBO every frame"
 );
@@ -67,31 +72,87 @@ assert.match(
 // side; and the terrain sheet must be indexed world-CW or it is culled from
 // above. Guard the two windings that were fixed.
 assert.match(
-  app,
+  panels,
   /BUG-EDITOR-CUBE-WINDING/,
   "build_cube must document the unified world-CW winding"
 );
-assert.doesNotMatch(
-  app,
-  /indices\.push_back\(a\);\s*indices\.push_back\(c\);\s*indices\.push_back\(b\);/,
-  "terrain indices must not regress to the world-CCW (a,c,b) order (culled from above)"
-);
-assert.match(
-  app,
-  /indices\.push_back\(a\);\s*indices\.push_back\(b\);\s*indices\.push_back\(c\);/,
-  "terrain indices must stay world-CW (a,b,c) so the sheet survives above views"
-);
+// Terrain index guard removed: the restructure replaced the single terrain
+// sheet with sampled column boxes (generate_terrain_mesh in the Vulkan TU),
+// so the (a,b,c) sheet winding no longer exists to guard.
 
 // A Block is a per-face atlas and can contain transparent/cutout texels. It
 // must be rendered through the alpha-aware material graph even when a future
 // caller omits the optional argument. Semantic names must also beat stale,
 // still-valid UUIDs stored in a .vblock sidecar after a registry rebuild.
-assert.match(app, /const\s+bool\s+requiresAlpha\s*=\s*withAlpha\s*\|\|\s*isBlockAtlas\s*;/);
+assert.match(assetsImplEarly, /const\s+bool\s+requiresAlpha\s*=\s*withAlpha\s*\|\|\s*isBlockAtlas\s*;/);
 assert.match(
-  app,
+  assetsImplEarly,
   /UUID\s+mainTex\s*=\s*exact\s*;\s*if\s*\(\s*!mainTex\.is_valid\(\)\s*\)\s*mainTex\s*=\s*namedSide\s*;[\s\S]{0,260}?if\s*\(\s*!mainTex\.is_valid\(\)\s*\)\s*mainTex\s*=\s*validTexture\s*\(\s*data\.texture\s*\)/,
   "semantic block texture names must be selected before sidecar UUID fallbacks"
 );
-assert.match(app, /ensure_texture_pipeline\s*\(\s*range\.blockId\s*,\s*m_blockGraphPipelines\s*,\s*true\s*\)/);
+assert.match(assetsImplEarly, /ensure_texture_pipeline\s*\(\s*range\.blockId\s*,\s*m_blockGraphPipelines\s*,\s*true\s*\)/);
+
+// BUG-EDITOR-SHADOWS-001/002 + BUG-EDITOR-GI-001: the basic viewport path must
+// sample the REAL shadow targets (sun map, spot atlas, point slot-0 atlas)
+// and the Agente 1 probe-grid irradiance uploaded through EditorShadowUbo.
+const vulkanImpl = read("../src/editor/EditorApplicationVulkan.cpp");
+const assetsImpl = read("../src/editor/EditorApplicationAssets.cpp");
+
+assert.match(
+  viewportFragment,
+  /layout\s*\(\s*set\s*=\s*0,\s*binding\s*=\s*1\s*\)\s*uniform\s+sampler2DShadow\s+sunShadowMap/,
+  "basic mesh path must sample the sun shadow map (binding 1)"
+);
+assert.match(
+  viewportFragment,
+  /layout\s*\(\s*set\s*=\s*0,\s*binding\s*=\s*2\s*\)\s*uniform\s+sampler2DShadow\s+spotShadowAtlas/,
+  "basic mesh path must sample the spot shadow atlas (binding 2)"
+);
+assert.match(
+  viewportFragment,
+  /layout\s*\(\s*set\s*=\s*0,\s*binding\s*=\s*3\s*\)\s*uniform\s+sampler2DShadow\s+pointShadowAtlas/,
+  "basic mesh path must sample the point shadow atlas (binding 3)"
+);
+assert.match(
+  viewportFragment,
+  /layout\s*\(\s*set\s*=\s*0,\s*binding\s*=\s*4\s*\)\s*uniform\s+EditorShadow\s*\{[\s\S]*?vec4\s+probeIrradiance\[512\]/,
+  "EditorShadow block must mirror EditorShadowUbo including the 512-probe grid"
+);
+assert.match(viewportFragment, /sun_shadow\s*\(\s*fragWorldPos\s*,\s*ndl\s*\)/,
+  "sun direct light must be multiplied by the sun shadow term");
+assert.match(viewportFragment, /point_shadow\s*\(\s*fragWorldPos\s*\)/,
+  "point slot 0 direct light must be multiplied by the point shadow term");
+assert.match(viewportFragment, /spot_shadow\s*\(\s*i,\s*fragWorldPos,\s*ndl\s*\)/,
+  "each spot slot must be multiplied by its shadow tile");
+assert.match(viewportFragment, /vec3\s+ambient\s*=\s*gi_irradiance\s*\(\s*fragWorldPos\s*\)/,
+  "ambient must come from the probe-grid irradiance (falls back to 0.22)");
+// The GLSL probe wrap must mirror the C++ dense index (x + y*res + z*res*res).
+assert.match(viewportFragment, /w\.x \+ w\.y \* 8 \+ w\.z \* 64/);
+assert.match(vulkanImpl, /const int idx = off\.x \+ off\.y \* res \+ off\.z \* res \* res;/);
+
+// The shadow passes must exist and feed from the shared caster enumeration,
+// which now includes terrain, cube placeholders and voxel volumes.
+assert.match(vulkanImpl, /record_spot_shadow_pass\s*\(\s*cmd,\s*scene\s*\)/);
+assert.match(vulkanImpl, /record_point_shadow_pass\s*\(\s*cmd,\s*scene\s*\)/);
+assert.match(vulkanImpl, /draw_shadow_casters\s*\(\s*cmd,\s*m_shadowMap\.pipelineLayout,\s*m_shadowMap\.pipeline/);
+assert.match(vulkanImpl, /[\s\S]*m_terrainValid[\s\S]*bind_and_draw_indexed\s*\(\s*m_terrainVB\.buffer/,
+  "terrain must be a shadow caster (BUG-EDITOR-SHADOWS-001)");
+assert.match(vulkanImpl, /editor_face_basis[\s\S]*std::abs\(d\.y\)\s*>\s*0\.9f/,
+  "C++ point-face basis must keep the mirrored formula (GLSL side: abs(fd.y) > 0.9)");
+assert.match(viewportFragment, /abs\(fd\.y\)\s*>\s*0\.9/);
+
+// Assets side: the scene light set grows to 5 bindings (lights UBO + 3 shadow
+// targets + EditorShadowUbo) and the basic path's sun-shadow flag turns on
+// with the map.
+assert.match(assetsImpl, /layoutInfo\.bindingCount = 5;/);
+assert.match(assetsImpl, /bindings\[i\]\.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;/,
+  "shadow targets must be combined image samplers (bindings 1-3)");
+assert.match(assetsImpl, /bindings\[4\]\.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;/);
+assert.match(assetsImpl, /init_gi_probes\s*\(\s*\)\s*;/,
+  "the probe grid core must be created with the scene light resources");
+assert.match(assetsImpl, /data\.shadowParams = glm::vec4\(m_shadowMap\.enabled \? 1\.0f : 0\.0f/,
+  "the basic path's sun shadow flag must follow the shadow map state");
+assert.match(header, /static_assert\(sizeof\(EditorShadowUbo\) == 64 \* kEditorSpotShadowSlots \+ 16 \* 5 \+ 16 \* kEditorProbeCount/,
+  "EditorShadowUbo must stay within the guaranteed uniform buffer range");
 
 console.log("editor_viewport_regression_tests: PASS");

@@ -1,7 +1,170 @@
 #include "EditorApplication.hpp"
+#include "EditorInternalHelpers.hpp"
+// Importação de textura via WIC (iwicimagingfactory/ComPtr) — includes do
+// monólito original que o split havia perdido.
+#include <wincodec.h>
+#include <wrl/client.h>
 
 namespace Engine {
 
+namespace {
+// Cluster restaurado do monólito (git 408c2d3 4460-4524): geometria de skin
+// de personagem usada pela importação de avatar — o split havia perdido.
+struct CharacterUVRect { float u0, v0, u1, v1; };
+
+void append_character_face(std::vector<EditorVertex>& verts, std::vector<uint32_t>& indices,
+                           const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
+                           const glm::vec3& d, const glm::vec2& ta, const glm::vec2& tb,
+                           const glm::vec2& tc, const glm::vec2& td, const glm::vec3& normal) {
+    const uint32_t base = static_cast<uint32_t>(verts.size());
+    const glm::vec3 p[4] = { a, b, c, d };
+    const glm::vec2 t[4] = { ta, tb, tc, td };
+    for (int i = 0; i < 4; ++i) {
+        EditorVertex v;
+        v.pos = p[i];
+        v.normal = normal;
+        v.color = glm::vec3(1.0f);
+        v.uv = t[i];
+        verts.push_back(v);
+    }
+    indices.push_back(base);
+    indices.push_back(base + 1);
+    indices.push_back(base + 2);
+    indices.push_back(base);
+    indices.push_back(base + 2);
+    indices.push_back(base + 3);
+}
+
+// Adds the six faces of a box. `right`/`left` map the +X/-X faces,
+// `front`/`back` the +Z/-Z (back flipped so the layout reads correctly),
+// `top`/`bottom` the +Y/-Y. UVs come from the 64-unit layout grid and are
+// normalized by `skinHeight` (64x64 or legacy 64x32).
+void append_character_box(std::vector<EditorVertex>& verts, std::vector<uint32_t>& indices,
+                          float x0, float y0, float z0, float x1, float y1, float z1,
+                          float skinHeight, const CharacterUVRect& right,
+                          const CharacterUVRect& left, const CharacterUVRect& front,
+                          const CharacterUVRect& back, const CharacterUVRect& top,
+                          const CharacterUVRect& bottom) {
+    const auto uv = [&](const CharacterUVRect& r, float u, float v) {
+        return glm::vec2((r.u0 + (r.u1 - r.u0) * u) / 64.0f,
+                         (r.v0 + (r.v1 - r.v0) * v) / skinHeight);
+    };
+    // +Z front
+    append_character_face(verts, indices, { x0, y0, z1 }, { x1, y0, z1 }, { x1, y1, z1 },
+                          { x0, y1, z1 }, uv(front, 0, 1), uv(front, 1, 1), uv(front, 1, 0),
+                          uv(front, 0, 0), { 0, 0, 1 });
+    // -Z back (u flipped)
+    append_character_face(verts, indices, { x1, y0, z0 }, { x0, y0, z0 }, { x0, y1, z0 },
+                          { x1, y1, z0 }, uv(back, 1, 1), uv(back, 0, 1), uv(back, 0, 0),
+                          uv(back, 1, 0), { 0, 0, -1 });
+    // +X right
+    append_character_face(verts, indices, { x1, y0, z0 }, { x1, y0, z1 }, { x1, y1, z1 },
+                          { x1, y1, z0 }, uv(right, 0, 1), uv(right, 1, 1), uv(right, 1, 0),
+                          uv(right, 0, 0), { 1, 0, 0 });
+    // -X left (u flipped)
+    append_character_face(verts, indices, { x0, y0, z1 }, { x0, y0, z0 }, { x0, y1, z0 },
+                          { x0, y1, z1 }, uv(left, 1, 1), uv(left, 0, 1), uv(left, 0, 0),
+                          uv(left, 1, 0), { -1, 0, 0 });
+    // +Y top (z1 -> v0, the front edge of the top rect)
+    append_character_face(verts, indices, { x0, y1, z1 }, { x1, y1, z1 }, { x1, y1, z0 },
+                          { x0, y1, z0 }, uv(top, 0, 0), uv(top, 1, 0), uv(top, 1, 1),
+                          uv(top, 0, 1), { 0, 1, 0 });
+    // -Y bottom
+    append_character_face(verts, indices, { x0, y0, z0 }, { x1, y0, z0 }, { x1, y0, z1 },
+                          { x0, y0, z1 }, uv(bottom, 0, 1), uv(bottom, 1, 1),
+                          uv(bottom, 1, 0), uv(bottom, 0, 0), { 0, -1, 0 });
+}
+} // namespace
+
+void build_character_geometry(float skinHeight, std::vector<EditorVertex>& verts,
+                              std::vector<uint32_t>& indices) {
+    // Skin layout rects in the 64x64 coordinate grid (authoritative: the
+    // reference implementation used by mineatar.io). v is normalized by
+    // skinHeight so legacy 64x32 skins work too.
+    const CharacterUVRect headTop{ 8, 0, 16, 8 }, headBottom{ 16, 0, 24, 8 },
+        headRight{ 0, 8, 8, 16 }, headFront{ 8, 8, 16, 16 },
+        headLeft{ 16, 8, 24, 16 }, headBack{ 24, 8, 32, 16 };
+    const CharacterUVRect bodyTop{ 20, 16, 28, 20 }, bodyBottom{ 28, 16, 36, 20 },
+        bodyRight{ 16, 20, 20, 32 }, bodyFront{ 20, 20, 28, 32 },
+        bodyLeft{ 28, 20, 32, 32 }, bodyBack{ 32, 20, 40, 32 };
+    const CharacterUVRect rightArmTop{ 44, 16, 48, 20 }, rightArmBottom{ 48, 16, 52, 20 },
+        rightArmRight{ 40, 20, 44, 32 }, rightArmFront{ 44, 20, 48, 32 },
+        rightArmLeft{ 48, 20, 52, 32 }, rightArmBack{ 52, 20, 56, 32 };
+    const CharacterUVRect rightLegTop{ 4, 16, 8, 20 }, rightLegBottom{ 8, 16, 12, 20 },
+        rightLegRight{ 0, 20, 4, 32 }, rightLegFront{ 4, 20, 8, 32 },
+        rightLegLeft{ 8, 20, 12, 32 }, rightLegBack{ 12, 20, 16, 32 };
+    CharacterUVRect leftArmTop = rightArmTop, leftArmBottom = rightArmBottom,
+        leftArmRight = rightArmRight, leftArmFront = rightArmFront,
+        leftArmLeft = rightArmLeft, leftArmBack = rightArmBack;
+    CharacterUVRect leftLegTop = rightLegTop, leftLegBottom = rightLegBottom,
+        leftLegRight = rightLegRight, leftLegFront = rightLegFront,
+        leftLegLeft = rightLegLeft, leftLegBack = rightLegBack;
+    if (skinHeight > 32.5f) {
+        // 64x64: dedicated left arm/leg regions.
+        leftArmTop = { 36, 48, 40, 52 }; leftArmBottom = { 40, 48, 44, 52 };
+        leftArmRight = { 32, 52, 36, 64 }; leftArmFront = { 36, 52, 40, 64 };
+        leftArmLeft = { 40, 52, 44, 64 }; leftArmBack = { 44, 52, 48, 64 };
+        leftLegTop = { 20, 48, 24, 52 }; leftLegBottom = { 24, 48, 28, 52 };
+        leftLegRight = { 16, 52, 20, 64 }; leftLegFront = { 20, 52, 24, 64 };
+        leftLegLeft = { 24, 52, 28, 64 }; leftLegBack = { 28, 52, 32, 64 };
+    }
+    verts.clear();
+    indices.clear();
+    // Right leg (+X), left leg (-X): 0.25 x 0.75 x 0.25 m.
+    append_character_box(verts, indices, 0.0f, 0.0f, -0.125f, 0.25f, 0.75f, 0.125f, skinHeight,
+                         rightLegRight, rightLegLeft, rightLegFront, rightLegBack,
+                         rightLegTop, rightLegBottom);
+    append_character_box(verts, indices, -0.25f, 0.0f, -0.125f, 0.0f, 0.75f, 0.125f, skinHeight,
+                         leftLegRight, leftLegLeft, leftLegFront, leftLegBack,
+                         leftLegTop, leftLegBottom);
+    // Body: 0.5 x 0.75 x 0.25 m.
+    append_character_box(verts, indices, -0.25f, 0.75f, -0.125f, 0.25f, 1.5f, 0.125f, skinHeight,
+                         bodyRight, bodyLeft, bodyFront, bodyBack, bodyTop, bodyBottom);
+    // Right arm (+X), left arm (-X): 0.25 x 0.75 x 0.25 m.
+    append_character_box(verts, indices, 0.25f, 0.75f, -0.125f, 0.5f, 1.5f, 0.125f, skinHeight,
+                         rightArmRight, rightArmLeft, rightArmFront, rightArmBack,
+                         rightArmTop, rightArmBottom);
+    append_character_box(verts, indices, -0.5f, 0.75f, -0.125f, -0.25f, 1.5f, 0.125f, skinHeight,
+                         leftArmRight, leftArmLeft, leftArmFront, leftArmBack,
+                         leftArmTop, leftArmBottom);
+    // Head: 0.5 x 0.5 x 0.5 m.
+    append_character_box(verts, indices, -0.25f, 1.5f, -0.25f, 0.25f, 2.0f, 0.25f, skinHeight,
+                         headRight, headLeft, headFront, headBack, headTop, headBottom);
+}
+
+uint64_t hash_material_graph(const Rendering::MaterialGraph& graph) {
+    uint64_t h = 14695981039346656037ull;
+    const auto mix = [&h](const void* data, size_t size) {
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        for (size_t i = 0; i < size; ++i) {
+            h ^= bytes[i];
+            h *= 1099511628211ull;
+        }
+    };
+    for (const auto& node : graph.nodes()) {
+        mix(&node.id, sizeof(node.id));
+        const auto kind = static_cast<uint8_t>(node.kind);
+        mix(&kind, 1);
+        const auto outputType = static_cast<uint8_t>(node.outputType);
+        mix(&outputType, 1);
+        mix(node.label.data(), node.label.size());
+        mix(node.parameter.data(), node.parameter.size());
+        std::visit([&](const auto& v) {
+            if constexpr (std::is_same_v<std::decay_t<decltype(v)>, std::string>) {
+                mix(v.data(), v.size());
+            } else {
+                mix(&v, sizeof(v));
+            }
+        }, node.value);
+    }
+    for (const auto& p : graph.parameters()) {
+        mix(p.name.data(), p.name.size());
+        const auto type = static_cast<uint8_t>(p.type);
+        mix(&type, 1);
+        mix(&p.exposed, 1);
+    }
+    return h;
+}
 
 void EditorApplication::ensure_block_cube_resource(const UUID& blockId) {
     const auto cached = m_meshResources.find(blockId);
@@ -3243,6 +3406,31 @@ void EditorApplication::init_scene_light_resources() {
     init_gi_probes();
 }
 
+void EditorApplication::refresh_shadow_descriptors() {
+    // Re-writes bindings 1-3 after the shadow targets were (re)created — a
+    // resize destroys and rebuilds the samplers/views, which would otherwise
+    // leave the scene light set pointing at dead objects.
+    if (m_sceneLightSet == VK_NULL_HANDLE) return;
+    if (m_shadowMap.sampler == VK_NULL_HANDLE || m_spotShadow.sampler == VK_NULL_HANDLE ||
+        m_pointShadow.sampler == VK_NULL_HANDLE) {
+        return;
+    }
+    VkDescriptorImageInfo infos[3]{
+        { m_shadowMap.sampler, m_shadowMap.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+        { m_spotShadow.sampler, m_spotShadow.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+        { m_pointShadow.sampler, m_pointShadow.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+    };
+    VkWriteDescriptorSet writes[3]{};
+    for (uint32_t i = 0; i < 3; ++i) {
+        writes[i].dstSet = m_sceneLightSet;
+        writes[i].dstBinding = 1 + i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[i].pImageInfo = &infos[i];
+    }
+    vkUpdateDescriptorSets(m_device, 3, writes, 0, nullptr);
+}
+
 void EditorApplication::destroy_scene_light_resources() {
     if (m_sceneLightBuffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(m_device, m_sceneLightBuffer, nullptr);
@@ -3355,5 +3543,10 @@ void EditorApplication::write_material_ubo(const GraphMaterialPipeline& p, const
 void EditorApplication::destroy_mesh_resources() {
     for (auto& [id, resource] : m_meshResources) {
         (void)id;
+        destroy_buffer(resource.vb);
+        destroy_buffer(resource.ib);
+    }
+    m_meshResources.clear();
+}
 
 } // namespace Engine

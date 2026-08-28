@@ -1,9 +1,24 @@
 #include "EditorApplication.hpp"
+#include "EditorInternalHelpers.hpp"
+// ImGui_ImplVulkan_AddTexture é da backend layer do ImGui — o monólito
+// incluía <imgui_impl_vulkan.h> aqui; o split havia perdido o include.
+#include <imgui_impl_vulkan.h>
 
 namespace Engine {
 
+namespace {
+constexpr glm::vec3 kAxisDirs[] = { { 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f } };
+constexpr glm::vec3 kAxisColors[] = { { 1.0f, 0.2f, 0.2f }, { 0.2f, 1.0f, 0.2f }, { 0.2f, 0.5f, 1.0f } };
+}
+
+// Forward declarations: helpers definidos mais abaixo neste arquivo e usados
+// antes da definição desde o split do monólito.
+void make_editor_depth_render_pass(VkDevice device, VkFormat depthFormat, VkRenderPass& out);
+VkSampler make_editor_shadow_sampler(VkDevice device);
+
 // Vulkan Infrastructure (split from EditorApplication.cpp)
 // ===========================================================================
+uint32_t EditorApplication::find_memory_type(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
     VkPhysicalDeviceMemoryProperties memProperties;
     vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &memProperties);
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
@@ -556,6 +571,9 @@ void EditorApplication::create_shadow_map() {
     // share the depth format, lifecycle and call sites of the sun map.
     create_spot_shadow_map();
     create_point_shadow_map();
+    // Re-created samplers/views must land in the scene light set (a resize
+    // destroys and rebuilds these targets while the set stays alive).
+    refresh_shadow_descriptors();
 }
 
 void EditorApplication::destroy_shadow_map() {
@@ -1245,21 +1263,6 @@ void EditorApplication::generate_gizmo_geometry() {
 
 namespace {
 
-void set_viewport_scissor(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
-    VkViewport viewport{ 0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h), 0.0f, 1.0f };
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    VkRect2D scissor{ { 0, 0 }, { w, h } };
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-}
-
-// Atlas-tile variant used by the spot/point shadow passes (BUG-EDITOR-SHADOWS-002).
-void set_viewport_scissor_offset(VkCommandBuffer cmd, float offsetX, float offsetY, uint32_t w, uint32_t h) {
-    VkViewport viewport{ offsetX, offsetY, static_cast<float>(w), static_cast<float>(h), 0.0f, 1.0f };
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    VkRect2D scissor{ { static_cast<int32_t>(offsetX), static_cast<int32_t>(offsetY) }, { w, h } };
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-}
-
 // ---------------------------------------------------------------------------
 // BUG-EDITOR-SHADOWS-002 shared shadow math. The GLSL side of
 // editor_viewport.frag (spot/point sampling) and the GI probe wrap mirror
@@ -1357,28 +1360,12 @@ VkSampler make_editor_shadow_sampler(VkDevice device) {
     return sampler;
 }
 
-void draw_indexed_cube(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb, const VkBuffer& ib,
-                       uint32_t indexCount, const glm::mat4& mvp, const glm::vec4& color,
-                       const glm::mat4& model = glm::mat4(1.0f)) {
-    const VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
-    vkCmdBindIndexBuffer(cmd, ib, 0, VK_INDEX_TYPE_UINT32);
-    push_constants(cmd, layout, mvp, color, model);
-    vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
-}
-
 void draw_line_list(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb, uint32_t vertexCount,
                     const glm::mat4& mvp, const glm::vec4& color) {
     const VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &offset);
     push_constants(cmd, layout, mvp, color);
     vkCmdDraw(cmd, vertexCount, 1, 0, 0);
-}
-
-void draw_indexed_editor_mesh(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer& vb,
-                              const VkBuffer& ib, uint32_t indexCount, const glm::mat4& mvp,
-                              const glm::vec4& color, const glm::mat4& model = glm::mat4(1.0f)) {
-    draw_indexed_cube(cmd, layout, vb, ib, indexCount, mvp, color, model);
 }
 
 } // namespace
@@ -2586,5 +2573,7 @@ float terrain_surface_height(uint32_t seed, float scale, int octaves,
 // transform, and the procedural terrain becomes sampled column boxes sharing
 // the exact height function of the visual sheet. Bodies land on what they see.
 void EditorApplication::build_play_world_collision() {
+
+}
 
 } // namespace Engine

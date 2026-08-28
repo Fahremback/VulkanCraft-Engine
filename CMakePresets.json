@@ -29,8 +29,11 @@
       "cacheVariables": {
         "CMAKE_C_COMPILER": "cl",
         "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_LINKER": "link.exe",
         "CMAKE_C_COMPILER_LAUNCHER": "${sourceDir}/tools/portability/sccache.exe",
-        "CMAKE_CXX_COMPILER_LAUNCHER": "${sourceDir}/tools/portability/sccache.exe",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "${sourceDir}/tools/portability/sccache.exe"
+      },
+      "environment": {
         "SCCACHE_CACHE_TYPE": "local",
         "SCCACHE_DIR": "$env{LOCALAPPDATA}/VulkanCraft/sccache",
         "SCCACHE_IGNORE_SERVER_IO_ERROR": "1"
