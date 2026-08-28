@@ -11,13 +11,15 @@
 // PLUGIN ARCHITECTURE: the item defines XPBD and FEMFX as SPECIALIZED
 // plugins behind this contract. `create_deformable_provider(kind, ...)` is
 // the seam:
-//   - Xpbd  — implemented (`src/engine/sdk/XpbdDeformable.cpp`, the only TU
-//             that crosses into the solver): self-contained, deterministic
-//             (fixed node/edge iteration order, no randomness), headless.
-//   - Femfx — specialized volumetric plugin NOT vendored (DEPENDENCY_POLICY
-//             lists it as an opt-in asset choice); the factory REFUSES it
-//             with a diagnostic instead of silently falling back, so a
-//             missing plugin is never mistaken for a working deformable.
+//   - Xpbd  — position-based dynamics (`src/engine/sdk/XpbdDeformable.cpp`):
+//             self-contained, deterministic (fixed node/edge iteration order,
+//             no randomness), headless.
+//   - Femfx — FEM LINEAR DE TRELIÇA (`src/engine/sdk/FemfxDeformable.cpp`), a
+//             contraparte headless/determinística do FEMFX proprietário (AMD),
+//             do zero (sem o SDK de GPU): os elementos são as arestas da malha
+//             node/edge, forças internas montadas em ordem fixa, integração
+//             semi-implícita de Euler, ancoras, per-edge stiffness com
+//             desativação e piso com restituição. Determinístico.
 //
 // Self-contained: the contract depends only on the standard library + glm.
 // Deterministic: identical provider config + body desc + step sequence
@@ -34,8 +36,8 @@
 namespace Engine::Deformable {
 
 enum class DeformableProviderKind : std::uint8_t {
-    Xpbd,  // position-based dynamics (implemented)
-    Femfx  // volumetric FEM plugin (specialized, opt-in, not vendored)
+    Xpbd,   // position-based dynamics (implemented)
+    Femfx   // FEM truss linear (implementado do zero, do zero — sem SDK AMD)
 };
 
 // One deformable body: a node/edge mesh. `nodes` are the rest positions in
@@ -119,9 +121,9 @@ public:
     virtual float constraint_error(DeformableBodyHandle body) const noexcept = 0;
 };
 
-// The plugin seam: Xpbd returns the implemented solver; Femfx is REFUSED
-// with a diagnostic (specialized opt-in plugin, not vendored — see
-// DEPENDENCY_POLICY). Never silently falls back.
+// The plugin seam: Xpbd returns the position-based solver; Femfx returns the
+// FEM truss provider (FemfxDeformable.cpp). Both validate the config
+// all-or-nothing; an invalid kind/config returns nullptr + diagnostic.
 std::unique_ptr<IDeformableProvider> create_deformable_provider(
     DeformableProviderKind kind, const DeformableConfig& config,
     std::string& errorOut);

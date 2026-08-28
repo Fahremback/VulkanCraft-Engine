@@ -30,7 +30,10 @@ import { spawnSync } from "node:child_process";
 
 const GATE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ENGINE_ROOT = path.resolve(GATE_DIR, "..", "..");
-const BUILD_DIR = path.join(ENGINE_ROOT, "build");
+// Build dir is overridable so the gate can run against the shared out-of-tree
+// build (e.g. VC_BUILD_DIR=out/mission-gate node tools/portability/external-consumer-gate.mjs).
+// Default stays the legacy in-tree "build" used by the packaging flow.
+const BUILD_DIR = path.join(ENGINE_ROOT, process.env.VC_BUILD_DIR ?? "build");
 const KEEP = process.argv.includes("--keep");
 
 const ABSOLUTE_PATH_RE = /((^|[^A-Za-z])[A-Za-z]:[\\/])|(^\\\\[^\\/])/;
@@ -145,7 +148,7 @@ function main() {
   const cacheText = fs.existsSync(cachePath) ? fs.readFileSync(cachePath, "utf8") : "";
   const cachedGenerator = cacheText.match(/^CMAKE_GENERATOR:INTERNAL=(.*)$/m)?.[1];
   const cmakeGenerator = cachedGenerator || process.env.CMAKE_GENERATOR || "Visual Studio 18 2026";
-  const cmakeConfigureArgs = ["-S", ".", "-B", "build", "-G", cmakeGenerator];
+  const cmakeConfigureArgs = ["-S", ".", "-B", BUILD_DIR, "-G", cmakeGenerator];
   if (cmakeGenerator.startsWith("Visual Studio") && !cachedGenerator) cmakeConfigureArgs.push("-A", "x64");
   const vsEnv = process.env.VCINSTALLDIR ? process.env : { ...process.env,
     PATH: `C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/bin/Hostx64/x64;C:/Program Files/CMake/bin;C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64;${process.env.PATH || ""}`,
@@ -166,7 +169,7 @@ function main() {
 
   // 0b. Build Release targets so .lib files exist for install.
   log("building Release targets");
-  result = run("cmake", ["--build", "build", "--config", "Release"],
+  result = run("cmake", ["--build", BUILD_DIR, "--config", "Release"],
     { cwd: ENGINE_ROOT, timeout: 600_000, env: vsEnv });
   if (result.status !== 0) {
     fail(`main build exited ${result.status}`);

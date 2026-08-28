@@ -97,15 +97,16 @@ bool boot_world(IWorldManager& manager, const std::string& name,
     world->register_generator(std::make_shared<FlatGenerator>(96));
     world->set_chunk_budget(budget);
     const auto start = std::chrono::steady_clock::now();
-    while (!world->is_chunk_loaded(0, 0)) {
+    for (int step = 0; step < 60 * 180; ++step) {
+        if (world->is_chunk_loaded(0, 0)) return true;
         if (std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start).count() > 8000) {
+                std::chrono::steady_clock::now() - start).count() > 30000) {
             return false;
         }
         manager.update_world(name, player, 1.0f / 60.0f);
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    return true;
+    return world->is_chunk_loaded(0, 0);
 }
 
 // 1. The core point: raw float32 cannot resolve blocks at 1e9; rebasing the

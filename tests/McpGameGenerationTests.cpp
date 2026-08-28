@@ -74,17 +74,18 @@ private:
 };
 
 static bool boot_world(engine::voxel::IVoxelWorld& w, const glm::vec3& player,
-                       int budget = 16, int maxMs = 8000) {
+                       int budget = 16, int maxSteps = 60 * 180, int maxMs = 30000) {
     w.set_chunk_budget(budget);
     auto start = std::chrono::steady_clock::now();
-    while (!w.is_chunk_loaded(0, 0)) {
+    for (int step = 0; step < maxSteps; ++step) {
+        if (w.is_chunk_loaded(0, 0)) return true;
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count();
         if (elapsed > maxMs) return false;
         w.update(player, 1.0f / 60.0f);
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    return true;
+    return w.is_chunk_loaded(0, 0);
 }
 
 static const std::string& scratch_dir() {

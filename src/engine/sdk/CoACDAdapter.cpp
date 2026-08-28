@@ -8,6 +8,8 @@
 
 #include "coacd.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -83,6 +85,35 @@ public:
             }
             result.parts.push_back(std::move(cp));
         }
+
+        // Canonical part ordering: CoACD is multithreaded (OpenMP) and appends
+        // finished parts to its output vector under a write lock, so the part
+        // ORDER varies with thread scheduling even when the decomposition
+        // itself is identical. Consumers (physics, collision, replay and the
+        // determinism contract) need a stable result, so order parts by a
+        // deterministic key derived from their geometry. Vertices only come
+        // from the same mesh, so a lexicographic key on the first vertices is
+        // a total order that is stable across runs, machines and thread
+        // scheduling. (The vendored sampler was also made deterministic.)
+        std::sort(result.parts.begin(), result.parts.end(),
+                  [](const ConvexPart& lhs, const ConvexPart& rhs) {
+                      const std::size_t n = std::min(lhs.vertices.size(), rhs.vertices.size());
+                      for (std::size_t i = 0; i < n; ++i) {
+                          if (lhs.vertices[i] != rhs.vertices[i]) {
+                              return lhs.vertices[i] < rhs.vertices[i];
+                          }
+                      }
+                      if (lhs.vertices.size() != rhs.vertices.size()) {
+                          return lhs.vertices.size() < rhs.vertices.size();
+                      }
+                      const std::size_t m = std::min(lhs.triangles.size(), rhs.triangles.size());
+                      for (std::size_t i = 0; i < m; ++i) {
+                          if (lhs.triangles[i] != rhs.triangles[i]) {
+                              return lhs.triangles[i] < rhs.triangles[i];
+                          }
+                      }
+                      return lhs.triangles.size() < rhs.triangles.size();
+                  });
 
         return true;
     }

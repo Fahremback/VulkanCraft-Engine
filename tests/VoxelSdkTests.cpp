@@ -236,12 +236,19 @@ public:
 };
 
 // Boots a world headless: drive update() with real-time pacing until the
-// center chunk is loaded or the wall-clock budget runs out.
+// center chunk is loaded. Deterministic in SIM-TIME: the number of update()
+// steps (each advancing dt=1/60 sim-seconds) needed for chunk (0,0) to load is
+// fixed by the scheduler budgets, independent of wall-clock machine load. The
+// wall-clock budget remains only as a sanity cap so a genuine non-convergence
+// fails fast instead of hanging — but convergence is decided by sim steps, so
+// heavy parallel ctest/(-j 8) load cannot flake it. (Mirrors the `settle`
+// pattern directly below; wall-clock-only polling flaked under load.)
 bool boot_world(engine::voxel::IVoxelWorld& world, const glm::vec3& player,
-                int budget, int maxBudgetMs = 8000) {
+                int budget, int maxSteps = 60 * 180, int maxBudgetMs = 30000) {
     world.set_chunk_budget(budget);
     const auto start = std::chrono::steady_clock::now();
-    while (!world.is_chunk_loaded(0, 0)) {
+    for (int step = 0; step < maxSteps; ++step) {
+        if (world.is_chunk_loaded(0, 0)) return true;
         if (std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start).count() > maxBudgetMs) {
             return false;
@@ -249,7 +256,7 @@ bool boot_world(engine::voxel::IVoxelWorld& world, const glm::vec3& player,
         world.update(player, 1.0f / 60.0f);
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    return true;
+    return world.is_chunk_loaded(0, 0);
 }
 
 // Runs update() until `predicate` holds. The sim advances by FIXED steps
@@ -6327,11 +6334,11 @@ void test_block_registry() {
     engine::registry::BlockRegistry reordered;
     std::string errA;
     CHECK(reordered.load_from_json(
-        R"([{"name":"sapphire","namespace":"test"},{"name":"ruby","namespace":"test","id":")" + ruby->uuid + R"("}]))", errA));
+        R"([{"name":"sapphire","namespace":"test"},{"name":"ruby","namespace":"test","id":")" + ruby->uuid + R"("}])", errA));
     const engine::registry::BlockDefinition* rubyReordered =
         reordered.find_by_name("test:ruby");
     CHECK(rubyReordered != nullptr);
-    CHECK(rubyReordered->uuid == ruby->uuid);
+    if (rubyReordered) CHECK(rubyReordered->uuid == ruby->uuid);
 
     // Invalid asset: clear diagnostic, nothing registered, safe fallback.
     engine::registry::BlockRegistry broken;

@@ -112,6 +112,7 @@ void test_rotation_residual() {
 
     // Avança até t=2.0 (20 ticks de 0.1) → settled e convergência.
     bool settled = false;
+    double lastY = 1.0;
     const BonePose* thigh = nullptr;
     for (int i = 0; i < 20; ++i) {
         const InertializerResult r =
@@ -119,10 +120,13 @@ void test_rotation_residual() {
         check(err.empty(), "tick rotacional sem erro");
         if (r.settled) settled = true;
         thigh = find_bone(r.pose, "thigh");
+        if (thigh != nullptr) lastY = thigh->local.rotation.y;
     }
     check(settled, "settled após 4T");
-    check(thigh != nullptr && std::fabs(thigh->local.rotation.y) < 0.01,
-          "converge à identidade (y ≈ 0)");
+    // Copia o valor para fora do escopo do loop: `thigh` aponta para o
+    // `InertializerResult` local ao loop (destruído a cada iteração);
+    // ler o ponteiro depois é use-after-scope. Guardamos o último y.
+    check(std::fabs(lastY) < 0.01, "converge à identidade (y ≈ 0)");
 }
 
 void test_clear_and_errors() {

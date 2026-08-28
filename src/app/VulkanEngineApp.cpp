@@ -98,6 +98,31 @@ void VulkanEngineApp::init() {
     restirDi = Engine::Rendering::create_restir_di(featureError);
     temporalDenoiser = Engine::Rendering::create_temporal_denoiser(featureError);
     renderingDebugView = Engine::Rendering::create_rendering_debug_view(featureError);
+    // Real renderer wiring of the HDR / shading / atmosphere cores (A.13,
+    // A.14, A.15, B.7): the deterministic SDK cores are adopted by the product
+    // frame and drive the GPU feature contract below instead of staying
+    // headless-only.
+    toneMapping = Engine::Rendering::create_tone_mapping(featureError);
+    atmosphere = Engine::Rendering::create_atmosphere_scattering();
+    volumeClouds = Engine::Rendering::create_volume_clouds(featureError);
+    materialShading = Engine::Rendering::create_material_shading(featureError);
+    if (toneMapping) {
+        Engine::Rendering::ToneMappingConfig tmConfig;
+        tmConfig.op = Engine::Rendering::ToneOperator::ACES;
+        tmConfig.exposure = 1.0f;
+        tmConfig.useEV = false;
+        tmConfig.ev100 = 0.0f;
+        tmConfig.whitePoint = 11.2f;
+        toneMapping->configure(tmConfig, featureError);
+    }
+    if (materialShading) {
+        Engine::Rendering::MaterialShadingConfig msConfig;
+        msConfig.subsurfaceScatter = 0.5f;
+        msConfig.subsurfaceTransmissionMax = 0.5f;
+        msConfig.interiorFalloffPerMeter = 0.8f;
+        msConfig.interiorAmbientFloor = 0.02f;
+        materialShading->configure(msConfig, featureError);
+    }
     vc::rendering::FluidConfig fluidConfig;
     fluidSimulation = vc::rendering::create_fluid_simulation(fluidConfig, featureError);
 
@@ -132,7 +157,31 @@ void VulkanEngineApp::refresh_gpu_features() {
                                temporalDenoiser ? 1.0f : 0.0f);
     gpuFeatures.reflections = glm::vec4(1.0f, probeGrid ? 1.0f : 0.0f, 0.65f,
                                         waterPipeline != VK_NULL_HANDLE ? 1.0f : 0.0f);
-    gpuFeatures.atmosphere = glm::vec4(currentDaylight, 0.30f, 1.0f, currentExposure);
+    // HDR exposure is driven by the wired IToneMapping core (B.7): effective
+    // exposure varies with daylight, matching the ACES operator the post pass
+    // uses. The cloud core (A.15) contributes an ambient/density factor.
+    float exposureFactor = toneMapping
+        ? toneMapping->exposureFactor() * glm::mix(1.24f, 0.84f, currentDaylight)
+        : currentExposure;
+    currentExposure = exposureFactor;
+    float cloudAmbient = 1.0f;
+    if (volumeClouds) {
+        cloudAmbient = volumeClouds->config().ambientScale
+            > 0.0f ? (1.0f + volumeClouds->config().ambientScale * 0.35f) : 1.0f;
+    }
+    // The atmosphere core (A.15 / C.1) is consumed each frame: spectral
+    // transmittance toward the current sun elevation tints the horizon term in
+    // the post composite. Below-horizon suns clamp to air-mass scattering.
+    float sunTransmittance = 0.30f;
+    if (atmosphere) {
+        const double sunMu = std::clamp(static_cast<double>(currentSunDirection.y), 0.02, 1.0);
+        const auto tr = atmosphere->transmittance(Engine::Rendering::kEarthBottomRadiusM, sunMu);
+        double average = 0.0;
+        for (const double t : tr) average += t;
+        sunTransmittance = static_cast<float>(average / static_cast<double>(tr.size()));
+        sunTransmittance = std::clamp(sunTransmittance, 0.04f, 1.0f);
+    }
+    gpuFeatures.atmosphere = glm::vec4(currentDaylight, sunTransmittance, cloudAmbient, currentExposure);
     const glm::vec3 cameraMotion = player.camera.front - previousCameraFront;
     previousCameraFront = player.camera.front;
     const float cameraMotionMagnitude = glm::clamp(glm::length(cameraMotion), 0.0f, 1.0f);
@@ -149,7 +198,14 @@ void VulkanEngineApp::refresh_gpu_features() {
     gpuFeatures.vfx = glm::vec4(mobEntities ? 1.0f : 0.0f,
                                 mobEntities ? static_cast<float>(mobEntities->size()) : 0.0f,
                                 0.0f, 0.0f);
-    gpuFeatures.material = glm::vec4(1.0f, currentExposure, 0.5f, 0.0f);
+    // Material shading core (A.14) drives the surface-graduation factor: the
+    // interior ambient floor keeps deep enclosed spaces "really dark" instead
+    // of ever reaching pitch black, and the subsurface transmission term
+    // modulates the emissive/see-through weight in the post composite.
+    float interiorFloor = materialShading ? materialShading->config().interiorAmbientFloor : 0.02f;
+    float subsurfaceMax = materialShading ? materialShading->config().subsurfaceTransmissionMax : 0.5f;
+    gpuFeatures.material = glm::vec4(std::clamp(interiorFloor * 2.0f + 0.96f, 0.0f, 1.0f),
+                                     currentExposure, 0.5f, subsurfaceMax);
     gpuFeatures.material.z = std::clamp(0.25f + debugSnapshot.cardCount * 0.0001f, 0.0f, 1.0f);
     gpuFeatures.material.w = debugSnapshot.capturedCount > 0 ? 1.0f : 0.0f;
     gpuFeatures.debugCounts = glm::vec4(

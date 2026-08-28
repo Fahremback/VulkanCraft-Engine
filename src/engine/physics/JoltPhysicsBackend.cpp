@@ -14,6 +14,7 @@
 #include <Jolt/Physics/Body/BodyInterface.h>
 #include <Jolt/Physics/Body/BodyID.h>
 #include <Jolt/Physics/Body/BodyLock.h>
+#include <Jolt/Physics/Body/BodyLockMulti.h>
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayer.h>
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseQuery.h>
 #include <Jolt/Physics/Collision/ObjectLayer.h>
@@ -588,13 +589,19 @@ ConstraintHandle JoltPhysicsBackend::create_distance_constraint(const DistanceCo
     const auto itB = impl_->bodies_.find(description.bodyB);
     if (itA == impl_->bodies_.end() || itB == impl_->bodies_.end()) return InvalidConstraint;
 
-    JPH::BodyInterface& bi = impl_->physicsSystem->GetBodyInterface();
-    const JPH::BodyLockWrite lockA(impl_->physicsSystem->GetBodyLockInterface(), itA->second.id);
-    const JPH::BodyLockWrite lockB(impl_->physicsSystem->GetBodyLockInterface(), itB->second.id);
-    if (!lockA.Succeeded() || !lockB.Succeeded()) return InvalidConstraint;
+    // JPH_ENABLE_ASSERTS (PhysicsLock::sCheckLock) tracks a single PerBody
+    // bit per context: taking TWO sequential BodyLockWrite locks trips
+    // "same or higher priority already taken". BodyLockMultiWrite acquires
+    // the combined per-body mutex mask with ONE tracker bit (the sanctioned
+    // two-body pattern).
+    const JPH::BodyID ids[2] = {itA->second.id, itB->second.id};
+    JPH::BodyLockMultiWrite lock(impl_->physicsSystem->GetBodyLockInterface(), ids, 2);
+    JPH::Body* bodyA = lock.GetBody(0);
+    JPH::Body* bodyB = lock.GetBody(1);
+    if (bodyA == nullptr || bodyB == nullptr) return InvalidConstraint;
 
-    const JPH::RVec3 anchorA = lockA.GetBody().GetCenterOfMassPosition() + lockA.GetBody().GetRotation() * to_jolt(description.localAnchorA);
-    const JPH::RVec3 anchorB = lockB.GetBody().GetCenterOfMassPosition() + lockB.GetBody().GetRotation() * to_jolt(description.localAnchorB);
+    const JPH::RVec3 anchorA = bodyA->GetCenterOfMassPosition() + bodyA->GetRotation() * to_jolt(description.localAnchorA);
+    const JPH::RVec3 anchorB = bodyB->GetCenterOfMassPosition() + bodyB->GetRotation() * to_jolt(description.localAnchorB);
 
     auto settings = std::make_unique<JPH::DistanceConstraintSettings>();
     settings->mPoint1 = anchorA;
@@ -602,7 +609,7 @@ ConstraintHandle JoltPhysicsBackend::create_distance_constraint(const DistanceCo
     settings->mMinDistance = std::max(0.0f, description.restLength);
     settings->mMaxDistance = std::max(0.0f, description.restLength);
 
-    JPH::Constraint* constraint = settings->Create(lockA.GetBody(), lockB.GetBody());
+    JPH::Constraint* constraint = settings->Create(*bodyA, *bodyB);
     if (!constraint) return InvalidConstraint;
 
     impl_->physicsSystem->AddConstraint(constraint);
@@ -617,9 +624,15 @@ ConstraintHandle JoltPhysicsBackend::create_swing_twist_constraint(const SwingTw
     const auto itB = impl_->bodies_.find(description.bodyB);
     if (itA == impl_->bodies_.end() || itB == impl_->bodies_.end()) return InvalidConstraint;
 
-    JPH::BodyLockWrite lockA(impl_->physicsSystem->GetBodyLockInterface(), itA->second.id);
-    JPH::BodyLockWrite lockB(impl_->physicsSystem->GetBodyLockInterface(), itB->second.id);
-    if (!lockA.Succeeded() || !lockB.Succeeded()) return InvalidConstraint;
+    // Same two-body lock pattern as create_distance_constraint: Jolt's
+    // PhysicsLock tracker allows ONE PerBody bit per context, so the combined
+    // mutex mask via BodyLockMultiWrite is required (two BodyLockWrite would
+    // assert under JPH_ENABLE_ASSERTS).
+    const JPH::BodyID ids[2] = {itA->second.id, itB->second.id};
+    JPH::BodyLockMultiWrite lock(impl_->physicsSystem->GetBodyLockInterface(), ids, 2);
+    JPH::Body* bodyA = lock.GetBody(0);
+    JPH::Body* bodyB = lock.GetBody(1);
+    if (bodyA == nullptr || bodyB == nullptr) return InvalidConstraint;
 
     auto settings = std::make_unique<JPH::SwingTwistConstraintSettings>();
     settings->mSpace = JPH::EConstraintSpace::LocalToBodyCOM;
@@ -641,7 +654,7 @@ ConstraintHandle JoltPhysicsBackend::create_swing_twist_constraint(const SwingTw
         settings->mTwistMotorSettings.mSpringSettings =
             JPH::SpringSettings(JPH::ESpringMode::FrequencyAndDamping, description.motorFrequency, description.motorDamping);
         constraint = static_cast<JPH::SwingTwistConstraint*>(
-            settings->Create(lockA.GetBody(), lockB.GetBody()));
+            settings->Create(*bodyA, *bodyB));
         if (constraint == nullptr) return InvalidConstraint;
         constraint->SetSwingMotorState(JPH::EMotorState::Position);
         constraint->SetTwistMotorState(JPH::EMotorState::Position);
@@ -653,7 +666,7 @@ ConstraintHandle JoltPhysicsBackend::create_swing_twist_constraint(const SwingTw
         constraint->SetTargetOrientationBS(to_jolt(description.motorTarget));
     } else {
         constraint = static_cast<JPH::SwingTwistConstraint*>(
-            settings->Create(lockA.GetBody(), lockB.GetBody()));
+            settings->Create(*bodyA, *bodyB));
         if (constraint == nullptr) return InvalidConstraint;
     }
 

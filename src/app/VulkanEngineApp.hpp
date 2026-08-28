@@ -15,6 +15,10 @@
 #include "engine/rendering/ITemporalDenoiser.hpp"
 #include "engine/rendering/IFluidSimulation.hpp"
 #include "engine/rendering/IBlockMaterialResolver.hpp"
+#include "engine/rendering/IToneMapping.hpp"
+#include "engine/rendering/IAtmosphereScattering.hpp"
+#include "engine/rendering/IVolumeClouds.hpp"
+#include "engine/rendering/IMaterialShading.hpp"
 #include "engine/rendering/lighting/RadianceCache.hpp"
 #include "simulation/voxel/streaming/WorldRenderBridge.hpp"
 #include "simulation/voxel/meshing/ChunkMeshResult.hpp"
@@ -182,6 +186,10 @@ public:
     std::unique_ptr<Engine::Rendering::ITemporalDenoiser> temporalDenoiser;
     std::unique_ptr<Engine::Rendering::IRenderingDebugView> renderingDebugView;
     std::unique_ptr<vc::rendering::IFluidSimulation> fluidSimulation;
+    std::unique_ptr<Engine::Rendering::IToneMapping> toneMapping;
+    std::unique_ptr<Engine::Rendering::IAtmosphereScattering> atmosphere;
+    std::unique_ptr<Engine::Rendering::IVolumeClouds> volumeClouds;
+    std::unique_ptr<Engine::Rendering::IMaterialShading> materialShading;
     bool gpuFeaturesReady{ false };
     void refresh_gpu_features();
 

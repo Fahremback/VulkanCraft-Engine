@@ -22,6 +22,7 @@
 
 #include "engine/deformable/IDeformableProvider.hpp"
 
+#include "engine/sdk/FemfxDeformable.hpp"
 #include "engine/sdk/RegistryJson.hpp"
 
 #include <algorithm>
@@ -370,11 +371,11 @@ private:
 std::unique_ptr<IDeformableProvider> create_deformable_provider(
     DeformableProviderKind kind, const DeformableConfig& config,
     std::string& errorOut) {
+    // Femfx: FEM truss linear (FemfxDeformable.cpp), do zero — a contraparte
+    // headless/determinística do FEMFX proprietário (AMD) por trás do mesmo
+    // contrato. Valida a mesma config (all-or-nothing).
     if (kind == DeformableProviderKind::Femfx) {
-        errorOut = "deformable provider: FEMFX is a specialized opt-in plugin "
-                   "not vendored (DEPENDENCY_POLICY); implement the same "
-                   "IDeformableProvider seam to add it";
-        return nullptr;
+        return create_femfx_provider(config, errorOut);
     }
     std::string validateError;
     if (!DeformableConfig_validate(config, validateError)) {

@@ -50,8 +50,8 @@ DeformableMeshDesc make_chain() {
     return desc;
 }
 
-// 1. Factory + plugin seam: Xpbd creates the solver; FEMFX is refused with a
-//    diagnostic; invalid configs are refused (never clamped).
+// 1. Factory + plugin seam: Xpbd and Femfx (from-scratch FEM truss) create
+//    their solvers; invalid configs are refused (never clamped).
 void test_factory_and_validation() {
     DeformableConfig config;
     std::string error;
@@ -59,10 +59,13 @@ void test_factory_and_validation() {
         create_deformable_provider(DeformableProviderKind::Xpbd, config, error);
     check(xpbd != nullptr && xpbd->kind() == DeformableProviderKind::Xpbd,
           "Xpbd provider created by the factory");
+    // FEMFX: agora implementado do zero (FEM truss, FemfxDeformable.cpp) — o
+    // seam aceita o kind em vez de recusar. Gate dedicado: femfx_deformable_tests.
     std::unique_ptr<IDeformableProvider> femfx =
         create_deformable_provider(DeformableProviderKind::Femfx, config, error);
-    check(femfx == nullptr && !error.empty(),
-          "FEMFX refused with a diagnostic (specialized plugin seam)");
+    check(femfx != nullptr &&
+              femfx->kind() == DeformableProviderKind::Femfx,
+          "Femfx provider created by the factory (from-scratch FEM truss)");
 
     // Config JSON validation (all-or-nothing).
     DeformableConfig loaded;

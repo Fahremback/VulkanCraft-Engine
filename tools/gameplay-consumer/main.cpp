@@ -95,7 +95,7 @@ int main() {
     engine::gameplay::RagdollJoint root;
     root.name = "root";
     ragdollAsset.joints.push_back(root);
-    auto renderer = engine::Engine::Rendering::create_rendering_debug_view(error);
+    auto renderer = Engine::Rendering::create_rendering_debug_view(error);
     auto voxel = engine::voxel::create_default_voxel_world();
     std::string replicationError;
     auto multiplayer = engine::networking::create_network_replication("gameplay-consumer", replicationError);

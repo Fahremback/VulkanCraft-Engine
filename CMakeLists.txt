@@ -724,6 +724,13 @@ vc_object_module(vc_sdk_rendering
     src/engine/sdk/EllipsoidMath.cpp
     src/engine/sdk/EmbreeRayTracer.cpp
     src/engine/sdk/VkRayTracer.cpp
+    # From-scratch native closures of the vendor-GPU repo items (criado do zero,
+    # sem depender dos SDKs externos): ocean spectrum via IFftCore (C.20 vkfft),
+    # dynamic Vulkan loader (C.21 volk) e offline ray-bake AO via IRayTracer
+    # (C.4 embree cooker).
+    src/engine/sdk/FftOceanSurface.cpp
+    src/engine/sdk/VulkanLoader.cpp
+    src/engine/sdk/RayBakeMesh.cpp
 )
 target_include_directories(vc_sdk_rendering PRIVATE
     ${VC_SOLUTIONS_DIR}/spirv-reflect
@@ -765,7 +772,18 @@ vc_object_module(vc_sdk_world
     src/engine/sdk/LodTerrainSampler.cpp
     src/engine/sdk/MultiScaleStreaming.cpp
     src/engine/sdk/XpbdDeformable.cpp
+    src/engine/sdk/FemfxDeformable.cpp
     src/engine/sdk/TetraMeshCooking.cpp
+    # G. seção G fechada do zero (adapters próprios, sem libs externas):
+    # splishsplash -> SphFluidSimulation, s2geometry -> HilbertCellIndex,
+    # shape-ml -> ShapeRecognition, project-chrono -> MultibodyDynamics,
+    # jsbsim -> FlightDynamics (voxy/scene culling e blast/explosion já
+    # estavam no SDK; erosion/lod terrain acima).
+    src/engine/sdk/SphFluidSimulation.cpp
+    src/engine/sdk/HilbertCellIndex.cpp
+    src/engine/sdk/ShapeRecognition.cpp
+    src/engine/sdk/MultibodyDynamics.cpp
+    src/engine/sdk/FlightDynamics.cpp
     src/engine/sdk/MobBehavior.cpp
     src/engine/sdk/WorldManager.cpp
     src/engine/sdk/WorldReplication.cpp
@@ -980,6 +998,31 @@ vc_object_module(vc_gameplay_sdk
     src/engine/sdk/GameplayPhase.cpp
     src/engine/sdk/GameplayBindings.cpp
     src/engine/sdk/GameplaySystemWiring.cpp
+    # Gameplay/nav/audio SDK facades consumed by external consumers through the
+    # installed vc_sdk archive (BUG-041: they were only compiled into ad-hoc
+    # test targets, so the installed lib was missing these symbols).
+    src/engine/sdk/GameplayEvents.cpp
+    src/engine/sdk/GameplayMetrics.cpp
+    src/engine/sdk/GameplayDebugSurface.cpp
+    src/engine/sdk/AsyncQueryScheduler.cpp
+    src/engine/sdk/AudioEventMapper.cpp
+    src/engine/sdk/NavStreaming.cpp
+    src/engine/sdk/NavInvalidation.cpp
+    # Entity/world/gameplay SDK facades also consumed through the installed
+    # vc_sdk archive (BUG-041 continued): previously compiled only into ad-hoc
+    # test targets.
+    src/engine/sdk/EntityArchetype.cpp
+    src/engine/sdk/EntityLifecycle.cpp
+    src/engine/sdk/SpatialIndex.cpp
+    src/engine/sdk/AbilityEffects.cpp
+    src/engine/sdk/DayNightCycle.cpp
+    src/engine/sdk/EffectStacks.cpp
+    src/engine/sdk/HitReaction.cpp
+    src/engine/sdk/AbilityEffectsFacade.cpp
+    src/engine/sdk/Replay.cpp
+    src/engine/sdk/NavigationSchedulerBridge.cpp
+    src/engine/sdk/PortalSystem.cpp
+    src/engine/sdk/TimelinePolicy.cpp
     src/engine/physics/PhysicsRuntime.cpp
     src/engine/physics/PhysicsBackend.cpp
     src/engine/physics/JoltPhysicsBackend.cpp
@@ -1341,6 +1384,7 @@ if(TARGET vc_generate_world_save)
     add_dependencies(mcp_game_generation_tests vc_generate_world_save)
 endif()
 add_test(NAME mcp_game_generation_tests COMMAND mcp_game_generation_tests)
+set_tests_properties(mcp_game_generation_tests PROPERTIES TIMEOUT 300 LABELS "integration;gameplay")
 
 # Agent 6 items 239, 249, 266, 268: integration and validation tests
 add_executable(integration_validation_tests EXCLUDE_FROM_ALL
@@ -1485,6 +1529,7 @@ if(TARGET vc_generate_world_save)
     add_dependencies(replay_crossplatform_tests vc_generate_world_save)
 endif()
 add_test(NAME replay_crossplatform_tests COMMAND replay_crossplatform_tests)
+set_tests_properties(replay_crossplatform_tests PROPERTIES TIMEOUT 300 LABELS "integration;gameplay")
 
 add_executable(effekseer_particles_tests EXCLUDE_FROM_ALL
     tests/EffekseerParticlesTests.cpp
@@ -2095,6 +2140,71 @@ target_link_libraries(fft_core_tests PRIVATE vc_build_options
 )
 add_test(NAME fft_core_tests COMMAND fft_core_tests)
 
+# From-scratch native closure gates — Agente 1 (criado do zero, sem vendors).
+
+add_executable(fft_ocean_surface_tests EXCLUDE_FROM_ALL
+    tests/FftOceanSurfaceTests.cpp
+    ${VC_SDK_PUBLIC_OBJECTS}
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_include_directories(fft_ocean_surface_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(fft_ocean_surface_tests PRIVATE vc_build_options
+    $<TARGET_OBJECTS:vc_core_runtime>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    vc_efsw shlwapi vc_ozz vc_acl vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+)
+add_test(NAME fft_ocean_surface_tests COMMAND fft_ocean_surface_tests)
+
+add_executable(vulkan_loader_tests EXCLUDE_FROM_ALL
+    tests/VulkanLoaderTests.cpp
+    ${VC_SDK_PUBLIC_OBJECTS}
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_include_directories(vulkan_loader_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(vulkan_loader_tests PRIVATE vc_build_options
+    $<TARGET_OBJECTS:vc_core_runtime>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    vc_efsw shlwapi vc_ozz vc_acl vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+)
+add_test(NAME vulkan_loader_tests COMMAND vulkan_loader_tests)
+
+add_executable(ray_bake_mesh_tests EXCLUDE_FROM_ALL
+    tests/RayBakeMeshTests.cpp
+    ${VC_SDK_PUBLIC_OBJECTS}
+    src/engine/networking/NetworkRuntime.cpp
+)
+target_include_directories(ray_bake_mesh_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(ray_bake_mesh_tests PRIVATE vc_build_options
+    $<TARGET_OBJECTS:vc_core_runtime>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    vc_efsw shlwapi vc_ozz vc_acl vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+)
+add_test(NAME ray_bake_mesh_tests COMMAND ray_bake_mesh_tests)
+
 # Agente 1 — B.8 scene culling core: deterministic headless core
 # (ISceneCulling — Test #26). Frustum extraction, AABB/sphere visibility, LOD
 # with hysteresis, conservative occlusion and instance grouping; no GPU
@@ -2680,6 +2790,7 @@ add_executable(gameplay_runtime_tests EXCLUDE_FROM_ALL
     src/engine/sdk/VehicleProvider.cpp
     src/engine/sdk/MotionDatabase.cpp
     src/engine/sdk/XpbdDeformable.cpp
+    src/engine/sdk/FemfxDeformable.cpp
     $<TARGET_OBJECTS:vc_gameplay_sdk>
 )
 target_include_directories(gameplay_runtime_tests PRIVATE
@@ -6788,3 +6899,145 @@ if(MSVC)
     endfunction()
     vc_force_embedded_msvc_debug("${CMAKE_SOURCE_DIR}")
 endif()
+
+# ────────────────────────────────────────────────────────────────────────────
+# G. Seção G fechada do zero — gates dos adapters próprios (AGENT-3).
+# Cada item [~] do pacote de repositórios ganhou um adapter C++ próprio,
+# self-contained, detrás de um seam público (padrão fastnoise2/manifold):
+#   godot-voxel  -> ILodTerrainSampler      (gate: lod_terrain_gate_tests)
+#   soil-machine -> IHeightmapErosion       (gate: erosion_gate_tests)
+#   femfx        -> IDeformableProvider FEM (gate: femfx_deformable_tests)
+#   splishsplash -> ISPHFluidSimulation     (gate: sph_fluid_tests)
+#   s2geometry   -> IHilbertCellIndex       (gate: hilbert_cell_index_tests)
+#   shape-ml     -> IShapeRecognition       (gate: shape_recognition_tests)
+#   project-chrono -> IMultibodyDynamics    (gate: multibody_dynamics_tests)
+#   jsbsim       -> IFlightDynamics         (gate: flight_dynamics_tests)
+# voxy/ISceneCulling, nvidia-blast/IExplosion, ftetwild/ITetraMeshCooking e
+# rigs-of-rods/IBeamGraphAsset já tinham seams + gates verdes
+# (scene_culling_tests, explosion_core_tests, tetra_cooking_tests,
+# beam_vehicle_tests). Cada gate compila os TUs do SDK que exercita
+# diretamente (padrão terrain_adaptation_tests) + glm, sem puxar o mundo.
+# ────────────────────────────────────────────────────────────────────────────
+
+# G.godot-voxel: terreno LOD coerente que consulta a MESMA função do mundo
+# (IVoxelGenerator) — paging/meshing do catálogo, do zero, sem Godot.
+add_executable(lod_terrain_gate_tests EXCLUDE_FROM_ALL
+    tests/LodTerrainGateTests.cpp
+    src/engine/sdk/LodTerrainSampler.cpp
+)
+target_compile_features(lod_terrain_gate_tests PRIVATE cxx_std_20)
+target_include_directories(lod_terrain_gate_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(lod_terrain_gate_tests PRIVATE vc_build_options glm)
+add_test(NAME lod_terrain_gate_tests COMMAND lod_terrain_gate_tests)
+
+# G.soil-machine: erosão hidráulica por partículas + cascata térmica, do
+# zero, sem TinyEngine/OpenGL (determinística, cache por tile).
+add_executable(erosion_gate_tests EXCLUDE_FROM_ALL
+    tests/ErosionGateTests.cpp
+    src/engine/sdk/HeightmapErosion.cpp
+    src/engine/sdk/RegistryJson.cpp
+)
+target_compile_features(erosion_gate_tests PRIVATE cxx_std_20)
+target_include_directories(erosion_gate_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(erosion_gate_tests PRIVATE vc_build_options glm)
+add_test(NAME erosion_gate_tests COMMAND erosion_gate_tests)
+
+# G.femfx: FEM linear de treliça atrás de IDeformableProvider — contraparte
+# do FEMFX (AMD), do zero, sem SDK proprietário. Compila o factory XPBD
+# (mesmo TU público) + o provedor FEM + o parser JSON do contrato.
+add_executable(femfx_deformable_tests EXCLUDE_FROM_ALL
+    tests/FemfxDeformableTests.cpp
+    src/engine/sdk/FemfxDeformable.cpp
+    src/engine/sdk/XpbdDeformable.cpp
+    src/engine/sdk/RegistryJson.cpp
+)
+target_compile_features(femfx_deformable_tests PRIVATE cxx_std_20)
+target_include_directories(femfx_deformable_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(femfx_deformable_tests PRIVATE vc_build_options glm)
+add_test(NAME femfx_deformable_tests COMMAND femfx_deformable_tests)
+
+# G.splishsplash: SPH (WCSPH) do zero, sem zlib/CompactNSearch/Discregrid.
+add_executable(sph_fluid_tests EXCLUDE_FROM_ALL
+    tests/SphFluidTests.cpp
+    src/engine/sdk/SphFluidSimulation.cpp
+)
+target_compile_features(sph_fluid_tests PRIVATE cxx_std_20)
+target_include_directories(sph_fluid_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(sph_fluid_tests PRIVATE vc_build_options glm)
+add_test(NAME sph_fluid_tests COMMAND sph_fluid_tests)
+
+# G.s2geometry: células hierárquicas estilo S2 na curva de Hilbert, do zero,
+# sem abseil/SWIG/OpenSSL.
+add_executable(hilbert_cell_index_tests EXCLUDE_FROM_ALL
+    tests/HilbertCellIndexTests.cpp
+    src/engine/sdk/HilbertCellIndex.cpp
+)
+target_compile_features(hilbert_cell_index_tests PRIVATE cxx_std_20)
+target_include_directories(hilbert_cell_index_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(hilbert_cell_index_tests PRIVATE vc_build_options glm)
+add_test(NAME hilbert_cell_index_tests COMMAND hilbert_cell_index_tests)
+
+# G.shape-ml: reconhecimento de primitivos por RANSAC determinístico, do
+# zero (sem licença GPL).
+add_executable(shape_recognition_tests EXCLUDE_FROM_ALL
+    tests/ShapeRecognitionTests.cpp
+    src/engine/sdk/ShapeRecognition.cpp
+)
+target_compile_features(shape_recognition_tests PRIVATE cxx_std_20)
+target_include_directories(shape_recognition_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(shape_recognition_tests PRIVATE vc_build_options glm)
+add_test(NAME shape_recognition_tests COMMAND shape_recognition_tests)
+
+# G.project-chrono: dinâmica multibody em coordenadas generalizadas, do
+# zero, sem a API massiva do Chrono.
+add_executable(multibody_dynamics_tests EXCLUDE_FROM_ALL
+    tests/MultibodyDynamicsTests.cpp
+    src/engine/sdk/MultibodyDynamics.cpp
+)
+target_compile_features(multibody_dynamics_tests PRIVATE cxx_std_20)
+target_include_directories(multibody_dynamics_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(multibody_dynamics_tests PRIVATE vc_build_options glm)
+add_test(NAME multibody_dynamics_tests COMMAND multibody_dynamics_tests)
+
+# G.jsbsim: dinâmica de voo 6-DOF por coeficientes, do zero, sem
+# PkgConfig/Cython/Python3.
+add_executable(flight_dynamics_tests EXCLUDE_FROM_ALL
+    tests/FlightDynamicsTests.cpp
+    src/engine/sdk/FlightDynamics.cpp
+)
+target_compile_features(flight_dynamics_tests PRIVATE cxx_std_20)
+target_include_directories(flight_dynamics_tests PRIVATE
+    src/engine/public
+    src
+    ${glm_SOURCE_DIR}
+)
+target_link_libraries(flight_dynamics_tests PRIVATE vc_build_options glm)
+add_test(NAME flight_dynamics_tests COMMAND flight_dynamics_tests)

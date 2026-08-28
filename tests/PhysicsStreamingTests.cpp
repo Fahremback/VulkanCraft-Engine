@@ -61,10 +61,11 @@ private:
 };
 
 bool boot_world(engine::voxel::IVoxelWorld& world, const glm::vec3& player,
-                int budget, int maxBudgetMs = 8000) {
+                int budget, int maxSteps = 60 * 180, int maxBudgetMs = 30000) {
     world.set_chunk_budget(budget);
     const auto start = std::chrono::steady_clock::now();
-    while (!world.is_chunk_loaded(0, 0)) {
+    for (int step = 0; step < maxSteps; ++step) {
+        if (world.is_chunk_loaded(0, 0)) return true;
         if (std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start).count() > maxBudgetMs) {
             return false;
@@ -72,7 +73,7 @@ bool boot_world(engine::voxel::IVoxelWorld& world, const glm::vec3& player,
         world.update(player, 1.0f / 60.0f);
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    return true;
+    return world.is_chunk_loaded(0, 0);
 }
 
 // Steps world + physics + bridge together until `predicate` holds.

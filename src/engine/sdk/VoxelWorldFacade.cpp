@@ -16,6 +16,7 @@
 #include "engine/entity/IMobBehavior.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -1000,6 +1001,43 @@ public:
             return false;
         }
 
+        // ---- Determinism guard (B-311): the world streams and generates
+        // chunks asynchronously; a commit targeting a chunk still being
+        // generated (or evicted) used to spuriously roll back with "chunk not
+        // loaded". Before touching any block, pump the sim pipeline (SIM-time
+        // deterministic — same bounded budget as boot_world) until every
+        // edited chunk is writable (`can_touch_chunk_at` mirrors set_block_at's
+        // guard exactly), or fail deterministically with a clear diagnostic
+        // instead of flaking. Never force-creates absent chunks: only lets the
+        // in-flight generator finish, so terrain is always real.
+        {
+            std::set<std::pair<int, int>> ensured;
+            for (const engine::voxel::BlockEdit& edit : edits) {
+                const std::pair<int, int> key{
+                    static_cast<int>(std::floor(static_cast<float>(edit.position.x) / CHUNK_SIZE_X)),
+                    static_cast<int>(std::floor(static_cast<float>(edit.position.z) / CHUNK_SIZE_Z)) };
+                if (!ensured.insert(key).second) continue;
+                const glm::vec3 pos(static_cast<float>(edit.position.x),
+                                    static_cast<float>(edit.position.y),
+                                    static_cast<float>(edit.position.z));
+                if (world_.can_touch_chunk_at(pos)) continue;
+                bool writable = false;
+                for (int frame = 0; frame < 600; ++frame) {
+                    update(playerPos_, 1.0f / 60.0f);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    if (world_.can_touch_chunk_at(pos)) { writable = true; break; }
+                }
+                if (!writable) {
+                    errorOut = "transaction rolled back: chunk not loaded at (" +
+                               std::to_string(edit.position.x) + ',' +
+                               std::to_string(edit.position.y) + ',' +
+                               std::to_string(edit.position.z) + ')';
+                    notify(engine::voxel::TransactionEvent::Kind::RolledBack, edits.size());
+                    return false;
+                }
+            }
+        }
+
         std::vector<engine::voxel::BlockEdit> applied;
         applied.reserve(edits.size());
         for (const engine::voxel::BlockEdit& edit : edits) {
@@ -1188,10 +1226,17 @@ public:
             entry.add_version(versionStr);
             pluginOffsets.push_back(entry.Finish());
         }
-        // Hoist every sub-object construction above the table builder: FlatBuffers
+        // Hoist EVERY sub-object construct above the table builder: FlatBuffers
         // forbids building a String/Table/Vector inside a table's construction
-        // window (NotNested asserts). Create strings first, then start the table.
+        // window (NotNested asserts). The plugins vector-of-offsets must be
+        // created here (nested == false) and referenced later by offset, exactly
+        // like the string offsets.
+        flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<
+            engine::voxel::save::PluginVersionEntry>>> pluginsVec;
         flatbuffers::Offset<flatbuffers::String> worldNameStr, rulesJsonStr;
+        if (!pluginOffsets.empty()) {
+            pluginsVec = builder.CreateVector(pluginOffsets);
+        }
         if (!worldName.empty()) {
             worldNameStr = builder.CreateString(worldName);
         }
@@ -1208,7 +1253,7 @@ public:
         }
         metaBuilder.add_registry_version(registryVersion);
         if (!pluginOffsets.empty()) {
-            metaBuilder.add_plugins(builder.CreateVector(pluginOffsets));
+            metaBuilder.add_plugins(pluginsVec);
         }
         return metaBuilder.Finish();
     }
@@ -1435,6 +1480,12 @@ public:
                 componentOffsets.push_back(comp.Finish());
             }
             const auto componentVec = builder.CreateVector(componentOffsets);
+            // Hoist the stable-id string above the table builder: FlatBuffers
+            // forbids building a String inside a table's construction window.
+            flatbuffers::Offset<flatbuffers::String> stableIdStr;
+            if (!snapshot.stableId.empty()) {
+                stableIdStr = builder.CreateString(snapshot.stableId);
+            }
             engine::voxel::save::EntityEntryBuilder entry(builder);
             entry.add_type(type);
             entry.add_x(snapshot.position.x);
@@ -1445,7 +1496,7 @@ public:
             entry.add_tick_interval(snapshot.tickInterval);
             entry.add_components(componentVec);
             if (!snapshot.stableId.empty()) {
-                entry.add_stable_id(builder.CreateString(snapshot.stableId));
+                entry.add_stable_id(stableIdStr);
             }
             worldEntityOffsets.push_back(entry.Finish());
         }
@@ -3069,6 +3120,12 @@ private:
                 componentOffsets.push_back(comp.Finish());
             }
             const auto componentVec = builder.CreateVector(componentOffsets);
+            // Hoist the stable-id string above the table builder: FlatBuffers
+            // forbids building a String inside a table's construction window.
+            flatbuffers::Offset<flatbuffers::String> stableIdStr;
+            if (!snapshot.stableId.empty()) {
+                stableIdStr = builder.CreateString(snapshot.stableId);
+            }
             engine::voxel::save::EntityEntryBuilder entry(builder);
             entry.add_type(type);
             entry.add_x(snapshot.position.x);
@@ -3079,7 +3136,7 @@ private:
             entry.add_tick_interval(snapshot.tickInterval);
             entry.add_components(componentVec);
             if (!snapshot.stableId.empty()) {
-                entry.add_stable_id(builder.CreateString(snapshot.stableId));
+                entry.add_stable_id(stableIdStr);
             }
             worldEntityOffsets.push_back(entry.Finish());
         }
