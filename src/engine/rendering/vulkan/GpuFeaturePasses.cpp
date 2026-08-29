@@ -44,6 +44,7 @@ bool create_host_buffer(VmaAllocator allocator, VkDeviceSize size, VkBuffer& buf
     std::memset(mapped, 0, static_cast<size_t>(size));
     return true;
 }
+
 }
 
 bool create_gpu_feature_passes(VkDevice device, VmaAllocator allocator, VkFormat historyFormat,
@@ -55,6 +56,16 @@ bool create_gpu_feature_passes(VkDevice device, VmaAllocator allocator, VkFormat
     out.historySize = static_cast<VkDeviceSize>(extent.width) * extent.height * 16;
     out.reservoirSize = std::max<VkDeviceSize>(sizeof(RadianceCache::ReservoirGpu), out.historySize / 4);
     out.probeSize = std::max<VkDeviceSize>(sizeof(RadianceCache::ProbeGpu), out.historySize / 4);
+    // feature/reservoir/probe are CPU-written (host buffers, inputs pushed from
+    // the app each frame). history is kept as a HOST-ZEROED buffer: the compute
+    // shader reads `previous = history[...]` on every invocation and mixes it
+    // in, so frame 0 MUST see deterministic zeros, not uninitialized GPU
+    // memory. A device-local allocation cannot be memset from the host and
+    // would feed garbage/NaN into the temporal history on the first frame
+    // (and for any resolution whose rows the shader touches before the GPU
+    // has written them). The PCIe overhead avoided by device-local only matters
+    // once the pass becomes the real temporal accumulation; until then the
+    // correctness of zero-init wins.
     if (!create_host_buffer(allocator, sizeof(GpuRenderFeatures), out.featureBuffer,
                             out.featureAllocation, out.featureMapped) ||
         !create_host_buffer(allocator, out.historySize, out.historyBuffer,
@@ -204,6 +215,20 @@ void record_gpu_feature_passes(VkCommandBuffer commandBuffer, const GpuFeaturePa
     dependency.bufferMemoryBarrierCount = 3;
     dependency.pBufferMemoryBarriers = outputBarriers;
     vkCmdPipelineBarrier2(commandBuffer, &dependency);
+
+    // STATE (honest): the temporal pass is currently feature PLUMBING, not the
+    // final optimized temporal/GI. The hdrImage/hdrView/hdrLayout are accepted
+    // for the future path (temporal accumulation reading the previous HDR
+    // frame + motion vectors), but feature_temporal.comp today only
+    // integrates feature signals (GI/reflections/atmosphere probes, ReSTIR
+    // reservoir, debug counters) into the history buffer — it never reads the
+    // HDR image. history stays a host-ZEROED buffer so frame 0 sees
+    // deterministic zeros (see create_gpu_feature_passes); reservoir/probe are
+    // host buffers because the app writes their inputs each frame. Turning this
+    // into the real temporal accumulation (HDR image + motion readback,
+    // disocclusion with velocity rejection) is renderer-side work tracked
+    // separately — and only then should the Gpu-only history move to
+    // device-local memory, together with a GPU-side zero-init fill.
     (void)hdrImage;
     (void)hdrView;
     (void)hdrLayout;

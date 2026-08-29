@@ -121,7 +121,11 @@
       "description": "AddressSanitizer build for memory error detection. MSVC /fsanitize=address required — MinGW GCC cannot link ASan on Windows (BUG-009). Configure from a VS Developer prompt.",
       "inherits": "ninja-base",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug"
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS": "/fsanitize=address /Zi",
+        "CMAKE_CXX_FLAGS": "/fsanitize=address /Zi",
+        "CMAKE_EXE_LINKER_FLAGS": "/fsanitize=address",
+        "CMAKE_SHARED_LINKER_FLAGS": "/fsanitize=address"
       },
       "generator": "Ninja"
     }

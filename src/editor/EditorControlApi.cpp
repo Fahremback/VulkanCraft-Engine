@@ -818,6 +818,13 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
                     status = (body.find("\"ok\":true") != std::string::npos) ? 200 : 422;
                     m_results.erase(id);
                 } else {
+                    // On timeout the command may still be queued and could be
+                    // executed later by the editor thread; complete_command()
+                    // would then write a permanent stale entry that nothing
+                    // ever erases (the only erase is the success path above).
+                    // Drop any late result now so m_results can never grow
+                    // unboundedly from repeated slow commands.
+                    m_results.erase(id);
                     body = "{\"ok\":false,\"error\":\"timeout: the editor did not execute the command\"}";
                     status = 504;
                 }

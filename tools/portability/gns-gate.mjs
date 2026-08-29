@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
  * gns-gate.mjs — Step 7u: proves the vendored game-networking-sockets builds
- * and the public API is exported from the DLL.
+ * and that the public API is exported from the DLL.
  *
- * The historical blocker (finding #303) was: build's own static lib lacked the
- * public API symbols and the DLL target failed to link on 126 unresolved
+ * The historical blocker (finding #303) was: the build's own static lib lacked
+ * the public API symbols and the DLL target failed to link on 126 unresolved
  * abseil symbols. Resolved (2026-08-28) by consuming the vendored abseil
  * (external/solutions/abseil) + the otel plugin's static protobuf, linking
  * utf8_range, and building with -DProtobuf_USE_STATIC_LIBS=ON. This gate pins
@@ -14,7 +14,7 @@
  * Env:   VC_OTEL_PROTOBUF_BUILD  otel protobuf build dir (default C:/oteltmp/build-gate/_deps/protobuf-build)
  * Exit 0 = all checks passed.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -37,21 +37,30 @@ function sh(cmd, args, opts = {}) {
 }
 function log(m) { process.stderr.write(`[gns-gate] ${m}\n`); }
 function fail(m) { log(`FAIL: ${m}`); process.exit(1); }
+function sizeOf(p) { return existsSync(p) ? statSync(p).size : 0; }
 
-// Find dumpbin (BuildTools or Community).
+// Find the REAL Hostx64/x64 dumpbin by walking the MSVC tree with Node (the
+// `for /r` shell form also matches directories named dumpbin.exe and is fragile
+// under cmd escaping). Prefer the x64 host tool; fall back to any .exe file.
 function findDumpbin() {
-  const roots = [
-    "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools",
-    "C:/Program Files (x86)/Microsoft Visual Studio/2022/Community",
-    "C:/Program Files/Microsoft Visual Studio/2022/BuildTools",
+  const msvcRoots = [
+    "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC",
+    "C:/Program Files (x86)/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC",
+    "C:/Program Files/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC",
   ];
-  for (const root of roots) {
-    const glob = `${root}/VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe`;
-    const { stdout } = sh("cmd", ["/c", `for /r "${root}\\VC\\Tools\\MSVC" %f in (dumpbin.exe) do @echo %f`]);
-    const first = (stdout || "").split(/\r?\n/).map(s => s.trim()).find(s => /dumpbin\.exe$/i.test(s));
-    if (first) return first;
-  }
-  return null;
+  const found = [];
+  const walk = (dir) => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) { walk(p); continue; }
+      if (/^dumpbin\.exe$/i.test(e.name) && /bin\\Hostx64\\x64$/.test(dir)) found.push(p);
+      else if (/^dumpbin\.exe$/i.test(e.name)) found.push(p);
+    }
+  };
+  for (const root of msvcRoots) if (existsSync(root)) walk(root);
+  return found.find(p => /bin\\Hostx64\\x64\\dumpbin\.exe$/i.test(p)) || found[0] || null;
 }
 
 log("GNS gate (Step 7u) starting...");
@@ -75,7 +84,7 @@ if (!existsSync(join(BUILD_DIR, "CMakeCache.txt"))) {
   if (r.status !== 0) fail(`configure failed:\n${(r.stderr || r.stdout || "").slice(-800)}`);
 }
 
-// Build the DLL + static lib idempotently.
+// Build the DLL + static lib idempotently (reuses an existing successful build).
 if (!existsSync(DLL) || !existsSync(STATIC_LIB)) {
   log("building GameNetworkingSockets (shared + static)...");
   const r = sh("cmake", ["--build", BUILD_DIR, "--config", "Release",
@@ -87,7 +96,7 @@ if (!existsSync(DLL) || !existsSync(STATIC_LIB)) {
 if (!existsSync(DLL)) fail(`DLL missing: ${DLL}`);
 if (!existsSync(STATIC_LIB)) fail(`static lib missing: ${STATIC_LIB}`);
 
-// Verify exports via dumpbin.
+// Verify exports via the real dumpbin.
 const dumpbin = findDumpbin();
 if (!dumpbin) fail("dumpbin not found (need MSVC BuildTools)");
 log(`checking exports of ${DLL} (dumpbin)...`);
@@ -96,12 +105,10 @@ const dumpOut = (ex.stdout || "") + (ex.stderr || "");
 for (const sym of KEY_EXPORTS) {
   if (!dumpOut.includes(sym)) fail(`public symbol NOT exported: ${sym}`);
 }
-// Sanity: it's a real DLL with exports, not a zero-export stub.
+// Sanity: a real DLL with hundreds of exports, not a zero-export stub.
 const exportRows = (dumpOut.match(/^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+/gm) || []).length;
 if (exportRows < 50) fail(`suspiciously few exports (${exportRows})`);
 
-log(`PASS — GameNetworkingSockets.dll (${(existingSize(DLL) / 1024).toFixed(0)}KB) links and exports ` +
-     `${KEY_EXPORTS.join(", ")}; static lib presents; ${exportRows} total exports`);
-
-function existingSize(p) { return existsSync(p) ? require("node:fs").statSync(p).size : 0; }
+log(`PASS — GameNetworkingSockets.dll (${(sizeOf(DLL) / 1024).toFixed(0)}KB, ${exportRows} exports) ` +
+     `links and exports ${KEY_EXPORTS.join(", ")}; static lib (${(sizeOf(STATIC_LIB) / 1024).toFixed(0)}KB) present`);
 process.exit(0);

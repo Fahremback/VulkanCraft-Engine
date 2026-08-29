@@ -239,4 +239,10 @@ run('node tools/portability/nakama-gate.mjs');
 log('Step 7t: Agones game server orchestration gate (Go SDK server build + run)');
 run('node tools/portability/agones-gate.mjs');
 
+log('Step 7u: game-networking-sockets gate (DLL links + public API exported)');
+run('node tools/portability/gns-gate.mjs');
+
+log('Step 7v: msquic gate (XDP datapath compiles; msquic.dll + core.lib)');
+run('node tools/portability/msquic-gate.mjs');
+
 log(`CI matrix PASSED on ${platform} with preset ${preset}`);

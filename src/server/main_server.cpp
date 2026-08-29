@@ -79,8 +79,22 @@ int main(int argc, char** argv) {
     Engine::Physics::PhysicsStreamingBridge bridge(*world, physics);
     bridge.sync(focus);
 
+    // Spawn just above the ACTUAL streamed surface so "rest and sleep on
+    // streamed terrain" is provable within a small tick budget. (A spawn at
+    // y=200 "well above terrain" needs ~5s / ~300 ticks of free fall before
+    // the body beds down, so a --ticks 10..120 gate can never prove rest.)
+    // Probe the surface column with the public voxel raycast; fall back to a
+    // high spawn if the probe misses.
+    float surfaceY = 200.0f;
+    {
+        const ::engine::voxel::VoxelRaycastHit surface = world->raycast(
+            glm::vec3(8.0f, 512.0f, 8.0f), glm::vec3(0.0f, -1.0f, 0.0f), 512.0f);
+        if (surface.hit) {
+            surfaceY = surface.position.y + 2.0f;  // a couple units above the surface block
+        }
+    }
     Engine::Physics::BodyDesc sphere;
-    sphere.position = glm::vec3(8.0f, 200.0f, 8.0f);  // well above any terrain
+    sphere.position = glm::vec3(8.0f, surfaceY, 8.0f);
     sphere.collider.shape = Engine::Physics::SphereShape{ 0.5f };
     const auto ball = bridge.spawn_dynamic(sphere);
     if (ball == Engine::Physics::InvalidBody) {

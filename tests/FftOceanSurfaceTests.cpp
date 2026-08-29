@@ -129,6 +129,41 @@ int main() {
         CHECK(driftMax < 1e-3f, "zero-choppiness ~ pure vertical (drift ~0)");
     }
 
+    // 5. Choppy displacement is a REAL spectral field, not the (Hermitian)
+    //    imaginary residue of the height IFFT. A nonzero choppiness must
+    //    produce horizontal drift that scales with choppiness (roughly
+    //    linearly) and is far larger than the zero-choppiness residue.
+    {
+        std::string err;
+        auto ocean = create_fft_ocean_surface(err);
+        CHECK(ocean != nullptr, "create");
+        FftOceanConfig c1 = ocean->config();
+        c1.choppiness = 1.0f;
+        auto o1 = create_fft_ocean_surface(err);
+        o1->configure(c1, err);
+        FftOceanConfig c2 = ocean->config();
+        c2.choppiness = 2.0f;
+        auto o2 = create_fft_ocean_surface(err);
+        o2->configure(c2, err);
+        std::vector<FftOceanVertex> v1, v2;
+        CHECK(o1->synthesize(1.0f, v1, err), "chop1 synth");
+        CHECK(o2->synthesize(1.0f, v2, err), "chop2 synth");
+        // Both must drift; mean |drift| must scale with choppiness.
+        double mean1 = 0.0, mean2 = 0.0;
+        for (std::size_t i = 0; i < v1.size(); ++i) {
+            mean1 += std::fabs(v1[i].position.x - v1[i].grid.x);
+            mean2 += std::fabs(v2[i].position.x - v2[i].grid.x);
+        }
+        mean1 /= static_cast<double>(v1.size());
+        mean2 /= static_cast<double>(v2.size());
+        // With choppiness the horizontal drift is a real physical field: it
+        // must be well above numeric noise and roughly scale with choppiness.
+        CHECK(mean1 > 1e-3, "nonzero choppiness produces real horizontal drift");
+        CHECK(mean2 > 1e-3, "choppiness 2 also drifts");
+        const double ratio = mean2 / (mean1 + 1e-12);
+        CHECK(ratio > 1.5 && ratio < 2.5, "drift scales ~linearly with choppiness");
+    }
+
     std::printf("\n[fftocean] Results: %d passed, %d failed\n", g_passed, g_failed);
     if (g_failed > 0) { std::printf("[fftocean] FAILED\n"); return 1; }
     std::printf("[fftocean] ALL PASSED\n");

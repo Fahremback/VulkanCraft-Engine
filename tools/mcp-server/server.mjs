@@ -61,6 +61,14 @@ const BLOCKED_WRITE_ROOTS = new Set([
   ".git"
 ]);
 
+// Valid CMake build configurations. Validating them HERE (not deferring to
+// cmake) makes the build surface deterministic across generators: a
+// single-config generator (Ninja/Makefile) silently ignores `--config` and
+// would otherwise report an invalid config as a SUCCESSFUL no-op build
+// ("ninja: no work to do") instead of failing. Rejecting the config up front
+// keeps the "invalid config -> failed job" invariant on every tree.
+const KNOWN_CONFIGS = new Set(["Release", "Debug", "RelWithDebInfo", "MinSizeRel"]);
+
 const TEXT_EXTENSIONS = new Set([
   ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
   ".glsl", ".vert", ".frag", ".comp", ".geom", ".tesc", ".tese",
@@ -556,6 +564,9 @@ function buildGameTool(args) {
     "VulkanEngineCooker", "vulkan_craft", "ALL_BUILD"]);
   if (!known.has(exe)) throw new Error(`unknown target '${exe}'`);
   const config = String(args.config ?? "Release");
+  if (!KNOWN_CONFIGS.has(config)) {
+    throw new Error(`unknown configuration '${config}'; supported: ${[...KNOWN_CONFIGS].sort().join(", ")}`);
+  }
   const buildRoot = path.join(ENGINE_ROOT, BUILD_REL);
   if (!fs.existsSync(buildRoot)) throw new Error(`build dir not found: ${buildRoot}`);
 
@@ -691,8 +702,6 @@ function startBuildTool(args) {
   const jobId = nextBuildJobId++;
   const name = `build-${exe}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
   const logPath = path.join(GAME_RUN_ROOT, name);
-  const argsList = ["--build", BUILD_REL, "--config", config];
-  if (exe !== "ALL_BUILD") argsList.push("--target", exe);
 
   const job = {
     job_id: jobId,
@@ -704,6 +713,27 @@ function startBuildTool(args) {
     exit_code: null,
     child: null
   };
+  // Fail fast on an invalid config WITHOUT spawning cmake. A single-config
+  // (Ninja) generator ignores `--config` and exits 0 with "no work to do", so
+  // deferring to cmake would turn an invalid config into a SUCCESSFUL no-op
+  // build. Rejecting here keeps the contract deterministic on every tree and
+  // matches the MSVC fast-fail shape (running -> failed, zero binaries).
+  if (!KNOWN_CONFIGS.has(config)) {
+    const message = `CMake Error: unknown configuration '${config}'; supported: ${[...KNOWN_CONFIGS].sort().join(", ")}`;
+    fs.writeFileSync(logPath, `${message}${os.EOL}`, "utf8");
+    job.child = null;
+    setImmediate(() => {
+      job.status = "failed";
+      job.finished_at = new Date().toISOString();
+      emitEvent("build.status_changed", { job_id: job.job_id, status: job.status, exe: job.exe, config: job.config });
+    });
+    BUILD_JOBS.set(jobId, job);
+    return { job_id: jobId, status: "running", log: job.log, poll_with: "build_status" };
+  }
+
+  const argsList = ["--build", BUILD_REL, "--config", config];
+  if (exe !== "ALL_BUILD") argsList.push("--target", exe);
+
   const child = spawn("cmake", argsList, { cwd: ENGINE_ROOT, windowsHide: true });
   job.child = child;
   const stream = fs.createWriteStream(logPath, { flags: "a" });
@@ -977,7 +1007,7 @@ const TOOLS = [
       type: "object",
       properties: {
         exe: { type: "string", default: "VulkanEngineGame", description: "Target: VulkanEngineGame, VulkanEngineEditor, VulkanEngineServer, VulkanEngineCooker, vulkan_craft or ALL_BUILD" },
-        config: { type: "string", default: "Release" }
+        config: { type: "string", default: "Release", description: "Build configuration: Release, Debug, RelWithDebInfo or MinSizeRel (validated by the server; invalid configs fail the job deterministically on every generator)" }
       },
       additionalProperties: false
     }
@@ -989,7 +1019,7 @@ const TOOLS = [
       type: "object",
       properties: {
         exe: { type: "string", default: "VulkanEngineGame", description: "Target: VulkanEngineGame, VulkanEngineEditor, VulkanEngineServer, VulkanEngineCooker, vulkan_craft or ALL_BUILD" },
-        config: { type: "string", default: "Release" }
+        config: { type: "string", default: "Release", description: "Build configuration: Release, Debug, RelWithDebInfo or MinSizeRel" }
       },
       additionalProperties: false
     }

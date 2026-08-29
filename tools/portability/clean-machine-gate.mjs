@@ -211,11 +211,16 @@ const copyDist = path.join(copyRoot, "dist");
       copyDirectory(path.join(ENGINE_ROOT, "schema"), path.join(copyRoot, "schema"));
     }
     fs.copyFileSync(path.join(ENGINE_ROOT, "CMakeLists.txt"), path.join(copyRoot, "CMakeLists.txt"));
-    // SDK.md is an INSTALL artifact (renamed from docs/SDK_MANIFEST.md by
-    // CMakeLists install rule); the engine root has only the source manifest.
-    // The clean copy mirrors the engine tree, so stage the manifest under its
-    // source name — the installed SDK.md is produced by cmake --install later.
-    fs.copyFileSync(path.join(ENGINE_ROOT, "docs", "SDK_MANIFEST.md"), path.join(copyRoot, "SDK.md"));
+    // SDK.md is an INSTALL artifact (renamed from docs/SDK_MANIFEST.md by the
+    // CMakeLists install rule: install(FILES docs/SDK_MANIFEST.md ... RENAME
+    // SDK.md)); the engine root has only the source manifest. The clean copy
+    // mirrors the engine tree, so stage the manifest under its SOURCE name
+    // (docs/SDK_MANIFEST.md) — the installed SDK.md is produced by cmake
+    // --install later. (Staging it as SDK.md instead made the relocated
+    // install fail: "file INSTALL cannot find docs/SDK_MANIFEST.md".)
+    fs.mkdirSync(path.join(copyRoot, "docs"), { recursive: true });
+    fs.copyFileSync(path.join(ENGINE_ROOT, "docs", "SDK_MANIFEST.md"),
+                    path.join(copyRoot, "docs", "SDK_MANIFEST.md"));
     log(`copied minimal tree (${CONSUMED_SOLUTIONS.length} solutions, ` +
         `${(treeBytes(copyRoot) / 1024 / 1024).toFixed(1)} MB)`);
 
@@ -223,7 +228,7 @@ const copyDist = path.join(copyRoot, "dist");
     const textFiles = collectTextFiles(path.join(copyRoot, "src"), "src")
       .concat(collectTextFiles(path.join(copyRoot, "tools"), "tools"))
       .concat(collectTextFiles(path.join(copyRoot, "tests"), "tests"))
-      .concat(["CMakeLists.txt", "SDK.md"]);
+      .concat(["CMakeLists.txt", "docs/SDK_MANIFEST.md"]);
     const leaks = scanForAbsolutePaths(copyRoot, textFiles);
     if (leaks.length) {
       log(`absolute-path leaks found (${leaks.length}):`);

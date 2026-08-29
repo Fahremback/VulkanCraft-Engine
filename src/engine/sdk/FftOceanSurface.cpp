@@ -174,55 +174,100 @@ public:
             }
         }
 
-        // 2D inverse FFT via two passes of 1D IFftCore (each includes 1/N,
-        // so the composition is 1/N^2 = the 2D inverse scaling).
-        std::vector<std::complex<float>> tmp(N * N), res(N), col(n), colRes(n);
-        for (std::uint32_t z = 0; z < n; ++z) {
-            for (std::uint32_t x = 0; x < n; ++x) res[x] = H[static_cast<std::size_t>(z) * N + x];
-            fft_->ifft(res, res);
-            for (std::uint32_t x = 0; x < n; ++x) tmp[static_cast<std::size_t>(z) * N + x] = res[x];
-        }
-        for (std::uint32_t x = 0; x < n; ++x) {
-            for (std::uint32_t z = 0; z < n; ++z) col[z] = tmp[static_cast<std::size_t>(z) * N + x];
-            fft_->ifft(col, colRes);
-            for (std::uint32_t z = 0; z < n; ++z) tmp[static_cast<std::size_t>(z) * N + x] = colRes[z];
-        }
-
-        // Assemble vertices: real part is the height; add choppy horizontal
-        // displacement from the imaginary part (cross-stream curl-free).
-        output.assign(N * N, FftOceanVertex{});
-        const float cell = L / static_cast<float>(n);
+        // Choppy-waves displacement spectra (Tessendorf): the horizontal
+        // displacement is NOT the imaginary part of the height field (that is
+        // ~0 because H is Hermitian -> IFFT is real). It is its own spectral
+        // field, derived from the height spectrum via the gradient operator:
+        //   Dx(k) = i * (-kx/|k|) * H(k)
+        //   Dz(k) = i * (-kz/|k|) * H(k)
+        // Each is Hermitian BY CONSTRUCTION (D(-k) = conj(D(k)) follows from
+        // H(-k) = conj(H(k)) and the real factor k/|k| flipping sign), so each
+        // IFFT yields a real displacement field. The three spectra are
+        // transformed SEPARATELY (height, Dx, Dz) and only then combined.
+        std::vector<std::complex<float>> Dx(N * N), Dz(N * N);
         for (std::uint32_t z = 0; z < n; ++z) {
             for (std::uint32_t x = 0; x < n; ++x) {
-                const std::complex<float>& h = tmp[static_cast<std::size_t>(z) * N + x];
-                const float hx = h.real();
-                const float hz = h.imag();  // orthogonal displacement component
+                std::int32_t kx = static_cast<std::int32_t>(x);
+                std::int32_t kz = static_cast<std::int32_t>(z);
+                if (kx > static_cast<std::int32_t>(n / 2)) kx -= static_cast<std::int32_t>(n);
+                if (kz > static_cast<std::int32_t>(n / 2)) kz -= static_cast<std::int32_t>(n);
+                const float fx = dk * static_cast<float>(kx);
+                const float fz = dk * static_cast<float>(kz);
+                const float kMag = std::sqrt(fx * fx + fz * fz);
+                const std::size_t idx = static_cast<std::size_t>(z) * N + x;
+                if (kMag < 1e-6f) {
+                    Dx[idx] = std::complex<float>(0.0f, 0.0f);  // DC: no gradient
+                    Dz[idx] = std::complex<float>(0.0f, 0.0f);
+                } else {
+                    // i * (-k/|k|) * H : the i rotates the gradient into the
+                    // horizontal plane (phase-quadrature), the -k/|k| unit
+                    // vector points the displacement along the wave normal.
+                    const std::complex<float> i(0.0f, 1.0f);
+                    const float invK = 1.0f / kMag;
+                    Dx[idx] = i * (-fx * invK) * H[idx];
+                    Dz[idx] = i * (-fz * invK) * H[idx];
+                }
+            }
+        }
+
+        // 2D inverse FFT via two passes of 1D IFftCore (each includes 1/N,
+        // so the composition is 1/N^2 = the 2D inverse scaling). Transform
+        // height, Dx and Dz separately.
+        const auto ifft2D = [&](const std::vector<std::complex<float>>& src,
+                                std::vector<std::complex<float>>& dst) {
+            std::vector<std::complex<float>> row(n), rowRes(n), col(n), colRes(n);
+            for (std::uint32_t z = 0; z < n; ++z) {
+                for (std::uint32_t x = 0; x < n; ++x) row[x] = src[static_cast<std::size_t>(z) * N + x];
+                fft_->ifft(row, rowRes);
+                for (std::uint32_t x = 0; x < n; ++x) dst[static_cast<std::size_t>(z) * N + x] = rowRes[x];
+            }
+            for (std::uint32_t x = 0; x < n; ++x) {
+                for (std::uint32_t z = 0; z < n; ++z) col[z] = dst[static_cast<std::size_t>(z) * N + x];
+                fft_->ifft(col, colRes);
+                for (std::uint32_t z = 0; z < n; ++z) dst[static_cast<std::size_t>(z) * N + x] = colRes[z];
+            }
+        };
+        std::vector<std::complex<float>> hField(N * N), dxField(N * N), dzField(N * N);
+        ifft2D(H, hField);
+        ifft2D(Dx, dxField);
+        ifft2D(Dz, dzField);
+
+        // Assemble vertices: real parts of the three inverse transforms are
+        // the height and the two horizontal displacement fields. The choppiness
+        // parameter scales the horizontal displacement (0 => pure vertical).
+        output.assign(N * N, FftOceanVertex{});
+        const float cell = L / static_cast<float>(n);
+        const float chop = config_.choppiness;
+        for (std::uint32_t z = 0; z < n; ++z) {
+            for (std::uint32_t x = 0; x < n; ++x) {
+                const std::size_t idx = static_cast<std::size_t>(z) * N + x;
+                const float hx = hField[idx].real();
+                const float dispX = dxField[idx].real();
+                const float dispZ = dzField[idx].real();
                 const float px = static_cast<float>(x) * cell;
                 const float pz = static_cast<float>(z) * cell;
                 FftOceanVertex v;
                 v.grid = glm::vec2(px, pz);
-                // A amplitude já está dentro de spectrum() (Phillips A);
-                // multiplicar de novo aqui dobraria o parâmetro.
                 v.height = hx;
-                v.position = glm::vec3(px + hz * config_.choppiness * 0.08f,
-                                       v.height,
-                                       pz - hx * config_.choppiness * 0.08f);
+                v.position = glm::vec3(px + dispX * chop,
+                                       hx,
+                                       pz + dispZ * chop);
                 // Approx normal from the (small) analytic gradient estimate:
                 // finite-difference slope from the neighboring cell heights.
                 const float scale = 0.06f;
                 float slopeX = 0.0f, slopeZ = 0.0f;
                 if (x + 1 < n) {
-                    const auto& e = tmp[static_cast<std::size_t>(z) * N + (x + 1)];
+                    const auto& e = hField[static_cast<std::size_t>(z) * N + (x + 1)];
                     slopeX = (e.real() - hx) / (cell * 1.0f);
                 }
                 if (z + 1 < n) {
-                    const auto& e = tmp[static_cast<std::size_t>(z + 1) * N + x];
+                    const auto& e = hField[static_cast<std::size_t>(z + 1) * N + x];
                     slopeZ = (e.real() - hx) / (cell * 1.0f);
                 }
                 v.normal = glm::normalize(glm::vec3(-slopeX * scale, 1.0f, -slopeZ * scale));
                 if (!std::isfinite(v.normal.x) || !std::isfinite(v.normal.z))
                     v.normal = glm::vec3(0.0f, 1.0f, 0.0f);
-                output[static_cast<std::size_t>(z) * N + x] = v;
+                output[idx] = v;
             }
         }
         return true;
