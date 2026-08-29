@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/config/inventory.json",
+  "title": "inventory config asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset name (becomes the file name)",
+      "type": "string"
+    },
+    "version": {
+      "description": "must be 1",
+      "default": 1,
+      "type": "integer"
+    },
+    "slots": {
+      "description": "slot contents: [{ item (namespaced id), count, damage, data } | null]",
+      "type": "array"
+    },
+    "filters": {
+      "description": "[{ slot (int), allow_items: [ns ids], allow_tags: [tag], allow_any }]",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  },
+  "required": [
+    "name",
+    "slots"
+  ]
+}

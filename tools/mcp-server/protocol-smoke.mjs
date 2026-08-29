@@ -887,8 +887,10 @@ try {
   // 2 vehicle kinds (§17 item 12) + 1 ability kind (§19) + 1 mission kind
   // (item 23) + 1 world profile kind (item 23 — geração procedural) + 1 gait
   // kind (item 23 — animações) + 1 simulation LOD kind (§20) + 1 prefab kind
-  // (item 23 — prefabs) + 1 particle kind (item 23 — partículas).
-  assert.equal(cliKinds.stdout.split(/\n/).filter(Boolean).length, schemaKinds.length + 9, cliKinds.stdout);
+  // (item 23 — prefabs) + 1 particle kind (item 23 — partículas) + 12 config
+  // kinds (§4.4/§4.5 — shader/render_graph/light/gi/ocean/post_process/
+  // fluid_sim/world/chunk/transaction/block_entity/inventory).
+  assert.equal(cliKinds.stdout.split(/\n/).filter(Boolean).length, schemaKinds.length + 21, cliKinds.stdout);
   const cliSchema = runCli(["schema", "block"]);
   assert.equal(cliSchema.status, 0, cliSchema.stderr);
   assert.deepEqual(JSON.parse(cliSchema.stdout).properties.collisionShape.enum, ["full", "cross", "none"]);
@@ -1707,6 +1709,104 @@ try {
   assert.equal(cliParticleSchema.status, 0, cliParticleSchema.stderr);
   assert.ok(JSON.parse(cliParticleSchema.stdout).properties.rate, "CLI particle schema declares emitter fields");
 
+  // ---- §4.4/§4.5 — rendering + voxel/world CONFIG assets (2026-08-28) ----
+  // Every new author tool mirrors a public C++ contract JSON surface
+  // (all-or-nothing); this gate authors one document per kind, inspects it,
+  // refuses the invalid cases, and counts every category in
+  // validate_game_project + inspect_game_project.
+  const configAuthor = async (name, args) => {
+    const result = await request("tools/call", { name, arguments: args });
+    assert.equal(result.result.isError, undefined, JSON.stringify(result));
+    const payload = JSON.parse(result.result.content[0].text);
+    assert.equal(payload.created, true, JSON.stringify(payload));
+    assert.equal(payload.diagnostics.length, 0, JSON.stringify(payload));
+    return payload;
+  };
+  await configAuthor("create_shader_asset", { project: smokeProject, name: "SmokeFrag", source: "#version 450\nvoid main() { gl_FragColor = vec4(1.0); }", stage: "fragment", opt_level: 2, defines: ["MAX_LIGHTS=8"] });
+  await configAuthor("author_render_graph", {
+    project: smokeProject, name: "SmokeRG",
+    resources: [
+      { name: "color", kind: "image", width: 1920, height: 1080 },
+      { name: "depth", kind: "image", width: 1920, height: 1080 }
+    ],
+    passes: [
+      { name: "Geometry", resources: [{ resource: "color", access: "write", state: "color_attachment" }] },
+      { name: "Lighting", resources: [{ resource: "color", access: "read", state: "shader_read" }] }
+    ],
+    dependencies: [{ before: "Geometry", after: "Lighting" }]
+  });
+  await configAuthor("create_light_asset", { project: smokeProject, name: "SmokeSun", type: "directional", color: [1, 0.95, 0.85], intensity: 10000 });
+  await configAuthor("author_gi_config", { project: smokeProject, name: "SmokeGI", cascade_count: 4, bounces: 3 });
+  await configAuthor("author_ocean_config", { project: smokeProject, name: "SmokeOcean", size: 128, wind_speed: 22 });
+  await configAuthor("author_post_processing", { project: smokeProject, name: "SmokePost", operator: "filmic", quality: "cinematic" });
+  await configAuthor("author_fluid_simulation", { project: smokeProject, name: "SmokeFluid", grid_size: 128 });
+  await configAuthor("author_world_asset", { project: smokeProject, name: "SmokeWorld", seed: 42, profile: "SmokeProfile", rules_json: "{\"day\":600}" });
+  await configAuthor("author_chunk_config", { project: smokeProject, name: "SmokeChunk", chunk_budget: 24, memory_budget_bytes: 104857600 });
+  await configAuthor("author_block_transaction", {
+    project: smokeProject, name: "SmokeTx", max_edits: 10, max_box_volume: 27,
+    edits: [
+      { position: [10, 64, 10], block_id: 0 },
+      { position: [11, 64, 10], block_id: 0 },
+      { position: [12, 64, 10], block_id: 3 }
+    ]
+  });
+  await configAuthor("author_block_entity", { project: smokeProject, name: "SmokeFurnace", type_id: "vulkancraft:furnace", components: [{ type: "inventory", version: 1, blob: "{}" }] });
+  await configAuthor("author_inventory", {
+    project: smokeProject, name: "SmokeChest",
+    slots: [{ item: "vulkancraft:iron_ingot", count: 32 }, null],
+    filters: [{ slot: 0, allow_items: ["vulkancraft:iron_ingot"] }]
+  });
+
+  // Refusal cases: render-graph cycle, ocean size not a power of two,
+  // transaction exceeding max_box_volume, block entity with non-namespaced id.
+  const configRefused = async (name, args) => {
+    const result = await request("tools/call", { name, arguments: args });
+    const payload = JSON.parse(result.result.content[0].text);
+    assert.equal(payload.refused, true, JSON.stringify(payload));
+    assert.ok(payload.diagnostics.length > 0, JSON.stringify(payload));
+  };
+  await configRefused("author_render_graph", {
+    project: smokeProject, name: "SmokeBadRG",
+    resources: [{ name: "r", kind: "buffer" }],
+    passes: [{ name: "A", resources: [] }, { name: "B", resources: [] }],
+    dependencies: [{ before: "A", after: "B" }, { before: "B", after: "A" }]
+  });
+  await configRefused("author_ocean_config", { project: smokeProject, name: "SmokeBadOcean", size: 100 });
+  await configRefused("author_block_transaction", {
+    project: smokeProject, name: "SmokeBadTx", max_box_volume: 4,
+    edits: [{ position: [0, 0, 0], block_id: 1 }, { position: [10, 0, 0], block_id: 1 }]
+  });
+  await configRefused("author_block_entity", { project: smokeProject, name: "SmokeBadBE", type_id: "furnace" });
+
+  // Every inspect_* lists the authored asset as valid.
+  const configInspects = [
+    ["inspect_shader_assets", "shaders"], ["inspect_render_graphs", "render_graphs"],
+    ["inspect_light_assets", "lights"], ["inspect_gi_configs", "gi_configs"],
+    ["inspect_ocean_configs", "ocean_configs"], ["inspect_post_processings", "post_processings"],
+    ["inspect_fluid_simulations", "fluid_simulations"], ["inspect_world_assets", "worlds"],
+    ["inspect_chunk_configs", "chunk_configs"], ["inspect_block_transactions", "block_transactions"],
+    ["inspect_block_entities", "block_entities"], ["inspect_inventories", "inventories"]
+  ];
+  for (const [tool, key] of configInspects) {
+    const result = await request("tools/call", { name: tool, arguments: { project: smokeProject } });
+    const payload = JSON.parse(result.result.content[0].text);
+    assert.equal(payload.count, 1, `${tool} count (${JSON.stringify(payload)})`);
+    assert.ok(payload[key].every((asset) => asset.valid), `${tool} all valid`);
+  }
+
+  // CLI exposes the config schemas and validates documents (registry-cli).
+  for (const kind of ["shader", "render_graph", "gi", "ocean", "post_process", "fluid_sim", "world", "chunk", "transaction", "block_entity", "inventory"]) {
+    const schema = runCli(["schema", kind]);
+    assert.equal(schema.status, 0, `${kind} schema: ${schema.stderr}`);
+    assert.ok(JSON.parse(schema.stdout).properties.name, `${kind} schema declares name`);
+  }
+  const goodShaderDoc = path.join(directory, "mcp-smoke-good-shader.json");
+  const badShaderDoc = path.join(directory, "mcp-smoke-bad-shader.json");
+  fs.writeFileSync(goodShaderDoc, JSON.stringify({ version: 1, name: "CliShader", source: "#version 450\nvoid main(){}", stage: "compute" }));
+  fs.writeFileSync(badShaderDoc, JSON.stringify({ version: 1, name: "CliShader", source: "", stage: "vertex" }));
+  assert.equal(runCli(["validate", "shader", goodShaderDoc]).status, 0, "CLI validates a good shader doc");
+  assert.equal(runCli(["validate", "shader", badShaderDoc]).status, 1, "CLI rejects an empty-source shader doc");
+
   // Item 23 final checkbox — "criar um jogo completo usando somente MCP + APIs
   // públicas": the accumulated smokeProject IS that game (registry content,
   // vehicle, ability, mission, world profile, gait, scene + entities +
@@ -1728,6 +1828,18 @@ try {
   assert.ok(completeGame.simulation_lod_specs >= 1, `simulation_lod_specs >= 1 (${completeGame.simulation_lod_specs})`);
   assert.ok(completeGame.prefabs >= 1, `prefabs >= 1 (${completeGame.prefabs})`);
   assert.ok(completeGame.particle_assets >= 1, `particle_assets >= 1 (${completeGame.particle_assets})`);
+  assert.ok(completeGame.shaders >= 1, `shaders >= 1 (${completeGame.shaders})`);
+  assert.ok(completeGame.render_graphs >= 1, `render_graphs >= 1 (${completeGame.render_graphs})`);
+  assert.ok(completeGame.lights >= 1, `lights >= 1 (${completeGame.lights})`);
+  assert.ok(completeGame.gi_configs >= 1, `gi_configs >= 1 (${completeGame.gi_configs})`);
+  assert.ok(completeGame.ocean_configs >= 1, `ocean_configs >= 1 (${completeGame.ocean_configs})`);
+  assert.ok(completeGame.post_processings >= 1, `post_processings >= 1 (${completeGame.post_processings})`);
+  assert.ok(completeGame.fluid_simulations >= 1, `fluid_simulations >= 1 (${completeGame.fluid_simulations})`);
+  assert.ok(completeGame.worlds >= 1, `worlds >= 1 (${completeGame.worlds})`);
+  assert.ok(completeGame.chunk_configs >= 1, `chunk_configs >= 1 (${completeGame.chunk_configs})`);
+  assert.ok(completeGame.block_transactions >= 1, `block_transactions >= 1 (${completeGame.block_transactions})`);
+  assert.ok(completeGame.block_entities >= 1, `block_entities >= 1 (${completeGame.block_entities})`);
+  assert.ok(completeGame.inventories >= 1, `inventories >= 1 (${completeGame.inventories})`);
   assert.ok(completeGame.scenes >= 1, `scenes >= 1 (${completeGame.scenes})`);
   const completeGameInspect = await request("tools/call", {
     name: "inspect_game_project",
@@ -1742,6 +1854,18 @@ try {
   assert.ok(completeGameInspectPayload.simulation_lod_specs.length >= 1, "inspect lists simulation LOD specs");
   assert.ok(completeGameInspectPayload.prefabs.length >= 1, "inspect lists prefabs");
   assert.ok(completeGameInspectPayload.particle_assets.length >= 1, "inspect lists particle assets");
+  assert.ok(completeGameInspectPayload.shaders.length >= 1, "inspect lists shaders");
+  assert.ok(completeGameInspectPayload.render_graphs.length >= 1, "inspect lists render graphs");
+  assert.ok(completeGameInspectPayload.lights.length >= 1, "inspect lists lights");
+  assert.ok(completeGameInspectPayload.gi_configs.length >= 1, "inspect lists GI configs");
+  assert.ok(completeGameInspectPayload.ocean_configs.length >= 1, "inspect lists ocean configs");
+  assert.ok(completeGameInspectPayload.post_processings.length >= 1, "inspect lists post processings");
+  assert.ok(completeGameInspectPayload.fluid_simulations.length >= 1, "inspect lists fluid simulations");
+  assert.ok(completeGameInspectPayload.worlds.length >= 1, "inspect lists worlds");
+  assert.ok(completeGameInspectPayload.chunk_configs.length >= 1, "inspect lists chunk configs");
+  assert.ok(completeGameInspectPayload.block_transactions.length >= 1, "inspect lists block transactions");
+  assert.ok(completeGameInspectPayload.block_entities.length >= 1, "inspect lists block entities");
+  assert.ok(completeGameInspectPayload.inventories.length >= 1, "inspect lists inventories");
   assert.ok(completeGameInspectPayload.scenes.length >= 1, "inspect lists scenes");
   assert.equal(completeGameInspectPayload.validation.valid, true, JSON.stringify(completeGameInspectPayload.validation));
 

@@ -1,0 +1,1 @@
+{"version":1,"name":"CliShader","source":"#version 450\nvoid main(){}","stage":"compute"}

@@ -152,6 +152,48 @@ void test_analytic_acceleration() {
           "angular acceleration matches the analytic value");
 }
 
+// Invariante matemático que os testes de cenário não pegam: cadeias são
+// INDEPENDENTES (não há acoplamento entre elas), então a dinâmica de uma
+// cadeia não pode depender de quais outras cadeias existem nem da ORDEM de
+// inserção. Antes da correção, chaines_ era um unordered_map — a ordem de
+// iteração não era a de inserção, então qualquer dependência da ordem (ou
+// troca do conteúdo do mapa) era indeterminismo não declarado.
+void test_chain_independence_and_permutation() {
+    MultibodyConfig config;
+    config.damping = 0.0f;
+    std::string error;
+
+    // Base (solo): só o pêndulo.
+    auto solo = create_multibody_dynamics(error);
+    check(solo->configure(config, error), "configure solo ok");
+    const auto hsolo = solo->create_chain({ pendulum_link() }, error);
+
+    // Permutado: uma cadeia "decoys" inserida ANTES do pêndulo — o pêndulo
+    // passa a ter outro handle, exigindo que a iteração seja por identidade
+    // (map ordenado por handle) e NÃO por posição de inserção.
+    auto wDecoy = create_multibody_dynamics(error);
+    check(wDecoy->configure(config, error), "configure decoy ok");
+    wDecoy->create_chain({ pendulum_link() }, error);  // decoy (2-link) — handle menor
+    auto decoy2 = pendulum_link();
+    decoy2.offset = glm::vec3(1.0f, 0.0f, 0.0f);
+    wDecoy->create_chain({ decoy2, pendulum_link() }, error);  // outra cadeia presente
+    const auto hp = wDecoy->create_chain({ pendulum_link() }, error);  // o observado
+    check(hp != engine::physics::InvalidMultibody, "decoy chains created");
+
+    check(solo->link_count(hsolo) == 1 && wDecoy->link_count(hp) == 1,
+          "each observed chain has one link");
+
+    for (int i = 0; i < 40; ++i) {
+        solo->step(0.008f);
+        wDecoy->step(0.008f);
+    }
+    const auto ss = solo->link_state(hsolo, 0);
+    const auto sp = wDecoy->link_state(hp, 0);
+    check(ss.position == sp.position && ss.jointAngle == sp.jointAngle &&
+              ss.jointVelocity == sp.jointVelocity,
+          "a chain's trajectory is invariant to insertion order and to other chains");
+}
+
 void test_double_chain_determinism() {
     MultibodyConfig config;
     config.damping = 0.0f;
@@ -195,6 +237,7 @@ int main() {
     test_validation_and_factory();
     test_pendulum_gravity();
     test_analytic_acceleration();
+    test_chain_independence_and_permutation();
     test_double_chain_determinism();
 
     if (g_failures == 0) {

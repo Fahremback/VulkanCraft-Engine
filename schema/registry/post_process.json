@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/config/post_process.json",
+  "title": "post_process config asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset name (becomes the file name)",
+      "type": "string"
+    },
+    "version": {
+      "description": "must be 1",
+      "default": 1,
+      "type": "integer"
+    },
+    "operator": {
+      "description": "tone mapping operator (IToneMapping.ToneOperator)",
+      "default": "aces",
+      "enum": [
+        "reinhard",
+        "aces",
+        "filmic",
+        "none"
+      ]
+    },
+    "exposure": {
+      "description": "manual exposure multiplier [0.01, 64]",
+      "default": 1,
+      "type": "number"
+    },
+    "use_ev": {
+      "description": "when true, EV-based exposure overrides manual",
+      "default": false,
+      "type": "boolean"
+    },
+    "ev100": {
+      "description": "EV value [-16, 16] -> 1/(1.2 * 2^EV)",
+      "default": 0,
+      "type": "number"
+    },
+    "white_point": {
+      "description": "Filmic white point [1, 64]",
+      "default": 11.2,
+      "type": "number"
+    },
+    "sharpness": {
+      "description": "CAS sharpness [0, 1]",
+      "default": 0.4,
+      "type": "number"
+    },
+    "clamp_values": {
+      "description": "CAS contrast clamp (anti-ringing)",
+      "default": true,
+      "type": "boolean"
+    },
+    "quality": {
+      "description": "rendering quality preset (IRenderingPresets)",
+      "default": "high",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "ultra",
+        "cinematic"
+      ]
+    }
+  },
+  "required": [
+    "name"
+  ]
+}

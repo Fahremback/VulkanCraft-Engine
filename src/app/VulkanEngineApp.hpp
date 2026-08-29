@@ -190,6 +190,7 @@ public:
     std::unique_ptr<Engine::Rendering::IAtmosphereScattering> atmosphere;
     std::unique_ptr<Engine::Rendering::IVolumeClouds> volumeClouds;
     std::unique_ptr<Engine::Rendering::IMaterialShading> materialShading;
+    std::unique_ptr<Engine::Rendering::IBlockMaterialResolver> blockMaterialResolver;
     bool gpuFeaturesReady{ false };
     void refresh_gpu_features();
 

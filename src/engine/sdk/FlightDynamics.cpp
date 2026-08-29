@@ -150,8 +150,15 @@ public:
                 (spec_.cmAlpha * alpha_ + spec_.cmElevator * de),
             qbar * spec_.wingArea * spec_.wingSpan * spec_.cnRudder * dr);
 
-        // Integração semi-implícita (velocidades primeiro).
-        state_.velocity += accel_ * dt;
+        // Integração semi-implícita (velocidades primeiro). state_.velocity é
+        // a velocidade no FRAME DO CORPO, então a dinâmica translacional
+        // precisa do termo de transporte rotacional: dv/dt = F/m − ω×v. Sem
+        // ele, em rotações fortes a velocidade corporal é transformada de
+        // forma fisicamente inconsistente (a taxa de variação de um vetor
+        // medido no frame girante inclui −ω×v).
+        const glm::vec3 coriolis =
+            glm::cross(state_.angularVelocity, state_.velocity);
+        state_.velocity += (accel_ - coriolis) * dt;
         const glm::vec3 I(spec_.inertia.x, spec_.inertia.y, spec_.inertia.z);
         const glm::vec3 gyro = glm::cross(state_.angularVelocity, I * state_.angularVelocity);
         const glm::vec3 angAcc = (moments - gyro) / I;

@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/config/block_entity.json",
+  "title": "block_entity config asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset name (becomes the file name)",
+      "type": "string"
+    },
+    "version": {
+      "description": "must be 1",
+      "default": 1,
+      "type": "integer"
+    },
+    "type_id": {
+      "description": "stable namespaced type id, e.g. 'project:furnace'",
+      "type": "string"
+    },
+    "data_version": {
+      "description": "project-owned data version >= 1",
+      "default": 1,
+      "type": "integer"
+    },
+    "script_id": {
+      "description": "optional project-owned script id (e.g. 'project:door_open')",
+      "default": "",
+      "type": "string"
+    },
+    "components": {
+      "description": "[{ type: inventory|script|custom, version, blob (opaque payload string) }]",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  },
+  "required": [
+    "name",
+    "type_id"
+  ]
+}

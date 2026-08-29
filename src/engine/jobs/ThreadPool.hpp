@@ -6,6 +6,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
+#include <string>
 
 class ThreadPool {
 public:
@@ -25,7 +26,21 @@ public:
                         this->tasks.pop();
                         ++this->activeTasks;
                     }
-                    task();
+                    try {
+                        task();
+                    } catch (...) {
+                        // A throwing job must never escape the worker thread:
+                        // an uncaught exception here would call std::terminate and
+                        // take down the whole engine mid-stream. Capture the first
+                        // error and let wait_idle() surface it to the caller instead.
+                        try {
+                            throw;
+                        } catch (const std::exception& e) {
+                            this->record_error(e.what());
+                        } catch (...) {
+                            this->record_error("unknown exception in background job");
+                        }
+                    }
                     {
                         std::lock_guard<std::mutex> lock(this->queueMutex);
                         --this->activeTasks;
@@ -48,8 +63,17 @@ public:
         condition.notify_one();
     }
 
-    // Shutdown and resource recreation must never race jobs that still hold
-    // references to World, Chunk or Vulkan-owned staging data.
+    // If any queued job threw, returns the first recorded error message so the
+    // caller can observe background failures instead of swallowing them.
+    // Returns an empty string when every job so far has succeeded.
+    std::string errors() {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        return firstError;
+    }
+
+    // Blocks until every queued job has finished. Shutdown and resource
+    // recreation must never race jobs that still hold references to World,
+    // Chunk or Vulkan-owned staging data.
     void wait_idle() {
         std::unique_lock<std::mutex> lock(queueMutex);
         idleCondition.wait(lock, [this] {
@@ -76,4 +100,10 @@ private:
     std::condition_variable idleCondition;
     std::size_t activeTasks{ 0 };
     bool stop{ false };
+    std::string firstError;
+
+    void record_error(const std::string& what) {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        if (firstError.empty()) firstError = what;
+    }
 };

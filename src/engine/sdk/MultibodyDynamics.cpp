@@ -15,7 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
-#include <unordered_map>
+#include <map>
 #include <vector>
 
 namespace engine {
@@ -184,8 +184,16 @@ public:
 
     void step(float dt) override {
         if (!(dt > 0.0f)) return;
-        // Ordem fixa de cadeias (inserção) e de juntas.
-        for (auto& kv : chains_) step_chain(kv.second, dt);
+        // Ordem fixa de cadeias e de juntas. chains_ é um std::map ordenado
+        // por handle — e como os handles são atribuídos monotonicamente
+        // (++nextHandle_), a ordem de iteração É a ordem de inserção.
+        // (unordered_map NÃO garante ordem de inserção; a alegação de
+        // determinismo dependia disso.)
+        const float subDt = dt / static_cast<float>(config_.solverIterations);
+        for (int pass = 0; pass < config_.solverIterations; ++pass) {
+            const bool last = pass == config_.solverIterations - 1;
+            for (auto& kv : chains_) step_chain(kv.second, subDt, last);
+        }
     }
 
     std::size_t link_count(MultibodyHandle chain) const noexcept override {
@@ -236,7 +244,7 @@ private:
                                                            : glm::vec3(0.0f);
     }
 
-    void step_chain(Chain& chain, float dt) {
+    void step_chain(Chain& chain, float dt, bool finalizePass) {
         const std::size_t n = chain.links.size();
         const ChainFk fk = forward_kinematics(chain);
 
@@ -269,14 +277,21 @@ private:
         // evolução futura.
         const VecN qdd = solve_linear(M, g);
 
-        const float damp = 1.0f - config_.damping;
+        // Integração semi-implícita. solverIterations divide a chamada em
+        // passes internos (cada um re-avalia M/g nas posições atualizadas —
+        // antes o parâmetro era validado mas não participava da resolução).
+        // Damping e limites são aplicados uma única vez por step() (na última
+        // passagem), preservando a taxa efetiva de amortecimento.
         for (std::size_t j = 0; j < n; ++j) {
             ChainLink& link = chain.links[j];
-            link.qdot = (link.qdot + qdd[j] * dt) * damp;
+            link.qdot += qdd[j] * dt;
             link.q += link.qdot * dt;
-            if (link.q < link.jointMin || link.q > link.jointMax) {
-                link.q = glm::clamp(link.q, link.jointMin, link.jointMax);
-                link.qdot = 0.0f;
+            if (finalizePass) {
+                link.qdot *= (1.0f - config_.damping);
+                if (link.q < link.jointMin || link.q > link.jointMax) {
+                    link.q = glm::clamp(link.q, link.jointMin, link.jointMax);
+                    link.qdot = 0.0f;
+                }
             }
         }
     }
@@ -316,7 +331,7 @@ private:
     }
 
     MultibodyConfig config_;
-    std::unordered_map<MultibodyHandle, Chain> chains_;
+    std::map<MultibodyHandle, Chain> chains_;
     MultibodyHandle nextHandle_{ InvalidMultibody };
 };
 

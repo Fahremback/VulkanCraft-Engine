@@ -118,13 +118,17 @@ public:
         const float L = config_.tileSizeMeters;
         const float g = 9.81f;
 
-        // Build the frequency-space spectrum H(kx,kz) hermitian-symmetric so
-        // the inverse FFT yields a real height field.
+        // Tessendorf construction: first draw the initial spectrum h0(k) with
+        // deterministic per-cell random phase for the WHOLE plane, then build
+        //   H(k,t) = h0(k)·e^{i·ω(k)·t} + conj(h0(−k))·e^{−i·ω(k)·t}
+        // which is Hermitian BY CONSTRUCTION: H(−k,t) = conj(H(k,t)) for every
+        // k, so the inverse FFT yields a real height field. (The previous code
+        // gave every cell an independent phase with no pairing, so the field
+        // was not actually Hermitian-symmetric.)
         const std::size_t N = static_cast<std::size_t>(n);
-        std::vector<std::complex<float>> H(N * N);
+        std::vector<std::complex<float>> H0(N * N), H(N * N);
         std::uint64_t seed = config_.seed;
         const float dk = 2.0f * 3.14159265358979f / L;
-        const float invN = 1.0f / static_cast<float>(N);
 
         for (std::uint32_t z = 0; z < n; ++z) {
             for (std::uint32_t x = 0; x < n; ++x) {
@@ -134,23 +138,39 @@ public:
                 if (kz > static_cast<std::int32_t>(n / 2)) kz -= static_cast<std::int32_t>(n);
                 const float fx = dk * static_cast<float>(kx);
                 const float fz = dk * static_cast<float>(kz);
-                const float en = spectrum(fx, fz);
-
+                // Amplitude espectral: |h0| = sqrt(P(k)) (Tessendorf usa a raiz
+                // do espectro, não o espectro em si).
+                const float en = std::sqrt(std::max(spectrum(fx, fz), 0.0f));
                 // deterministic phase (seeded per grid cell)
                 std::uint64_t s = mix64(seed + static_cast<std::uint64_t>(z) * 1000003ull +
                                         static_cast<std::uint64_t>(x) * 1031ull + 0x9e3779b97f4a7c15ull);
                 const float phi = unitFloat(s) * 2.0f * 3.14159265358979f;
-                // half-spectrum amplitude (Hermitian partner adds the conjugate)
-                std::complex<float> v(std::cos(phi) * en, std::sin(phi) * en);
-                // Deep-water dispersion advances each component's phase in time,
-                // making the synthesized surface time-varying (angular freq
-                // omega = sqrt(g * k)); Hermitian-invariant since omega depends
-                // only on |k|.
+                H0[static_cast<std::size_t>(z) * N + x] =
+                    std::complex<float>(std::cos(phi) * en, std::sin(phi) * en);
+            }
+        }
+
+        for (std::uint32_t z = 0; z < n; ++z) {
+            for (std::uint32_t x = 0; x < n; ++x) {
+                std::int32_t kx = static_cast<std::int32_t>(x);
+                std::int32_t kz = static_cast<std::int32_t>(z);
+                if (kx > static_cast<std::int32_t>(n / 2)) kx -= static_cast<std::int32_t>(n);
+                if (kz > static_cast<std::int32_t>(n / 2)) kz -= static_cast<std::int32_t>(n);
+                const float fx = dk * static_cast<float>(kx);
+                const float fz = dk * static_cast<float>(kz);
+                // Deep-water dispersion: omega = sqrt(g·|k|), função só de |k|,
+                // então o pareamento Hermitiano é preservado no tempo.
                 const float kMag = std::sqrt(fx * fx + fz * fz);
                 const float omega = (kMag > 1e-6f) ? std::sqrt(g * kMag) : 0.0f;
                 const float wt = omega * time;
-                std::complex<float> tp(std::cos(wt), std::sin(wt));
-                H[z * N + x] = v * tp * invN;
+                const std::complex<float> tp(std::cos(wt), std::sin(wt));
+                // −k na indexação wrap-around (N par): índice (n−x)%n em cada
+                // eixo; DC e modo de Nyquist são o próprio conjugado.
+                const std::size_t idx = static_cast<std::size_t>(z) * N + x;
+                const std::size_t mz = static_cast<std::size_t>((n - z) % n);
+                const std::size_t mx = static_cast<std::size_t>((n - x) % n);
+                H[idx] = H0[idx] * tp +
+                         std::conj(H0[mz * N + mx]) * std::conj(tp);
             }
         }
 
@@ -181,7 +201,9 @@ public:
                 const float pz = static_cast<float>(z) * cell;
                 FftOceanVertex v;
                 v.grid = glm::vec2(px, pz);
-                v.height = hx * config_.amplitude;
+                // A amplitude já está dentro de spectrum() (Phillips A);
+                // multiplicar de novo aqui dobraria o parâmetro.
+                v.height = hx;
                 v.position = glm::vec3(px + hz * config_.choppiness * 0.08f,
                                        v.height,
                                        pz - hx * config_.choppiness * 0.08f);

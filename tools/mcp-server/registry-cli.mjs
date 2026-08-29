@@ -28,6 +28,7 @@ import {
   SIMULATION_LOD_KINDS,
   PREFAB_KINDS,
   PARTICLE_KINDS,
+  CONFIG_KINDS,
   buildRegistryJsonSchema,
   buildVehicleJsonSchema,
   buildAbilityJsonSchema,
@@ -37,6 +38,7 @@ import {
   buildSimulationLodJsonSchema,
   buildPrefabJsonSchema,
   buildParticleJsonSchema,
+  buildConfigJsonSchema,
   validateRegistryDocument,
   validateVehicleDocument,
   validateAbilityDocument,
@@ -45,12 +47,13 @@ import {
   validateGaitDocument,
   validateSimulationLodDocument,
   validatePrefabDocument,
-  validateParticleDocument
+  validateParticleDocument,
+  validateConfigDocument
 } from "./game-authoring.mjs";
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ENGINE_ROOT = path.resolve(SERVER_DIR, "..", "..");
-const ALL_KINDS = [...REGISTRY_KINDS, ...VEHICLE_KINDS, ...ABILITY_KINDS, ...MISSION_KINDS, ...WORLD_PROFILE_KINDS, ...GAIT_KINDS, ...SIMULATION_LOD_KINDS, ...PREFAB_KINDS, ...PARTICLE_KINDS];
+const ALL_KINDS = [...REGISTRY_KINDS, ...VEHICLE_KINDS, ...ABILITY_KINDS, ...MISSION_KINDS, ...WORLD_PROFILE_KINDS, ...GAIT_KINDS, ...SIMULATION_LOD_KINDS, ...PREFAB_KINDS, ...PARTICLE_KINDS, ...CONFIG_KINDS];
 const VEHICLE_KIND_SET = new Set(VEHICLE_KINDS);
 const ABILITY_KIND_SET = new Set(ABILITY_KINDS);
 const MISSION_KIND_SET = new Set(MISSION_KINDS);
@@ -59,6 +62,16 @@ const GAIT_KIND_SET = new Set(GAIT_KINDS);
 const SIMULATION_LOD_KIND_SET = new Set(SIMULATION_LOD_KINDS);
 const PREFAB_KIND_SET = new Set(PREFAB_KINDS);
 const PARTICLE_KIND_SET = new Set(PARTICLE_KINDS);
+const CONFIG_KIND_SET = new Set(CONFIG_KINDS);
+
+// §4.4/§4.5 config kinds — directory under Content/ where the CLI authors
+// each kind (mirrors configDir in game-authoring.mjs).
+const CONFIG_DIRS = Object.freeze({
+  shader: "Shaders", render_graph: "RenderGraphs", light: "Lights", gi: "GI",
+  ocean: "Ocean", post_process: "PostProcess", fluid_sim: "FluidSims",
+  world: "Worlds", chunk: "Chunks", transaction: "Transactions",
+  block_entity: "BlockEntities", inventory: "Inventories"
+});
 
 function fail(message, code = 1) {
   console.error(`registry-cli: ${message}`);
@@ -88,9 +101,8 @@ function cmdKinds() {
   console.log(ALL_KINDS.join("\n"));
 }
 
-function cmdSchema(kind) {
-  if (!ALL_KINDS.includes(kind)) fail(`unsupported asset kind '${kind}' (supported: ${ALL_KINDS.join(", ")})`);
-  const schema = VEHICLE_KIND_SET.has(kind)
+function buildKindSchema(kind) {
+  return VEHICLE_KIND_SET.has(kind)
     ? buildVehicleJsonSchema(kind)
     : ABILITY_KIND_SET.has(kind)
       ? buildAbilityJsonSchema(kind)
@@ -106,48 +118,13 @@ function cmdSchema(kind) {
                 ? buildPrefabJsonSchema(kind)
                 : PARTICLE_KIND_SET.has(kind)
                   ? buildParticleJsonSchema(kind)
-                  : buildRegistryJsonSchema(kind);
-  console.log(JSON.stringify(schema, null, 2));
+                  : CONFIG_KIND_SET.has(kind)
+                    ? buildConfigJsonSchema(kind)
+                    : buildRegistryJsonSchema(kind);
 }
 
-function cmdExportSchemas(outDir) {
-  const target = outDir ?? path.join(ENGINE_ROOT, "schema");
-  fs.mkdirSync(target, { recursive: true });
-  const written = [];
-  for (const kind of ALL_KINDS) {
-    const file = path.join(target, `${kind}.json`);
-    const schema = VEHICLE_KIND_SET.has(kind)
-      ? buildVehicleJsonSchema(kind)
-      : ABILITY_KIND_SET.has(kind)
-        ? buildAbilityJsonSchema(kind)
-        : MISSION_KIND_SET.has(kind)
-          ? buildMissionJsonSchema(kind)
-          : WORLD_PROFILE_KIND_SET.has(kind)
-            ? buildWorldProfileJsonSchema(kind)
-            : GAIT_KIND_SET.has(kind)
-              ? buildGaitJsonSchema(kind)
-              : SIMULATION_LOD_KIND_SET.has(kind)
-                ? buildSimulationLodJsonSchema(kind)              : PREFAB_KIND_SET.has(kind)
-                ? buildPrefabJsonSchema(kind)
-                : PARTICLE_KIND_SET.has(kind)
-                  ? buildParticleJsonSchema(kind)
-                  : buildRegistryJsonSchema(kind);
-    atomicWriteJson(file, schema);
-    written.push(file);
-  }
-  for (const file of written) console.log(`wrote ${path.relative(ENGINE_ROOT, file).replaceAll(path.sep, "/")}`);
-}
-
-function cmdValidate(kind, file) {
-  if (!ALL_KINDS.includes(kind)) fail(`unsupported asset kind '${kind}' (supported: ${ALL_KINDS.join(", ")})`);
-  if (!file) fail("usage: validate <kind> <file.json>");
-  let document;
-  try {
-    document = readJson(file);
-  } catch (error) {
-    fail(`cannot read '${file}': ${error.message}`);
-  }
-  const result = VEHICLE_KIND_SET.has(kind)
+function validateKindDocument(kind, document) {
+  return VEHICLE_KIND_SET.has(kind)
     ? validateVehicleDocument(kind, document)
     : ABILITY_KIND_SET.has(kind)
       ? validateAbilityDocument(kind, document)
@@ -163,7 +140,38 @@ function cmdValidate(kind, file) {
                 ? validatePrefabDocument(document)
                 : PARTICLE_KIND_SET.has(kind)
                   ? validateParticleDocument(document)
-                  : validateRegistryDocument(kind, document);
+                  : CONFIG_KIND_SET.has(kind)
+                    ? validateConfigDocument(kind, document)
+                    : validateRegistryDocument(kind, document);
+}
+
+function cmdSchema(kind) {
+  if (!ALL_KINDS.includes(kind)) fail(`unsupported asset kind '${kind}' (supported: ${ALL_KINDS.join(", ")})`);
+  console.log(JSON.stringify(buildKindSchema(kind), null, 2));
+}
+
+function cmdExportSchemas(outDir) {
+  const target = outDir ?? path.join(ENGINE_ROOT, "schema");
+  fs.mkdirSync(target, { recursive: true });
+  const written = [];
+  for (const kind of ALL_KINDS) {
+    const file = path.join(target, `${kind}.json`);
+    atomicWriteJson(file, buildKindSchema(kind));
+    written.push(file);
+  }
+  for (const file of written) console.log(`wrote ${path.relative(ENGINE_ROOT, file).replaceAll(path.sep, "/")}`);
+}
+
+function cmdValidate(kind, file) {
+  if (!ALL_KINDS.includes(kind)) fail(`unsupported asset kind '${kind}' (supported: ${ALL_KINDS.join(", ")})`);
+  if (!file) fail("usage: validate <kind> <file.json>");
+  let document;
+  try {
+    document = readJson(file);
+  } catch (error) {
+    fail(`cannot read '${file}': ${error.message}`);
+  }
+  const result = validateKindDocument(kind, document);
   if (!result.valid) {
     for (const diagnostic of result.errors) console.error(`- ${diagnostic}`);
     console.error(`registry-cli: '${file}' is INVALID (${result.errors.length} diagnostic(s))`);
@@ -190,23 +198,7 @@ function cmdAuthor(args) {
   } catch (error) {
     fail(`cannot read '${file}': ${error.message}`);
   }
-  const validation = VEHICLE_KIND_SET.has(kind)
-    ? validateVehicleDocument(kind, document)
-    : ABILITY_KIND_SET.has(kind)
-      ? validateAbilityDocument(kind, document)
-      : MISSION_KIND_SET.has(kind)
-        ? validateMissionDocument(kind, document)
-        : WORLD_PROFILE_KIND_SET.has(kind)
-          ? validateWorldProfileDocument(kind, document)
-          : GAIT_KIND_SET.has(kind)
-            ? validateGaitDocument(kind, document)
-            : SIMULATION_LOD_KIND_SET.has(kind)
-              ? validateSimulationLodDocument(kind, document)
-              : PREFAB_KIND_SET.has(kind)
-                ? validatePrefabDocument(document)
-                : PARTICLE_KIND_SET.has(kind)
-                  ? validateParticleDocument(document)
-                  : validateRegistryDocument(kind, document);
+  const validation = validateKindDocument(kind, document);
   if (!validation.valid) {
     for (const diagnostic of validation.errors) console.error(`- ${diagnostic}`);
     fail(`asset '${kind}/${name}' fails public-contract validation; nothing was written`);
@@ -226,7 +218,9 @@ function cmdAuthor(args) {
                   ? path.join(engine, "Projects", project, "Content", "Prefabs", `${name}.prefab`)
                   : PARTICLE_KIND_SET.has(kind)
                     ? path.join(engine, "Projects", project, "Content", "Particles", `${name}.particle`)
-                    : path.join(engine, "Projects", project, "Content", "Registry", kind, `${name}.json`);
+                    : CONFIG_KIND_SET.has(kind)
+                      ? path.join(engine, "Projects", project, "Content", CONFIG_DIRS[kind], `${name}.json`)
+                      : path.join(engine, "Projects", project, "Content", "Registry", kind, `${name}.json`);
   const relative = path.relative(path.join(engine, "Projects", project), target).replaceAll(path.sep, "/");
   const previous = fs.existsSync(target) ? readJson(target) : null;
   if (dryRun) {

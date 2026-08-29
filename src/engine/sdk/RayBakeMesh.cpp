@@ -84,7 +84,22 @@ public:
     bool bake(const float* origins, std::size_t points,
               std::vector<RayBakeSample>& output,
               std::string& errorOut) const override {
+        // Default hemisphere up = +Y (backward compatible with the original
+        // bake()). The normal-aware path does the per-sample TBN.
         if (!tracer_ || !origins || points == 0) {
+            errorOut = "scene not built or no query points";
+            return false;
+        }
+        std::vector<float> up(points * 3, 0.0f);
+        for (std::size_t i = 0; i < points; ++i) up[i * 3 + 1] = 1.0f;
+        return bake_normals(origins, up.data(), points, output, errorOut);
+    }
+
+    bool bake_normals(const float* origins, const float* normals,
+                      std::size_t points,
+                      std::vector<RayBakeSample>& output,
+                      std::string& errorOut) const override {
+        if (!tracer_ || !origins || !normals || points == 0) {
             errorOut = "scene not built or no query points";
             return false;
         }
@@ -94,28 +109,59 @@ public:
             const float ox = origins[i * 3 + 0];
             const float oy = origins[i * 3 + 1];
             const float oz = origins[i * 3 + 2];
+            // Normal da superfície neste ponto: hemisfério segue a normal
+            // (TBN por amostra), não +Y fixo — correto para paredes/slopes.
+            float nx = normals[i * 3 + 0];
+            float ny = normals[i * 3 + 1];
+            float nz = normals[i * 3 + 2];
+            const float nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (nlen < 1e-6f) { nx = 0.0f; ny = 1.0f; nz = 0.0f; }
+            else { const float inv = 1.0f / nlen; nx *= inv; ny *= inv; nz *= inv; }
+            // Base ortonormal (tangente, bitangente, normal). Escolhe um eixo
+            // auxiliar determinístico não paralelo à normal.
+            float ax = 0.0f, ay = 1.0f, az = 0.0f;
+            if (std::fabs(ny) > 0.95f) { ax = 1.0f; ay = 0.0f; }
+            float tx = ay * nz - az * ny;
+            float ty = az * nx - ax * nz;
+            float tz = ax * ny - ay * nx;
+            const float tlen = std::sqrt(tx * tx + ty * ty + tz * tz);
+            if (tlen < 1e-6f) { tx = 1.0f; ty = 0.0f; tz = 0.0f; }
+            else { const float inv = 1.0f / tlen; tx *= inv; ty *= inv; tz *= inv; }
+            // bitangente = cross(normal, tangente)
+            const float bx = ny * tz - nz * ty;
+            const float by = nz * tx - nx * tz;
+            const float bz = nx * ty - ny * tx;
+
             std::uint64_t s = mix64(config_.seed + static_cast<std::uint64_t>(i) * 0x9E3779B97F4A7C15ull);
             int hits = 0;
             double distAcc = 0.0;
             for (std::uint32_t j = 0; j < config_.samples; ++j) {
-                // Uniform cosine-weighted hemisphere (up = +y), seeded + stratified.
+                // Cosine-weighted hemisphere no frame local, seeded/stratified.
                 const float u1 = unit01(mix64(s + j * 3u + 1u));
                 const float u2 = unit01(mix64(s + j * 3u + 2u));
                 const float r = std::sqrt(std::max(u1, 0.0f));
                 const float phi = u2 * 2.0f * 3.14159265358979f;
-                const float x = r * std::cos(phi);
-                const float z = r * std::sin(phi);
-                const float yy = std::sqrt(std::max(1.0f - r * r, 0.0f));
-                const float len = std::sqrt(x * x + yy * yy + z * z);
+                const float lx = r * std::cos(phi);
+                const float lz = r * std::sin(phi);
+                const float ly = std::sqrt(std::max(1.0f - r * r, 0.0f));
+                // Converte o raio local para o espaço do mundo via TBN.
                 RayTracerRay ray;
                 ray.ox = ox; ray.oy = oy; ray.oz = oz;
-                ray.dx = x / len; ray.dy = yy / len; ray.dz = z / len;
+                ray.dx = tx * lx + bx * lz + nx * ly;
+                ray.dy = ty * lx + by * lz + ny * ly;
+                ray.dz = tz * lx + bz * lz + nz * ly;
+                const float dlen = std::sqrt(ray.dx * ray.dx + ray.dy * ray.dy + ray.dz * ray.dz);
+                if (dlen < 1e-6f) continue;
+                ray.dx /= dlen; ray.dy /= dlen; ray.dz /= dlen;
                 ray.tMin = 1e-3f;
                 ray.tMax = maxD;
-                if (tracer_->occluded(ray)) {
+                // QUERY ÚNICA: closestHit deriva a oclusão do próprio resultado
+                // (antes, occluded() + closestHit() faziam DUAS travessias da
+                // estrutura de aceleração por raio ocluído).
+                const RayTracerHit h = tracer_->closestHit(ray);
+                if (h.hit) {
                     ++hits;
-                    auto h = tracer_->closestHit(ray);
-                    distAcc += h.hit ? static_cast<double>(h.t) : maxD;
+                    distAcc += static_cast<double>(h.t);
                 }
             }
             const float open = 1.0f - static_cast<float>(hits) / static_cast<float>(config_.samples);

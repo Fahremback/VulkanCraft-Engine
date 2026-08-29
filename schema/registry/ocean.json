@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/config/ocean.json",
+  "title": "ocean config asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset name (becomes the file name)",
+      "type": "string"
+    },
+    "version": {
+      "description": "must be 1",
+      "default": 1,
+      "type": "integer"
+    },
+    "size": {
+      "description": "tile size per axis (power of two) [16, 1024]",
+      "default": 64,
+      "type": "integer"
+    },
+    "tile_size_meters": {
+      "description": "world size of the tile [16, 8192]",
+      "default": 256,
+      "type": "number"
+    },
+    "wind_speed": {
+      "description": "wind speed m/s [0.5, 40]",
+      "default": 18,
+      "type": "number"
+    },
+    "wind_dir_rad": {
+      "description": "main wave direction (radians), finite",
+      "default": 0.7,
+      "type": "number"
+    },
+    "choppiness": {
+      "description": "horizontal displacement scale [0, 4]",
+      "default": 1.2,
+      "type": "number"
+    },
+    "amplitude": {
+      "description": "spectrum amplitude scale [0.01, 8]",
+      "default": 0.9,
+      "type": "number"
+    },
+    "seed": {
+      "description": "deterministic phase seed",
+      "default": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "name"
+  ]
+}

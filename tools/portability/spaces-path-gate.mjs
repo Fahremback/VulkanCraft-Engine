@@ -18,7 +18,9 @@ import { ERRORS } from './error-registry.mjs';
 
 const GATE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ENGINE_ROOT = path.resolve(GATE_DIR, '..', '..');
-const BUILD_DIR = path.join(ENGINE_ROOT, 'build');
+// Build dir overridable so the gate can run against the shared out-of-tree
+// build (e.g. VC_BUILD_DIR=out/mission-gate). Default stays legacy in-tree build.
+const BUILD_DIR = path.join(ENGINE_ROOT, process.env.VC_BUILD_DIR ?? 'build');
 const ERR_INSTALL = ERRORS.find((e) => e.id === 'E-5001'); // SDK install/consume misconfig
 const ERR_BUILD = ERRORS.find((e) => e.id === 'E-4001');   // build failed
 

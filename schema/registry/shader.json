@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/config/shader.json",
+  "title": "shader config asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset name (becomes the file name)",
+      "type": "string"
+    },
+    "version": {
+      "description": "must be 1",
+      "default": 1,
+      "type": "integer"
+    },
+    "stage": {
+      "description": "shader stage (vertex/fragment/compute) — mirror of IShaderCompiler.ShaderStage",
+      "default": "fragment",
+      "enum": [
+        "vertex",
+        "fragment",
+        "compute"
+      ]
+    },
+    "source": {
+      "description": "GLSL source text",
+      "type": "string"
+    },
+    "target_env": {
+      "description": "SPIR-V target env (e.g. 'spirv1.5'); empty = compiler default",
+      "default": "",
+      "type": "string"
+    },
+    "opt_level": {
+      "description": "optimization level: 0 = none, 1 = size, 2 = speed",
+      "default": 0,
+      "type": "integer"
+    },
+    "defines": {
+      "description": "macro defines, e.g. ['MAX_LIGHTS=64']",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "name",
+    "source"
+  ]
+}

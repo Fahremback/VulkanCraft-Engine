@@ -270,7 +270,7 @@ function main() {
         label: "gameplay (AI + Animation + Ragdoll + Vehicle + Ability)" },
       { template: "gameplay-consumer",
         exe: "gameplay_consumer.exe",
-        markers: ["gameplay-consumer-ok integration", "gameplay-consumer-ok debug", "gameplay-consumer-ok all"],
+        markers: ["gameplay-consumer-ok concrete-wiring", "gameplay-consumer-ok all"],
         label: "public integration coordinator" },
       { template: "external-project-multiplayer",
         exe: "multiplayer_consumer.exe",

@@ -44,10 +44,21 @@ const ENGINE_ROOT = path.resolve(GATE_DIR, "..", "..");
 // The exact external/solutions subdirectories the build consumes (grep
 // VC_SOLUTIONS_DIR in CMakeLists.txt). The full catalog is 11 GB; the portable
 // engine includes only what it builds with ("somente o necessário", §24).
+// The exact external/solutions subdirectories the build consumes — derived
+// from `grep -oE 'VC_SOLUTIONS_DIR}/[a-z0-9_-]+' CMakeLists.txt` (audit
+// 2026-08-29: the previous 11-entry list missed efsw/embree/eigen/spirv-
+// reflect/effekseer/ktx-software/atmospheric-scattering/etc, which made the
+// clean-copy configure fail with "add_subdirectory given source ... not an
+// existing directory").
 const CONSUMED_SOLUTIONS = [
-  "zstd", "blake3", "flatbuffers", "rocksdb",
-  "entt", "recast-navigation", "fast-wfc",
-  "delaunator-cpp", "earcut-hpp", "meshoptimizer", "xatlas"
+  "abseil", "acl", "atmospheric-scattering", "behavior-tree-cpp", "blake3",
+  "coacd", "concurrentqueue", "delaunator-cpp", "earcut-hpp", "effekseer",
+  "efsw", "eigen", "embree", "entt", "fast-wfc", "flatbuffers", "fuzztest",
+  "geometry-central", "godot-voxel", "google-benchmark", "googletest",
+  "ktx-software", "manifold", "meshoptimizer", "mimalloc",
+  "motion-matching", "opus", "ozz-animation", "position-based-dynamics",
+  "recast-navigation", "rocksdb", "spdlog", "spirv-reflect", "taskflow",
+  "tracy", "xatlas", "zstd"
 ];
 
 // Windows absolute paths: a drive letter (single letter + colon + slash) at a
@@ -55,6 +66,35 @@ const CONSUMED_SOLUTIONS = [
 // (the letter before ':' is not at a boundary), and comment lines starting
 // with // never match (they use forward slashes).
 const ABSOLUTE_PATH_RE = /((^|[^A-Za-z])[A-Za-z]:[\\/])|(^\\\\[^\\/])/;
+
+// Build-ENVIRONMENT paths are NOT source-portability violations (the gate's
+// own header: "Dependency fetching is a build-ENVIRONMENT concern (like
+// installing the Vulkan SDK), not a source portability one"). Installed
+// SDKs/toolchains must survive the scan exactly like a machine's own paths:
+// the local MSVC vcvars64.bat and Windows Kits referenced by the vendored
+// toolchain gates under tools/portability, the Qt install noted in the editor
+// port doc, the Vulkan SDK fallback in ShaderCompiler.cpp, and the short-path
+// workaround C:\oteltmp (otel probe, findings #307). The check that matters
+// for §24 is: no absolute path pointing at the ORIGINAL WORKSPACE (engine
+// root / build trees). Source files ESCAPE their string literals (double
+// backslashes), so match generously: any run of slashes/backslashes between
+// the meaningful segments.
+const ENVIRONMENT_PATH_RE =
+  /(Program Files|VulkanSDK|Windows Kits|oteltmp|[\\/]Qt[\\/])/i;
+function isEnvironmentPath(line) {
+  return ENVIRONMENT_PATH_RE.test(line);
+}
+
+// Deliberate test fixtures are NOT leaks: the blackbox-certification suite
+// proves its path-injection detector by quoting injected private paths (its
+// report strings use ellipsis-abbreviated paths, never real ones), and
+// ProjectTemplateTests uses a fake absolute path for a rename edge case. A
+// path containing an ellipsis is by construction not a real path; the rest is
+// an explicit list of the intentional fake locations.
+const FIXTURE_PATH_RE = /(\.\.\.\/|definitely[\\/]not[\\/]here)/i;
+function isFixturePath(line) {
+  return FIXTURE_PATH_RE.test(line);
+}
 
 function log(message) {
   process.stderr.write(`[clean-machine-gate] ${message}${os.EOL}`);
@@ -107,7 +147,7 @@ function scanForAbsolutePaths(root, relativeFiles) {
     }
     const content = fs.readFileSync(absolute, "utf8");
     for (const line of content.split(/\r?\n/)) {
-      if (ABSOLUTE_PATH_RE.test(line)) {
+      if (ABSOLUTE_PATH_RE.test(line) && !isEnvironmentPath(line) && !isFixturePath(line)) {
         leaks.push(`${file}: ${line.trim().slice(0, 160)}`);
       }
     }
@@ -170,9 +210,12 @@ const copyDist = path.join(copyRoot, "dist");
     if (fs.existsSync(path.join(ENGINE_ROOT, "schema"))) {
       copyDirectory(path.join(ENGINE_ROOT, "schema"), path.join(copyRoot, "schema"));
     }
-    for (const file of ["CMakeLists.txt", "SDK.md"]) {
-      fs.copyFileSync(path.join(ENGINE_ROOT, file), path.join(copyRoot, file));
-    }
+    fs.copyFileSync(path.join(ENGINE_ROOT, "CMakeLists.txt"), path.join(copyRoot, "CMakeLists.txt"));
+    // SDK.md is an INSTALL artifact (renamed from docs/SDK_MANIFEST.md by
+    // CMakeLists install rule); the engine root has only the source manifest.
+    // The clean copy mirrors the engine tree, so stage the manifest under its
+    // source name — the installed SDK.md is produced by cmake --install later.
+    fs.copyFileSync(path.join(ENGINE_ROOT, "docs", "SDK_MANIFEST.md"), path.join(copyRoot, "SDK.md"));
     log(`copied minimal tree (${CONSUMED_SOLUTIONS.length} solutions, ` +
         `${(treeBytes(copyRoot) / 1024 / 1024).toFixed(1)} MB)`);
 
@@ -195,10 +238,18 @@ const copyDist = path.join(copyRoot, "dist");
     // RocksDB's configure hangs on Windows, and the MAIN workspace build
     // covers the full set. The gate proves the minimal core (scheduler +
     // physics backends + project/package tools) builds from an arbitrary dir.
+    // Pin the SAME multi-config generator/toolchain as the workspace so the
+    // relocated build uses MSVC v143 (VS17 BuildTools 14.44), not whatever
+    // newest VS CMake auto-picks (VS18/v14.50 on this machine). This is the
+    // generator-mismatch trap documented in findings #307. The vendored
+    // storage deps (flatbuffers/zstd/blake3) stay ON because vc_sdk_world /
+    // VoxelWorldFacade hard-depends on them; only RocksDB stays OFF because
+    // its configure hangs on Windows (the gate's own comment below) and no
+    // gate-built target links it.
     const configureFlags = [
       "-S", copyRoot, "-B", copyBuild,
-      "-DVC_ENABLE_ROCKSDB=OFF", "-DVC_ENABLE_FLATBUFFERS=OFF",
-      "-DVC_ENABLE_ZSTD=OFF", "-DVC_ENABLE_BLAKE3=OFF"
+      "-G", "Visual Studio 17 2022", "-A", "x64",
+      "-DVC_ENABLE_ROCKSDB=OFF"
     ];
     if (!skipBuild) {
       if (seedDeps) {
@@ -242,11 +293,16 @@ const copyDist = path.join(copyRoot, "dist");
       // user-decision caveat as visual validation).
       const serverExe = path.join(copyBuild, "Release", "VulkanEngineServer.exe");
       if (!fs.existsSync(serverExe)) return fail("relocated VulkanEngineServer.exe missing");
-      result = run(serverExe, ["--ticks", "10"]);
-      if (result.status !== 0 || !/completed 10 headless ticks/.test(result.stdout || "")) {
+      // --ticks 10 is NOT enough for the sleep+rest proof: the dynamic body
+      // needs ~60+ ticks to come to rest on the streamed terrain (verified
+      // identical on the MAIN build and the relocated copy — a gate expectation
+      // issue, not a server regression). --ticks 300 completes the full
+      // authority proof (rest+sleep, wake, eviction despawn) reliably.
+      result = run(serverExe, ["--ticks", "300"]);
+      if (result.status !== 0 || !/completed 300 headless ticks/.test(result.stdout || "")) {
         return fail("relocated VulkanEngineServer headless run failed");
       }
-      log("relocated VulkanEngineServer --ticks 10: PASS (headless dedicated server)");
+      log("relocated VulkanEngineServer --ticks 300: PASS (headless dedicated server)");
       const cookerExe = path.join(copyBuild, "Release", "VulkanEngineCooker.exe");
       if (!fs.existsSync(cookerExe)) return fail("relocated VulkanEngineCooker.exe missing");
       const cooker = run(cookerExe, []);
@@ -274,9 +330,21 @@ const copyDist = path.join(copyRoot, "dist");
     const manifest = JSON.parse(
       fs.readFileSync(path.join(copyRoot, "Projects", projectName, "project.json"), "utf8"));
     if (manifest.engine !== "../..") return fail(`project engine ref not relative: ${manifest.engine}`);
+    // Cross-references must resolve (FALTANTES item 9): the Titanium block's
+    // auto-filled drop is "vulkancraft:Titanium", and the recipe inputs/outputs
+    // reference "vulkancraft:titanium"/"vulkancraft:titanium_ingot". The
+    // validator requires every drop/recipe reference to resolve to an AUTHORED
+    // item, so the gate must author the items too (mirroring protocol-smoke).
     const block = callSemanticTool(copyRoot, "author_registry_asset", {
-      project: projectName, kind: "block", name: "Titanium", hardness: 3.5, tags: ["metal"] });
+      project: projectName, kind: "block", name: "Titanium", hardness: 3.5, tags: ["metal"],
+      drops: ["vulkancraft:titanium"] });
     if (!block.created || block.diagnostics.length) return fail("MCP block authoring failed in the copy");
+    const oreItem = callSemanticTool(copyRoot, "author_registry_asset", {
+      project: projectName, kind: "item", name: "titanium", max_stack: 64, tags: ["metal"] });
+    if (!oreItem.created || oreItem.diagnostics.length) return fail("MCP titanium item authoring failed in the copy");
+    const ingotItem = callSemanticTool(copyRoot, "author_registry_asset", {
+      project: projectName, kind: "item", name: "titanium_ingot", max_stack: 64, tags: ["metal"] });
+    if (!ingotItem.created || ingotItem.diagnostics.length) return fail("MCP titanium_ingot item authoring failed in the copy");
     const recipe = callSemanticTool(copyRoot, "author_registry_asset", {
       project: projectName, kind: "recipe", name: "TitaniumIngot",
       inputs: [{ item: "vulkancraft:titanium", count: 2 }],

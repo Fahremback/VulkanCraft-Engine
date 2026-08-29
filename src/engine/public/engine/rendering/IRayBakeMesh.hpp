@@ -51,11 +51,22 @@ public:
     virtual bool build(const RayTracerTriangle* tris, std::int32_t count,
                        std::string& errorOut) = 0;
 
-    // Deterministic hemisphere AO over each `origin`. Returns false (output
-    // untouched) when the scene is not built or inputs mismatch.
+    // Deterministic hemisphere AO over each `origin` (hemisphere up = +Y,
+    // geometrically correct only for +Y-facing surfaces). Returns false
+    // (output untouched) when the scene is not built or inputs mismatch.
     virtual bool bake(const float* origins, std::size_t points,
                       std::vector<RayBakeSample>& output,
                       std::string& errorOut) const = 0;
+
+    // Same as bake(), but the hemisphere follows the per-point NORMAL: a
+    // tangent/bitangent frame is built per sample from the supplied normals,
+    // so wall/sloped surfaces bake the correct hemisphere instead of always
+    // shooting up. normals is a flat xyz array with 3*points floats, must be
+    // unit-length (non-unit normals are normalized internally).
+    virtual bool bake_normals(const float* origins, const float* normals,
+                              std::size_t points,
+                              std::vector<RayBakeSample>& output,
+                              std::string& errorOut) const = 0;
 };
 
 // ---- public factory ----

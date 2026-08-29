@@ -32,7 +32,8 @@ import { spawnSync } from "node:child_process";
 
 const GATE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ENGINE_ROOT = path.resolve(GATE_DIR, "..", "..");
-const BUILD_DIR = path.join(ENGINE_ROOT, "build");
+// Build dir overridable (shared out-of-tree build). Default stays legacy in-tree.
+const BUILD_DIR = path.join(ENGINE_ROOT, process.env.VC_BUILD_DIR ?? "build");
 const KEEP = process.argv.includes("--keep");
 
 const SDK_LIB_TARGETS = [

@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/config/light.json",
+  "title": "light config asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset name (becomes the file name)",
+      "type": "string"
+    },
+    "version": {
+      "description": "must be 1",
+      "default": 1,
+      "type": "integer"
+    },
+    "type": {
+      "description": "light type (0=Directional, 1=Point, 2=Spot, 3=Area)",
+      "default": "directional",
+      "enum": [
+        "directional",
+        "point",
+        "spot",
+        "area"
+      ]
+    },
+    "color": {
+      "description": "RGB color 0..1",
+      "default": [
+        1,
+        1,
+        1
+      ],
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "number"
+      }
+    },
+    "intensity": {
+      "description": "light intensity > 0",
+      "default": 1000,
+      "type": "number"
+    },
+    "range": {
+      "description": "range >= 0 (directional ignores)",
+      "default": 50,
+      "type": "number"
+    },
+    "cast_shadows": {
+      "description": "\"cast_shadows\" config field",
+      "default": true,
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "name"
+  ]
+}

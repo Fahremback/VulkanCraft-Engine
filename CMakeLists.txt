@@ -287,6 +287,281 @@ target_include_directories(vc_meshoptimizer PUBLIC ${VC_SOLUTIONS_DIR}/meshoptim
 add_library(vc_xatlas STATIC ${VC_SOLUTIONS_DIR}/xatlas/source/xatlas/xatlas.cpp)
 target_include_directories(vc_xatlas PUBLIC ${VC_SOLUTIONS_DIR}/xatlas/source/xatlas)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENTE 4 §8 — soluções externas sob propriedade deste agente, promovidas ao
+# build (DEPENDENCY_POLICY gate de promoção). Cada uma segue o padrão das
+# promoções anteriores: target vc_* compilando direto do clone pinado em
+# external/solutions, adapter em src/engine/sdk/* como ÚNICO TU com includes
+# externos, contrato público self-contained em src/engine/public/engine/* e
+# gate headless em tests/.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# §8 opus (Xiph.Org Foundation, BSD-3-Clause) — codec de voz/áudio de rede.
+# Fontes oficiais FLOAT (celt + silk + silk/float + src) do clone pinado; o
+# CMake upstream não é usado. OPUS_BUILD ativa o código; sem HAVE_CONFIG_H o
+# build usa os defaults portáteis (float, sem SIMD). O contrato público
+# engine/audio/IAudioCodec.hpp nunca inclui opus; só src/engine/sdk/OpusCodec.cpp
+# inclui <opus.h> (regra do adapter).
+set(VC_OPUS_DIR ${VC_SOLUTIONS_DIR}/opus)
+add_library(vc_opus STATIC
+    ${VC_OPUS_DIR}/celt/bands.c
+    ${VC_OPUS_DIR}/celt/celt.c
+    ${VC_OPUS_DIR}/celt/celt_decoder.c
+    ${VC_OPUS_DIR}/celt/celt_encoder.c
+    ${VC_OPUS_DIR}/celt/celt_lpc.c
+    ${VC_OPUS_DIR}/celt/cwrs.c
+    ${VC_OPUS_DIR}/celt/entcode.c
+    ${VC_OPUS_DIR}/celt/entdec.c
+    ${VC_OPUS_DIR}/celt/entenc.c
+    ${VC_OPUS_DIR}/celt/kiss_fft.c
+    ${VC_OPUS_DIR}/celt/laplace.c
+    ${VC_OPUS_DIR}/celt/mathops.c
+    ${VC_OPUS_DIR}/celt/mdct.c
+    ${VC_OPUS_DIR}/celt/modes.c
+    ${VC_OPUS_DIR}/celt/pitch.c
+    ${VC_OPUS_DIR}/celt/quant_bands.c
+    ${VC_OPUS_DIR}/celt/rate.c
+    ${VC_OPUS_DIR}/celt/vq.c
+    ${VC_OPUS_DIR}/silk/A2NLSF.c
+    ${VC_OPUS_DIR}/silk/CNG.c
+    ${VC_OPUS_DIR}/silk/HP_variable_cutoff.c
+    ${VC_OPUS_DIR}/silk/LPC_analysis_filter.c
+    ${VC_OPUS_DIR}/silk/LPC_fit.c
+    ${VC_OPUS_DIR}/silk/LPC_inv_pred_gain.c
+    ${VC_OPUS_DIR}/silk/LP_variable_cutoff.c
+    ${VC_OPUS_DIR}/silk/NLSF2A.c
+    ${VC_OPUS_DIR}/silk/NLSF_VQ.c
+    ${VC_OPUS_DIR}/silk/NLSF_VQ_weights_laroia.c
+    ${VC_OPUS_DIR}/silk/NLSF_decode.c
+    ${VC_OPUS_DIR}/silk/NLSF_del_dec_quant.c
+    ${VC_OPUS_DIR}/silk/NLSF_encode.c
+    ${VC_OPUS_DIR}/silk/NLSF_stabilize.c
+    ${VC_OPUS_DIR}/silk/NLSF_unpack.c
+    ${VC_OPUS_DIR}/silk/NSQ.c
+    ${VC_OPUS_DIR}/silk/NSQ_del_dec.c
+    ${VC_OPUS_DIR}/silk/PLC.c
+    ${VC_OPUS_DIR}/silk/VAD.c
+    ${VC_OPUS_DIR}/silk/VQ_WMat_EC.c
+    ${VC_OPUS_DIR}/silk/ana_filt_bank_1.c
+    ${VC_OPUS_DIR}/silk/biquad_alt.c
+    ${VC_OPUS_DIR}/silk/bwexpander.c
+    ${VC_OPUS_DIR}/silk/bwexpander_32.c
+    ${VC_OPUS_DIR}/silk/check_control_input.c
+    ${VC_OPUS_DIR}/silk/code_signs.c
+    ${VC_OPUS_DIR}/silk/control_SNR.c
+    ${VC_OPUS_DIR}/silk/control_audio_bandwidth.c
+    ${VC_OPUS_DIR}/silk/control_codec.c
+    ${VC_OPUS_DIR}/silk/debug.c
+    ${VC_OPUS_DIR}/silk/dec_API.c
+    ${VC_OPUS_DIR}/silk/decode_core.c
+    ${VC_OPUS_DIR}/silk/decode_frame.c
+    ${VC_OPUS_DIR}/silk/decode_indices.c
+    ${VC_OPUS_DIR}/silk/decode_parameters.c
+    ${VC_OPUS_DIR}/silk/decode_pitch.c
+    ${VC_OPUS_DIR}/silk/decode_pulses.c
+    ${VC_OPUS_DIR}/silk/decoder_set_fs.c
+    ${VC_OPUS_DIR}/silk/enc_API.c
+    ${VC_OPUS_DIR}/silk/encode_indices.c
+    ${VC_OPUS_DIR}/silk/encode_pulses.c
+    ${VC_OPUS_DIR}/silk/gain_quant.c
+    ${VC_OPUS_DIR}/silk/init_decoder.c
+    ${VC_OPUS_DIR}/silk/init_encoder.c
+    ${VC_OPUS_DIR}/silk/inner_prod_aligned.c
+    ${VC_OPUS_DIR}/silk/interpolate.c
+    ${VC_OPUS_DIR}/silk/lin2log.c
+    ${VC_OPUS_DIR}/silk/log2lin.c
+    ${VC_OPUS_DIR}/silk/pitch_est_tables.c
+    ${VC_OPUS_DIR}/silk/process_NLSFs.c
+    ${VC_OPUS_DIR}/silk/quant_LTP_gains.c
+    ${VC_OPUS_DIR}/silk/resampler.c
+    ${VC_OPUS_DIR}/silk/resampler_down2.c
+    ${VC_OPUS_DIR}/silk/resampler_down2_3.c
+    ${VC_OPUS_DIR}/silk/resampler_private_AR2.c
+    ${VC_OPUS_DIR}/silk/resampler_private_IIR_FIR.c
+    ${VC_OPUS_DIR}/silk/resampler_private_down_FIR.c
+    ${VC_OPUS_DIR}/silk/resampler_private_up2_HQ.c
+    ${VC_OPUS_DIR}/silk/resampler_rom.c
+    ${VC_OPUS_DIR}/silk/shell_coder.c
+    ${VC_OPUS_DIR}/silk/sigm_Q15.c
+    ${VC_OPUS_DIR}/silk/sort.c
+    ${VC_OPUS_DIR}/silk/stereo_LR_to_MS.c
+    ${VC_OPUS_DIR}/silk/stereo_MS_to_LR.c
+    ${VC_OPUS_DIR}/silk/stereo_decode_pred.c
+    ${VC_OPUS_DIR}/silk/stereo_encode_pred.c
+    ${VC_OPUS_DIR}/silk/stereo_find_predictor.c
+    ${VC_OPUS_DIR}/silk/stereo_quant_pred.c
+    ${VC_OPUS_DIR}/silk/sum_sqr_shift.c
+    ${VC_OPUS_DIR}/silk/table_LSF_cos.c
+    ${VC_OPUS_DIR}/silk/tables_LTP.c
+    ${VC_OPUS_DIR}/silk/tables_NLSF_CB_NB_MB.c
+    ${VC_OPUS_DIR}/silk/tables_NLSF_CB_WB.c
+    ${VC_OPUS_DIR}/silk/tables_gain.c
+    ${VC_OPUS_DIR}/silk/tables_other.c
+    ${VC_OPUS_DIR}/silk/tables_pitch_lag.c
+    ${VC_OPUS_DIR}/silk/tables_pulses_per_block.c
+    ${VC_OPUS_DIR}/silk/float/apply_sine_window_FLP.c
+    ${VC_OPUS_DIR}/silk/float/corrMatrix_FLP.c
+    ${VC_OPUS_DIR}/silk/float/encode_frame_FLP.c
+    ${VC_OPUS_DIR}/silk/float/find_LPC_FLP.c
+    ${VC_OPUS_DIR}/silk/float/find_LTP_FLP.c
+    ${VC_OPUS_DIR}/silk/float/find_pitch_lags_FLP.c
+    ${VC_OPUS_DIR}/silk/float/find_pred_coefs_FLP.c
+    ${VC_OPUS_DIR}/silk/float/LPC_analysis_filter_FLP.c
+    ${VC_OPUS_DIR}/silk/float/LTP_analysis_filter_FLP.c
+    ${VC_OPUS_DIR}/silk/float/LTP_scale_ctrl_FLP.c
+    ${VC_OPUS_DIR}/silk/float/noise_shape_analysis_FLP.c
+    ${VC_OPUS_DIR}/silk/float/process_gains_FLP.c
+    ${VC_OPUS_DIR}/silk/float/regularize_correlations_FLP.c
+    ${VC_OPUS_DIR}/silk/float/residual_energy_FLP.c
+    ${VC_OPUS_DIR}/silk/float/warped_autocorrelation_FLP.c
+    ${VC_OPUS_DIR}/silk/float/wrappers_FLP.c
+    ${VC_OPUS_DIR}/silk/float/autocorrelation_FLP.c
+    ${VC_OPUS_DIR}/silk/float/burg_modified_FLP.c
+    ${VC_OPUS_DIR}/silk/float/bwexpander_FLP.c
+    ${VC_OPUS_DIR}/silk/float/energy_FLP.c
+    ${VC_OPUS_DIR}/silk/float/inner_product_FLP.c
+    ${VC_OPUS_DIR}/silk/float/k2a_FLP.c
+    ${VC_OPUS_DIR}/silk/float/LPC_inv_pred_gain_FLP.c
+    ${VC_OPUS_DIR}/silk/float/pitch_analysis_core_FLP.c
+    ${VC_OPUS_DIR}/silk/float/scale_copy_vector_FLP.c
+    ${VC_OPUS_DIR}/silk/float/scale_vector_FLP.c
+    ${VC_OPUS_DIR}/silk/float/schur_FLP.c
+    ${VC_OPUS_DIR}/silk/float/sort_FLP.c
+    ${VC_OPUS_DIR}/src/analysis.c
+    ${VC_OPUS_DIR}/src/extensions.c
+    ${VC_OPUS_DIR}/src/mapping_matrix.c
+    ${VC_OPUS_DIR}/src/mlp.c
+    ${VC_OPUS_DIR}/src/mlp_data.c
+    ${VC_OPUS_DIR}/src/opus.c
+    ${VC_OPUS_DIR}/src/opus_decoder.c
+    ${VC_OPUS_DIR}/src/opus_encoder.c
+    ${VC_OPUS_DIR}/src/opus_multistream.c
+    ${VC_OPUS_DIR}/src/opus_multistream_decoder.c
+    ${VC_OPUS_DIR}/src/opus_multistream_encoder.c
+    ${VC_OPUS_DIR}/src/opus_projection_decoder.c
+    ${VC_OPUS_DIR}/src/opus_projection_encoder.c
+    ${VC_OPUS_DIR}/src/repacketizer.c
+)
+target_include_directories(vc_opus PUBLIC ${VC_OPUS_DIR}/include)
+target_include_directories(vc_opus PRIVATE
+    ${VC_OPUS_DIR}/src ${VC_OPUS_DIR}/celt ${VC_OPUS_DIR}/silk ${VC_OPUS_DIR}/silk/float)
+target_compile_definitions(vc_opus PRIVATE OPUS_BUILD USE_ALLOCA)
+if(MSVC)
+    target_compile_options(vc_opus PRIVATE /w)
+endif()
+
+# §8 opus gate: codec REAL vendido atrás de IAudioCodec — round-trip,
+# determinismo bit-exact, silêncio compacto e recusas all-or-nothing.
+add_executable(opus_codec_tests EXCLUDE_FROM_ALL
+    tests/OpusCodecTests.cpp
+    src/engine/sdk/OpusCodec.cpp
+)
+target_include_directories(opus_codec_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(opus_codec_tests PRIVATE vc_build_options vc_opus)
+add_test(NAME opus_codec_tests COMMAND opus_codec_tests)
+
+# §8 behavior-tree-cpp (Davide Faconti et al., MIT) — runtime de Behavior
+# Trees vendido. Core compilado direto do clone pinado (sem Groot2/ZeroMQ,
+# sem SQLite logging, sem manual_node ncurses, sem logger ROS2/minitrace);
+# tinyxml2 e minicoro (header-only) são os vendored 3rdparty do próprio clone.
+# O contrato público engine/ai/IVendorBehaviorTree.hpp nunca inclui o
+# BehaviorTree.CPP; só src/engine/sdk/VendorBehaviorTree.cpp inclui
+# <behaviortree_cpp/...> (regra do adapter).
+set(VC_BTCPP_DIR ${VC_SOLUTIONS_DIR}/behavior-tree-cpp)
+add_library(vc_behavior_tree_cpp STATIC
+    ${VC_BTCPP_DIR}/src/action_node.cpp
+    ${VC_BTCPP_DIR}/src/basic_types.cpp
+    ${VC_BTCPP_DIR}/src/behavior_tree.cpp
+    ${VC_BTCPP_DIR}/src/blackboard.cpp
+    ${VC_BTCPP_DIR}/src/bt_factory.cpp
+    ${VC_BTCPP_DIR}/src/condition_node.cpp
+    ${VC_BTCPP_DIR}/src/control_node.cpp
+    ${VC_BTCPP_DIR}/src/decorator_node.cpp
+    ${VC_BTCPP_DIR}/src/json_export.cpp
+    ${VC_BTCPP_DIR}/src/script_parser.cpp
+    ${VC_BTCPP_DIR}/src/script_tokenizer.cpp
+    ${VC_BTCPP_DIR}/src/shared_library.cpp
+    ${VC_BTCPP_DIR}/src/shared_library_WIN.cpp
+    ${VC_BTCPP_DIR}/src/tree_node.cpp
+    ${VC_BTCPP_DIR}/src/xml_parsing.cpp
+    ${VC_BTCPP_DIR}/src/actions/sleep_node.cpp
+    ${VC_BTCPP_DIR}/src/actions/test_node.cpp
+    ${VC_BTCPP_DIR}/src/actions/updated_action.cpp
+    ${VC_BTCPP_DIR}/src/controls/fallback_node.cpp
+    ${VC_BTCPP_DIR}/src/controls/if_then_else_node.cpp
+    ${VC_BTCPP_DIR}/src/controls/parallel_all_node.cpp
+    ${VC_BTCPP_DIR}/src/controls/parallel_node.cpp
+    ${VC_BTCPP_DIR}/src/controls/reactive_fallback.cpp
+    ${VC_BTCPP_DIR}/src/controls/reactive_sequence.cpp
+    ${VC_BTCPP_DIR}/src/controls/sequence_node.cpp
+    ${VC_BTCPP_DIR}/src/controls/sequence_with_memory_node.cpp
+    ${VC_BTCPP_DIR}/src/controls/switch_node.cpp
+    ${VC_BTCPP_DIR}/src/controls/try_catch_node.cpp
+    ${VC_BTCPP_DIR}/src/controls/while_do_else_node.cpp
+    ${VC_BTCPP_DIR}/src/decorators/delay_node.cpp
+    ${VC_BTCPP_DIR}/src/decorators/inverter_node.cpp
+    ${VC_BTCPP_DIR}/src/decorators/repeat_node.cpp
+    ${VC_BTCPP_DIR}/src/decorators/retry_node.cpp
+    ${VC_BTCPP_DIR}/src/decorators/subtree_node.cpp
+    ${VC_BTCPP_DIR}/src/decorators/timeout_node.cpp
+    ${VC_BTCPP_DIR}/src/decorators/updated_decorator.cpp
+    ${VC_BTCPP_DIR}/src/loggers/abstract_logger.cpp
+    ${VC_BTCPP_DIR}/src/loggers/bt_cout_logger.cpp
+    ${VC_BTCPP_DIR}/src/loggers/bt_observer.cpp
+    ${VC_BTCPP_DIR}/3rdparty/tinyxml2/tinyxml2.cpp
+)
+target_include_directories(vc_behavior_tree_cpp PUBLIC ${VC_BTCPP_DIR}/include)
+target_include_directories(vc_behavior_tree_cpp PRIVATE
+    ${VC_BTCPP_DIR}/3rdparty/tinyxml2
+    ${VC_BTCPP_DIR}/3rdparty/minicoro
+)
+target_compile_features(vc_behavior_tree_cpp PRIVATE cxx_std_17)
+target_compile_definitions(vc_behavior_tree_cpp PRIVATE BTCPP_LIBRARY_VERSION="4.10.0")
+if(MSVC)
+    target_compile_options(vc_behavior_tree_cpp PRIVATE /w)
+endif()
+
+# §8 behavior-tree-cpp gate: runtime REAL vendido atrás de IVendorBehaviorTree
+# — árvores XML, nós customizados, blackboard, tick RUNNING, recusas.
+add_executable(vendor_behavior_tree_tests EXCLUDE_FROM_ALL
+    tests/VendorBehaviorTreeTests.cpp
+    src/engine/sdk/VendorBehaviorTree.cpp
+)
+target_include_directories(vendor_behavior_tree_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(vendor_behavior_tree_tests PRIVATE vc_build_options vc_behavior_tree_cpp)
+add_test(NAME vendor_behavior_tree_tests COMMAND vendor_behavior_tree_tests)
+
+# §8 motion-matching (Daniel Holden, MIT) — core de motion matching vendido,
+# header-only (database.h/vec.h/quat.h/spring.h/array.h/common.h, sem raylib;
+# o demo controller.cpp é gráfico e não é promovido). O contrato público
+# engine/animation/IMotionMatchVendor.hpp nunca inclui os headers do doador;
+# só src/engine/sdk/MotionMatchVendor.cpp inclui database.h (regra do
+# adapter).
+set(VC_MOTIONMATCH_DIR ${VC_SOLUTIONS_DIR}/motion-matching)
+add_library(vc_motion_matching INTERFACE)
+target_include_directories(vc_motion_matching INTERFACE ${VC_MOTIONMATCH_DIR})
+# O doador usa __restrict__ (GCC/Clang); o MSVC não conhece — definir vazio.
+target_compile_definitions(vc_motion_matching INTERFACE __restrict__=)
+
+# §8 motion-matching gate: banco de poses + busca por vizinho mais próximo com
+# features normalizadas e custo de transição do doador — determinístico.
+add_executable(motion_match_vendor_tests EXCLUDE_FROM_ALL
+    tests/MotionMatchVendorTests.cpp
+    src/engine/sdk/MotionMatchVendor.cpp
+)
+target_include_directories(motion_match_vendor_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(motion_match_vendor_tests PRIVATE vc_build_options vc_motion_matching)
+add_test(NAME motion_match_vendor_tests COMMAND motion_match_vendor_tests)
+
 # FastNoise2 (catalog authority for "noise graph") is BLOCKED at the promotion
 # gate: this pinned clone requires FastSIMD (include/FastNoise/Utility/Config.h
 # -> <FastSIMD/DispatchClass.h>) which is not vendored in the clone nor in the
@@ -4117,6 +4392,21 @@ target_include_directories(effect_stacks_tests PRIVATE
 target_link_libraries(effect_stacks_tests PRIVATE vc_build_options glm)
 add_test(NAME effect_stacks_tests COMMAND effect_stacks_tests)
 
+# Ability effects facade (engine::gameplay IAbilityEffects): autor define
+# efeitos validados ALL-OR-NOTHING; emit publica evento tipado no
+# IGameplayEvents — self-contained std.
+add_executable(ability_effects_facade_tests EXCLUDE_FROM_ALL
+    tests/AbilityEffectsFacadeTests.cpp
+    src/engine/sdk/AbilityEffectsFacade.cpp
+    src/engine/sdk/GameplayEvents.cpp
+)
+target_include_directories(ability_effects_facade_tests PRIVATE
+    src/engine/public
+    src
+)
+target_link_libraries(ability_effects_facade_tests PRIVATE vc_build_options glm)
+add_test(NAME ability_effects_facade_tests COMMAND ability_effects_facade_tests)
+
 # Ragdoll asset (agente 4 §4 item 55, CORE do asset configurável): skeleton
 # data-driven (joints/limits/drives/auto-balance/blend) em JSON versionado
 # all-or-nothing bit-exact + build_bones p/ o RagdollBone público do runtime
@@ -6650,6 +6940,93 @@ target_include_directories(gtest_smoke_test PRIVATE
     src)
 include(GoogleTest)
 gtest_discover_tests(gtest_smoke_test)
+
+# GoogleTest core WITHOUT main — for consumers that provide their own main()
+# (e.g. the fuzztest gate below, whose main() calls fuzztest::InitFuzzTest).
+add_library(gtest_all STATIC
+    ${VC_SOLUTIONS_DIR}/googletest/googletest/src/gtest-all.cc)
+target_include_directories(gtest_all PUBLIC
+    ${VC_SOLUTIONS_DIR}/googletest/googletest/include
+    ${VC_SOLUTIONS_DIR}/googletest/googletest)
+target_compile_features(gtest_all PUBLIC cxx_std_14)
+
+# --- fuzztest (Apache-2.0, external/solutions/fuzztest) — Google FuzzTest ---
+# Runtime de fuzzing compilado direto das fontes vendidas (o CMake do vendor
+# foi corrigido para aceitar MSVC, mas ele puxa abseil/re2/antlr por
+# FetchContent; aqui usamos o abseil JÁ vendido em external/solutions/abseil,
+# pacote instalado com abslConfig.cmake — runtime /MD, compatível com a
+# engine). re2 NÃO é vendido -> InRegexp/InGrammar ficam guardados por
+# FUZZTEST_HAVE_RE2 (indefinido; ver patches em regexp_dfa.h/in_regexp_impl.h/
+# domain.h); subprocess.cc é POSIX-only (excluído); flatbuffers_domain_impl e
+# llvm_fuzzer_* não são compilados; fuzztest_gtest_main.cc não é embutido
+# (o gate fornece main() próprio). 30 TUs, um único adapter target.
+# Canonical export lives at lib/cmake/absl (the root abslTargets.cmake is a
+# stray copy with wrong _IMPORT_PREFIX depth). Export repaired 2026-08-29:
+# 88 STATIC targets gained IMPORTED_LOCATION; absl::absl_check/absl_log are
+# INTERFACE meta targets chaining to compiled libs.
+unset(absl_DIR CACHE)
+find_package(absl CONFIG REQUIRED PATHS ${VC_SOLUTIONS_DIR}/abseil/lib/cmake/absl NO_DEFAULT_PATH)
+set(VC_FUZZTEST_ROOT ${VC_SOLUTIONS_DIR}/fuzztest)
+set(VC_FUZZTEST_SOURCES
+    ${VC_FUZZTEST_ROOT}/common/bazel.cc
+    ${VC_FUZZTEST_ROOT}/common/blob_file.cc
+    ${VC_FUZZTEST_ROOT}/common/crashing_input_filename.cc
+    ${VC_FUZZTEST_ROOT}/common/hash.cc
+    ${VC_FUZZTEST_ROOT}/common/remote_file.cc
+    ${VC_FUZZTEST_ROOT}/common/remote_file_oss.cc
+    ${VC_FUZZTEST_ROOT}/common/sha1.cc
+    ${VC_FUZZTEST_ROOT}/common/temp_dir.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/fuzzing_bit_gen.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/fuzztest_macros.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/init_fuzztest.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/compatibility_mode.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/configuration.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/corpus_database.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/coverage.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/escaping.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/fixture_driver.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/googletest_adaptor.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/io.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/logging.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/register_absl_fuzzing_mocks.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/registry.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/runtime.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/sanitizer_interface.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/seed_seq.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/serialization.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/status.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/type_support.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/domains/rune.cc
+    ${VC_FUZZTEST_ROOT}/fuzztest/internal/domains/utf.cc)
+add_library(vc_fuzztest STATIC ${VC_FUZZTEST_SOURCES})
+target_include_directories(vc_fuzztest PUBLIC ${VC_FUZZTEST_ROOT})
+target_include_directories(vc_fuzztest PRIVATE
+    ${VC_SOLUTIONS_DIR}/googletest/googletest/include
+    ${VC_SOLUTIONS_DIR}/googletest/googletest)
+target_compile_definitions(vc_fuzztest PUBLIC CENTIPEDE_DISABLE_RIEGELI)
+target_compile_features(vc_fuzztest PUBLIC cxx_std_17)
+# Silenciar warnings do vendor (código Google, não nosso).
+if(MSVC)
+    target_compile_options(vc_fuzztest PRIVATE /w)
+endif()
+target_link_libraries(vc_fuzztest PUBLIC
+    vc_build_options
+    absl::absl_check absl::absl_log absl::algorithm_container
+    absl::any_invocable absl::bind_front absl::bits absl::cord
+    absl::core_headers absl::failure_signal_handler absl::fast_type_id
+    absl::flags absl::flags_parse absl::flags_reflection
+    absl::flat_hash_map absl::flat_hash_set absl::function_ref
+    absl::hash absl::int128 absl::no_destructor absl::nullability
+    absl::random_bit_gen_ref absl::random_distributions
+    absl::random_random absl::span
+    absl::status absl::statusor absl::str_format absl::string_view
+    absl::strings absl::symbolize absl::synchronization absl::time)
+
+add_executable(fuzztest_smoke_tests EXCLUDE_FROM_ALL
+    tests/FuzzTestSmokeTests.cpp)
+target_link_libraries(fuzztest_smoke_tests PRIVATE
+    vc_build_options vc_fuzztest gtest_all)
+add_test(NAME fuzztest_smoke_tests COMMAND fuzztest_smoke_tests)
 
 # Google Benchmark smoke test — proves external solution integration
 file(GLOB GENCHMARK_SOURCES ${VC_SOLUTIONS_DIR}/google-benchmark/src/*.cc)

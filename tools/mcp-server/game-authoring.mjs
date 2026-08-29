@@ -372,6 +372,156 @@ export const PARTICLE_FIELD_SCHEMAS = Object.freeze({
   ]
 });
 
+// ---------------------------------------------------------------------------
+// §4.4 + §4.5 — rendering + voxel/world CONFIG asset kinds (2026-08-28). Each
+// document mirrors EXACTLY the versioned JSON the public C++ contracts parse
+// (all-or-nothing, never clamped):
+//   shader         -> IShaderCompiler.ShaderCompilerConfig + GLSL source
+//   render_graph   -> IRenderGraph (resources, passes, dependencies DAG)
+//   light          -> Light component schema + light_types (game_capabilities)
+//   gi             -> GiClipmapConfig + DiffuseGiConfig (IGlobalIlluminationProvider/IDiffuseGlobalIllumination)
+//   ocean          -> FftOceanConfig (IFftOceanSurface)
+//   post_process   -> ToneMappingConfig + CasConfig + quality (IToneMapping/ICasSharpening/IRenderingPresets)
+//   fluid_sim      -> FluidConfig (IFluidSimulation)
+//   world          -> WorldSpec + portals (IWorldManager)
+//   chunk          -> StreamingSnapshot budgets (IVoxelStreaming)
+//   transaction    -> BlockEdit[] + TransactionLimits (IVoxelWorld)
+//   block_entity   -> IVoxelBlockEntity (type_id/data_version/script/components)
+//   inventory      -> Inventory serialize_json (engine/registry/Inventory.hpp)
+export const CONFIG_KINDS = Object.freeze([
+  "shader", "render_graph", "light", "gi", "ocean", "post_process", "fluid_sim",
+  "world", "chunk", "transaction", "block_entity", "inventory"
+]);
+
+// Enum surfaces mirroring the public C++ contracts.
+const SHADER_STAGES = Object.freeze(["vertex", "fragment", "compute"]);
+const TONE_OPERATORS = Object.freeze(["reinhard", "aces", "filmic", "none"]);
+const QUALITY_LEVELS = Object.freeze(["low", "medium", "high", "ultra", "cinematic"]);
+const LIGHT_TYPE_NAMES = Object.freeze(["directional", "point", "spot", "area"]);
+const RESOURCE_KINDS = Object.freeze(["buffer", "image"]);
+const RENDER_QUEUES = Object.freeze(["graphics", "compute", "transfer"]);
+const RENDER_ACCESS = Object.freeze(["read", "write", "readwrite"]);
+const RESOURCE_STATES = Object.freeze(["undefined", "shader_read", "color_attachment", "depth_attachment", "general", "transfer_source", "transfer_destination", "present"]);
+const BLOCK_ENTITY_COMPONENT_TYPES = Object.freeze(["inventory", "script", "custom"]);
+
+// Compact field contracts surfaced by game_capabilities so an agent can author
+// every config kind without reading the engine source. Single source for the
+// exported JSON Schema (buildConfigJsonSchema) and the author tools.
+export const CONFIG_FIELD_SCHEMAS = Object.freeze({
+  shader: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "stage", type: "enum", values: [...SHADER_STAGES], required: false, default: "fragment", description: "shader stage (vertex/fragment/compute) — mirror of IShaderCompiler.ShaderStage" },
+    { name: "source", type: "string", required: true, description: "GLSL source text" },
+    { name: "target_env", type: "string", required: false, default: "", description: "SPIR-V target env (e.g. 'spirv1.5'); empty = compiler default" },
+    { name: "opt_level", type: "integer", required: false, default: 0, description: "optimization level: 0 = none, 1 = size, 2 = speed" },
+    { name: "defines", type: "array[string]", required: false, default: [], description: "macro defines, e.g. ['MAX_LIGHTS=64']" }
+  ],
+  render_graph: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "resources", type: "array[object]", required: true, description: "[{ name (unique), kind: buffer|image, byte_size, width, height, depth, transient, imported, initial_state }]" },
+    { name: "passes", type: "array[object]", required: true, description: "[{ name (unique), queue: graphics|compute|transfer, enabled, resources: [{ resource (name), access: read|write|readwrite, state }] }]" },
+    { name: "dependencies", type: "array[object]", required: false, default: [], description: "[{ before, after }] — pass names; the graph must be acyclic" }
+  ],
+  light: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "type", type: "enum", values: [...LIGHT_TYPE_NAMES], required: false, default: "directional", description: "light type (0=Directional, 1=Point, 2=Spot, 3=Area)" },
+    { name: "color", type: "array[3]", required: false, default: [1, 1, 1], description: "RGB color 0..1" },
+    { name: "intensity", type: "number", required: false, default: 1000, description: "light intensity > 0" },
+    { name: "range", type: "number", required: false, default: 50, description: "range >= 0 (directional ignores)" },
+    { name: "cast_shadows", type: "boolean", required: false, default: true }
+  ],
+  gi: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "cascade_count", type: "integer", required: false, default: 6, description: "probe clipmap cascades [1, 6]" },
+    { name: "resolution", type: "integer", required: false, default: 16, description: "probes per axis [4, 32]" },
+    { name: "probes_per_frame", type: "integer", required: false, default: 192, description: "bake budget per frame >= 1" },
+    { name: "base_spacing", type: "number", required: false, default: 4.0, description: "cascade base spacing meters >= 0.5" },
+    { name: "cascade_scale", type: "number", required: false, default: 4.0, description: ">= 2" },
+    { name: "sun_refresh_angle_degrees", type: "number", required: false, default: 2.0, description: "sun-revision threshold [0.25, 15]" },
+    { name: "bounces", type: "integer", required: false, default: 2, description: "multi-bounce gather iterations [1, 8]" },
+    { name: "skylight", type: "array[3]", required: false, default: [0.05, 0.07, 0.10], description: "shadowed ambient RGB term" },
+    { name: "max_distance", type: "number", required: false, default: 128.0, description: "form-factor cull distance > 0" },
+    { name: "intensity", type: "number", required: false, default: 1.0, description: "global scale on gathered light [0.01, 64]" }
+  ],
+  ocean: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "size", type: "integer", required: false, default: 64, description: "tile size per axis (power of two) [16, 1024]" },
+    { name: "tile_size_meters", type: "number", required: false, default: 256.0, description: "world size of the tile [16, 8192]" },
+    { name: "wind_speed", type: "number", required: false, default: 18.0, description: "wind speed m/s [0.5, 40]" },
+    { name: "wind_dir_rad", type: "number", required: false, default: 0.7, description: "main wave direction (radians), finite" },
+    { name: "choppiness", type: "number", required: false, default: 1.2, description: "horizontal displacement scale [0, 4]" },
+    { name: "amplitude", type: "number", required: false, default: 0.9, description: "spectrum amplitude scale [0.01, 8]" },
+    { name: "seed", type: "integer", required: false, default: 1, description: "deterministic phase seed" }
+  ],
+  post_process: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "operator", type: "enum", values: [...TONE_OPERATORS], required: false, default: "aces", description: "tone mapping operator (IToneMapping.ToneOperator)" },
+    { name: "exposure", type: "number", required: false, default: 1.0, description: "manual exposure multiplier [0.01, 64]" },
+    { name: "use_ev", type: "boolean", required: false, default: false, description: "when true, EV-based exposure overrides manual" },
+    { name: "ev100", type: "number", required: false, default: 0.0, description: "EV value [-16, 16] -> 1/(1.2 * 2^EV)" },
+    { name: "white_point", type: "number", required: false, default: 11.2, description: "Filmic white point [1, 64]" },
+    { name: "sharpness", type: "number", required: false, default: 0.4, description: "CAS sharpness [0, 1]" },
+    { name: "clamp_values", type: "boolean", required: false, default: true, description: "CAS contrast clamp (anti-ringing)" },
+    { name: "quality", type: "enum", values: [...QUALITY_LEVELS], required: false, default: "high", description: "rendering quality preset (IRenderingPresets)" }
+  ],
+  fluid_sim: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "grid_size", type: "integer", required: false, default: 64, description: "NxN heightfield, > 0" },
+    { name: "cell_size", type: "number", required: false, default: 1.0, description: "world units per cell, > 0" },
+    { name: "gravity", type: "number", required: false, default: 9.81, description: "> 0" },
+    { name: "dt", type: "number", required: false, default: 0.0166667, description: "time step, > 0" },
+    { name: "solver_iterations", type: "integer", required: false, default: 4, description: "Jacobi iterations per step, > 0" },
+    { name: "damping", type: "number", required: false, default: 0.999, description: "velocity damping [0, 1]" },
+    { name: "viscosity", type: "number", required: false, default: 0.001, description: "viscosity coefficient >= 0" },
+    { name: "surface_tension", type: "number", required: false, default: 0.0, description: "surface tension coefficient >= 0" }
+  ],
+  world: [
+    { name: "name", type: "string", required: true, description: "unique world name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "seed", type: "integer", required: false, default: 0, description: "per-world generator/behavior RNG seed" },
+    { name: "rules_json", type: "string", required: false, default: "", description: "optional opaque rules document (must be well-formed JSON when non-empty)" },
+    { name: "profile", type: "string", required: false, default: "", description: "name of a world profile asset in Content/Profiles (WorldSpec.profileJson)" },
+    { name: "save_path", type: "string", required: false, default: "", description: "default persistence location for load_world/save_world" },
+    { name: "portals", type: "array[object]", required: false, default: [], description: "[{ from_world, from: [x,y,z], to_world, to: [x,y,z], yaw_degrees }]" }
+  ],
+  chunk: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "chunk_budget", type: "integer", required: false, default: 16, description: "streaming budget (chunk radius), >= 0" },
+    { name: "memory_budget_bytes", type: "integer", required: false, default: 0, description: "RAM-budgeted chunk cache bytes; 0 = unlimited" },
+    { name: "far_lod_percent", type: "integer", required: false, default: 0, description: "far-LOD endpoint 0..100" },
+    { name: "worker_threads", type: "integer", required: false, default: 0, description: "world worker pool size; 0 = unknown/auto" }
+  ],
+  transaction: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "max_edits", type: "integer", required: false, default: 0, description: "per-transaction edit cap; 0 = unlimited" },
+    { name: "max_box_volume", type: "integer", required: false, default: 0, description: "bounding-box volume cap; 0 = unlimited" },
+    { name: "edits", type: "array[object]", required: true, description: "[{ position: [x,y,z] (integers), block_id (uint, 0 = Air) }]" }
+  ],
+  block_entity: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "type_id", type: "string", required: true, description: "stable namespaced type id, e.g. 'project:furnace'" },
+    { name: "data_version", type: "integer", required: false, default: 1, description: "project-owned data version >= 1" },
+    { name: "script_id", type: "string", required: false, default: "", description: "optional project-owned script id (e.g. 'project:door_open')" },
+    { name: "components", type: "array[object]", required: false, default: [], description: "[{ type: inventory|script|custom, version, blob (opaque payload string) }]" }
+  ],
+  inventory: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "slots", type: "array", required: true, description: "slot contents: [{ item (namespaced id), count, damage, data } | null]" },
+    { name: "filters", type: "array[object]", required: false, default: [], description: "[{ slot (int), allow_items: [ns ids], allow_tags: [tag], allow_any }]" }
+  ]
+});
+
 // Compact field contracts surfaced by game_capabilities so an agent can author
 // a vehicle assembly without reading the engine source. Single source for the
 // exported JSON Schema (buildVehicleJsonSchema) and the author tool.
@@ -934,6 +1084,649 @@ export function buildParticleJsonSchema(kind) {
   };
 }
 
+// JSON Schema (draft-07) for one CONFIG kind (shader/render_graph/light/gi/
+// ocean/post_process/fluid_sim/world/chunk/transaction/block_entity/
+// inventory), generated from the SAME CONFIG_FIELD_SCHEMAS contracts the
+// author tools mirror against — a single source of truth so the exported
+// schema can never drift from what the mirror validation accepts (the same
+// pattern as the registry/vehicle/ability/... builders).
+export function buildConfigJsonSchema(kind) {
+  const fields = CONFIG_FIELD_SCHEMAS[kind];
+  if (!fields) throw new Error(`unsupported config kind '${kind}'`);
+  const properties = {};
+  const required = [];
+  for (const field of fields) {
+    let schema = { description: field.description ?? `"${field.name}" config field` };
+    if (field.default !== undefined) schema.default = field.default;
+    switch (field.type) {
+      case "string": schema.type = "string"; break;
+      case "boolean": schema.type = "boolean"; break;
+      case "number": schema.type = "number"; break;
+      case "integer": schema.type = "integer"; break;
+      case "enum": schema.enum = [...field.values]; break;
+      case "object": schema.type = "object"; break;
+      case "array": schema.type = "array"; break;
+      case "array[object]": schema.type = "array"; schema.items = { type: "object" }; break;
+      case "array[string]": schema.type = "array"; schema.items = { type: "string" }; break;
+      case "array[3]": schema.type = "array"; schema.minItems = 3; schema.maxItems = 3; schema.items = { type: "number" }; break;
+      default: throw new Error(`unknown config field type '${field.type}' in ${kind} schema`);
+    }
+    properties[field.name] = schema;
+    if (field.required) required.push(field.name);
+  }
+  return {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    $id: `https://vulkancraft.engine/schema/config/${kind}.json`,
+    title: `${kind} config asset`,
+    type: "object",
+    additionalProperties: true,
+    properties,
+    ...(required.length > 0 ? { required } : {})
+  };
+}
+
+// ─── CONFIG asset document builders ─────────────────────────────────────────
+// Each builder mirrors the public C++ contract's JSON surface; snake_case
+// authoring args map to the C++ camelCase document keys exactly as the
+// factories parse them (all-or-nothing, never clamped).
+function buildConfigDocument(kind, args) {
+  const name = String(args.name ?? "");
+  const num = (value, fallback) => (value === undefined || value === null ? fallback : Number(value));
+  const int = (value, fallback) => (value === undefined || value === null ? fallback : Math.trunc(Number(value)));
+  const bool = (value, fallback) => (value === undefined || value === null ? fallback : Boolean(value));
+  const arr3 = (value, fallback) => (value === undefined || value === null ? [...fallback] : (Array.isArray(value) ? value.map(Number) : []));
+  const doc = { name, version: int(args.version, 1) };
+  switch (kind) {
+    case "shader": {
+      doc.stage = String(args.stage ?? "fragment");
+      doc.source = String(args.source ?? "");
+      doc.targetEnv = String(args.target_env ?? "");
+      doc.optLevel = int(args.opt_level, 0);
+      doc.defines = Array.isArray(args.defines) ? args.defines.map(String) : [];
+      break;
+    }
+    case "render_graph": {
+      doc.resources = Array.isArray(args.resources) ? args.resources.map((r) => ({
+        name: String(r.name ?? ""),
+        kind: String(r.kind ?? "image"),
+        byteSize: num(r.byte_size, 0),
+        width: int(r.width, 1),
+        height: int(r.height, 1),
+        depth: int(r.depth, 1),
+        transient: bool(r.transient, true),
+        imported: bool(r.imported, false),
+        initialState: String(r.initial_state ?? "undefined")
+      })) : [];
+      doc.passes = Array.isArray(args.passes) ? args.passes.map((p) => ({
+        name: String(p.name ?? ""),
+        queue: String(p.queue ?? "graphics"),
+        enabled: bool(p.enabled, true),
+        resources: Array.isArray(p.resources) ? p.resources.map((ra) => ({
+          resource: String(ra.resource ?? ""),
+          access: String(ra.access ?? "read"),
+          state: String(ra.state ?? "shader_read")
+        })) : []
+      })) : [];
+      doc.dependencies = Array.isArray(args.dependencies) ? args.dependencies.map((d) => ({
+        before: String(d.before ?? ""),
+        after: String(d.after ?? "")
+      })) : [];
+      break;
+    }
+    case "light": {
+      doc.type = String(args.type ?? "directional");
+      doc.color = arr3(args.color, [1, 1, 1]);
+      doc.intensity = num(args.intensity, 1000);
+      doc.range = num(args.range, 50);
+      doc.castShadows = bool(args.cast_shadows, true);
+      break;
+    }
+    case "gi": {
+      doc.cascadeCount = int(args.cascade_count, 6);
+      doc.resolution = int(args.resolution, 16);
+      doc.probesPerFrame = int(args.probes_per_frame, 192);
+      doc.baseSpacing = num(args.base_spacing, 4.0);
+      doc.cascadeScale = num(args.cascade_scale, 4.0);
+      doc.sunRefreshAngleDegrees = num(args.sun_refresh_angle_degrees, 2.0);
+      doc.bounces = int(args.bounces, 2);
+      doc.skylight = arr3(args.skylight, [0.05, 0.07, 0.10]);
+      doc.maxDistance = num(args.max_distance, 128.0);
+      doc.intensity = num(args.intensity, 1.0);
+      break;
+    }
+    case "ocean": {
+      doc.size = int(args.size, 64);
+      doc.tileSizeMeters = num(args.tile_size_meters, 256.0);
+      doc.windSpeed = num(args.wind_speed, 18.0);
+      doc.windDirRad = num(args.wind_dir_rad, 0.7);
+      doc.choppiness = num(args.choppiness, 1.2);
+      doc.amplitude = num(args.amplitude, 0.9);
+      doc.seed = int(args.seed, 1);
+      break;
+    }
+    case "post_process": {
+      doc.operator = String(args.operator ?? "aces");
+      doc.exposure = num(args.exposure, 1.0);
+      doc.useEV = bool(args.use_ev, false);
+      doc.ev100 = num(args.ev100, 0.0);
+      doc.whitePoint = num(args.white_point, 11.2);
+      doc.sharpness = num(args.sharpness, 0.4);
+      doc.clampValues = bool(args.clamp_values, true);
+      doc.quality = String(args.quality ?? "high");
+      break;
+    }
+    case "fluid_sim": {
+      doc.gridSize = int(args.grid_size, 64);
+      doc.cellSize = num(args.cell_size, 1.0);
+      doc.gravity = num(args.gravity, 9.81);
+      doc.dt = num(args.dt, 1 / 60);
+      doc.solverIterations = int(args.solver_iterations, 4);
+      doc.damping = num(args.damping, 0.999);
+      doc.viscosity = num(args.viscosity, 0.001);
+      doc.surfaceTension = num(args.surface_tension, 0.0);
+      break;
+    }
+    case "world": {
+      doc.seed = int(args.seed, 0);
+      doc.rulesJson = String(args.rules_json ?? "");
+      doc.profile = String(args.profile ?? "");
+      doc.savePath = String(args.save_path ?? "");
+      doc.portals = Array.isArray(args.portals) ? args.portals.map((p) => ({
+        fromWorld: String(p.from_world ?? ""),
+        from: Array.isArray(p.from) ? p.from.map(Number) : [],
+        toWorld: String(p.to_world ?? ""),
+        to: Array.isArray(p.to) ? p.to.map(Number) : [],
+        yawDegrees: num(p.yaw_degrees, 0.0)
+      })) : [];
+      break;
+    }
+    case "chunk": {
+      doc.chunkBudget = int(args.chunk_budget, 16);
+      doc.memoryBudgetBytes = int(args.memory_budget_bytes, 0);
+      doc.farLodPercent = int(args.far_lod_percent, 0);
+      doc.workerThreads = int(args.worker_threads, 0);
+      break;
+    }
+    case "transaction": {
+      doc.maxEdits = int(args.max_edits, 0);
+      doc.maxBoxVolume = int(args.max_box_volume, 0);
+      doc.edits = Array.isArray(args.edits) ? args.edits.map((e) => {
+        const position = Array.isArray(e.position) ? e.position.map(Number) : [];
+        return { position, blockId: int(e.block_id, 0) };
+      }) : [];
+      break;
+    }
+    case "block_entity": {
+      doc.typeId = String(args.type_id ?? "");
+      doc.dataVersion = int(args.data_version, 1);
+      doc.scriptId = String(args.script_id ?? "");
+      doc.components = Array.isArray(args.components) ? args.components.map((c) => ({
+        type: String(c.type ?? "custom"),
+        version: int(c.version, 1),
+        blob: String(c.blob ?? "")
+      })) : [];
+      break;
+    }
+    case "inventory": {
+      doc.slots = Array.isArray(args.slots) ? args.slots.map((slot) => (slot === null ? null : {
+        item: String(slot.item ?? ""),
+        count: int(slot.count, 1),
+        damage: int(slot.damage, 0),
+        data: String(slot.data ?? "")
+      })) : [];
+      doc.filters = Array.isArray(args.filters) ? args.filters.map((f) => ({
+        slot: int(f.slot, 0),
+        allowItems: Array.isArray(f.allow_items) ? f.allow_items.map(String) : [],
+        allowTags: Array.isArray(f.allow_tags) ? f.allow_tags.map(String) : [],
+        allowAny: bool(f.allow_any, false)
+      })) : [];
+      break;
+    }
+    default:
+      throw new Error(`unsupported config kind '${kind}'`);
+  }
+  return doc;
+}
+
+// ─── CONFIG asset validators (all-or-nothing, mirroring the C++ ranges) ────
+function finiteNum(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isPow2(value) {
+  return value > 0 && (value & (value - 1)) === 0;
+}
+
+export function validateConfigDocument(kind, document) {
+  const errors = [];
+  const fail = (message) => errors.push(`${kind} asset ${message}`);
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
+    return { valid: false, errors: ["config asset must be a JSON object"] };
+  }
+  if (!CONFIG_KINDS.includes(kind)) return { valid: false, errors: [`unsupported config kind '${kind}'`] };
+  if (document.version !== undefined && document.version !== 1) fail("'version' must be 1");
+  if (typeof document.name !== "string" || !document.name) fail("'name' is required");
+
+  // The C++ contracts apply DOCUMENTED DEFAULTS before validating (the same
+  // pattern as GaitAsset::load_from_json): an omitted optional field takes its
+  // default and is never treated as missing/NaN.
+  const stage = document.stage ?? "fragment";
+  const targetEnv = document.targetEnv ?? "";
+  const optLevel = document.optLevel ?? 0;
+  const defines = document.defines ?? [];
+  const type = document.type ?? "directional";
+  const color = document.color ?? [1, 1, 1];
+  const intensity = document.intensity ?? 1000;
+  const range = document.range ?? 50;
+  const cascadeCount = document.cascadeCount ?? 6;
+  const resolution = document.resolution ?? 16;
+  const probesPerFrame = document.probesPerFrame ?? 192;
+  const baseSpacing = document.baseSpacing ?? 4.0;
+  const cascadeScale = document.cascadeScale ?? 4.0;
+  const sunRefreshAngleDegrees = document.sunRefreshAngleDegrees ?? 2.0;
+  const bounces = document.bounces ?? 2;
+  const skylight = document.skylight ?? [0.05, 0.07, 0.10];
+  const maxDistance = document.maxDistance ?? 128.0;
+  const giIntensity = document.intensity ?? 1.0;
+  const size = document.size ?? 64;
+  const tileSizeMeters = document.tileSizeMeters ?? 256.0;
+  const windSpeed = document.windSpeed ?? 18.0;
+  const windDirRad = document.windDirRad ?? 0.7;
+  const choppiness = document.choppiness ?? 1.2;
+  const amplitude = document.amplitude ?? 0.9;
+  const seed = document.seed ?? 1;
+  const operator = document.operator ?? "aces";
+  const exposure = document.exposure ?? 1.0;
+  const ev100 = document.ev100 ?? 0.0;
+  const whitePoint = document.whitePoint ?? 11.2;
+  const sharpness = document.sharpness ?? 0.4;
+  const quality = document.quality ?? "high";
+  const gridSize = document.gridSize ?? 64;
+  const cellSize = document.cellSize ?? 1.0;
+  const gravity = document.gravity ?? 9.81;
+  const dt = document.dt ?? 1 / 60;
+  const solverIterations = document.solverIterations ?? 4;
+  const damping = document.damping ?? 0.999;
+  const viscosity = document.viscosity ?? 0.001;
+  const surfaceTension = document.surfaceTension ?? 0.0;
+  const chunkBudget = document.chunkBudget ?? 16;
+  const memoryBudgetBytes = document.memoryBudgetBytes ?? 0;
+  const farLodPercent = document.farLodPercent ?? 0;
+  const workerThreads = document.workerThreads ?? 0;
+  const maxEdits = document.maxEdits ?? 0;
+  const maxBoxVolume = document.maxBoxVolume ?? 0;
+  const dataVersion = document.dataVersion ?? 1;
+  const scriptId = document.scriptId ?? "";
+  const components = document.components ?? [];
+  const filters = document.filters ?? [];
+  const portals = document.portals ?? [];
+
+  switch (kind) {
+    case "shader": {
+      if (!SHADER_STAGES.includes(stage)) fail(`'stage' must be one of ${SHADER_STAGES.join(", ")}`);
+      if (typeof document.source !== "string" || !document.source.trim()) fail("'source' GLSL text is required");
+      if (typeof targetEnv !== "string") fail("'targetEnv' must be a string");
+      if (!Number.isInteger(optLevel) || optLevel < 0 || optLevel > 2) fail("'optLevel' must be 0, 1 or 2");
+      if (!Array.isArray(defines) || !defines.every((d) => typeof d === "string")) fail("'defines' must be an array of strings");
+      break;
+    }
+    case "render_graph": {
+      const resourceNames = new Set();
+      if (!Array.isArray(document.resources) || document.resources.length === 0) {
+        fail("'resources' must be a non-empty array");
+        return { valid: errors.length === 0, errors };
+      }
+      document.resources.forEach((resource, index) => {
+        const where = `resource ${index}`;
+        if (!resource || typeof resource !== "object" || Array.isArray(resource)) return fail(`${where} must be an object`);
+        if (typeof resource.name !== "string" || !resource.name) return fail(`${where} 'name' must not be empty`);
+        if (resourceNames.has(resource.name)) return fail(`${where} 'name' '${resource.name}' is duplicated`);
+        resourceNames.add(resource.name);
+        if (!RESOURCE_KINDS.includes(resource.kind)) fail(`${where} 'kind' must be buffer or image`);
+        if (!RESOURCE_STATES.includes(resource.initialState)) fail(`${where} 'initialState' is unknown`);
+        ["width", "height", "depth"].forEach((dim) => {
+          if (!Number.isInteger(resource[dim]) || resource[dim] < 1) fail(`${where} '${dim}' must be an integer >= 1`);
+        });
+        if (!finiteNum(resource.byteSize) || resource.byteSize < 0) fail(`${where} 'byteSize' must be finite and >= 0`);
+      });
+      const passNames = new Set();
+      if (!Array.isArray(document.passes) || document.passes.length === 0) {
+        fail("'passes' must be a non-empty array");
+        return { valid: errors.length === 0, errors };
+      }
+      document.passes.forEach((pass, index) => {
+        const where = `pass ${index}`;
+        if (!pass || typeof pass !== "object" || Array.isArray(pass)) return fail(`${where} must be an object`);
+        if (typeof pass.name !== "string" || !pass.name) return fail(`${where} 'name' must not be empty`);
+        if (passNames.has(pass.name)) return fail(`${where} 'name' '${pass.name}' is duplicated`);
+        passNames.add(pass.name);
+        if (!RENDER_QUEUES.includes(pass.queue)) fail(`${where} 'queue' must be graphics/compute/transfer`);
+        if (!Array.isArray(pass.resources)) fail(`${where} 'resources' must be an array`);
+        else pass.resources.forEach((access, ai) => {
+          if (!access || typeof access !== "object") return fail(`${where} resource[${ai}] must be an object`);
+          if (!resourceNames.has(access.resource)) return fail(`${where} resource[${ai}] references unknown resource '${access.resource}'`);
+          if (!RENDER_ACCESS.includes(access.access)) fail(`${where} resource[${ai}] 'access' must be read/write/readwrite`);
+          if (!RESOURCE_STATES.includes(access.state)) fail(`${where} resource[${ai}] 'state' is unknown`);
+        });
+      });
+      if (!Array.isArray(document.dependencies)) fail("'dependencies' must be an array");
+      else document.dependencies.forEach((dep, index) => {
+        const where = `dependency ${index}`;
+        if (!dep || typeof dep !== "object") return fail(`${where} must be an object`);
+        if (!passNames.has(dep.before)) return fail(`${where} references unknown pass '${dep.before}'`);
+        if (!passNames.has(dep.after)) return fail(`${where} references unknown pass '${dep.after}'`);
+        if (dep.before === dep.after) return fail(`${where} cannot depend on itself`);
+      });
+      // Cycle check (topological) — mirrors IRenderGraph::compile erroring on
+      // a cyclic graph instead of hanging.
+      const adjacency = new Map([...passNames].map((name) => [name, []]));
+      for (const dep of document.dependencies) adjacency.get(dep.before).push(dep.after);
+      const visiting = new Set();
+      const visited = new Set();
+      const visit = (name) => {
+        if (visiting.has(name)) return false;  // cycle
+        if (visited.has(name)) return true;
+        visiting.add(name);
+        for (const next of adjacency.get(name) ?? []) {
+          if (!visit(next)) return false;
+        }
+        visiting.delete(name);
+        visited.add(name);
+        return true;
+      };
+      for (const name of passNames) if (!visit(name)) { fail("'dependencies' form a cycle"); break; }
+      break;
+    }
+    case "light": {
+      if (!LIGHT_TYPE_NAMES.includes(type)) fail(`'type' must be one of ${LIGHT_TYPE_NAMES.join(", ")}`);
+      if (!Array.isArray(color) || color.length !== 3 || !color.every((v) => finiteNum(v) && v >= 0 && v <= 1)) {
+        fail("'color' must be [r, g, b] with each in 0..1");
+      }
+      if (!finiteNum(intensity) || intensity <= 0) fail("'intensity' must be finite and > 0");
+      if (!finiteNum(range) || range < 0) fail("'range' must be finite and >= 0");
+      break;
+    }
+    case "gi": {
+      const checks = [
+        ["cascadeCount", Number.isInteger(cascadeCount) && cascadeCount >= 1 && cascadeCount <= 6],
+        ["resolution", Number.isInteger(resolution) && resolution >= 4 && resolution <= 32],
+        ["probesPerFrame", Number.isInteger(probesPerFrame) && probesPerFrame >= 1],
+        ["baseSpacing", finiteNum(baseSpacing) && baseSpacing >= 0.5],
+        ["cascadeScale", finiteNum(cascadeScale) && cascadeScale >= 2],
+        ["sunRefreshAngleDegrees", finiteNum(sunRefreshAngleDegrees) && sunRefreshAngleDegrees >= 0.25 && sunRefreshAngleDegrees <= 15],
+        ["bounces", Number.isInteger(bounces) && bounces >= 1 && bounces <= 8],
+        ["maxDistance", finiteNum(maxDistance) && maxDistance > 0],
+        ["intensity", finiteNum(giIntensity) && giIntensity >= 0.01 && giIntensity <= 64]
+      ];
+      for (const [field, ok] of checks) if (!ok) fail(`'${field}' is out of the contract range`);
+      if (!Array.isArray(skylight) || skylight.length !== 3 || !skylight.every(finiteNum)) {
+        fail("'skylight' must be [r, g, b] of finite numbers");
+      }
+      break;
+    }
+    case "ocean": {
+      if (!Number.isInteger(size) || !isPow2(size) || size < 16 || size > 1024) {
+        fail("'size' must be a power of two in [16, 1024]");
+      }
+      const checks = [
+        ["tileSizeMeters", finiteNum(tileSizeMeters) && tileSizeMeters >= 16 && tileSizeMeters <= 8192],
+        ["windSpeed", finiteNum(windSpeed) && windSpeed >= 0.5 && windSpeed <= 40],
+        ["windDirRad", finiteNum(windDirRad)],
+        ["choppiness", finiteNum(choppiness) && choppiness >= 0 && choppiness <= 4],
+        ["amplitude", finiteNum(amplitude) && amplitude >= 0.01 && amplitude <= 8]
+      ];
+      for (const [field, ok] of checks) if (!ok) fail(`'${field}' is out of the contract range`);
+      if (!Number.isInteger(seed) || seed < 0) fail("'seed' must be a non-negative integer");
+      break;
+    }
+    case "post_process": {
+      if (!TONE_OPERATORS.includes(operator)) fail(`'operator' must be one of ${TONE_OPERATORS.join(", ")}`);
+      if (!QUALITY_LEVELS.includes(quality)) fail(`'quality' must be one of ${QUALITY_LEVELS.join(", ")}`);
+      const checks = [
+        ["exposure", finiteNum(exposure) && exposure >= 0.01 && exposure <= 64],
+        ["ev100", finiteNum(ev100) && ev100 >= -16 && ev100 <= 16],
+        ["whitePoint", finiteNum(whitePoint) && whitePoint >= 1 && whitePoint <= 64],
+        ["sharpness", finiteNum(sharpness) && sharpness >= 0 && sharpness <= 1]
+      ];
+      for (const [field, ok] of checks) if (!ok) fail(`'${field}' is out of the contract range`);
+      break;
+    }
+    case "fluid_sim": {
+      const checks = [
+        ["gridSize", Number.isInteger(gridSize) && gridSize > 0],
+        ["cellSize", finiteNum(cellSize) && cellSize > 0],
+        ["gravity", finiteNum(gravity) && gravity > 0],
+        ["dt", finiteNum(dt) && dt > 0],
+        ["solverIterations", Number.isInteger(solverIterations) && solverIterations > 0],
+        ["damping", finiteNum(damping) && damping >= 0 && damping <= 1],
+        ["viscosity", finiteNum(viscosity) && viscosity >= 0],
+        ["surfaceTension", finiteNum(surfaceTension) && surfaceTension >= 0]
+      ];
+      for (const [field, ok] of checks) if (!ok) fail(`'${field}' is out of the contract range`);
+      break;
+    }
+    case "world": {
+      const worldSeed = document.seed ?? 0;
+      const rulesJson = document.rulesJson ?? "";
+      const profile = document.profile ?? "";
+      if (!Number.isInteger(worldSeed) || worldSeed < 0) fail("'seed' must be a non-negative integer");
+      if (typeof rulesJson !== "string") fail("'rulesJson' must be a string");
+      if (rulesJson.trim()) {
+        try { JSON.parse(rulesJson); } catch { fail("'rulesJson' must be well-formed JSON when non-empty"); }
+      }
+      if (typeof profile !== "string" || !profile) fail("'profile' must name a world profile asset in Content/Profiles");
+      if (!Array.isArray(portals)) fail("'portals' must be an array");
+      else portals.forEach((portal, index) => {
+        const where = `portal ${index}`;
+        if (!portal || typeof portal !== "object") return fail(`${where} must be an object`);
+        if (typeof portal.fromWorld !== "string" || !portal.fromWorld) return fail(`${where} 'fromWorld' must not be empty`);
+        if (typeof portal.toWorld !== "string" || !portal.toWorld) return fail(`${where} 'toWorld' must not be empty`);
+        for (const axis of ["from", "to"]) {
+          if (!Array.isArray(portal[axis]) || portal[axis].length !== 3 || !portal[axis].every(finiteNum)) {
+            fail(`${where} '${axis}' must be [x, y, z] of finite numbers`);
+          }
+        }
+        if (!finiteNum(portal.yawDegrees)) fail(`${where} 'yawDegrees' must be finite`);
+      });
+      break;
+    }
+    case "chunk": {
+      const checks = [
+        ["chunkBudget", Number.isInteger(chunkBudget) && chunkBudget >= 0],
+        ["memoryBudgetBytes", Number.isInteger(memoryBudgetBytes) && memoryBudgetBytes >= 0],
+        ["farLodPercent", Number.isInteger(farLodPercent) && farLodPercent >= 0 && farLodPercent <= 100],
+        ["workerThreads", Number.isInteger(workerThreads) && workerThreads >= 0]
+      ];
+      for (const [field, ok] of checks) if (!ok) fail(`'${field}' is out of the contract range`);
+      break;
+    }
+    case "transaction": {
+      const edits = document.edits ?? [];
+      if (!Number.isInteger(maxEdits) || maxEdits < 0) fail("'maxEdits' must be a non-negative integer");
+      if (!Number.isInteger(maxBoxVolume) || maxBoxVolume < 0) fail("'maxBoxVolume' must be a non-negative integer");
+      if (!Array.isArray(edits) || edits.length === 0) {
+        fail("'edits' must be a non-empty array");
+        return { valid: errors.length === 0, errors };
+      }
+      if (maxEdits > 0 && edits.length > maxEdits) {
+        fail(`edit count ${edits.length} exceeds maxEdits ${maxEdits}`);
+      }
+      let minX = Infinity; let maxX = -Infinity; let minY = Infinity; let maxY = -Infinity; let minZ = Infinity; let maxZ = -Infinity;
+      edits.forEach((edit, index) => {
+        const where = `edit ${index}`;
+        if (!edit || typeof edit !== "object") return fail(`${where} must be an object`);
+        if (!Array.isArray(edit.position) || edit.position.length !== 3 || !edit.position.every((v) => Number.isInteger(v))) {
+          return fail(`${where} 'position' must be [x, y, z] of integers`);
+        }
+        if (!Number.isInteger(edit.blockId) || edit.blockId < 0) fail(`${where} 'blockId' must be a non-negative integer (0 = Air)`);
+        const [x, y, z] = edit.position;
+        minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+        minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+      });
+      if (maxBoxVolume > 0) {
+        const volume = (maxX - minX + 1) * (maxY - minY + 1) * (maxZ - minZ + 1);
+        if (volume > maxBoxVolume) fail(`bounding-box volume ${volume} exceeds maxBoxVolume ${maxBoxVolume}`);
+      }
+      break;
+    }
+    case "block_entity": {
+      if (typeof document.typeId !== "string" || !document.typeId.includes(":")) fail("'typeId' must be a namespaced id (ns:name)");
+      if (!Number.isInteger(dataVersion) || dataVersion < 1) fail("'dataVersion' must be an integer >= 1");
+      if (typeof scriptId !== "string") fail("'scriptId' must be a string");
+      if (!Array.isArray(components)) fail("'components' must be an array");
+      else components.forEach((component, index) => {
+        const where = `component ${index}`;
+        if (!component || typeof component !== "object") return fail(`${where} must be an object`);
+        if (!BLOCK_ENTITY_COMPONENT_TYPES.includes(component.type)) fail(`${where} 'type' must be inventory/script/custom`);
+        if (!Number.isInteger(component.version) || component.version < 1) fail(`${where} 'version' must be an integer >= 1`);
+        if (typeof component.blob !== "string") fail(`${where} 'blob' must be a string`);
+      });
+      break;
+    }
+    case "inventory": {
+      const slots = document.slots ?? [];
+      if (!Array.isArray(slots)) fail("'slots' must be an array");
+      else slots.forEach((slot, index) => {
+        const where = `slot ${index}`;
+        if (slot === null) return;
+        if (!slot || typeof slot !== "object") return fail(`${where} must be an object or null`);
+        if (typeof slot.item !== "string" || !slot.item.includes(":")) fail(`${where} 'item' must be a namespaced id (ns:name)`);
+        if (!Number.isInteger(slot.count) || slot.count < 0) fail(`${where} 'count' must be a non-negative integer`);
+        if (!Number.isInteger(slot.damage) || slot.damage < 0) fail(`${where} 'damage' must be a non-negative integer`);
+        if (typeof slot.data !== "string") fail(`${where} 'data' must be a string`);
+      });
+      if (!Array.isArray(filters)) fail("'filters' must be an array");
+      else filters.forEach((filter, index) => {
+        const where = `filter ${index}`;
+        if (!filter || typeof filter !== "object") return fail(`${where} must be an object`);
+        if (!Number.isInteger(filter.slot) || filter.slot < 0 || filter.slot >= slots.length) {
+          fail(`${where} 'slot' must be a valid slot index (0..${slots.length - 1})`);
+        }
+        if (!Array.isArray(filter.allowItems) || !filter.allowItems.every((id) => typeof id === "string")) fail(`${where} 'allowItems' must be an array of strings`);
+        if (!Array.isArray(filter.allowTags) || !filter.allowTags.every((tag) => typeof tag === "string")) fail(`${where} 'allowTags' must be an array of strings`);
+      });
+      break;
+    }
+    default:
+      return { valid: false, errors: [`unsupported config kind '${kind}'`] };
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+// ─── CONFIG asset read/inspect/author (mirrors the other author_* tools) ────
+function configDir(project, kind) {
+  const dirs = {
+    shader: project.shaders, render_graph: project.renderGraphs, light: project.lights,
+    gi: project.gi, ocean: project.ocean, post_process: project.postProcess,
+    fluid_sim: project.fluidSims, world: project.worlds, chunk: project.chunks,
+    transaction: project.transactions, block_entity: project.blockEntities,
+    inventory: project.inventories
+  };
+  return dirs[kind];
+}
+
+function readConfigAssets(project, kind) {
+  const directory = configDir(project, kind);
+  const assets = [];
+  if (!fs.existsSync(directory)) return assets;
+  for (const fileName of fs.readdirSync(directory).filter((file) => file.endsWith(".json")).sort()) {
+    const file = path.join(directory, fileName);
+    const baseName = fileName.replace(/\.json$/, "");
+    let document = null;
+    const diagnostics = [];
+    try {
+      document = readJson(file);
+    } catch (error) {
+      diagnostics.push(`malformed JSON: ${error.message}`);
+    }
+    if (document && typeof document === "object" && !Array.isArray(document)) {
+      diagnostics.push(...validateConfigDocument(kind, document).errors);
+    } else if (document) {
+      diagnostics.push("config asset must be a JSON object");
+    }
+    assets.push({
+      kind,
+      name: baseName,
+      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      document,
+      valid: diagnostics.length === 0,
+      diagnostics
+    });
+  }
+  return assets;
+}
+
+// Result key per config kind — matches the inspect_* tool names so the JSON
+// is predictable for consumers (inspect_gi_configs -> gi_configs, ...).
+const CONFIG_INSPECT_KEYS = Object.freeze({
+  shader: "shaders", render_graph: "render_graphs", light: "lights", gi: "gi_configs",
+  ocean: "ocean_configs", post_process: "post_processings", fluid_sim: "fluid_simulations",
+  world: "worlds", chunk: "chunk_configs", transaction: "block_transactions",
+  block_entity: "block_entities", inventory: "inventories"
+});
+
+function inspectConfigAssets(engineRoot, projectName, kind) {
+  const project = requireProject(engineRoot, projectName);
+  const assets = readConfigAssets(project, kind);
+  const key = CONFIG_INSPECT_KEYS[kind] ?? `${kind}s`;
+  return { project: project.project, [key]: assets, count: assets.length };
+}
+
+function configDiff(previous, document) {
+  const keys = new Set([...Object.keys(previous), ...Object.keys(document)]);
+  const changed = [...keys].filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(document[key])).sort();
+  return { changed_fields: changed };
+}
+
+function authorConfigAsset(engineRoot, args, kind) {
+  const project = requireProject(engineRoot, args.project);
+  if (!CONFIG_KINDS.includes(kind)) throw new Error(`unsupported config kind '${kind}' (supported: ${CONFIG_KINDS.join(", ")})`);
+  const name = assetName(args.name);
+  const document = buildConfigDocument(kind, args);
+  const validation = validateConfigDocument(kind, document);
+  if (!validation.valid) {
+    return {
+      refused: true,
+      project: project.project,
+      kind,
+      name,
+      diagnostics: validation.errors,
+      reason: `${kind} fails public-contract validation; nothing was written`
+    };
+  }
+  const file = path.join(configDir(project, kind), `${name}.json`);
+  const previous = fs.existsSync(file) ? readJson(file) : null;
+  const diff = previous ? configDiff(previous, document) : null;
+  const relative = path.relative(project.root, file).replaceAll(path.sep, "/");
+  if (args.dry_run) {
+    return {
+      dry_run: true,
+      would_write: relative,
+      project: project.project,
+      kind,
+      name,
+      document,
+      diagnostics: [],
+      diff
+    };
+  }
+  if (previous && !args.update) throw new Error(`${kind} '${name}' already exists (pass update: true to replace, or use dry_run to preview the diff)`);
+  atomicWriteJson(file, document);
+  return {
+    created: !previous,
+    updated: Boolean(previous),
+    project: project.project,
+    kind,
+    name,
+    path: relative,
+    sha256: sha256File(file),
+    diagnostics: [],
+    diff,
+    rollback: previous ? { document: previous, hint: "re-author with update: true and this document to restore" } : undefined
+  };
+}
+
 const PROJECT_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const PROFILE_NAMES = new Set(["Debug", "Development", "Shipping", "Server", "Editor"]);
 const PLATFORM_NAMES = new Set(["windows-x64", "linux-x64", "macos-universal", "dedicated-server"]);
@@ -1003,7 +1796,19 @@ function projectPaths(engineRoot, projectName) {
     animations: path.join(root, "Content", "Animations"),
     simulationLod: path.join(root, "Content", "SimulationLod"),
     prefabs: path.join(root, "Content", "Prefabs"),
-    particles: path.join(root, "Content", "Particles")
+    particles: path.join(root, "Content", "Particles"),
+    shaders: path.join(root, "Content", "Shaders"),
+    renderGraphs: path.join(root, "Content", "RenderGraphs"),
+    lights: path.join(root, "Content", "Lights"),
+    gi: path.join(root, "Content", "GI"),
+    ocean: path.join(root, "Content", "Ocean"),
+    postProcess: path.join(root, "Content", "PostProcess"),
+    fluidSims: path.join(root, "Content", "FluidSims"),
+    worlds: path.join(root, "Content", "Worlds"),
+    chunks: path.join(root, "Content", "Chunks"),
+    transactions: path.join(root, "Content", "Transactions"),
+    blockEntities: path.join(root, "Content", "BlockEntities"),
+    inventories: path.join(root, "Content", "Inventories")
   };
 }
 
@@ -1245,6 +2050,24 @@ function capabilityDocument() {
       dry_run: "create_particle_asset accepts dry_run: true to preview the document without writing.",
       rollback: "create_particle_asset with update: true replaces the asset and returns the previous document for rollback."
     },
+    // §4.4/§4.5 — rendering + voxel/world CONFIG assets (2026-08-28): the
+    // data surfaces the public C++ rendering/voxel contracts parse. Each
+    // document is a versioned JSON mirror of the C++ contract JSON surface
+    // (all-or-nothing; never clamped); game_capabilities surfaces the field
+    // contracts + generated draft-07 schemas (single source for export).
+    config_asset_kinds: CONFIG_KINDS.map((kind) => ({
+      kind,
+      file: `Content/${kindDirName(kind)}/<name>.json`,
+      fields: CONFIG_FIELD_SCHEMAS[kind]
+    })),
+    config_schemas: Object.fromEntries(
+      CONFIG_KINDS.map((kind) => [kind, buildConfigJsonSchema(kind)])
+    ),
+    config_validation: {
+      note: "Each config asset mirrors exactly the versioned JSON the public C++ contracts parse — IShaderCompiler (shader), IRenderGraph (render_graph), Light component (light), IGlobalIlluminationProvider/IDiffuseGlobalIllumination (gi), IFftOceanSurface (ocean), IToneMapping/ICasSharpening/IRenderingPresets (post_process), IFluidSimulation (fluid_sim), IWorldManager (world), IVoxelStreaming (chunk), IVoxelWorld (transaction), IVoxelBlockEntity (block_entity), engine/registry/Inventory.hpp (inventory). The MCP validates structure + ranges all-or-nothing; the runtime validates the same document again on load.",
+      dry_run: "Every author_*/create_* config tool accepts dry_run: true to validate and preview the document/diff without writing.",
+      rollback: "Updates return the previous document; re-authoring it with update: true restores the prior state."
+    },
     // Full JSON Schema (draft-07) per registry kind (FALTANTES item 10): the
     // editor/IDE, scripting and CI validate or auto-complete assets against
     // these; they are generated from REGISTRY_FIELD_SCHEMAS, the same
@@ -1259,6 +2082,17 @@ function capabilityDocument() {
     },
     engine_source_modification_required: false
   };
+}
+
+// Maps a config kind to its content directory name (for capability docs).
+function kindDirName(kind) {
+  const names = {
+    shader: "Shaders", render_graph: "RenderGraphs", light: "Lights", gi: "GI",
+    ocean: "Ocean", post_process: "PostProcess", fluid_sim: "FluidSims",
+    world: "Worlds", chunk: "Chunks", transaction: "Transactions",
+    block_entity: "BlockEntities", inventory: "Inventories"
+  };
+  return names[kind];
 }
 
 export function semanticToolDefinitions() {
@@ -2007,6 +2841,300 @@ export function semanticToolDefinitions() {
         type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
       }
     },
+    // §4.4/§4.5 — rendering + voxel/world CONFIG assets (2026-08-28). Each
+    // author tool mirrors the public C++ contract JSON surface (all-or-nothing)
+    // and accepts dry_run/update/rollback like every other author tool.
+    {
+      name: "create_shader_asset",
+      description: "Author a shader asset (Content/Shaders/<name>.json) mirroring IShaderCompiler.ShaderCompilerConfig: GLSL source, stage, target_env, opt_level, defines. Validates structure against the public contract; dry_run previews; update replaces and returns the previous document for rollback.",
+      inputSchema: {
+        type: "object", required: ["project", "name", "source"],
+        properties: {
+          project: { type: "string" }, name: { type: "string" },
+          source: { type: "string" },
+          stage: { type: "string", enum: [...SHADER_STAGES], default: "fragment" },
+          target_env: { type: "string", default: "" },
+          opt_level: { type: "integer", minimum: 0, maximum: 2, default: 0 },
+          defines: { type: "array", items: { type: "string" }, default: [] },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_shader_assets",
+      description: "List and validate every shader asset under Content/Shaders for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "author_render_graph",
+      description: "Author a render graph asset (Content/RenderGraphs/<name>.json) mirroring IRenderGraph: resources (name/kind/byte_size/width/height/depth/transient/imported/initial_state), passes (name/queue/enabled/resources with access+state), dependencies (before/after). Validates unique names, resource references and acyclicity (topological).",
+      inputSchema: {
+        type: "object", required: ["project", "name", "resources", "passes"],
+        properties: {
+          project: { type: "string" }, name: { type: "string" },
+          resources: { type: "array", items: { type: "object" } },
+          passes: { type: "array", items: { type: "object" } },
+          dependencies: { type: "array", items: { type: "object" }, default: [] },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_render_graphs",
+      description: "List and validate every render graph asset under Content/RenderGraphs for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "create_light_asset",
+      description: "Author a light asset (Content/Lights/<name>.json) mirroring the Light component schema + game_capabilities light types: type (directional/point/spot/area), color [r,g,b], intensity, range, cast_shadows.",
+      inputSchema: {
+        type: "object", required: ["project", "name"],
+        properties: {
+          project: { type: "string" }, name: { type: "string" },
+          type: { type: "string", enum: [...LIGHT_TYPE_NAMES], default: "directional" },
+          color: { type: "array", items: { type: "number" }, default: [1, 1, 1] },
+          intensity: { type: "number", default: 1000 },
+          range: { type: "number", default: 50 },
+          cast_shadows: { type: "boolean", default: true },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_light_assets",
+      description: "List and validate every light asset under Content/Lights for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "author_gi_config",
+      description: "Author a global-illumination config (Content/GI/<name>.json) mirroring GiClipmapConfig (IGlobalIlluminationProvider) + DiffuseGiConfig (IDiffuseGlobalIllumination): cascade_count/resolution/probes_per_frame/base_spacing/cascade_scale/sun_refresh_angle_degrees/bounces/skylight/max_distance/intensity.",
+      inputSchema: {
+        type: "object", required: ["project", "name"],
+        properties: {
+          project: { type: "string" }, name: { type: "string" },
+          cascade_count: { type: "integer", minimum: 1, maximum: 6, default: 6 },
+          resolution: { type: "integer", minimum: 4, maximum: 32, default: 16 },
+          probes_per_frame: { type: "integer", minimum: 1, default: 192 },
+          base_spacing: { type: "number", default: 4.0 },
+          cascade_scale: { type: "number", default: 4.0 },
+          sun_refresh_angle_degrees: { type: "number", default: 2.0 },
+          bounces: { type: "integer", minimum: 1, maximum: 8, default: 2 },
+          skylight: { type: "array", items: { type: "number" }, default: [0.05, 0.07, 0.10] },
+          max_distance: { type: "number", default: 128.0 },
+          intensity: { type: "number", default: 1.0 },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_gi_configs",
+      description: "List and validate every GI config under Content/GI for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "author_ocean_config",
+      description: "Author an FFT ocean surface config (Content/Ocean/<name>.json) mirroring FftOceanConfig (IFftOceanSurface): size (power of two 16..1024), tile_size_meters, wind_speed, wind_dir_rad, choppiness, amplitude, seed.",
+      inputSchema: {
+        type: "object", required: ["project", "name"],
+        properties: {
+          project: { type: "string" }, name: { type: "string" },
+          size: { type: "integer", minimum: 16, maximum: 1024, default: 64 },
+          tile_size_meters: { type: "number", default: 256.0 },
+          wind_speed: { type: "number", default: 18.0 },
+          wind_dir_rad: { type: "number", default: 0.7 },
+          choppiness: { type: "number", default: 1.2 },
+          amplitude: { type: "number", default: 0.9 },
+          seed: { type: "integer", default: 1 },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_ocean_configs",
+      description: "List and validate every ocean config under Content/Ocean for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "author_post_processing",
+      description: "Author a post-processing config (Content/PostProcess/<name>.json) mirroring ToneMappingConfig (IToneMapping) + CasConfig (ICasSharpening) + IRenderingPresets quality: operator/exposure/use_ev/ev100/white_point/sharpness/clamp_values/quality.",
+      inputSchema: {
+        type: "object", required: ["project", "name"],
+        properties: {
+          project: { type: "string" }, name: { type: "string" },
+          operator: { type: "string", enum: [...TONE_OPERATORS], default: "aces" },
+          exposure: { type: "number", default: 1.0 },
+          use_ev: { type: "boolean", default: false },
+          ev100: { type: "number", default: 0.0 },
+          white_point: { type: "number", default: 11.2 },
+          sharpness: { type: "number", default: 0.4 },
+          clamp_values: { type: "boolean", default: true },
+          quality: { type: "string", enum: [...QUALITY_LEVELS], default: "high" },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_post_processings",
+      description: "List and validate every post-processing config under Content/PostProcess for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "author_fluid_simulation",
+      description: "Author a fluid simulation config (Content/FluidSims/<name>.json) mirroring FluidConfig (IFluidSimulation): grid_size, cell_size, gravity, dt, solver_iterations, damping, viscosity, surface_tension.",
+      inputSchema: {
+        type: "object", required: ["project", "name"],
+        properties: {
+          project: { type: "string" }, name: { type: "string" },
+          grid_size: { type: "integer", minimum: 1, default: 64 },
+          cell_size: { type: "number", default: 1.0 },
+          gravity: { type: "number", default: 9.81 },
+          dt: { type: "number", default: 0.0166667 },
+          solver_iterations: { type: "integer", minimum: 1, default: 4 },
+          damping: { type: "number", default: 0.999 },
+          viscosity: { type: "number", default: 0.001 },
+          surface_tension: { type: "number", default: 0.0 },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_fluid_simulations",
+      description: "List and validate every fluid simulation config under Content/FluidSims for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "author_world_asset",
+      description: "Author a world asset (Content/Worlds/<name>.json) mirroring IWorldManager.WorldSpec: seed, rules_json (well-formed JSON), profile (world profile asset name in Content/Profiles), save_path, portals (from/to world anchors + yaw).",
+      inputSchema: {
+        type: "object", required: ["project", "name"],
+        properties: {
+          project: { type: "string" }, name: { type: "string" },
+          seed: { type: "integer", default: 0 },
+          rules_json: { type: "string", default: "" },
+          profile: { type: "string", default: "" },
+          save_path: { type: "string", default: "" },
+          portals: { type: "array", items: { type: "object" }, default: [] },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_world_assets",
+      description: "List and validate every world asset under Content/Worlds for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "author_chunk_config",
+      description: "Author a chunk streaming config (Content/Chunks/<name>.json) mirroring IVoxelStreaming budgets: chunk_budget, memory_budget_bytes, far_lod_percent, worker_threads.",
+      inputSchema: {
+        type: "object", required: ["project", "name"],
+        properties: {
+          project: { type: "string" }, name: { type: "string" },
+          chunk_budget: { type: "integer", minimum: 0, default: 16 },
+          memory_budget_bytes: { type: "integer", minimum: 0, default: 0 },
+          far_lod_percent: { type: "integer", minimum: 0, maximum: 100, default: 0 },
+          worker_threads: { type: "integer", minimum: 0, default: 0 },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_chunk_configs",
+      description: "List and validate every chunk config under Content/Chunks for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "author_block_transaction",
+      description: "Author a block transaction document (Content/Transactions/<name>.json) mirroring IVoxelWorld BlockEdit[] + TransactionLimits: edits [{ position: [x,y,z], block_id }], max_edits, max_box_volume. Validation computes the bounding-box volume and edit count against the limits (dry-run diff).",
+      inputSchema: {
+        type: "object", required: ["project", "name", "edits"],
+        properties: {
+          project: { type: "string" }, name: { type: "string" },
+          edits: { type: "array", items: { type: "object" } },
+          max_edits: { type: "integer", minimum: 0, default: 0 },
+          max_box_volume: { type: "integer", minimum: 0, default: 0 },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_block_transactions",
+      description: "List and validate every block transaction under Content/Transactions for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "author_block_entity",
+      description: "Author a block entity definition (Content/BlockEntities/<name>.json) mirroring IVoxelBlockEntity: type_id (namespaced), data_version, script_id, components (type inventory/script/custom, version, blob).",
+      inputSchema: {
+        type: "object", required: ["project", "name", "type_id"],
+        properties: {
+          project: { type: "string" }, name: { type: "string" }, type_id: { type: "string" },
+          data_version: { type: "integer", minimum: 1, default: 1 },
+          script_id: { type: "string", default: "" },
+          components: { type: "array", items: { type: "object" }, default: [] },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_block_entities",
+      description: "List and validate every block entity definition under Content/BlockEntities for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
+      name: "author_inventory",
+      description: "Author an inventory asset (Content/Inventories/<name>.json) mirroring engine/registry/Inventory.hpp serialize_json: slots [{ item (namespaced), count, damage, data } | null], filters [{ slot, allow_items, allow_tags, allow_any }].",
+      inputSchema: {
+        type: "object", required: ["project", "name", "slots"],
+        properties: {
+          project: { type: "string" }, name: { type: "string" },
+          slots: { type: "array", items: {} },
+          filters: { type: "array", items: { type: "object" }, default: [] },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_inventories",
+      description: "List and validate every inventory asset under Content/Inventories for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
     {
       name: "validate_game_project",
       description: "Validate the portable project, scenes, entity UUIDs, components, hierarchy, scripts, registry assets, and asset metadata without compiling the engine.",
@@ -2080,6 +3208,31 @@ export function callSemanticTool(engineRoot, name, args = {}) {
     case "create_particle_asset": return createParticleAsset(engineRoot, args);
     case "apply_particle_asset": return applyParticleAsset(engineRoot, args);
     case "inspect_particle_assets": return inspectParticleAssets(engineRoot, args.project);
+    // §4.4/§4.5 — rendering + voxel/world CONFIG assets (2026-08-28).
+    case "create_shader_asset": return authorConfigAsset(engineRoot, args, "shader");
+    case "inspect_shader_assets": return inspectConfigAssets(engineRoot, args.project, "shader");
+    case "author_render_graph": return authorConfigAsset(engineRoot, args, "render_graph");
+    case "inspect_render_graphs": return inspectConfigAssets(engineRoot, args.project, "render_graph");
+    case "create_light_asset": return authorConfigAsset(engineRoot, args, "light");
+    case "inspect_light_assets": return inspectConfigAssets(engineRoot, args.project, "light");
+    case "author_gi_config": return authorConfigAsset(engineRoot, args, "gi");
+    case "inspect_gi_configs": return inspectConfigAssets(engineRoot, args.project, "gi");
+    case "author_ocean_config": return authorConfigAsset(engineRoot, args, "ocean");
+    case "inspect_ocean_configs": return inspectConfigAssets(engineRoot, args.project, "ocean");
+    case "author_post_processing": return authorConfigAsset(engineRoot, args, "post_process");
+    case "inspect_post_processings": return inspectConfigAssets(engineRoot, args.project, "post_process");
+    case "author_fluid_simulation": return authorConfigAsset(engineRoot, args, "fluid_sim");
+    case "inspect_fluid_simulations": return inspectConfigAssets(engineRoot, args.project, "fluid_sim");
+    case "author_world_asset": return authorConfigAsset(engineRoot, args, "world");
+    case "inspect_world_assets": return inspectConfigAssets(engineRoot, args.project, "world");
+    case "author_chunk_config": return authorConfigAsset(engineRoot, args, "chunk");
+    case "inspect_chunk_configs": return inspectConfigAssets(engineRoot, args.project, "chunk");
+    case "author_block_transaction": return authorConfigAsset(engineRoot, args, "transaction");
+    case "inspect_block_transactions": return inspectConfigAssets(engineRoot, args.project, "transaction");
+    case "author_block_entity": return authorConfigAsset(engineRoot, args, "block_entity");
+    case "inspect_block_entities": return inspectConfigAssets(engineRoot, args.project, "block_entity");
+    case "author_inventory": return authorConfigAsset(engineRoot, args, "inventory");
+    case "inspect_inventories": return inspectConfigAssets(engineRoot, args.project, "inventory");
     case "validate_game_project": return validateProject(engineRoot, args.project);
     case "run_batch": return runBatch(engineRoot, args);
     default: return undefined;
@@ -2283,6 +3436,18 @@ export function inspectProject(engineRoot, projectName) {
     simulation_lod_specs: files(paths.simulationLod, ".json"),
     prefabs: files(paths.prefabs, ".prefab"),
     particle_assets: files(paths.particles, ".particle"),
+    shaders: files(paths.shaders, ".json"),
+    render_graphs: files(paths.renderGraphs, ".json"),
+    lights: files(paths.lights, ".json"),
+    gi_configs: files(paths.gi, ".json"),
+    ocean_configs: files(paths.ocean, ".json"),
+    post_processings: files(paths.postProcess, ".json"),
+    fluid_simulations: files(paths.fluidSims, ".json"),
+    worlds: files(paths.worlds, ".json"),
+    chunk_configs: files(paths.chunks, ".json"),
+    block_transactions: files(paths.transactions, ".json"),
+    block_entities: files(paths.blockEntities, ".json"),
+    inventories: files(paths.inventories, ".json"),
     validation: validateProject(engineRoot, paths.project)
   };
 }
@@ -5225,5 +6390,47 @@ function validateProject(engineRoot, projectName) {
     }
   }
 
-  return { project: project.project, valid: errors.length === 0, errors, warnings, scenes: sceneFiles.length, registry_assets: registryAssets.length, vehicle_assets: vehicleAssets.length, ability_assets: abilityAssets.length, mission_assets: missionAssets.length, world_profiles: worldProfileAssets.length, gait_assets: gaitAssets.length, simulation_lod_specs: simulationLodAssets.length, prefabs: prefabAssets.length, particle_assets: particleAssets.length };
+  // §4.4/§4.5 — rendering + voxel/world CONFIG assets (2026-08-28): every
+  // config kind validates against its public C++ contract mirror (structure +
+  // ranges, all-or-nothing). A malformed config fails the project validation
+  // exactly like a malformed registry asset.
+  const configKindAssets = {};
+  for (const kind of CONFIG_KINDS) {
+    const assets = readConfigAssets(project, kind);
+    configKindAssets[kind] = assets;
+    for (const asset of assets) {
+      for (const diagnostic of asset.diagnostics) {
+        errors.push(`${asset.path}: ${diagnostic}`);
+      }
+    }
+  }
+
+  return {
+    project: project.project,
+    valid: errors.length === 0,
+    errors,
+    warnings,
+    scenes: sceneFiles.length,
+    registry_assets: registryAssets.length,
+    vehicle_assets: vehicleAssets.length,
+    ability_assets: abilityAssets.length,
+    mission_assets: missionAssets.length,
+    world_profiles: worldProfileAssets.length,
+    gait_assets: gaitAssets.length,
+    simulation_lod_specs: simulationLodAssets.length,
+    prefabs: prefabAssets.length,
+    particle_assets: particleAssets.length,
+    shaders: configKindAssets.shader.length,
+    render_graphs: configKindAssets.render_graph.length,
+    lights: configKindAssets.light.length,
+    gi_configs: configKindAssets.gi.length,
+    ocean_configs: configKindAssets.ocean.length,
+    post_processings: configKindAssets.post_process.length,
+    fluid_simulations: configKindAssets.fluid_sim.length,
+    worlds: configKindAssets.world.length,
+    chunk_configs: configKindAssets.chunk.length,
+    block_transactions: configKindAssets.transaction.length,
+    block_entities: configKindAssets.block_entity.length,
+    inventories: configKindAssets.inventory.length
+  };
 }

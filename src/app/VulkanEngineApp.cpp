@@ -106,6 +106,17 @@ void VulkanEngineApp::init() {
     atmosphere = Engine::Rendering::create_atmosphere_scattering();
     volumeClouds = Engine::Rendering::create_volume_clouds(featureError);
     materialShading = Engine::Rendering::create_material_shading(featureError);
+    // B.1 per-face block material resolver: instantiate the deterministic core
+    // in the product. It consumes the data-driven BlockRegistry (voxel domain)
+    // and advertises the data-driven material path to the post composite via
+    // gpuFeatures.material.x below.
+    blockMaterialResolver = Engine::Rendering::create_block_material_resolver(featureError);
+    if (blockMaterialResolver) {
+        Engine::Rendering::BlockMaterialConfig bmConfig;
+        bmConfig.variantSeed = 1;
+        std::string bmError;
+        blockMaterialResolver->configure(bmConfig, bmError);
+    }
     if (toneMapping) {
         Engine::Rendering::ToneMappingConfig tmConfig;
         tmConfig.op = Engine::Rendering::ToneOperator::ACES;
@@ -213,6 +224,13 @@ void VulkanEngineApp::refresh_gpu_features() {
         static_cast<float>(debugSnapshot.probeCount),
         static_cast<float>(debugSnapshot.capturedCount),
         static_cast<float>(debugSnapshot.confidenceLevel));
+    // The temporal history buffer is laid out row-major with a stride equal to
+    // the render width, and the compute shader must index rows with the REAL
+    // width (a hardcoded constant breaks every resolution except that one).
+    // This must match the extent used to allocate the history buffer and to
+    // dispatch the pass (swapchainExtent in both places).
+    gpuFeatures.extent = glm::vec4(static_cast<float>(swapchainExtent.width),
+                                   static_cast<float>(swapchainExtent.height), 0.0f, 0.0f);
     if (gpuFeaturesReady)
         Engine::Rendering::update_gpu_feature_binding(allocator, gpuFeatureBinding, gpuFeatures);
     if (gpuFeaturePasses.initialized) {

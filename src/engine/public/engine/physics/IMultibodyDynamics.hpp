@@ -51,7 +51,9 @@ struct MultibodyLinkDesc {
 // Configuração (all-or-nothing: fora do range é recusado, nunca clampeado).
 struct MultibodyConfig {
     std::size_t maxLinks{ 16 };    // cap de links [1, 64]
-    int solverIterations{ 8 };     // iterações de projeção pós-integração [1, 64]
+    int solverIterations{ 8 };     // passes internos de integração por step() [1, 64]
+                                   // (cada passagem re-avalia M/g nas posições
+                                   // atualizadas; damping e limites uma vez por step)
     float damping{ 0.05f };        // amortecimento de junta [0, 1)
     glm::vec3 gravity{ 0.0f, -9.8f, 0.0f };
 

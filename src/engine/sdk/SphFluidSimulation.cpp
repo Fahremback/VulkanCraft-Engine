@@ -219,22 +219,33 @@ private:
         }
         std::sort(grid.begin(), grid.end());
 
-        // Listas de vizinhos por partícula (índices ascendentes).
+        // Listas de vizinhos por partícula (pares únicos e SIMÉTRICOS: quando
+        // i e j são vizinhos, ambos aparecem na lista do outro). Antes, cada
+        // par era registrado só no lado de índice menor, o que tornava a
+        // densidade dependente da ordem de inserção (rho(i) != rho(j) para um
+        // par simétrico) e descartava pares entre células quando o índice da
+        // partícula na célula de chave menor era maior que o da outra.
         std::vector<std::vector<std::uint32_t>> neighbors(particles_.size());
         for (std::size_t g = 0; g < grid.size();) {
             std::size_t runEnd = g;
             while (runEnd < grid.size() && grid[runEnd].first == grid[g].first)
                 ++runEnd;
+            // Pares dentro da mesma célula: cada par exatamente uma vez
+            // (b = a + 1), registrado nos dois lados.
             for (std::size_t a = g; a < runEnd; ++a) {
-                for (std::size_t b = g; b < runEnd; ++b) {
-                    if (grid[a].second < grid[b].second)
-                        neighbors[grid[a].second].push_back(grid[b].second);
+                for (std::size_t b = a + 1; b < runEnd; ++b) {
+                    neighbors[grid[a].second].push_back(grid[b].second);
+                    neighbors[grid[b].second].push_back(grid[a].second);
                 }
             }
             // Células vizinhas (26-vizinhança): decodifica as coordenadas da
             // célula atual e re-codifica cada vizinho explicitamente (sem
             // aritmética de chave, sem risco de carry entre campos). Ordem
-            // lexicográfica fixa de offsets (dz, dy, dx).
+            // lexicográfica fixa de offsets (dz, dy, dx). A condição nk > key
+            // garante que cada par de células é visitado uma única vez (da
+            // célula de chave menor), mas o registro do par de partículas NÃO
+            // depende dos IDs — sem isso, pares entre células somem conforme
+            // a ordem de inserção das partículas.
             const std::int64_t key = grid[g].first;
             int cx = 0;
             int cy = 0;
@@ -253,8 +264,8 @@ private:
                         if (nIt == grid.end() || nIt->first != nk) continue;
                         for (auto it = nIt; it != grid.end() && it->first == nk; ++it) {
                             for (std::size_t a = g; a < runEnd; ++a) {
-                                if (grid[a].second < it->second)
-                                    neighbors[grid[a].second].push_back(it->second);
+                                neighbors[grid[a].second].push_back(it->second);
+                                neighbors[it->second].push_back(grid[a].second);
                             }
                         }
                     }
@@ -262,7 +273,10 @@ private:
             }
             g = runEnd;
         }
-        for (auto& list : neighbors) std::sort(list.begin(), list.end());
+        for (auto& list : neighbors) {
+            std::sort(list.begin(), list.end());
+            list.erase(std::unique(list.begin(), list.end()), list.end());
+        }
 
         // Densidade e pressão (ordem fixa de partículas). O termo próprio usa
         // W(0) = 315/(64π h³) (o kernel poly6 devolve 0 em r2 <= 0).

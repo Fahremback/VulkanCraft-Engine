@@ -131,6 +131,43 @@ void test_edge_stiffness_deactivation() {
           "deactivated element: free node settles on the ground");
 }
 
+// A força externa aplicada antes de step() deve atuar por TODA a chamada,
+// independente de quantos substeps o solver usa. Antes da correção ela era
+// limpa no fim de cada substep, então substeps=8 fazia a mesma força atuar
+// só 1/8 do frame (comportamento dependente de config).
+void test_external_force_substep_invariance() {
+    // Malha de dois nós com uma aresta, ambos livres.
+    DeformableMeshDesc desc;
+    desc.nodes = { glm::vec3(0.0f, 2.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f) };
+    desc.edges = { { 0, 1 } };
+    desc.fixed = { false, false };
+
+    const auto run = [&](int substeps) {
+        DeformableConfig config;
+        config.stiffness = 0.8f;      // usado; o elemento é desativado abaixo
+        config.substeps = substeps;
+        config.damping = 0.0f;
+        config.gravity = glm::vec3(0.0f);  // isola a força externa
+        config.groundCollision = false;
+        std::string error;
+        auto femfx = create_deformable_provider(DeformableProviderKind::Femfx,
+                                                config, error);
+        const auto body = femfx->create_body(desc, error);
+        // Desativa a aresta: sem forças internas, só a externa age.
+        femfx->set_edge_stiffness(body, 0, 0.0f);
+        femfx->apply_force(body, 0, glm::vec3(0.0f, 1.0f, 0.0f));
+        femfx->step(0.016f);
+        return femfx->node_velocity(body, 0).y;
+    };
+
+    const float v1 = run(1);
+    const float v8 = run(8);
+    // Com a correção, a força persiste pelos substeps: o impulso total
+    // (força * dt) é o mesmo nos dois casos (dt=0.016, massa unitária).
+    check(v1 > 0.0f && std::fabs(v8 - v1) < 1e-6f,
+          "external force acts across ALL substeps (substep-invariant impulse)");
+}
+
 void test_determinism() {
     DeformableConfig config;
     config.stiffness = 0.6f;
@@ -162,6 +199,7 @@ int main() {
     test_factory_and_validation();
     test_hanging_chain_equilibrium();
     test_edge_stiffness_deactivation();
+    test_external_force_substep_invariance();
     test_determinism();
 
     if (g_failures == 0) {

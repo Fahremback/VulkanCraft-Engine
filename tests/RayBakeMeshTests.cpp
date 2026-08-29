@@ -117,13 +117,44 @@ int main() {
         CHECK(same, "deterministic bit-exact");
     }
 
-    // 7. Build refusal all-or-nothing.
+    // 7. bake_normals: a wall surface (normal +Z) must bake the hemisphere
+    //    FACING the wall — the +Y-only bake() would shoot up and miss it.
+    {
+        std::vector<RayTracerTriangle> t;
+        // Vertical wall at z = 0. The probe sits on the -z side, so the front
+        // face must point -z (winding with right-hand normal -z); the tracer is
+        // single-sided and culls rays that hit the back face.
+        RayTracerTriangle a = {{-10.f,0.f,0.f},{10.f,6.f,0.f},{10.f,0.f,0.f}};
+        RayTracerTriangle b = {{-10.f,0.f,0.f},{-10.f,6.f,0.f},{10.f,6.f,0.f}};
+        t.push_back(a); t.push_back(b);
+        auto bake = create_ray_bake_mesh(err);
+        RayBakeConfig bc = bake->config();
+        bc.samples = 128;
+        bake->configure(bc, err);
+        CHECK(bake->build(t.data(), (std::int32_t)t.size(), err), "build wall");
+        float o[3] = {0.f, 3.f, -2.f};      // 2 units in front of the wall
+        float n[3] = {0.f, 0.f, 1.f};       // normal points AT the wall
+        std::vector<RayBakeSample> outN, outY;
+        CHECK(bake->bake_normals(o, n, 1, outN, err), "bake_normals wall");
+        CHECK(bake->bake(o, 1, outY, err), "bake (+Y) wall");
+        // With the normal-aware hemisphere the wall occludes most rays;
+        // the +Y hemisphere looks up and sees open sky.
+        CHECK(outN[0].occlusion < 0.6f, "wall normal hemisphere sees the wall");
+        CHECK(outY[0].occlusion > outN[0].occlusion + 0.15f,
+              "+Y-only bake overestimates openness on a wall");
+    }
+
+    // 8. Build refusal all-or-nothing.
     {
         auto bake = create_ray_bake_mesh(err);
         std::string be;
         CHECK(!bake->build(nullptr, 3, be), "null build refused");
         std::vector<RayTracerTriangle> empty;
         CHECK(!bake->build(empty.data(), 0, be), "0 tri refused");
+        // bake_normals refuses null normals too.
+        std::vector<RayBakeSample> out;
+        float o[3] = {0.f, 1.f, 0.f};
+        CHECK(!bake->bake_normals(o, nullptr, 1, out, be), "null normals refused");
     }
 
     std::printf("\n[raybake] Results: %d passed, %d failed\n", g_passed, g_failed);

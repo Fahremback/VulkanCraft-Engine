@@ -1647,10 +1647,18 @@ void World::run_light_pass(const glm::vec3& playerPos) {
             // pre-dispatch isDirty clear): a job in flight owns the relight.
             // If the job is cancelled, the edit that changed the revision
             // already re-dirtied the chunk — nothing is lost.
+            // Increment the in-flight counter BEFORE the erase is observable:
+            // streaming_snapshot() reads lightDirtyChunks_ under the mutex and
+            // pendingLightJobs without it, and the light-settle predicate
+            // requires BOTH to be zero. Erasing first and bumping the counter
+            // after releasing the lock opened a window where a snapshot saw
+            // dirty == 0 && pending == 0 while the relight job was not yet
+            // dispatched — the settle predicate returned true prematurely and
+            // a region could be packed with a half-propagated light field.
+            ++pendingLightJobs;
             lightDirtyChunks_.erase(key);
         }
         const uint64_t revision = chunk->revision();
-        ++pendingLightJobs;
         threadPool.enqueue([this, key, chunk, neighbors, revision,
                             edits = std::move(edits)]() mutable {
             this->run_light_job(key, chunk, neighbors, revision, std::move(edits));

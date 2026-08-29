@@ -180,8 +180,27 @@ public:
     void step(float dt) override {
         if (!(dt > 0.0f)) return;
         const float subDt = dt / static_cast<float>(config_.substeps);
+        // solverIterations passa a ser o número de passos internos de
+        // relaxação por substep: cada passagem re-monta as forças internas
+        // com as posições já atualizadas e integra com um passo menor. Antes
+        // o parâmetro era validado mas não participava da resolução.
+        const float innerDt = subDt / static_cast<float>(config_.solverIterations);
         for (int s = 0; s < config_.substeps; ++s) {
-            for (auto& kv : bodies_) step_body(kv.second, subDt);
+            for (auto& kv : bodies_) {
+                FemBody& body = kv.second;
+                for (int iter = 0; iter < config_.solverIterations; ++iter) {
+                    const bool last = iter == config_.solverIterations - 1;
+                    step_body(body, innerDt, last);
+                }
+            }
+        }
+        // Forças externas persistem por TODOS os substeps da chamada step()
+        // (aplicadas em cada passo interno) e são limpas aqui — antes eram
+        // limpas no fim de cada substep, então uma força aplicada antes do
+        // step() atuava só no primeiro substep (comportamento dependente do
+        // número de substeps).
+        for (auto& kv : bodies_) {
+            for (FemNode& n : kv.second.nodes) n.force = glm::vec3(0.0f);
         }
     }
 
@@ -220,7 +239,7 @@ public:
     }
 
 private:
-    void step_body(FemBody& body, float subDt) {
+    void step_body(FemBody& body, float dt, bool finalizePass) {
         // 1) Monta forças internas (ordem fixa de arestas) + gravidade.
         std::vector<glm::vec3> f(body.nodes.size(), glm::vec3(0.0f));
         for (const FemEdge& e : body.edges) {
@@ -243,23 +262,33 @@ private:
                 f[i] += config_.gravity;  // massa unitária
         }
 
-        // 2) Integração semi-implícita (nós em ordem).
-        const float damp = 1.0f - config_.damping;
+        // 2) Integração semi-implícita (nós em ordem). Damping e colisão com
+        // o piso são aplicados uma única vez por substep (na última passagem
+        // interna) para preservar a taxa de amortecimento efetiva; os passos
+        // internos anteriores são pura relaxação das forças internas.
         for (std::size_t i = 0; i < body.nodes.size(); ++i) {
             FemNode& n = body.nodes[i];
             if (n.inverseMass <= 0.0f) continue;  // ancorado
-            n.velocity = (n.velocity + f[i] * n.inverseMass * subDt) * damp;
-            n.position += n.velocity * subDt;
-            if (config_.groundCollision &&
+            n.velocity += f[i] * n.inverseMass * dt;
+            n.position += n.velocity * dt;
+            if (finalizePass && config_.groundCollision &&
                 n.position.y < config_.groundY) {
                 n.position.y = config_.groundY;
                 if (n.velocity.y < 0.0f)
                     n.velocity.y = -n.velocity.y * config_.bounce;
             }
         }
-
-        // 3) Limpa forças externas acumuladas (próximo step()).
-        for (auto& n : body.nodes) n.force = glm::vec3(0.0f);
+        // Damping aplicado uma vez por substep (passagem final), não por
+        // passo interno — caso contrário a taxa efetiva dependeria de
+        // solverIterations.
+        if (finalizePass) {
+            const float damp = 1.0f - config_.damping;
+            for (std::size_t i = 0; i < body.nodes.size(); ++i) {
+                FemNode& n = body.nodes[i];
+                if (n.inverseMass <= 0.0f) continue;
+                n.velocity *= damp;
+            }
+        }
     }
 
     DeformableConfig config_;

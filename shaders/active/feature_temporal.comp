@@ -11,6 +11,7 @@ layout(push_constant) uniform FeatureParams {
     vec4 vfx;
     vec4 material;
     vec4 debugCounts;
+    vec4 extent;
 } features;
 
 layout(set = 0, binding = 0, std430) readonly buffer FeatureBuffer { vec4 values[]; } featureBuffer;
@@ -19,7 +20,11 @@ layout(set = 0, binding = 2, std430) buffer ReSTIRReservoirs { vec4 values[]; } 
 layout(set = 0, binding = 3, std430) readonly buffer ProbeGrid { vec4 values[]; } probes;
 
 void main() {
-    const uint historyWidth = 8192u;
+    // The history buffer is laid out row-major with a stride of the render
+    // width (the CPU allocates extent.width * extent.height * 16 bytes). A
+    // hardcoded width (e.g. 8192) desynchronizes rows for any other
+    // resolution, so the real width comes from the push constant.
+    const uint historyWidth = uint(max(features.extent.x, 1.0));
     const uint index = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * historyWidth;
     if (index >= history.values.length()) return;
 

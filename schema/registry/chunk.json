@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/config/chunk.json",
+  "title": "chunk config asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset name (becomes the file name)",
+      "type": "string"
+    },
+    "version": {
+      "description": "must be 1",
+      "default": 1,
+      "type": "integer"
+    },
+    "chunk_budget": {
+      "description": "streaming budget (chunk radius), >= 0",
+      "default": 16,
+      "type": "integer"
+    },
+    "memory_budget_bytes": {
+      "description": "RAM-budgeted chunk cache bytes; 0 = unlimited",
+      "default": 0,
+      "type": "integer"
+    },
+    "far_lod_percent": {
+      "description": "far-LOD endpoint 0..100",
+      "default": 0,
+      "type": "integer"
+    },
+    "worker_threads": {
+      "description": "world worker pool size; 0 = unknown/auto",
+      "default": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "name"
+  ]
+}

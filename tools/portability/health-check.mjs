@@ -37,9 +37,12 @@ const STEPS = [
 
 function run(name, cmd, argsList) {
   console.log(`\n[health] ▶ ${name}`);
+  // Propagate VC_BUILD_DIR to sub-gates so they resolve the shared out-of-tree
+  // build instead of the legacy in-tree build/ (BUG-038 drift).
+  const env = { ...process.env };
   const res = spawnSync(cmd, argsList, {
     cwd: ROOT, encoding: 'utf8', timeout: 900000, windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['ignore', 'pipe', 'pipe'], env,
   });
   const tail = ((res.stdout || '') + (res.stderr || '')).trim().split('\n').slice(-3).join('\n');
   if (res.status === 0) { console.log(`[health]   ✓ ${name} PASSED`); return true; }

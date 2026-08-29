@@ -28,6 +28,9 @@ function cppSurface() {
   const candidates = [
     join(ROOT, 'build', 'Release', 'semantic_api_tests.exe'),
     join(ROOT, 'out', 'release', 'bin', 'semantic_api_tests.exe'),
+    // Shared out-of-tree build (BUG-038 drift): gates should also resolve the
+    // active shared build, not only the legacy in-tree one.
+    join(ROOT, process.env.VC_BUILD_DIR ?? '', 'semantic_api_tests.exe'),
   ];
   const exe = candidates.find((p) => existsSync(p));
   if (!exe) {

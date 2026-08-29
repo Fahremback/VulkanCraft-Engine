@@ -1208,7 +1208,10 @@ public:
     // content provenance (seed, name, rules, plugin versions, registry
     // fingerprint). Used by BOTH the monolithic emitter (emit_world_save_
     // body) and the region manifest page (build_region_manifest_body) so the
-    // two can never drift.
+    // two can never drift. FlatBuffers-only: both call sites are already
+    // inside #if VC_ENABLE_FLATBUFFERS, so the definition must be too (a
+    // VC_ENABLE_FLATBUFFERS=OFF build would otherwise fail to compile).
+#if VC_ENABLE_FLATBUFFERS
     static flatbuffers::Offset<engine::voxel::save::WorldMeta>
     build_meta_offset(
         flatbuffers::FlatBufferBuilder& builder, uint64_t seed,
@@ -1257,6 +1260,7 @@ public:
         }
         return metaBuilder.Finish();
     }
+#endif  // VC_ENABLE_FLATBUFFERS
 
     // Deterministic fingerprint of a block registry: FNV-1a 64 over the
     // concatenation of (uuid, definition version, namespaced name) of every
@@ -2037,12 +2041,19 @@ public:
         }
         // v5 body is a FlatBuffers container; v1-v4 use the manual parser.
         if (version >= kWorldSaveVersion) {
+#if VC_ENABLE_FLATBUFFERS
             const bool ok = deserialize_world_v5(body, errorOut);
             if (ok) {
                 loadRollback.commit();
                 reset_session_history();
             }
             return ok;
+#else
+            (void)loadRollback;
+            errorOut =
+                "world save uses schema v5 (requires VC_ENABLE_FLATBUFFERS)";
+            return false;
+#endif
         }
         const bool hasPalette = version >= kWorldSaveVersionV2;
         // Entity section exists since v3; v1/v2 saves predate it.
@@ -2973,6 +2984,11 @@ private:
 
     // Core load (slot-free): o chamador já segura o slot. Compartilhado pelo
     // caminho sync (claim + executa + finish) e pelo async (claim + job).
+    // FlatBuffers-only: both call sites (load_world_regions sync and
+    // load_world_regions_async) are inside #if VC_ENABLE_FLATBUFFERS, so the
+    // definition must be too (the public entry points already return a clear
+    // error when FlatBuffers is disabled).
+#if VC_ENABLE_FLATBUFFERS
     bool load_world_regions_impl(const std::string& filePath, std::string& errorOut) {
         RestoreModeGuard restoreGuard(*this, world_);
         LoadRollback loadRollback(*this, world_);
@@ -2997,6 +3013,7 @@ private:
         reset_session_history();
         return true;
     }
+#endif  // VC_ENABLE_FLATBUFFERS
 
     // Async load (FALTANTES §4 item 5): the file reads, decompression and
     // chunk apply run as ONE background job on the world's thread pool; the

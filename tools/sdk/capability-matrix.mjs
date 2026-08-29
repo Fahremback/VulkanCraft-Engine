@@ -22,7 +22,8 @@ import { fileURLToPath } from "node:url";
 import {
   semanticToolDefinitions,
   REGISTRY_KINDS, VEHICLE_KINDS, ABILITY_KINDS, MISSION_KINDS,
-  WORLD_PROFILE_KINDS, GAIT_KINDS, SIMULATION_LOD_KINDS, PREFAB_KINDS, PARTICLE_KINDS
+  WORLD_PROFILE_KINDS, GAIT_KINDS, SIMULATION_LOD_KINDS, PREFAB_KINDS, PARTICLE_KINDS,
+  CONFIG_KINDS
 } from "../mcp-server/game-authoring.mjs";
 
 const ENGINE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -55,12 +56,20 @@ for (const file of publicHeaders) {
 
 const semanticTools = semanticToolDefinitions();
 const allKinds = [...REGISTRY_KINDS, ...VEHICLE_KINDS, ...ABILITY_KINDS, ...MISSION_KINDS,
-  ...WORLD_PROFILE_KINDS, ...GAIT_KINDS, ...SIMULATION_LOD_KINDS, ...PREFAB_KINDS, ...PARTICLE_KINDS];
+  ...WORLD_PROFILE_KINDS, ...GAIT_KINDS, ...SIMULATION_LOD_KINDS, ...PREFAB_KINDS, ...PARTICLE_KINDS,
+  ...CONFIG_KINDS];
 
 const YES = "✅";
 const NO = "—";
-const REFL = NO + " (§2 pendente)";
-const SCRIPT = NO + " (§3 pendente)";
+const PARTIAL = "⚠️";
+// Reflection metadata (IReflection, engine/entity/IReflection.hpp — FieldKind
+// Variant/Array/Map/Optional/Uuid/Handle/Range, reflection_tests PASS) and the
+// visual-scripting runtime (IVisualScriptRuntime — variables/events/flow/
+// breakpoints/watch/profiling; create_visual_script authors graphs) BOTH
+// EXIST. What does NOT exist yet is per-tool metadata wiring that maps each
+// semantic tool to its reflection/scripting surface — that is the honest gap.
+const REFL = PARTIAL + " (runtime IReflection existe; sem mapeamento por-tool)";
+const SCRIPT = PARTIAL + " (create_visual_script + IVisualScriptRuntime; sem mapeamento por-tool)";
 
 // Inline code marker in a template literal (escaped backtick).
 const code = (s) => `\`${s}\``;
@@ -82,8 +91,8 @@ lines.push("|---|---|---|");
 lines.push(`| **C++** | ${YES} | ${publicHeaders.length} headers públicos em ${domains.size} domínios (${code("ISemanticApi")} + contratos por domínio; ${code("docs/SDK_API_INVENTORY.md")}) |`);
 lines.push(`| **MCP** | ${YES} | ${semanticTools.length} tools semânticas + ${RUNTIME_TOOLS.length} tools de runtime/processo (${code("server.mjs")} TOOLS) |`);
 lines.push(`| **CLI** | ${YES} | ${code("semantic-cli.mjs")} (${semanticTools.length} tools, mesmas factories do MCP) + ${code("registry-cli.mjs")} (${allKinds.length} kinds de asset) |`);
-lines.push(`| **reflection** | ${REFL} | metadados de reflection em runtime não existem (itens §2) |`);
-lines.push(`| **scripting visual** | ⚠️ | só autoria de grafo (${code("create_visual_script")}); runtime Luau/WASM/plugins §3 pendente |`);
+lines.push(`| **reflection** | ${PARTIAL} | runtime existe (${code("IReflection")} + ${code("reflection_tests")} PASS — FieldKind Variant/Array/Map/Optional/Uuid/Handle/Range); mapeamento por-tool da fachada semântica NÃO está wired (item §8 pendente) |`);
+lines.push(`| **scripting visual** | ${PARTIAL} | runtime existe (${code("IVisualScriptRuntime")} — variables/events/flow/breakpoints/watch/profiling; ${code("create_visual_script")} autoriza grafos; ${code("visual_script_graph_tests")} PASS); mapeamento por-tool da fachada semântica NÃO está wired (item §8 pendente) |`);
 lines.push("");
 
 // ---- C++ domains ---------------------------------------------------------
@@ -137,8 +146,8 @@ lines.push("");
 lines.push("## Conclusão");
 lines.push("");
 lines.push(`- **C++, MCP e CLI são coerentes por construção** para toda a fachada semântica (${semanticTools.length} tools) e para os ${allKinds.length} kinds de asset — as três superfícies compartilham as mesmas factories/contratos, e os gates de frescor (schemas #182, inventário #184) impedem drift.`);
-lines.push("- **reflection** e **scripting visual em runtime** são os únicos vetores que NÃO cobrem a mesma superfície: dependem dos itens §2 (reflection/codegen) e §3 (Luau/WASM/plugins) — decisões de arquitetura global, fora desta fronteira (dono natural: agentes de reflection/scripting).");
-lines.push("- O item §8 item 1 permanece `[~]` até §2/§3 existirem; esta matriz torna o gap **verificável e regenerável**, não mais subentendido.");
+lines.push(`- **reflection** e **scripting visual** têm INFRAESTRUTURA entregue (${code("IReflection")} + ${code("reflection_tests")}; ${code("IVisualScriptRuntime")} + ${code("visual_script_graph_tests")}; ${code("create_visual_script")} autoriza grafos) — o que falta para o item §8 é o WIRING por-tool: mapear cada tool da fachada semântica para o metadata de reflection e para o runtime visual-scripting (cross-domain, registrado).`);
+lines.push("- O item §8 item 1 permanece pendente até esse mapeamento existir; esta matriz torna o gap **verificável e regenerável**, não mais subentendido.");
 lines.push("");
 
 const output = process.argv[2];

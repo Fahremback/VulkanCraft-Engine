@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulkancraft.engine/schema/config/render_graph.json",
+  "title": "render_graph config asset",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "description": "asset name (becomes the file name)",
+      "type": "string"
+    },
+    "version": {
+      "description": "must be 1",
+      "default": 1,
+      "type": "integer"
+    },
+    "resources": {
+      "description": "[{ name (unique), kind: buffer|image, byte_size, width, height, depth, transient, imported, initial_state }]",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "passes": {
+      "description": "[{ name (unique), queue: graphics|compute|transfer, enabled, resources: [{ resource (name), access: read|write|readwrite, state }] }]",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "dependencies": {
+      "description": "[{ before, after }] — pass names; the graph must be acyclic",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  },
+  "required": [
+    "name",
+    "resources",
+    "passes"
+  ]
+}

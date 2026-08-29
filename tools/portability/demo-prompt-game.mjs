@@ -110,7 +110,10 @@ function main() {
   const pkg = join(work, 'package');
 
   // Install SDK from existing build
-  const install = run('cmake', ['--install', join(ROOT, 'build'), '--config', 'Release', '--prefix', prefix]);
+  // Build dir overridable (shared out-of-tree build); default legacy in-tree
+  // (BUG-038 drift).
+  const buildDir = join(ROOT, process.env.VC_BUILD_DIR ?? 'build');
+  const install = run('cmake', ['--install', buildDir, '--config', 'Release', '--prefix', prefix]);
   evidence.steps.installSdk = { ok: install.status === 0 };
   if (install.status !== 0) return fail('SDK install failed (E-5001)');
   log('   SDK installed to ' + prefix);

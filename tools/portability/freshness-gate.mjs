@@ -18,11 +18,14 @@ const problems = [];
 // roots. Scans are bounded: public headers + core src for the SDK manifests,
 // src/engine/sdk + src/simulation/voxel for the world-save header, and the
 // whole src/ for the built exes in build/Release and out/release.
+// The world-save codegen follows VC_BUILD_DIR like the built exes below
+// (the old hardcoded 'out/release/generated' path matched no active build
+// tree — the generated header lives in each build dir's generated/).
 const OUTPUTS = [
   { label: 'SDK_API_INVENTORY.md (anti-drift manifest)', path: 'docs/SDK_API_INVENTORY.md', deps: ['src/engine/public', 'schema/registry'] },
   { label: 'SDK_CAPABILITY_MATRIX.md (capability manifest)', path: 'docs/SDK_CAPABILITY_MATRIX.md', deps: ['src/engine/public', 'tools/mcp-server'] },
   { label: 'BINDINGS_GENERATED.md (bindings doc)', path: 'docs/BINDINGS_GENERATED.md', deps: ['src/engine/public', 'tools/mcp-server', 'schema/registry'] },
-  { label: 'world_save_generated.h (schema codegen)', path: 'out/release/generated/world_save_generated.h', deps: ['src/engine/sdk/world_save.fbs'] },
+  { label: 'world_save_generated.h (schema codegen)', path: `${buildDir}/generated/world_save_generated.h`, deps: ['src/engine/sdk/world_save.fbs'] },
 ];
 
 function newestSource(deps) {
@@ -66,7 +69,7 @@ for (const out of OUTPUTS) {
 const srcRoot = join(ROOT, 'src');
 let newestSrc = newestSource(['src']);
 for (const exe of [`${buildDir}/Release/VulkanEngineGame.exe`, `${buildDir}/Release/VulkanEngineServer.exe`,
-                    'out/release/VulkanEngineGame.exe', 'out/release/Release/VulkanEngineGame.exe']) {
+                    `${buildDir}/VulkanEngineGame.exe`, `${buildDir}/VulkanEngineServer.exe`]) {
   if (!existsSync(join(ROOT, exe))) continue;
   const t = statSync(join(ROOT, exe)).mtimeMs;
   if (newestSrc > t + 1000) {

@@ -156,6 +156,48 @@ void test_gravity_settling_and_mass() {
     check(avgSpeed < 0.05f, "settled particles are nearly at rest");
 }
 
+// Invariantes matemáticos que testes de cenário não pegam: a densidade de
+// um par deve ser SIMÉTRICA (rho(i) == rho(j) para partículas a mesma
+// distância) e INVARIANTE a permutação de índices — a física não pode
+// depender de qual partícula foi inserida primeiro.
+void test_pair_symmetry_and_permutation() {
+    SphFluidConfig config;
+    config.particleRadius = 0.1f;
+    std::string error;
+    auto sim = create_sph_fluid_simulation(error);
+    check(sim->configure(config, error), "configure ok");
+
+    // Par dentro do suporte (h = 0.4), cruzando a fronteira de célula
+    // (célula negativa x positiva) para exercitar o caminho cross-cell.
+    const glm::vec3 a(-0.09f, 2.0f, 0.0f);
+    const glm::vec3 b(0.09f, 2.0f, 0.0f);
+    std::vector<glm::vec3> pos{ a, b };
+    std::vector<glm::vec3> vel(2, glm::vec3(0.0f));
+    check(sim->reset(pos, vel, error), "reset ok");
+    sim->step(0.016f);
+    const float rhoA = sim->particle_density(0);
+    const float rhoB = sim->particle_density(1);
+    // Simetria: ambas as partículas enxergam a mesma vizinhança.
+    check(std::fabs(rhoA - rhoB) < 1e-6f,
+          "pair density is symmetric (rho0 == rho1)");
+
+    // Permutação: re-ordenar os índices não pode mudar a densidade de cada
+    // posição física. Antes da correção, o par cross-cell sumia quando a
+    // partícula da célula de chave menor tinha índice maior que a da outra.
+    auto swapped = create_sph_fluid_simulation(error);
+    check(swapped->configure(config, error), "configure swapped ok");
+    std::vector<glm::vec3> posSwapped{ b, a };
+    std::vector<glm::vec3> velSwapped(2, glm::vec3(0.0f));
+    check(swapped->reset(posSwapped, velSwapped, error), "reset swapped ok");
+    swapped->step(0.016f);
+    // Posição b agora tem índice 0 (célula de chave maior); a posição a tem
+    // índice 1 (célula de chave menor). O par precisa ser encontrado nos
+    // dois casos — as densidades por posição física devem coincidir.
+    check(std::fabs(swapped->particle_density(0) - rhoB) < 1e-6f &&
+              std::fabs(swapped->particle_density(1) - rhoA) < 1e-6f,
+          "density is invariant to particle index permutation (cross-cell pair kept)");
+}
+
 void test_determinism() {
     SphFluidConfig config;
     config.particleRadius = 0.1f;
@@ -194,6 +236,7 @@ int main() {
     test_validation_and_factory();
     test_density_and_repulsion();
     test_gravity_settling_and_mass();
+    test_pair_symmetry_and_permutation();
     test_determinism();
 
     if (g_failures == 0) {
