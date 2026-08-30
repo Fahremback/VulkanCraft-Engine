@@ -22,10 +22,14 @@
 
 #include "EditorApplication.hpp"
 #include "EditorInternalHelpers.hpp"
+#include "EditorSdkContractJson.hpp"
+
+#include "engine/voxel/IVoxelBlockEntity.hpp"
 
 #include <cmath>
 #include <cstdint>
-#include <sstream>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -95,8 +99,14 @@ bool sdk_boot_world(engine::voxel::IVoxelWorld& world, const glm::vec3& player,
 }  // namespace
 
 void EditorApplication::refresh_sdk_contract_runtimes() {
-    std::ostringstream out;
-    out << "{";
+    // Agente 3 (fechamento_solidacao — A3-SDK-JSON-INVALIDO): the observable
+    // /sdk-contracts document is built by the standalone nlohmann-based
+    // serializer (EditorSdkContractJson.cpp) instead of manual oss-string
+    // concatenation. Every subsystem here still drives its REAL contract
+    // methods each frame exactly as before; only the final serialization path
+    // changed, so a failing factory or a hostile string can no longer emit
+    // invalid JSON (no leading comma, no unescaped quote/backslash/newline).
+    SdkContractStats stats;
 
     // ---- 1. create_job_system (engine::jobs::IJobSystem) ------------------
     // Real job dispatch: each frame the editor submits a genuine unit of work
@@ -115,10 +125,11 @@ void EditorApplication::refresh_sdk_contract_runtimes() {
         const std::size_t pendingBefore = m_jobSystem->pending();
         // Drain the queue in submission order; the job runs here.
         m_jobSystem->drain();
-        out << ",\"jobs\":{\"submitted\":" << m_jobSystemSubmitted
-            << ",\"completed\":" << m_jobSystemCompleted
-            << ",\"pending\":" << (m_jobSystem->pending() == 0 ? 0 : pendingBefore)
-            << ",\"handle\":" << handle.id << "}";
+        stats.hasJobs = true;
+        stats.jobsSubmitted = m_jobSystemSubmitted;
+        stats.jobsCompleted = m_jobSystemCompleted;
+        stats.jobsPending = m_jobSystem->pending() == 0 ? 0 : pendingBefore;
+        stats.jobsHandle = handle.id;
     }
 
     // ---- 2+3. create_procgen_jobs + create_cancellation_token ------------
@@ -155,11 +166,12 @@ void EditorApplication::refresh_sdk_contract_runtimes() {
             case engine::procgen::JobResult::Cancelled: m_procgenJobResult = "Cancelled"; break;
             case engine::procgen::JobResult::Failed: m_procgenJobResult = "Failed"; break;
         }
-        out << ",\"procgen\":{\"jobs\":\"" << m_procgenJobResult
-            << "\",\"units\":" << m_procgenJobUnits
-            << ",\"progress\":" << progressUnits
-            << ",\"cancelled\":" << (m_cancelToken->cancelled() ? "true" : "false")
-            << ",\"error\":\"" << jobErr << "\"}";
+        stats.hasProcgen = true;
+        stats.procgenResult = m_procgenJobResult;
+        stats.procgenUnits = m_procgenJobUnits;
+        stats.procgenProgress = progressUnits;
+        stats.procgenCancelled = m_cancelToken->cancelled();
+        stats.procgenError = jobErr;
     }
 
     // ---- 4. create_procgen_preview (engine::procgen::IProcgenPreview) -----
@@ -185,13 +197,10 @@ void EditorApplication::refresh_sdk_contract_runtimes() {
         for (const engine::procgen::PreviewStat& stat : render.stats) {
             m_previewStats.emplace_back(stat.label, stat.value);
         }
-        out << ",\"preview\":{\"ok\":" << (ok ? "true" : "false")
-            << ",\"title\":\"" << m_previewTitle
-            << "\",\"rows\":" << m_previewLines.size()
-            << ",\"firstLine\":";
-        if (!m_previewLines.empty()) out << "\"" << m_previewLines.front() << "\"";
-        else out << "\"\"";
-        out << "}";
+        stats.hasPreview = true;
+        stats.previewOk = ok;
+        stats.previewTitle = m_previewTitle;
+        stats.previewLines = m_previewLines;
     }
 
     // ---- 5. create_farm_cooker (Engine::Farm::IFarmCooker) ----------------
@@ -218,10 +227,11 @@ void EditorApplication::refresh_sdk_contract_runtimes() {
         } else {
             m_farmCookVerified = false;
         }
-        out << ",\"farm\":{\"kind\":\""
-            << (m_farmCooker->kind() == Engine::Farm::FarmKind::RuntimeCooker ? "RuntimeCooker" : "other")
-            << "\",\"signature\":" << m_farmCookedSignature
-            << ",\"verified\":" << (m_farmCookVerified ? "true" : "false") << "}";
+        stats.hasFarm = true;
+        stats.farmKind =
+            m_farmCooker->kind() == Engine::Farm::FarmKind::RuntimeCooker ? "RuntimeCooker" : "other";
+        stats.farmSignature = m_farmCookedSignature;
+        stats.farmVerified = m_farmCookVerified;
     }
 
     // ---- 6+7. create_hilbert_cell_index + create_hilbert_cell_index_json --
@@ -271,14 +281,14 @@ void EditorApplication::refresh_sdk_contract_runtimes() {
         int dx = 0, dy = 0;
         std::string posErr;
         hil->cell_position(m_hilbertCellId, dx, dy, posErr);
-        out << ",\"hilbert\":{\"cellId\":" << m_hilbertCellId
-            << ",\"parent\":" << m_hilbertParentId
-            << ",\"coverCells\":" << m_hilbertCoverCells
-            << ",\"decoded\":[" << dx << "," << dy << "]"
-            << ",\"jsonVariant\":" << (m_hilbertIndexJson ? "true" : "false")
-            << ",\"contains\":"
-            << (hil->contains(m_hilbertCellId, dx, dy, posErr) ? "true" : "false")
-            << "}";
+        stats.hasHilbert = true;
+        stats.hilCellId = m_hilbertCellId;
+        stats.hilParent = m_hilbertParentId;
+        stats.hilCoverCells = m_hilbertCoverCells;
+        stats.hilDecodedX = dx;
+        stats.hilDecodedY = dy;
+        stats.hilJsonVariant = m_hilbertIndexJson != nullptr;
+        stats.hilContains = hil->contains(m_hilbertCellId, dx, dy, posErr);
     }
 
     // ---- 8. create_block_entity_scripting (engine::voxel::IBlockEntityScripting)
@@ -338,16 +348,60 @@ void EditorApplication::refresh_sdk_contract_runtimes() {
         if (m_blockScripting->script_variable({ 8, 96, 8 }, "count", countVar)) {
             m_blockScriptVariable = countVar;
         }
-        out << ",\"blockEntity\":{\"booted\":"
-            << (m_blockEntityBooted ? "true" : "false")
-            << ",\"active\":" << m_blockActiveInstances
-            << ",\"completedRuns\":" << m_blockCompletedRuns
-            << ",\"failedRuns\":" << m_blockFailedRuns
-            << ",\"lastError\":\"" << m_blockScripting->last_error()
-            << "\",\"scriptVar_count\":" << m_blockScriptVariable
-            << ",\"hasScript\":"
-            << (m_blockScripting->has_script("project:chest_loot") ? "true" : "false")
-            << "}";
+        stats.hasBlockEntity = true;
+        stats.blockBooted = m_blockEntityBooted;
+        stats.blockActive = m_blockActiveInstances;
+        stats.blockCompletedRuns = m_blockCompletedRuns;
+        stats.blockFailedRuns = m_blockFailedRuns;
+        stats.blockLastError = m_blockScripting->last_error();
+        stats.blockScriptVar = m_blockScriptVariable;
+        stats.blockHasScript = m_blockScripting->has_script("project:chest_loot");
+    }
+
+    // ---- CONTA 6 (particle — same provider as the game) -------------------
+    // The editor consumes the SAME public Engine::Rendering::create_particle_system()
+    // contract the game uses (no parallel ParticleSimulation track): a real
+    // .efk effect is loaded once (the same asset the game loads), an instance
+    // is spawned at the play camera origin and stepped every frame; the alive
+    // count is the per-frame observable.
+    if (!m_particleSystemC) {
+        m_particleSystemC = Engine::Rendering::create_particle_system();
+        if (m_particleSystemC) {
+            std::ifstream efkFile("assets/effects/block_simple.efk", std::ios::binary);
+            if (!efkFile && std::getenv("VULKANCRAFT_ASSET_DIR")) {
+                efkFile.open(std::string(std::getenv("VULKANCRAFT_ASSET_DIR")) +
+                             "/effects/block_simple.efk", std::ios::binary);
+            }
+            if (efkFile) {
+                std::vector<std::uint8_t> efkBytes(
+                    (std::istreambuf_iterator<char>(efkFile)),
+                    std::istreambuf_iterator<char>());
+                std::string pErr;
+                if (m_particleSystemC->loadEffect(efkBytes.data(), efkBytes.size(), pErr)) {
+                    m_particleSystemBooted = true;
+                } else {
+                    std::cout << "[Editor] particle load refused: " << pErr << "\n";
+                }
+            } else {
+                std::cout << "[Editor] effekseer asset not found "
+                             "(assets/effects/block_simple.efk)\n";
+            }
+        }
+    }
+    if (m_particleSystemC && m_particleSystemBooted) {
+        if (m_particleSystemHandle < 0) {
+            m_particleSystemHandle = m_particleSystemC->spawn(0.0f, 1.8f, 0.0f, 7);
+        }
+        m_particleSystemC->step(1.0f / 60.0f);
+        m_particleAlive = m_particleSystemC->aliveCount(m_particleSystemHandle);
+        stats.hasParticle = true;
+        stats.particleBooted = true;
+        stats.particleHandle = m_particleSystemHandle;
+        stats.particleAlive = m_particleAlive;
+    } else if (m_particleSystemC) {
+        stats.hasParticle = true;
+        stats.particleBooted = false;
+        stats.particleAlive = 0;
     }
 
     // ---- 9. create_audio_mixer (engine::audio::IAudioMixer) ---------------
@@ -380,15 +434,14 @@ void EditorApplication::refresh_sdk_contract_runtimes() {
         m_audioMixerC->set_input("sfx", voiceLevel, mErr);
         m_audioMixerC->tick(1.0 / 60.0, mErr);
         m_audioMixerMaster = m_audioMixerC->master_level();
-        out << ",\"audio\":{\"master\":" << m_audioMixerMaster
-            << ",\"music\":" << m_audioMixerC->bus_level("music")
-            << ",\"sfx\":" << m_audioMixerC->bus_level("sfx")
-            << ",\"gain_db_master\":" << m_audioMixerC->gain_db("master")
-            << "}";
+        stats.hasAudio = true;
+        stats.audioMaster = m_audioMixerMaster;
+        stats.audioMusic = m_audioMixerC->bus_level("music");
+        stats.audioSfx = m_audioMixerC->bus_level("sfx");
+        stats.audioGainDbMaster = m_audioMixerC->gain_db("master");
     }
 
-    out << "}";
-    m_sdkContractJson = out.str();
+    m_sdkContractJson = serialize_sdk_contract_json(stats);
 }
 
 }  // namespace Engine

@@ -32,6 +32,10 @@ public:
     virtual std::size_t pending() const = 0;
     // Executes queued jobs in submission order until the queue is empty.
     virtual void drain() = 0;
+    // Shuts the system down: every subsequent submit() is rejected with an
+    // invalid handle (id 0) instead of being silently accepted and dropped
+    // (A4-JOBS-SHUTDOWN-SILENCIOSO). Already-queued jobs remain for drain().
+    virtual void shutdown() = 0;
 };
 
 std::shared_ptr<IJobSystem> create_job_system();

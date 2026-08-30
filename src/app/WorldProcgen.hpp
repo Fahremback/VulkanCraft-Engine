@@ -26,6 +26,7 @@
 #include "engine/procgen/ILodTerrain.hpp"
 #include "engine/procgen/IMultiScaleStreaming.hpp"
 #include "engine/procgen/IMeshCooking.hpp"
+#include "engine/procgen/IMeshGeometryProcessing.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -42,6 +43,13 @@ public:
     void tick(World& world, float playerX, float playerZ);
     // Composed summary appended to the window title (real observables).
     std::string summary() const;
+
+    // A4-PROCGEN-FACTORY-FAILURE: reports a REQUIRED factory failure to stderr
+    // (name + diagnostic) and returns false so init() aborts instead of
+    // degrading silently with a null factory. Static so the reporting path is
+    // directly testable (WorldProcgen.RequiredFactoryFailureReported).
+    static bool require_factory(const char* name, const std::string& diag,
+                                bool has_value);
 
 private:
     // ---- group 1: biome / climate ---------------------------------------
@@ -68,6 +76,9 @@ private:
     std::shared_ptr<engine::procgen::ILodTerrainSampler> lodSampler_;
     std::shared_ptr<engine::procgen::IMultiScaleStreaming> multiScale_;
     std::shared_ptr<engine::procgen::IMeshCooker> meshCooker_;
+    // ---- group 6: mesh geometry post-processing (geodesic/smooth/decimate)
+    std::unique_ptr<Engine::Procgen::IMeshGeometryProcessing> geomProcessor_;
+    std::size_t smoothedVertices_{ 0 };
 
     // Surviving cooked-mesh output (never a dead local).
     std::vector<float> cookedPositions_;

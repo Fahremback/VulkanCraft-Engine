@@ -187,6 +187,8 @@ public:
             d.position = s.position;
             d.hostile = s.hostile;
             d.kind = s.kind;
+            d.faction = s.faction;   // A2-114: faction chega aos sensores
+            d.damage = s.damage;     // A2-114: dano/threat chega aos sensores
             d.distance = dist;
 
             if (dist <= spec_.proximity_range) {

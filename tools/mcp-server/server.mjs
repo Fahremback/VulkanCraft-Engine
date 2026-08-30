@@ -2242,17 +2242,34 @@ function installSignalHandlers() {
   process.on("SIGINT", () => stop("SIGINT"));
   process.on("SIGTERM", () => stop("SIGTERM"));
 }
+// Agente 3 (fechamento_solidacao) — the prompts and renderer are exported so the
+// headless audit (prompt-tools-audit.mjs) can validate that every tool a prompt
+// tells the LLM to call actually exists in the TOOLS catalog, without starting
+// a server. Running this file directly still launches the server as before.
+// The exact catalog served by tools/list — the audit and the runtime share it
+// (single source of truth, so a prompt can never reference a tool that the
+// server does not actually expose).
+export function mcpToolCatalog() {
+  return [...TOOLS, ...publicRuntimeTools()];
+}
+export { PROMPTS, renderPrompt };
+
 installSignalHandlers();
 
-const argv = process.argv.slice(2);
-const httpFlag = argv.indexOf("--http");
-if (httpFlag >= 0) {
-  const portFlag = argv.indexOf("--port");
-  const port = portFlag >= 0 && Number(argv[portFlag + 1]) > 0 ? Number(argv[portFlag + 1]) : 8322;
-  startHttpTransport(port, "127.0.0.1");
-} else {
-  process.stdin.setEncoding("utf8");
-  process.stdin.on("data", (chunk) => { inputBuffer += chunk; drainInput(); });
-  process.stdin.on("end", () => process.exit(0));
-  log(`ready; root=${ENGINE_ROOT}`);
+// MCP_SERVER_ONLY_* guards: when imported by the audit test we export the prompt
+// surface but must NOT bind stdin / start a server (the import is side-effect
+// free except for module init). The real server entrypoint sets this env var.
+if (!process.env.VC_MCP_AUDIT_ONLY) {
+  const argv = process.argv.slice(2);
+  const httpFlag = argv.indexOf("--http");
+  if (httpFlag >= 0) {
+    const portFlag = argv.indexOf("--port");
+    const port = portFlag >= 0 && Number(argv[portFlag + 1]) > 0 ? Number(argv[portFlag + 1]) : 8322;
+    startHttpTransport(port, "127.0.0.1");
+  } else {
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { inputBuffer += chunk; drainInput(); });
+    process.stdin.on("end", () => process.exit(0));
+    log(`ready; root=${ENGINE_ROOT}`);
+  }
 }

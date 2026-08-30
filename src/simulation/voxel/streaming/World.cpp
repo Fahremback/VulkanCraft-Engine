@@ -916,6 +916,11 @@ bool World::restore_chunk_data(int cx, int cz, int extent,
     return true;
 }
 
+std::size_t World::structure_populated_count() const {
+    std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+    return structurePopulatedChunks.size();
+}
+
 bool World::can_touch_chunk_at(const glm::vec3& worldPos) const {
     int cx = static_cast<int>(std::floor(worldPos.x / CHUNK_SIZE_X));
     int cz = static_cast<int>(std::floor(worldPos.z / CHUNK_SIZE_Z));

@@ -6,6 +6,8 @@
 
 namespace Engine::Networking {
 
+ReliableTransport::ReliableTransport() : config_(Config{}) {}
+
 ReliableTransport::ReliableTransport(Config config) : config_(config) {}
 
 ReliableTransport::~ReliableTransport() {
@@ -31,8 +33,14 @@ void ReliableTransport::close() {
 }
 
 bool ReliableTransport::listen(std::uint16_t port) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // The receive thread's callback locks mutex_. Calling socket_.stop_receive()
+    // (which joins that thread) WHILE holding mutex_ is a textbook A↔B
+    // deadlock whenever a datagram is in flight: the join waits for the thread
+    // to finish, but the thread's callback is blocked on the lock we hold.
+    // Adopt the close() lifecycle: tear down the socket/receive thread first,
+    // then re-bind and restart under the lock.
     socket_.stop_receive();
+    socket_.close();
     if (!socket_.listen(port, SocketKind::Udp)) return false;
     socket_.start_receive([this](Datagram datagram) {
         const auto now = std::chrono::steady_clock::now();
@@ -42,16 +50,26 @@ bool ReliableTransport::listen(std::uint16_t port) {
         }
         handle_datagram(datagram.payload.data(), datagram.payload.size(), now);
     });
-    status_ = Status::Disconnected;
-    nextOutSeq_ = 1;  // fresh DATA seq space for this connection
-    lastReceive_ = std::chrono::steady_clock::now();
-    lastHeartbeat_ = lastReceive_;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        status_ = Status::Disconnected;
+        nextOutSeq_ = 1;  // fresh DATA seq space for this connection
+        // Drop any learned peer from a prior connection. A re-listen is a new
+        // endpoint whose peer is re-learned from the first inbound datagram;
+        // keeping the stale address would misroute our first sends.
+        peerTarget_.clear();
+        lastReceive_ = std::chrono::steady_clock::now();
+        lastHeartbeat_ = lastReceive_;
+    }
     return true;
 }
 
 bool ReliableTransport::connect(const std::string& host, std::uint16_t port) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // See listen(): never call socket_.stop_receive() under mutex_. Tear the
+    // receive thread down first, then bind/connect and restart it, then update
+    // state under the lock.
     socket_.stop_receive();
+    socket_.close();
     if (!socket_.listen(0, SocketKind::Udp)) return false;
     if (!socket_.connect(host, port, SocketKind::Udp)) return false;
     socket_.start_receive([this](Datagram datagram) {
@@ -62,13 +80,20 @@ bool ReliableTransport::connect(const std::string& host, std::uint16_t port) {
         }
         handle_datagram(datagram.payload.data(), datagram.payload.size(), now);
     });
-    status_ = Status::Handshaking;
-    nextOutSeq_ = 1;  // fresh DATA seq space for this connection
-    handshakeSent_ = false;
-    synRetries_ = 0;
-    lastSend_ = std::chrono::steady_clock::time_point{};
-    lastReceive_ = std::chrono::steady_clock::now();
-    lastHeartbeat_ = lastReceive_;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        status_ = Status::Handshaking;
+        nextOutSeq_ = 1;  // fresh DATA seq space for this connection
+        handshakeSent_ = false;
+        synRetries_ = 0;
+        // Reconnect to a (possibly different) peer: must forget the old peer
+        // address, else the first SYN here goes to the previous connection's
+        // endpoint (send_packet routes on peerTarget_ when non-empty).
+        peerTarget_.clear();
+        lastSend_ = std::chrono::steady_clock::time_point{};
+        lastReceive_ = std::chrono::steady_clock::now();
+        lastHeartbeat_ = lastReceive_;
+    }
     return true;
 }
 
@@ -117,6 +142,13 @@ bool ReliableTransport::send(const std::byte* data, std::size_t size) {
         header.payloadSize = static_cast<std::uint16_t>(sendSize);
         send_packet(header, sendPayload, sendSize);
 
+        // Remember exactly what went on the wire (compressed OR raw bytes with
+        // the matching FLAG_COMPRESSED bit). retransmit() replays this verbatim
+        // instead of re-deriving the compression decision, so a peer never
+        // receives a COMPRESSED-flagged packet whose body is plain bytes.
+        packet.wirePayload.assign(sendPayload, sendPayload + sendSize);
+        packet.wireFlags = header.flags;
+
         sendQueue_.push_back(std::move(packet));
         offset += chunk;
     }
@@ -155,6 +187,7 @@ void ReliableTransport::update(std::chrono::steady_clock::time_point now) {
     std::lock_guard<std::mutex> lock(mutex_);
     // The receive thread delivers datagrams via the callback; nothing to poll
     // here. Drive handshake, retransmission, heartbeats and timeouts.
+    sweep_stale_buffers(now);
     if (status_ == Status::Handshaking) {
         // Loss-resilient handshake: retry the SYN on the retransmit cadence
         // until the peer answers (or maxRetransmits, then TimedOut). A single
@@ -204,7 +237,6 @@ void ReliableTransport::handle_datagram(const std::byte* data, std::size_t size,
     const bool ack = (header.flags & FLAG_ACK) != 0;
     const bool dataFlag = (header.flags & FLAG_DATA) != 0;
     const bool heartbeat = (header.flags & FLAG_HEARTBEAT) != 0;
-    const bool compressed = (header.flags & FLAG_COMPRESSED) != 0;
 
     // Piggybacked ACKs: every packet carries the peer's receive cursor. The
     // heartbeats and data carry it too — without processing it here, a sender
@@ -286,15 +318,36 @@ void ReliableTransport::handle_datagram(const std::byte* data, std::size_t size,
 
 void ReliableTransport::process_data(const PacketHeader& header, const std::byte* payload,
                                      std::size_t size, std::chrono::steady_clock::time_point now) {
+    // ── Malformed-fragment validation (DoS hardening) ──────────────────────
+    // Every field is attacker-controlled from the wire. A hostile peer can
+    // otherwise underflow frag/seq math, allocate unbounded partials, or force
+    // absurd reassembly sizes. Reject the fragment outright and drop it.
+    const auto reject = [&]() { ++rejectedFragments_; return; };
+
+    if (header.fragmentCount == 0) return reject();          // no such message shape
+    if (header.fragmentIndex >= header.fragmentCount) return reject();  // index out of range
+    // firstSeq = seq - index would underflow when index > seq (uint32 wrap to
+    // a huge number that can alias a live partial / cause unbounded growth).
+    if (header.fragmentIndex > header.seq) return reject();
+    if (header.seq < nextInSeq_) return;  // stale duplicate of a delivered seq
+    if (size > config_.maxMessageSize) return reject();      // absurd single fragment
+    if (header.fragmentCount > config_.maxFragments) return reject();  // absurd message
+
     if (header.fragmentCount == 1 && header.fragmentIndex == 0) {
         // Single-fragment message: buffer by sequence, deliver only in order.
-        if (header.seq < nextInSeq_) return;  // stale duplicate of a delivered seq
+        if (reorderBuffer_.size() >= config_.maxReorderEntries) {
+            // Reorder buffer is saturated with out-of-order/unacked single
+            // messages. Drop the newest to bound memory under a flood of
+            // unique unseen seqs; a bogus stream should not grow unbounded.
+            return reject();
+        }
         if (reorderBuffer_.count(header.seq) == 0) {
             std::vector<std::byte> message(payload, payload + size);
             if (header.flags & FLAG_COMPRESSED) {
                 std::vector<std::byte> decompressed(config_.receiveBuffer);
                 const std::size_t n = decompress(payload, size, decompressed.data(), decompressed.size());
                 decompressed.resize(n);
+                if (decompressed.size() > config_.maxMessageSize) return reject();
                 message = std::move(decompressed);
             }
             reorderBuffer_[header.seq] = std::move(message);
@@ -303,16 +356,53 @@ void ReliableTransport::process_data(const PacketHeader& header, const std::byte
         return;
     }
 
-    // Multi-fragment message: accumulate until complete.
-    const std::uint32_t firstSeq = header.seq - header.fragmentIndex;
+    // Multi-fragment message: accumulate until complete (with limits).
+    const std::uint32_t firstSeq = header.seq - header.fragmentIndex;  // safe: index<=seq checked
+    // Bound the partial table: never let an attacker grow unbounded partials
+    // with first-fragment-only floods. Also bound the fragment count per
+    // message and the assembled size.
+    if (partials_.size() >= config_.maxPartialEntries &&
+        partials_.find(firstSeq) == partials_.end()) {
+        return reject();
+    }
     auto& partial = partials_[firstSeq];
     partial.count = header.fragmentCount;
     partial.received = now;
+    if (partial.fragments.size() >= partial.count) {
+        // All fragments already present; this is a duplicate/invalid send.
+        ++rejectedFragments_;
+        return;
+    }
+    // Decompress this fragment NOW from its own wire flag (send() compresses
+    // each fragment independently and may mix compressed/uncompressed when the
+    // data barely shrinks). Storing the decoded bytes here means deliver_ordered()
+    // just concatenates — it must NOT bulk-decompress the assembled stream,
+    // which would corrupt incompressible fragments that went out uncompressed.
+    std::vector<std::byte> fragData;
+    if (header.flags & FLAG_COMPRESSED) {
+        std::vector<std::byte> dec(config_.receiveBuffer);
+        const std::size_t n = decompress(payload, size, dec.data(), dec.size());
+        dec.resize(n);
+        if (n == 0 || dec.size() > config_.maxMessageSize) {
+            partials_.erase(firstSeq);
+            return reject();
+        }
+        fragData = std::move(dec);
+    } else {
+        fragData.assign(payload, payload + size);
+    }
+    // Bound assembled message size (on the decoded size).
+    std::size_t assembledSoFar = 0;
+    for (const auto& f : partial.fragments) assembledSoFar += f.data.size();
+    if (assembledSoFar + fragData.size() > config_.maxMessageSize) {
+        partials_.erase(firstSeq);
+        return reject();
+    }
     bool exists = false;
     for (auto& f : partial.fragments) {
         if (f.index == header.fragmentIndex) { exists = true; break; }
     }
-    if (!exists) partial.fragments.push_back({header.fragmentIndex, {payload, payload + size}});
+    if (!exists) partial.fragments.push_back({header.fragmentIndex, std::move(fragData)});
 
     if (partial.fragments.size() == partial.count) {
         deliver_ordered();
@@ -357,13 +447,9 @@ void ReliableTransport::deliver_ordered() {
             const std::uint32_t count = partial->second.count;
             partials_.erase(partial);
             nextInSeq_ += count;
-            // Fragments were compressed individually by send(); decompress the
-            // assembled message (non-compressed when too small to shrink).
-            std::vector<std::byte> decompressed(config_.receiveBuffer);
-            const std::size_t n = decompress(message.data(), message.size(),
-                                             decompressed.data(), decompressed.size());
-            decompressed.resize(n);
-            deliver_message(std::move(decompressed));
+            // Fragments were already decompressed individually by process_data()
+            // from their own wire flags; just hand the assembled bytes through.
+            deliver_message(std::move(message));
             continue;
         }
         break;
@@ -377,6 +463,43 @@ void ReliableTransport::deliver_message(std::vector<std::byte> message) {
         mutex_.unlock();
         handler(message.data(), message.size());
         mutex_.lock();
+    }
+}
+
+void ReliableTransport::sweep_stale_buffers(std::chrono::steady_clock::time_point now) {
+    // Global, age-based sweep that runs on the update() cadence regardless of
+    // which datagram just arrived. Without it, abandoned partials (a message
+    // ended at fragment 1 of N and no more ever came) and stale out-of-order
+    // singletons stayed in their tables until the exact same firstSeq was
+    // re-touched — a hostile flood of unique first fragments grew partials_
+    // without bound. Run it periodically, never under the packet-hot path.
+    const auto interval = std::chrono::milliseconds(std::max<long long>(16ll,
+        static_cast<long long>(config_.timeoutAfter.count()) / 4));
+    if (lastSweep_ != std::chrono::steady_clock::time_point{} &&
+        (now - lastSweep_) < interval) {
+        return;
+    }
+    lastSweep_ = now;
+
+    // Evict abandoned partials by age (the core fix). Without this sweep, a
+    // message that ended at fragment 1 of N and never resumed would linger in
+    // partials_ until the exact same firstSeq was re-touched; a hostile flood
+    // of unique first-fragments grew the table without bound.
+    for (auto it = partials_.begin(); it != partials_.end();) {
+        if (now - it->second.received > config_.timeoutAfter) {
+            ++droppedFragments_;
+            it = partials_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // Out-of-order singletons have no per-entry timestamp; keep the reorder
+    // table bounded as a hard safety net (process_data already caps insertion,
+    // this is belt-and-braces). check_timeout clears everything on timeout.
+    while (reorderBuffer_.size() > config_.maxReorderEntries) {
+        auto oldest = reorderBuffer_.begin();
+        ++droppedFragments_;
+        reorderBuffer_.erase(oldest);
     }
 }
 
@@ -407,14 +530,20 @@ void ReliableTransport::retransmit(std::chrono::steady_clock::time_point now) {
             PacketHeader header{};
             header.seq = packet.seq;
             header.ack = nextInSeq_;
-            header.flags = FLAG_DATA | FLAG_COMPRESSED;
+            // Repeat the EXACT wire flags that were sent originally. If the
+            // fragment went on the wire uncompressed (compression did not
+            // shrink it), wireFlags has no FLAG_COMPRESSED bit, so the
+            // retransmission replays raw bytes as raw — the receiver never
+            // tries to decompress plain data (the P0 corruption bug).
+            header.flags = packet.wireFlags;
             // Repeat the ORIGINAL fragment metadata: retransmitting a fragment
             // of a multi-fragment message as "index 0 of 1" made the receiver
             // deliver a truncated message and the real one never completed.
             header.fragmentIndex = packet.fragmentIndex;
             header.fragmentCount = packet.fragmentCount;
-            header.payloadSize = static_cast<std::uint16_t>(packet.payload.size());
-            send_packet(header, packet.payload.data(), packet.payload.size());
+            // Replay the byte-exact wire payload (compressed or raw).
+            header.payloadSize = static_cast<std::uint16_t>(packet.wirePayload.size());
+            send_packet(header, packet.wirePayload.data(), packet.wirePayload.size());
         }
     }
 }

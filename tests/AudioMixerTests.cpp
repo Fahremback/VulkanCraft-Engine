@@ -254,6 +254,50 @@ void test_determinism() {
     check(a->gain_db("music") == b->gain_db("music"), "determinismo: gain bit-exato");
 }
 
+// A2-124 (Agente 5): the game's mixer spec (master + music/sfx under it,
+// sfx~>music sidechain at threshold 0.35) drives the `mixer` title observable
+// — a loud sfx event ducks music and the master level/gain reflect it.
+void test_game_mixer_observable() {
+    auto m = create_audio_mixer();
+    std::string err;
+    AudioMixerSpec spec;
+    spec.buses = {
+        {"master", -3.0, ""},
+        {"music", 0.0, "master"},
+        {"sfx", 0.0, "master"},
+    };
+    spec.sidechains = {
+        {"sfx", "music", 0.35, -9.0, 0.05, 0.25},
+    };
+    check(m->configure(spec, err), "game mixer configure");
+
+    // Baseline: music input full, no sfx -> no duck. bus_level("music") is the
+    // post-gain level (base 0 dB effective -> 1.0); master applies its own
+    // -3 dB gain over the summed children (master level ~ db_to_linear(-3)).
+    check(m->set_input("music", 1.0, err), "music input full");
+    check(m->set_input("sfx", 0.0, err), "sfx silent");
+    check(m->tick(0.016, err), "tick");
+    check(m->gain_db("master") == -3.0, "master gain -3 dB baseline");
+    check(approx(m->bus_level("music"), 1.0), "music not ducked: post gain 1.0");
+    check(approx(m->master_level(), db_to_linear(-3.0)), "master = -3 dB baseline");
+
+    // Loud sfx above the 0.35 threshold ducks music by up to -9 dB; the master
+    // and music levels change accordingly (what the `mixer` title prints).
+    check(m->set_input("sfx", 1.0, err), "sfx loud");
+    for (int i = 0; i < 30; ++i) check(m->tick(0.016, err), "duck attack tick");
+    check(m->gain_db("music") == -9.0, "music ducked -9 dB");
+    check(m->bus_level("music") < 1.0, "music post-gain lowered by duck");
+
+    // Observable values are stable and finite (what the title prints).
+    check(m->master_level() > 0.0 && m->master_level() < 1.0,
+          "master level in (0,1)");
+    check(m->gain_db("master") <= 0.0, "master gain non-positive dB");
+    std::cout << "[mixer] master=" << m->master_level()
+              << " music=" << m->bus_level("music")
+              << " sfx=" << m->bus_level("sfx")
+              << " gain=" << m->gain_db("master") << " dB\n";
+}
+
 }  // namespace
 
 int main() {
@@ -267,6 +311,7 @@ int main() {
     test_runtime_refusals();
     test_master_clamp();
     test_determinism();
+    test_game_mixer_observable();
 
     if (g_failures == 0) {
         std::cout << "audio_mixer_tests: all checks passed\n";

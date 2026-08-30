@@ -24,16 +24,39 @@ assert.match(gridVertex, /farWorld\s*=\s*unproject\s*\(\s*ndc\s*,\s*1\.0\s*\)/);
 // BUG-EDITOR-GRID-005 (orbit jitter): the raw far-plane endpoint is
 // unprojected at clipZ=1.0 = the FULL far plane (50000), and must NOT be
 // handed to the rasterizer as an interpolant (huge OPPOSITE corners cancel in
-// fp32 toward screen centre). The vertex must clamp the ray to a fixed,
-// modest world length and pass only that precise same-line segment to the
-// fragment.
+// fp32 toward screen centre). The vertex must reduce the projective ray by
+// ONE fixed, constant scale and pass only that precise same-line segment to
+// the fragment (A1-G-GRID-RIGHT-SKEW-UNDERSIDE: un-normalized projective
+// vector, scaled by a single constant — never per-vertex normalize, which is
+// nonlinear and bends the interpolated direction field).
 assert.match(
   gridVertex,
-  /const\s+float\s+RAY_LENGTH\s*=\s*3000\.0\s*;.*farPoint\s*=\s*nearPoint\s*\+\s*dir\s*\*\s*RAY_LENGTH\s*;/s,
-  "grid vertex must clamp the far ray to a fixed modest length (BUG-EDITOR-GRID-005)"
+  /const\s+float\s+RAY_SCALE\s*=\s*1\.0\s*\/\s*24\.0\s*;.*farPoint\s*=\s*nearPoint\s*\+\s*dir\s*\*\s*RAY_SCALE\s*;/s,
+  "grid vertex must reduce the projective far ray by one fixed constant scale (BUG-EDITOR-GRID-005 / A1-G)"
+);
+assert.match(
+  gridFragment,
+  /vec3\s+rayDirection\s*=\s*rawLen\s*>\s*1e-9\s*\?\s*\(\s*rawDir\s*\/\s*rawLen\s*\)/,
+  "grid fragment must re-normalize the interpolated ray — the ONLY normalization (A1-G)"
+);
+assert.doesNotMatch(
+  gridVertex,
+  /normalize\s*\(\s*\w+\s*\)/,
+  "grid vertex must never normalize per-vertex (nonlinear, bends the ray field — A1-G)"
 );
 assert.match(gridFragment, /float\s+gridDepth\s*=\s*clipPoint\.z\s*\/\s*safeClipW\s*;/);
 assert.doesNotMatch(gridFragment, /gl_FragDepth\s*=\s*clamp\s*\(\s*t\s*,/);
+// C1-GRID-RUNTIME-001 / A1-G-GRID-RIGHT-SKEW-UNDERSIDE (executable invariant):
+// the grid plane only exists on the side facing UP. A ray striking Y=0 from
+// BELOW must produce NO grid — the fragment rejects the underside by requiring
+// a downward ray (denom < -1e-6) AND a forward intersection (t >= 0), and
+// invalid fragments write zero premultiplied alpha so no grid appears above
+// the plane. These are the code invariants the Agente 6 render capture must
+// reproduce (the only normalization happens in the fragment, after interpolation).
+assert.match(gridFragment, /bool\s+above\s*=\s*denom\s*<\s*-1e-6\s*;/);
+assert.match(gridFragment, /bool\s+valid\s*=\s*above\s*&&\s*t\s*>=\s*0\.0\s*;/);
+assert.match(gridFragment, /alpha\s*\*=\s*valid\s*\?\s*1\.0\s*:\s*0\.0\s*;/);
+assert.match(gridFragment, /rayDirection\s*=\s*rawLen\s*>\s*1e-9\s*\?\s*\(\s*rawDir\s*\/\s*rawLen\s*\)/);
 assert.match(
   header,
   /struct\s+GridPushConstants\s*\{\s*glm::mat4\s+invViewProj\s*;\s*glm::mat4\s+viewProj\s*;\s*\};/,

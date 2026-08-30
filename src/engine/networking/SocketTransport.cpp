@@ -59,6 +59,14 @@ bool SocketTransport::listen(uint16_t port, SocketKind kind) {
 #if defined(_WIN32)
     static WinsockInit init;
 #endif
+    // TCP is NOT implemented end-to-end here (no accept()/recv()/send() path;
+    // the receive loop and datagram framing are UDP-shaped). Rather than expose
+    // a half-working flag that promises a mode it cannot deliver (A1-TCP-MEIO),
+    // reject it explicitly: selectors get a clear failure instead of silence.
+    if (kind == SocketKind::Tcp) {
+        lastError_ = "SocketKind::Tcp is not supported by SocketTransport";
+        return false;
+    }
     close();
     const int type = (kind == SocketKind::Udp) ? SOCK_DGRAM : SOCK_STREAM;
     const SOCKET_T s = ::socket(AF_INET, type, 0);
@@ -118,6 +126,12 @@ bool SocketTransport::connect(const std::string& host, uint16_t port, SocketKind
 #if defined(_WIN32)
     static WinsockInit init;
 #endif
+    // See listen(): TCP has no functional path here; reject it explicitly so a
+    // caller cannot silently fall into a half-configured UDP-shaped socket.
+    if (kind == SocketKind::Tcp) {
+        lastError_ = "SocketKind::Tcp is not supported by SocketTransport";
+        return false;
+    }
     close();
     const int type = (kind == SocketKind::Udp) ? SOCK_DGRAM : SOCK_STREAM;
     const SOCKET_T s = ::socket(AF_INET, type, 0);
@@ -133,7 +147,6 @@ bool SocketTransport::connect(const std::string& host, uint16_t port, SocketKind
         hints.ai_family = AF_INET;
         hints.ai_socktype = type;
         addrinfo* results = nullptr;
-        const char* service = std::to_string(port).c_str();
         char serviceBuf[16];
         std::snprintf(serviceBuf, sizeof(serviceBuf), "%u", port);
         if (getaddrinfo(host.c_str(), serviceBuf, &hints, &results) == 0 && results) {
@@ -156,12 +169,22 @@ bool SocketTransport::connect(const std::string& host, uint16_t port, SocketKind
         clientTarget_ = std::string(ip) + ":" + std::to_string(port);
         localPort_ = 0;
         isServer_ = false;
-        // Bind an ephemeral local port so replies come back.
+        // Bind an ephemeral local port so replies come back, then report the
+        // actual bound port (0/"ephemeral" is not the real source port).
         sockaddr_in local{};
         local.sin_family = AF_INET;
         local.sin_addr.s_addr = htonl(INADDR_ANY);
         local.sin_port = 0;
-        ::bind(s, reinterpret_cast<sockaddr*>(&local), sizeof(local));
+        if (::bind(s, reinterpret_cast<sockaddr*>(&local), sizeof(local)) == 0) {
+#if defined(_WIN32)
+            int boundLen = sizeof(local);
+#else
+            socklen_t boundLen = sizeof(local);
+#endif
+            if (::getsockname(s, reinterpret_cast<sockaddr*>(&local), &boundLen) == 0) {
+                localPort_ = ntohs(local.sin_port);
+            }
+        }
     } else {
         if (::connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
 #if defined(_WIN32)
@@ -193,7 +216,7 @@ bool SocketTransport::start_receive(ReceiveCallback callback) {
 }
 
 void SocketTransport::run_receive_loop() {
-    while (receiving_) {
+    while (receiving_.load(std::memory_order_acquire)) {
         auto dg = poll();
         if (dg) {
             if (callback_) callback_(std::move(*dg));
@@ -204,7 +227,7 @@ void SocketTransport::run_receive_loop() {
 }
 
 void SocketTransport::stop_receive() {
-    receiving_ = false;
+    receiving_.store(false, std::memory_order_release);
     if (receiveThread_) {
         auto* t = static_cast<std::thread*>(receiveThread_);
         if (t->joinable()) t->join();

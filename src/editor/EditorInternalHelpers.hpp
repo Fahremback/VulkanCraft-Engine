@@ -60,7 +60,18 @@ std::pair<uint32_t, uint32_t> append_ring(
     const glm::vec3& axis, float radius, int segments,
     const glm::vec3& color);
 void build_cube(std::vector<EditorVertex>& verts, std::vector<uint32_t>& indices);
+
+// ── SPIR-V loading / fingerprint (C6-GRID-ARTIFACT-001) ───────────────────
+// read_spv resolves VULKANCRAFT_SHADER_DIR (the canonical build-tree shader
+// dir `${CMAKE_BINARY_DIR}/shaders`). To make WHICH tree the editor actually
+// executed auditable, every loaded module is fingerprinted (FNV-1a 64 over the
+// raw SPIR-V words) and the path + hash are logged at boot. Certification
+// (Agente 6) compares the logged hash against the canonical compile_shaders
+// output so a stale copy from build/out/ag3 can never be mistaken for the fix.
 std::vector<uint32_t> read_spv(const char* name);
+uint64_t fnv1a_spirv(const std::vector<uint32_t>& spirv);
+void log_shader_fingerprint(const std::string& label, const std::string& path,
+                            const std::vector<uint32_t>& spirv);
 VkPipeline create_scene_pipeline(VkDevice device, VkRenderPass renderPass, VkPipelineLayout layout,
                                  VkShaderModule vert, VkShaderModule frag,
                                  VkSampleCountFlagBits samples, bool wireframe, bool depthTest, bool cull,

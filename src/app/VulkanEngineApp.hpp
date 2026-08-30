@@ -34,6 +34,7 @@
 #include "engine/rendering/IKtx2Transcoder.hpp"
 #include "engine/rendering/IXrMath.hpp"
 #include "engine/rendering/IHairPhysics.hpp"
+#include "engine/profiling/ISystemTimeline.hpp"
 #include "engine/rendering/IShaderCompiler.hpp"
 #include "engine/rendering/IRenderPassMetrics.hpp"
 #include "engine/rendering/ISceneCulling.hpp"
@@ -77,11 +78,14 @@
 #include "engine/gameplay/IGameplayEvents.hpp"
 #include "engine/gameplay/IGameplayMetrics.hpp"
 #include "engine/gameplay/IGameplayEventRouter.hpp"
+#include "engine/gameplay/IGameplayCrossDomain.hpp"
+#include "engine/gameplay/IGameplayPhase.hpp"
 #include "engine/gameplay/IDayNightCycle.hpp"
 #include "engine/navigation/IAsyncQueryScheduler.hpp"
 #include "engine/audio/IAudioEventMapper.hpp"
 #include "engine/audio/ISpatialAudio.hpp"
 #include "engine/audio/IAdaptiveMusic.hpp"
+#include "engine/audio/IAudioMixer.hpp"
 #include "engine/ai/ISteering.hpp"
 #include "engine/ai/IPerception.hpp"
 #include "engine/ai/IFsm.hpp"
@@ -422,6 +426,29 @@ public:
     std::size_t perceptionDetections{ 0 };
     std::size_t perceptionMemory{ 0 };
     float nearestThreatDistance{ -1.0f };
+    // A2-114 (Agente 5): aggregate of the sensor signals this frame — the
+    // distinct factions sensed and the max damage/threat of the detected set.
+    // Published in the title as the `percept` segment.
+    std::string perceptSummary;
+    std::string perceptFactions;
+    float perceptMaxDamage{ 0.0f };
+    // A2-73 (Agente 5): time-travel/world-switch lifecycle policies for
+    // network + particles — pausing HOLDS both (like the audio J.126 holds
+    // voices) and a rewind cleans them. Counters + last-event type are
+    // observable in the title as the `policy` segment.
+    std::uint64_t policyNetPausedFrames{ 0 };
+    std::uint64_t policyParticlePausedFrames{ 0 };
+    std::uint64_t policyRewindCleanups{ 0 };
+    std::uint64_t policyLastObservedRewinds{ 0 };
+    std::string policySummary{ "none" };
+    // A2-50/57 (Agente 5): continuous light/fluid/structure streaming is
+    // observable every frame — the world's live streaming_snapshot (light-dirty
+    // chunks, active fluid cells, pending fluid ticks) plus the applied
+    // structure-populated chunk count. Published in the `stream` title segment.
+    std::string streamSummary;
+    std::size_t streamLightDirty{ 0 };
+    std::size_t streamFluidCells{ 0 };
+    std::size_t streamStructures{ 0 };
     // AGENTE 2 block I.114 (FSM): a deterministic combat state machine for a
     // mob — driven by the SAME perception suite (nearest threat). The FSM core
     // is pure: tick() emits action ids the game maps to observables. State /
@@ -570,6 +597,17 @@ public:
     std::shared_ptr<engine::vehicles::IVehicleReplication> showcaseVehClientReplication;
     std::unique_ptr<engine::gameplay::IVehicle> showcaseVehPredicted;
     std::size_t showcaseVehRollbacks{ 0 };
+    // SDK-INTERNAL resolution: IGameplayCrossDomain + IGameplayPhase wired
+    // into the product as cross-domain status coordinator + domain lifecycle.
+    // (Agente 5 — A4-REQ-CROSS-DOMAIN / A4-REQ-PHASE) created + bound +
+    // advanced per frame in the game executable, with observables in the title.
+    std::unique_ptr<engine::gameplay::IGameplayCrossDomain> crossDomain_;
+    std::unique_ptr<engine::gameplay::IGameplayPhase> phase_;
+    std::unique_ptr<engine::navigation::INavigationSchedulerBridge>
+        navSchedulerBridge_;
+    std::string crossDomainSummary;
+    std::string phaseSummary;
+    std::string crossDomainJson_;
     std::shared_ptr<engine::voxel::IVoxelReplication> showcaseVoxelReplication;
     std::size_t showcaseVoxelRegionEntities{ 0 };
     bool showcaseVehNetSetup{ false };
@@ -923,6 +961,21 @@ public:
     std::unique_ptr<engine::animation::IMotionMatchVendor> motionMatchVendor;
     std::size_t motionMatchFrame{ 0 };
     float motionMatchCost{ 0.0f };
+    // CONTA 6: create_hair_physics (vc::rendering::IHairPhysics) — the PUBLIC
+    // headless Verlet hair contract, advanced every fixed tick over a real
+    // strand anchored at the player head; particle count + tip displacement
+    // from rest are the per-tick observables (published in the title).
+    std::unique_ptr<vc::rendering::IHairPhysics> showcaseHairPhysics;
+    vc::rendering::HairStrand showcaseHairStrand;
+    std::size_t showcaseHairParticles{ 0 };
+    float showcaseHairTipDisp{ 0.0f };
+    // CONTA 6: create_system_timeline (engine::profiling::ISystemTimeline) —
+    // the PUBLIC per-system CPU frame breakdown; every fixed tick the real
+    // elapsed of the world/procgen section is recorded (begin_frame /
+    // record_system / end_frame) and the p95 of that system is published.
+    std::unique_ptr<engine::profiling::ISystemTimeline> showcaseTimeline;
+    std::size_t showcaseTimelineFrames{ 0 };
+    float showcaseTimelineP95{ 0.0f };
     void showcase_content_physics_init();
     void showcase_content_physics_tick(float fixedDt);
     void showcase_content_physics_shutdown();
@@ -1088,6 +1141,15 @@ public:
     // gain) is published in the window title.
     std::unique_ptr<engine::audio::ISpatialAudio> spatialAudio;
     std::unique_ptr<engine::audio::IAdaptiveMusic> adaptiveMusic;
+    // A2-124 (Agente 5): the deterministic IAudioMixer (gain/routing core,
+    // headless) is a REAL per-frame consumer in the game — master/bus levels
+    // derive from the live audio activity this frame (spatial voice count +
+    // music layer gain), not a constant. The resulting state (master, music,
+    // sfx bus levels + master gain) is published as the `mixer` title segment.
+    std::unique_ptr<engine::audio::IAudioMixer> gameMixer;
+    std::string gameMixerState;
+    double gameMixerMasterDb{ 0.0 };
+    double gameMixerMasterLevel{ 0.0 };
     std::size_t spatialActiveSources{ 0 };
     std::size_t spatialVirtualizedSources{ 0 };
     std::string adaptiveMusicState;
@@ -1106,6 +1168,13 @@ public:
     std::size_t craftableRecipeCount{ 0 };
     std::size_t recipeCount{ 0 };
     std::string playerInventorySummary;
+    // A2-90 (Agente 5): the hotbar is a REAL persistent consumer — loaded from
+    // disk at boot, saved whenever its serialized state changes. Load/save
+    // counters are observable in the title.
+    std::size_t inventoryLoads{ 0 };
+    std::size_t inventorySaves{ 0 };
+    std::string inventorySaveSummary{ "not-loaded" };
+    std::string lastSavedHotbarJson;
     Player player;
     TextureManager textureManager;
     RadianceCache radianceCache;

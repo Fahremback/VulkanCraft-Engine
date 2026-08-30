@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <functional>
@@ -60,7 +61,11 @@ private:
     bool isServer_{false};
     std::string clientTarget_;
     ReceiveCallback callback_;
-    bool receiving_{false};
+    // Read by the receive loop thread and written by whichever thread calls
+    // start_receive()/stop_receive(). A plain bool read concurrently with a
+    // write is undefined behavior (formal data race). Make it atomic so the
+    // loop can safely observe a stop without instrumentation reporting a race.
+    std::atomic_bool receiving_{false};
     void* receiveThread_{nullptr}; // std::thread* (kept opaque to avoid header deps)
     std::string lastError_;
 

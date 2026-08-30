@@ -118,6 +118,7 @@
 #include "engine/rendering/IRenderPassMetrics.hpp"
 #include "engine/rendering/IRenderProviderRegistry.hpp"
 #include "engine/rendering/IRenderingDebugView.hpp"
+#include "engine/rendering/IParticleSystem.hpp"
 #include "WindowClamp.hpp"
 #include "tools/WickedToolsPanel.hpp"
 
@@ -1403,6 +1404,14 @@ private:
     std::unique_ptr<engine::audio::IAudioMixer> m_audioMixerC;
     // Bus levels fed into the audio mixer each frame; master reflects the mix.
     double m_audioMixerMaster{ 0.0 };
+    // CONTA 6 (particle — same provider as the game): the editor consumes the
+    // SAME public Engine::Rendering::create_particle_system() contract the
+    // game uses (no parallel sim); a real effect is loaded once, an instance
+    // is spawned and stepped every frame, and alive-count is the observable.
+    std::unique_ptr<Engine::Rendering::IParticleSystem> m_particleSystemC;
+    std::int32_t m_particleSystemHandle{ -1 };
+    std::int32_t m_particleAlive{ 0 };
+    bool m_particleSystemBooted{ false };
     // The composed observable JSON for the SDK-contract consumers (serialized
     // each frame by refresh_sdk_contract_runtimes, GET /sdk-contracts).
     std::string m_sdkContractJson;

@@ -6,6 +6,8 @@ import { dirname, resolve } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const shaderPath = resolve(here, "../shaders/active/editor_grid.frag");
 const shader = readFileSync(shaderPath, "utf8");
+const vertPath = resolve(here, "../shaders/active/editor_grid.vert");
+const vert = readFileSync(vertPath, "utf8");
 
 assert.doesNotMatch(
   shader,
@@ -51,6 +53,52 @@ assert.match(
   shader,
   /gridDepth\s*-=\s*gridDepth\s*\*\s*1\.2e-6\s*;/,
   "grid depth must keep the ~10 ULP coplanar tie-break nudge toward the camera"
+);
+
+// A1-G-GRID-RIGHT-SKEW-UNDERSIDE / C1-GRID-RUNTIME-001 (executable invariants
+// that the Agente 6 capture must reproduce): the VERTEX stage must hand the
+// rasterizer a PROJECTIVE, UN-normalized ray vector (scaled by one fixed
+// constant), because per-vertex normalize() bends the direction field across
+// the fullscreen triangle and skews the plane on the right of the camera. The
+// FRAGMENT stage performs the ONE normalization after interpolation and must
+// reject the underside (ray descending onto Y=0, i.e. denom < -1e-6) outright.
+// These regex assertions are the local-executable stand-in for the render
+// capture; they FAIL if someone re-introduces per-vertex normalize / drops the
+// underside rejection.
+assert.match(
+  vert,
+  /vec3\s+dir\s*=\s*farWorld\s*-\s*nearPoint\s*;/,
+  "A1-G: vertex must compute the raw projective ray (farWorld - nearPoint)"
+);
+assert.match(
+  vert,
+  /farPoint\s*=\s*nearPoint\s*\+\s*dir\s*\*\s*RAY_SCALE\s*;/,
+  "A1-G: vertex must pass the UN-normalized vector scaled by the fixed constant (NOT per-vertex normalize)"
+);
+assert.doesNotMatch(
+  vert,
+  /normalize\s*\(\s*dir\s*\)|normalize\s*\(\s*farWorld\s*-\s*nearPoint\s*\)/,
+  "A1-G: vertex must never normalize the projective per-vertex ray (bends direction field)"
+);
+assert.match(
+  shader,
+  /vec3\s+rayDirection\s*=\s*rawLen\s*>\s*1e-9\s*\?\s*\(\s*rawDir\s*\/\s*rawLen\s*\)\s*:\s*vec3\s*\(\s*0\.0\s*,\s*-1\.0\s*,\s*0\.0\s*\)\s*;/,
+  "C1/A1-G: the ONLY normalization is performed in the fragment after interpolation"
+);
+assert.match(
+  shader,
+  /bool\s+above\s*=\s*denom\s*<\s*-1e-6\s*;/,
+  "C1: a ray descending onto the plane (denom < -1e-6) is the only valid intersection"
+);
+assert.match(
+  shader,
+  /bool\s+valid\s*=\s*above\s*&&\s*t\s*>=\s*0\.0\s*;/,
+  "C1: underside / behind-camera intersections are rejected outright"
+);
+assert.match(
+  shader,
+  /valid\s*\?\s*1\.0\s*:\s*0\.0/,
+  "C1: invalid (underside) fragments get zero alpha so no grid appears above the plane"
 );
 
 console.log("editor_grid_shader_tests: PASS");

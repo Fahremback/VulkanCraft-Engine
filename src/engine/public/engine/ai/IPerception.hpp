@@ -33,6 +33,13 @@ struct PerceptionStimulus {
     float loudness = 1.0f;  // [0,1] — escala o raio de audição
     bool hostile = false;   // alimenta nearest_threat
     std::string kind;       // tag livre ("player", "enemy", ...)
+    // A2-114 (Agente 5): faction affiliation of the stimulus source and its
+    // damage/threat level. Aditivo e opcional — o adapter usa `hostile` para
+    // nearest_threat (a facção/IPerception continua compatível); o JOGO
+    // preenche `faction`/`damage` dos dados reais do componente para os
+    // sensores consumirem dano/facção, não só hostil/kind.
+    std::string faction;    // id da facção/equipe do emissor ("" = desconhecida)
+    float damage = 0.0f;    // dano/threat do emissor (>= 0; 0 = nenhum)
 };
 
 // Um estímulo detectado (snapshot determinístico do último update).
@@ -45,6 +52,9 @@ struct Detection {
     bool hostile = false;
     std::string kind;
     float distance = 0.0f;
+    // A2-114 (Agente 5): mirrors the stimulus faction/damage.
+    std::string faction;
+    float damage = 0.0f;
 };
 
 // Configuração dos sensores. `load_from_json`/`validate` são all-or-nothing:

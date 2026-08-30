@@ -236,6 +236,13 @@ public:
     // relight (present in lightDirtyChunks_). False for an unknown chunk.
     bool is_light_dirty(int cx, int cz) const;
 
+    // Streaming validation (Agente 5 — A2-50/57): live structure-stream count
+    // — how many chunks have structure population applied. Consumed by the
+    // game's `stream` title segment alongside the streaming_snapshot (light +
+    // fluid + structure) so streaming light/fluid/structure are observable and
+    // validated on the real executable, not just documented.
+    [[nodiscard]] std::size_t structure_populated_count() const;
+
     void update(const glm::vec3& playerPos, WorldRenderBridge& renderBridge, float deltaTime);
     void cleanup();
 

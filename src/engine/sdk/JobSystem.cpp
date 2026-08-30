@@ -23,11 +23,21 @@ class JobSystem final : public IJobSystem {
 public:
     JobHandle submit(std::function<void()> job) override {
         if (!job) return {};
-        const JobHandle handle{nextId_.fetch_add(1, std::memory_order_relaxed)};
         std::lock_guard lock(mutex_);
+        if (stopped_) {
+            return {};  // Job rejected: system is shut down.
+        }
+        const JobHandle handle{nextId_.fetch_add(1, std::memory_order_relaxed)};
         states_[handle.id] = JobState::Queued;
         push_job({handle, std::move(job)});
         return handle;
+    }
+
+    // Shuts down the job system: all subsequent submit() calls return an
+    // invalid handle. Already-queued jobs remain in the queue for drain().
+    void shutdown() {
+        std::lock_guard lock(mutex_);
+        stopped_ = true;
     }
 
     bool cancel(JobHandle handle) override {
@@ -113,6 +123,7 @@ private:
 #endif
     std::unordered_map<std::uint64_t, JobState> states_;
     std::atomic<std::uint64_t> nextId_{1};
+    bool stopped_{false};
 };
 
 } // namespace

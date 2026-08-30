@@ -3123,6 +3123,7 @@ add_executable(gameplay_framework_tests EXCLUDE_FROM_ALL
     src/engine/sdk/VehicleProvider.cpp
     src/engine/sdk/MotionDatabase.cpp
     src/engine/sdk/XpbdDeformable.cpp
+    src/engine/sdk/FemfxDeformable.cpp
     src/engine/physics/PhysicsRuntime.cpp
     src/engine/physics/PhysicsBackend.cpp
     src/engine/physics/JoltPhysicsBackend.cpp
@@ -3468,6 +3469,22 @@ target_include_directories(editor_layout_tests PRIVATE
 )
 target_link_libraries(editor_layout_tests PRIVATE vc_build_options)
 add_test(NAME editor_layout_tests COMMAND editor_layout_tests)
+
+# Editor /sdk-contracts serializer (Agente 3 — A3-SDK-JSON-INVALIDO): the
+# observable document must ALWAYS parse as strict JSON even when a factory
+# fails (no leading comma) or strings contain quotes/backslashes/newlines.
+# Standalone nlohmann-based serializer, headless — no Vulkan/editor target.
+add_executable(editor_sdk_contract_json_tests EXCLUDE_FROM_ALL
+    tests/EditorSdkContractJsonTests.cpp
+    src/editor/EditorSdkContractJson.cpp
+)
+target_include_directories(editor_sdk_contract_json_tests PRIVATE
+    src/editor
+    src
+    ${VC_SOLUTIONS_DIR}/fidelityfx-sdk/Kits/OpenSource
+)
+target_link_libraries(editor_sdk_contract_json_tests PRIVATE vc_build_options)
+add_test(NAME editor_sdk_contract_json_tests COMMAND editor_sdk_contract_json_tests)
 
 # Hot-reload debounce (plano agente 2 §D "efsw watcher + debounce"): the pure
 # coalescing core (injected clock -> deterministic). Native watcher wiring is a
@@ -6743,6 +6760,38 @@ if(VC_NODE_EXECUTABLE)
         COMMAND "${VC_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/EditorViewportRegressionTests.mjs")
     set_tests_properties(editor_viewport_regression_tests PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # Pipeline parity (A1-14/84/102): game and editor must route material-graph
+    # PBR through the SAME shared compiler contract (Rendering::compile_glsl_to_spirv),
+    # never through a private duplicated std::system("glslc") path. Fails (exit 1)
+    # if a product executable drops the shared generator/compiler symbols.
+    add_test(NAME render_parity_gate
+        COMMAND "${VC_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/RenderParityGate.mjs")
+    set_tests_properties(render_parity_gate PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # Executed CPU simulation of the editor grid shader math: proves C1 behavior
+    # (underside rejected with zero alpha, visible above plane, straight world
+    # lines for A1-G, projected depth in [0,1] monotonic) with real computed
+    # pixels, without requiring a window/build.
+    add_test(NAME grid_simulation_tests
+        COMMAND "${VC_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/GridSimulationTests.mjs")
+    set_tests_properties(grid_simulation_tests PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # C6-GRID-ARTIFACT-001: proves the active sources (shaders/active/) compile
+    # DETERMINISTICALLY to the canonical SPIR-V hashes (out/dev-shared/shaders),
+    # closing the source -> SPIR-V -> runtime chain without a full build. Fails
+    # (exit 1) if a source diverges from the canonical artifact (phantom copy
+    # re-introduced or source regression). Requires the Vulkan SDK glslc.
+    add_test(NAME grid_shader_source_gate
+        COMMAND "${VC_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/GridShaderSourceGate.mjs")
+    set_tests_properties(grid_shader_source_gate PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # MCP prompts (Agente 3 — fechamento_solidacao): every tool a prompt tells the
+    # LLM to call must exist in the exact catalog tools/list serves. Fail = a
+    # prompt references a tool that is not registered (a ghost tool reference).
+    add_test(NAME mcp_prompt_tools_audit
+        COMMAND "${VC_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/mcp-server/prompt-tools-audit.mjs")
+    set_tests_properties(mcp_prompt_tools_audit PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 endif()
 
 add_executable(block_texture_atlas_tests EXCLUDE_FROM_ALL
@@ -6783,6 +6832,18 @@ add_executable(VulkanEngineGame EXCLUDE_FROM_ALL
     src/engine/sdk/SwapchainManager.cpp
     src/engine/sdk/VendorBehaviorTree.cpp
     src/engine/sdk/CoACDAdapter.cpp
+    # The same live-loop consumption pattern for the factories ShowcaseGameplay/
+    # WorldProcgen drive through vc_app_runtime: opus voice codec, manifold
+    # CSG booleans, motion-match vendor and the mesh geometry processor. Their
+    # implementations previously lived only in test targets, leaving these
+    # symbols unresolved in the Game exe (same A5 integration gap class).
+    src/engine/sdk/OpusCodec.cpp
+    src/engine/sdk/ManifoldAdapter.cpp
+    src/engine/sdk/MotionMatchVendor.cpp
+    src/engine/sdk/GeometryCentralAdapter.cpp
+    src/engine/sdk/SystemTimeline.cpp
+    $<TARGET_OBJECTS:vc_manifold>
+    $<TARGET_OBJECTS:vc_geometry_central>
     # CoACD core WITHOUT the bundled Bullet subset: vc_build_options already
     # links the real bullet lib, and coacd's btConvexHullComputer.cpp /
     # btAlignedAllocator.cpp define the SAME symbols (LNK2005 collision).
@@ -6843,7 +6904,21 @@ target_link_libraries(VulkanEngineGame PRIVATE
     $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
     vc_efsw shlwapi
     vc_behavior_tree_cpp
+    vc_opus
+    vc_motion_matching
 )
+# The Game's SDK adapter TUs (OpusCodec/ManifoldAdapter/GeometryCentralAdapter)
+# compile the vendored headers directly; mirror the object-module include
+# surface so they see manifold/geometry-central/eigen just like the tests do.
+target_include_directories(VulkanEngineGame PRIVATE
+    ${VC_MANIFOLD_DIR}/include
+    ${VC_GC_DIR}/include
+    ${EIGEN3_INCLUDE_DIR}
+    ${VC_GC_DIR}/deps/nanort/include
+    ${VC_GC_DIR}/deps/nanoflann/include
+    ${VC_GC_DIR}/deps/happly
+)
+target_compile_definitions(VulkanEngineGame PRIVATE _USE_MATH_DEFINES GC_NO_DEBUG)
 
 set(IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui.cpp
@@ -6859,8 +6934,13 @@ add_executable(VulkanEngineEditor
     src/editor/main_editor.cpp
     src/editor/EditorApplication.cpp
     src/editor/EditorInternalHelpers.cpp
+    src/editor/EditorSdkContractJson.cpp
     src/editor/EditorApplicationPanels.cpp
     src/editor/EditorApplicationRecovered.cpp
+    src/editor/EditorApplicationControlApi.cpp
+    src/editor/EditorApplicationCameraGizmo.cpp
+    src/editor/EditorApplicationScenePersistence.cpp
+    src/editor/EditorApplicationStateRefreshers.cpp
     src/editor/EditorApplicationVulkan.cpp
     src/editor/EditorApplicationPlay.cpp
     src/editor/EditorApplicationAssets.cpp
@@ -6889,6 +6969,7 @@ add_executable(VulkanEngineEditor
     src/engine/scripting/ScriptDebugger.cpp
     src/engine/scripting/ScriptGraphBridge.cpp
     src/engine/scripting/VisualScriptCanvas.cpp
+    src/engine/sdk/BlockEntityScripting.cpp
     src/engine/scripting/VisualScriptGraph.cpp
     src/engine/networking/NetworkRuntime.cpp
     # AI debug recorder (self-contained std) consumed by the editor play AI
@@ -6910,6 +6991,9 @@ target_include_directories(VulkanEngineEditor PRIVATE
     src/editor/frontend/wicked
     ${VC_SOLUTIONS_DIR}/recast-navigation/Recast/Include
     ${VC_SOLUTIONS_DIR}/recast-navigation/Detour/Include
+    # Agente 3 (fechamento_solidacao): vendored nlohmann::json single-header used
+    # by EditorSdkContractJson.cpp (A3-SDK-JSON-INVALIDO — /sdk-contracts).
+    ${VC_SOLUTIONS_DIR}/fidelityfx-sdk/Kits/OpenSource
 )
 target_link_libraries(VulkanEngineEditor PRIVATE
     vc_build_options glfw glm vk-bootstrap Vulkan::Vulkan windowscodecs ole32 ws2_32 vc_material_pipeline vc_navigation vc_ozz vc_acl
@@ -6930,6 +7014,10 @@ add_dependencies(VulkanEngineEditor compile_shaders)
 add_executable(VulkanEngineServer EXCLUDE_FROM_ALL
     src/server/main_server.cpp
     src/engine/networking/NetworkRuntime.cpp
+    # main_server.cpp drives create_opus_codec on the real network voice path
+    # (§3 opus voice round-trip) — the adapter TU lives with the test target
+    # otherwise, leaving the symbol unresolved in the Server exe.
+    src/engine/sdk/OpusCodec.cpp
     $<TARGET_OBJECTS:vc_core_runtime>
     $<TARGET_OBJECTS:vc_gameplay_sdk>
     ${VC_SDK_PUBLIC_OBJECTS}
@@ -6952,6 +7040,7 @@ target_link_libraries(VulkanEngineServer PRIVATE
     $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
     vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
     vc_efsw
+    vc_opus
 )
 if(TARGET vc_generate_world_save)
     add_dependencies(VulkanEngineServer vc_generate_world_save)
@@ -7276,6 +7365,46 @@ target_link_libraries(job_system_tests PRIVATE vc_build_options
 )
 target_include_directories(job_system_tests PRIVATE src/engine/public src)
 add_test(NAME job_system_tests COMMAND job_system_tests)
+
+# WorldProcgen.RequiredFactoryFailureReported (A4-PROCGEN-FACTORY-FAILURE,
+# Agente 6): the require_factory reporting/abort decision used by every
+# REQUIRED call site in WorldProcgen::init. Headless assert-based test — the
+# method is static precisely so the failure path is testable without booting a
+# World.
+add_executable(world_procgen_tests EXCLUDE_FROM_ALL
+    tests/WorldProcgenTests.cpp
+    src/app/WorldProcgen.cpp
+    src/engine/sdk/GeometryCentralAdapter.cpp
+    src/engine/sdk/ManifoldAdapter.cpp
+    src/engine/networking/NetworkRuntime.cpp
+    ${VC_SDK_PUBLIC_OBJECTS}
+)
+target_link_libraries(world_procgen_tests PRIVATE vc_build_options
+    $<TARGET_OBJECTS:vc_core_runtime>
+    $<TARGET_OBJECTS:vc_voxel_runtime>
+    $<TARGET_OBJECTS:vc_voxel_generation>
+    $<TARGET_OBJECTS:vc_gameplay_sdk>
+    $<TARGET_OBJECTS:vc_geometry_central>
+    $<TARGET_OBJECTS:vc_manifold>
+    vc_ozz vc_acl vc_navigation vc_fastwfc vc_meshoptimizer vc_xatlas
+    vc_efsw shlwapi
+    vc_opus
+    $<$<BOOL:${VC_ENABLE_ZSTD}>:vc_zstd>
+    $<$<BOOL:${VC_ENABLE_BLAKE3}>:vc_blake3>
+    $<$<BOOL:${VC_ENABLE_FLATBUFFERS}>:vc_flatbuffers>
+    $<$<BOOL:${VC_ENABLE_ROCKSDB}>:vc_rocksdb>
+)
+target_include_directories(world_procgen_tests PRIVATE
+    ${VC_MANIFOLD_DIR}/include
+    ${VC_GC_DIR}/include
+    ${EIGEN3_INCLUDE_DIR}
+    ${VC_GC_DIR}/deps/nanort/include
+    ${VC_GC_DIR}/deps/nanoflann/include
+    ${VC_GC_DIR}/deps/happly
+)
+target_compile_definitions(world_procgen_tests PRIVATE _USE_MATH_DEFINES GC_NO_DEBUG)
+target_include_directories(world_procgen_tests PRIVATE src/engine/public src src/app)
+add_test(NAME world_procgen_tests COMMAND world_procgen_tests)
 if(VC_BUILD_TEST_LABELS)
     set_tests_properties(job_system_tests PROPERTIES LABELS "unit;integration;headless")
 endif()

@@ -397,9 +397,60 @@ void test_json_roundtrip() {
 
 }  // namespace
 
+// A biped (Agente 5 - A2-105): the gait planner must handle ARBITRARY
+// creatures - a 2-leg humanoid (LeftLeg/RightLeg, phase offset 0.5) mirrors
+// the showcase_character_gait.json consumed in the JOGO by tick. Regression
+// here fails loudly if planning collapsed back to quadruped-only.
+engine::animation::GaitAsset make_biped() {
+    engine::animation::GaitAsset gait;
+    gait.name = "biped";
+    gait.cycleDuration = 1.0f;
+    gait.stanceFraction = 0.6f;
+    gait.stepHeight = 0.2f;
+    gait.maxStride = 0.5f;
+    const glm::vec3 hips[2] = { { -0.18f, 0.9f, 0.0f }, { 0.18f, 0.9f, 0.0f } };
+    const char* names[2] = { "LeftLeg", "RightLeg" };
+    for (int i = 0; i < 2; ++i) {
+        engine::animation::LegChainAsset leg;
+        leg.name = names[i];
+        leg.hipOffset = hips[i];
+        leg.upperLength = 1.0f;
+        leg.lowerLength = 1.0f;
+        leg.restOffset = glm::vec3(0.0f, -0.8f, 0.0f);
+        leg.hipBone = 1 + i * 2;
+        leg.kneeBone = 2 + i * 2;
+        leg.footBone = 3 + i * 2;
+        gait.legs.push_back(leg);
+    }
+    gait.legPhases = { 0.0f, 0.5f };
+    return gait;
+}
+
+// Two-legged plan: both legs plan; the phase-0.5 leg is mid-swing while the
+// phase-0 leg is in stance (humanoid alternating gait).
+void test_biped_plan() {
+    const engine::animation::GaitAsset gait = make_biped();
+    check(gait.legs.size() == 2, "biped: exactly 2 legs");
+    auto planner = engine::animation::create_contact_planner();
+    std::string err;
+    engine::animation::GaitPlan plan;
+    const glm::vec3 body(0.0f, 0.0f, 0.0f);
+    const bool ok = planner->plan(gait, 0.25f, body, 0.0f, { 0.0f, 1.0f },
+                                  plan, err);
+    check(ok && err.empty(), "biped: plan succeeds");
+    check(plan.feet.size() == 2, "biped: plan has 2 feet");
+    // Stance/swing alternate: left (phase 0) in stance, right (phase 0.5) in
+    // swing for this gait clock.
+    check(plan.feet[0].stance && !plan.feet[1].stance,
+          "biped: left stance / right swing");
+    check(plan.feet[0].withinReach, "biped: stance foot within reach");
+    std::printf("[gait] biped: 2-leg alternating plan consumed by tick OK\n");
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     test_validation();
+    test_biped_plan();
     test_walking_and_determinism();
     test_ik_integration();
     test_json_roundtrip();

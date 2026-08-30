@@ -28,5 +28,19 @@ int main() {
     assert(jobs->state(first) == engine::jobs::JobState::Completed);
     assert(jobs->state(third) == engine::jobs::JobState::Completed);
     assert(jobs->pending() == 0);
+
+    // Jobs.EnqueueAfterShutdownReportsFailure (A4-JOBS-SHUTDOWN-SILENCIOSO):
+    // after shutdown(), submit() must be REJECTED with an invalid handle (id 0)
+    // instead of being silently accepted and dropped. Without the stopped_
+    // guard the handle would be non-zero and this assert fails.
+    {
+        auto dead = engine::jobs::create_job_system();
+        dead->shutdown();
+        int ran = 0;
+        const auto rejected = dead->submit([&] { ++ran; });
+        assert(rejected.id == 0);  // rejected, not accepted-then-dropped
+        dead->drain();
+        assert(ran == 0);          // the task never executed
+    }
     return 0;
 }

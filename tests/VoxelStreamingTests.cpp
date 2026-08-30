@@ -726,6 +726,72 @@ bool scenario_no_pingpong(TestWorld& test) {
 
 } // namespace
 
+// A2-48 (Agente 5): VoxelTransaction is the game's ONLY block-mutation path
+// (EngineLifecycle break/place/build + the spawn registry blocks). Prove the
+// atomicity that raw set_block_at lacks: a multi-edit transaction applies
+// atomically, and an invalid edit in the transaction rolls the WHOLE batch
+// back (a raw set_block_at loop would apply the valid edit and silently skip
+// the invalid one — partial mutation).
+bool scenario_gameplay_mutation_via_transaction(TestWorld& test) {
+    auto air_y_on = [&](int cx, int cz) -> int {
+        int y = static_cast<int>(std::floor(test.player.y));
+        for (int i = 0; i < 200; ++i) {
+            if (y >= CHUNK_SIZE_Y) break;
+            if (test.world.get_block_at(glm::vec3(cx, y, cz)) == kRuntimeAirId) break;
+            ++y;
+        }
+        return y;
+    };
+    const RuntimeBlockId stoneId = runtime_id(BlockType::Stone);
+    const glm::ivec3 boff(static_cast<int>(std::floor(test.player.x)), 0,
+                          static_cast<int>(std::floor(test.player.z)));
+
+    // 1) A multi-edit transaction applies atomically (all three land).
+    {
+        const int y = air_y_on(boff.x, boff.z);
+        std::string err;
+        auto tx = test.world.begin_transaction();
+        tx->set_block(glm::vec3(boff.x, y, boff.z), stoneId);
+        tx->set_block(glm::vec3(boff.x + 1, y, boff.z), stoneId);
+        tx->set_block(glm::vec3(boff.x + 2, y, boff.z), stoneId);
+        CHECK(tx->commit(err));
+        CHECK(err.empty());
+        CHECK(test.world.get_block_at(glm::vec3(boff.x, y, boff.z)) == stoneId);
+        CHECK(test.world.get_block_at(glm::vec3(boff.x + 1, y, boff.z)) == stoneId);
+        CHECK(test.world.get_block_at(glm::vec3(boff.x + 2, y, boff.z)) == stoneId);
+    }
+
+    // 2) An invalid edit flips the WHOLE transaction: the valid edit in the
+    // same batch is NOT applied (all-or-nothing). Raw set_block_at would have
+    // applied it and skipped the invalid one — partial.
+    {
+        // Pick a row that is air on BOTH columns (terrain can be uneven).
+        int y2 = std::max(air_y_on(boff.x + 10, boff.z),
+                          air_y_on(boff.x + 11, boff.z));
+        while (y2 + 1 < CHUNK_SIZE_Y &&
+               (test.world.get_block_at(glm::vec3(boff.x + 10, y2, boff.z)) !=
+                    kRuntimeAirId ||
+                test.world.get_block_at(glm::vec3(boff.x + 11, y2, boff.z)) !=
+                    kRuntimeAirId)) {
+            ++y2;  // climb until both columns are clear air
+        }
+        std::string err;
+        auto tx = test.world.begin_transaction();
+        tx->set_block(glm::vec3(boff.x + 10, y2, boff.z), stoneId);
+        tx->set_block(glm::vec3(boff.x + 11, y2, boff.z), 999'999u);  // invalid id
+        CHECK(tx->edit_count() == 2);
+        CHECK(!tx->commit(err));
+        CHECK(!err.empty());
+        CHECK(test.world.get_block_at(glm::vec3(boff.x + 10, y2, boff.z)) ==
+              kRuntimeAirId);
+        CHECK(test.world.get_block_at(glm::vec3(boff.x + 11, y2, boff.z)) ==
+              kRuntimeAirId);
+    }
+    std::cout << "[test] gameplay mutation via VoxelTransaction: atomic commit "
+                 "+ all-or-nothing rollback OK\n";
+    return true;
+}
+
 int main() {
     run_with_retry("pipeline->uploaded", scenario_pipeline);
     run_with_retry("edit->remesh->upload", scenario_edit);
@@ -739,6 +805,8 @@ int main() {
     scenario_face_materials_and_occlusion();
     scenario_dynamic_fluid_meshes_as_fluid();
     scenario_state_materials();
+    run_with_retry("gameplay mutation via transaction",
+                   scenario_gameplay_mutation_via_transaction);
 
     if (g_failures != 0) {
         std::cerr << "[voxel_streaming_tests] " << g_failures << " failure(s)\n";

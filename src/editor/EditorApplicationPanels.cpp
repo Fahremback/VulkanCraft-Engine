@@ -3068,6 +3068,10 @@ std::vector<uint32_t> read_spv(const char* name) {
     }
     std::vector<uint32_t> spirv(static_cast<size_t>(size) / 4);
     in.read(reinterpret_cast<char*>(spirv.data()), size);
+    // C6-GRID-ARTIFACT-001: log path + fingerprint of the SPIR-V tree the editor
+    // ACTUALLY loaded, so certification can prove it executed the canonical
+    // shader (out/dev-shared/shaders) and not a stale build/out/ag3 copy.
+    log_shader_fingerprint(name, path, spirv);
     return spirv;
 }
 
@@ -3329,34 +3333,13 @@ namespace {
 
 // Compiles GLSL to SPIR-V via glslc (same tool as the ShaderCompiler target).
 std::vector<uint32_t> compile_material_glsl(VkShaderStageFlagBits stage, const std::string& source) {
-    const std::filesystem::path tmp = std::filesystem::temp_directory_path() / "vc_editor_material_tmp";
-    const std::string stageArg = (stage == VK_SHADER_STAGE_VERTEX_BIT) ? "vert" : "frag";
-    const std::filesystem::path srcFile = std::filesystem::path(tmp.string() + "." + stageArg);
-    const std::filesystem::path spvFile = std::filesystem::path(tmp.string() + ".spv");
-    {
-        std::ofstream out(srcFile, std::ios::binary);
-        out << source;
-    }
-    const std::string cmd = "glslc \"" + srcFile.string() + "\" -fshader-stage=" + stageArg +
-                            " -o \"" + spvFile.string() + "\" 2>nul";
-    const int rc = std::system(cmd.c_str());
-    std::vector<uint32_t> spirv;
-    if (rc == 0) {
-        std::ifstream in(spvFile, std::ios::binary);
-        if (in) {
-            in.seekg(0, std::ios::end);
-            const std::streamsize size = in.tellg();
-            in.seekg(0, std::ios::beg);
-            if (size > 0 && size % 4 == 0) {
-                spirv.resize(static_cast<size_t>(size) / 4);
-                in.read(reinterpret_cast<char*>(spirv.data()), size);
-            }
-        }
-    }
-    std::error_code ec;
-    std::filesystem::remove(srcFile, ec);
-    std::filesystem::remove(spvFile, ec);
-    return spirv;
+    // Pipeline parity (A1-14/84/102): the editor must route GLSL→SPIR-V through
+    // the SAME public compiler contract as the game (Rendering::compile_glsl_to_spirv,
+    // which goes through the IShaderCompiler slang core and only falls back to the
+    // legacy temp-file glslc system() call when the toolchain is unavailable). Using
+    // a private std::system("glslc ...") here used to be a parallel path that could
+    // diverge from the game's shader pipeline and was duplicated across two TUs.
+    return Engine::Rendering::compile_glsl_to_spirv(source, stage);
 }
 } // anonymous namespace
 

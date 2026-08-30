@@ -42,6 +42,7 @@
 #include <engine/world/ILocalSpace.hpp>
 #include <engine/registry/BlockRegistry.hpp>
 #include <engine/observability/IObservability.hpp>
+#include <engine/observability/OtlpExporter.hpp>
 #include <engine/compression/ICompressionProvider.hpp>
 #include "engine/sdk/RegistryJson.hpp"
 
@@ -332,14 +333,23 @@ int main(int argc, char** argv) {
         void emit(const std::string&) override { ++lines; }
     };
     ServerObsSink obsSink;
+    // Agente 3 (fechamento_solidacao — A3-ORFAOS-EDITOR): OtlpExporter was a
+    // pure-header orphan (0 production call sites). It is now a REAL sink in
+    // the server's observability loop: every telemetry line emitted by
+    // IObservability is also captured here as OTLP-compatible JSON (the format
+    // an OTLP collector consumes). alive count is asserted in the shutdown
+    // report below — a real observable fed from the running loop.
+    engine::observability::OtlpExporter otlpSink;
     std::string obsError;
     auto observability = engine::observability::create_observability(
         "ag3-server-obs", 64, obsError);
     if (observability) {
         observability->register_sink("stdout", &obsSink, obsError);
+        observability->register_sink("otlp", &otlpSink, obsError);
         observability->set_gauge("peers", 1, obsError);
         observability->set_gauge("tick_rate", netConfig.tick_rate, obsError);
     }
+    std::size_t otlpCapturedLines = otlpSink.count();
     std::size_t interestRelevantEntities = 0;
     std::uint64_t obsRollbacks = 0;
 
@@ -664,8 +674,8 @@ int main(int argc, char** argv) {
         engine::gameplay::PhysicsBackend::Builtin);
     auto clientVehReplication =
         engine::vehicles::create_vehicle_replication(*clientVehRuntime);
-    std::shared_ptr<engine::vehicles::IVehicle> serverVeh;
-    std::shared_ptr<engine::vehicles::IVehicle> clientVeh;
+    std::shared_ptr<engine::gameplay::IVehicle> serverVeh;
+    std::shared_ptr<engine::gameplay::IVehicle> clientVeh;
     {
         engine::gameplay::BodySpec ground;
         ground.motion = engine::gameplay::MotionType::Static;
@@ -2119,6 +2129,9 @@ int main(int argc, char** argv) {
                   << serverEcsBodies.size() << " remaining)\n";
     }
 
+    // Real final observable: count telemetry lines actually captured by the
+    // OtlpExporter sink over the whole run (not the boot-time value).
+    otlpCapturedLines = otlpSink.count();
     std::cout << "VulkanEngineServer completed " << tickCount
               << " headless ticks: world-replication+transport OK "
                  "(registered 1 client, streamed "
@@ -2126,6 +2139,8 @@ int main(int argc, char** argv) {
               << " chunk snapshot(s), " << interestRelevantEntities
               << " interest-relevant entity ref(s) per tick, committed "
                  "authoritative block edits via IWorldReplication), "
+                 "OtlpExporter captured " << otlpCapturedLines
+              << " OTLP telemetry line(s), "
                  "CONTA4 SDK symbols consumed per tick (create_voxel_replication "
               << voxelRegionChunks
               << " region chunk window(s) + " << voxelRegionEntities

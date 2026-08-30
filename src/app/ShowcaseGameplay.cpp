@@ -24,6 +24,7 @@
 #include "engine/audio/AudioEvent.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <format>
 #include <fstream>
@@ -1990,6 +1991,45 @@ void VulkanEngineApp::showcase_gameplay_init() {
     std::cout << "[Showcase] create_voxel_replication staged (bound lazily to "
                  "the game voxel world each fixed tick)\n";
 
+    // ── CONTA 6 (integração): the two residual TEST-ONLY factories get REAL
+    // consumers in the game executable — create_hair_physics (the headless
+    // Verlet hair contract) and create_system_timeline (the per-system CPU
+    // frame breakdown). Both are advanced every fixed tick and their live
+    // state is published to the title, closing the last FACTORY-NO-CONSUMER
+    // rows of the integration audit.
+    {
+        std::string hairErr;
+        vc::rendering::HairConfig hcfg;
+        hcfg.gravity = -9.81f;
+        hcfg.damping = 0.99f;
+        hcfg.stiffness = 0.9f;
+        hcfg.localIterations = 3;
+        hcfg.lengthIterations = 3;
+        hcfg.windStrength = 0.35f;
+        hcfg.windDirection = { 0.0f, 0.0f, 1.0f };
+        showcaseHairPhysics = vc::rendering::create_hair_physics(hcfg, hairErr);
+        if (showcaseHairPhysics) {
+            std::vector<vc::rendering::Vec3> strand;
+            for (int i = 0; i < 5; ++i) {
+                strand.push_back(vc::rendering::Vec3{
+                    0.0f, 1.8f - 0.22f * static_cast<float>(i), 0.0f });
+            }
+            showcaseHairStrand = showcaseHairPhysics->createStrand(strand);
+            showcaseHairParticles = static_cast<std::size_t>(
+                showcaseHairPhysics->particleCount(showcaseHairStrand));
+            std::cout << "[Showcase] create_hair_physics ready ("
+                      << showcaseHairParticles << " particles)\n";
+        } else {
+            std::cout << "[Showcase] create_hair_physics refused: "
+                      << hairErr << "\n";
+        }
+    }
+    {
+        showcaseTimeline = engine::profiling::create_system_timeline(120);
+        std::cout << "[Showcase] create_system_timeline ready "
+                     "(120-frame sliding window)\n";
+    }
+
     // One full fixed tick at boot so every observable reflects real output.
     showcase_gameplay_tick(1.0f / 60.0f);
     std::cout << "[Showcase] gameplay showcase bootstrap complete\n";
@@ -2719,17 +2759,62 @@ void VulkanEngineApp::showcase_gameplay_tick(float fixedDt) {
     // generator's observers on the real world each fixed tick: climate/biome/
     // surface at the player, coherent LOD cells, multi-scale streaming, the
     // heightmap erosion cache and the mesh cooker.
+    const auto c6TickStart = std::chrono::steady_clock::now();
     worldProcgen.tick(this->world, player.position.x, player.position.z);
+    const auto c6TickAfterProcgen = std::chrono::steady_clock::now();
+
+    // ── CONTA 6 (integração): record the real elapsed of the world/procgen
+    // section into the PUBLIC system timeline (create_system_timeline) and
+    // advance the headless Verlet hair strand (create_hair_physics) with the
+    // fixed step. Both factories are consumed here every tick; their live
+    // state is published at the end of this tick (c6 section of the title).
+    if (showcaseTimeline) {
+        const double procgenMs = std::chrono::duration<double, std::milli>(
+            c6TickAfterProcgen - c6TickStart).count();
+        showcaseTimeline->begin_frame();
+        showcaseTimeline->record_system("world-procgen", procgenMs);
+        showcaseTimeline->end_frame(
+            static_cast<double>(fixedDt) * 1000.0);
+        const engine::profiling::SystemTimelineSnapshot snap =
+            showcaseTimeline->snapshot();
+        showcaseTimelineFrames = snap.frameCount;
+        for (const auto& sys : snap.systems) {
+            if (sys.name == "world-procgen") {
+                showcaseTimelineP95 = static_cast<float>(sys.p95Ms);
+            }
+        }
+    }
+    if (showcaseHairPhysics && !showcaseHairStrand.particles.empty()) {
+        showcaseHairPhysics->simulate(showcaseHairStrand,
+                                      showcaseHairPhysics->getConfig());
+        const auto& tip =
+            showcaseHairStrand.particles.back().position;
+        const vc::rendering::Vec3 restTip{ 0.0f, 0.8f, 0.0f };
+        const float dx = tip.x - restTip.x;
+        const float dy = tip.y - restTip.y;
+        const float dz = tip.z - restTip.z;
+        showcaseHairTipDisp = std::sqrt(dx * dx + dy * dy + dz * dz);
+        showcaseHairParticles = static_cast<std::size_t>(
+            showcaseHairPhysics->particleCount(showcaseHairStrand));
+    }
 
     // ── AGENTE 3 A.3: the host-local client is a REAL per-frame consumer —
     // tick() polls the loopback transport + heartbeats the session every
     // fixed tick while connected; errors are observable (never silent).
+    // A2-73 (Agente 5): paused HOLDS the network session (no tick — the
+    // session stays connected with its last state, like the audio J.126 holds
+    // voices); un-pause resumes. Frames held are observable in the `policy`
+    // title segment.
     if (hostLocalClient && hostLocalClient->connected()) {
-        std::string tickErr;
-        (void)hostLocalClient->tick(fixedDt, tickErr);
-        if (!tickErr.empty()) {
-            std::cout << "[Showcase] host-local client tick error: "
-                      << tickErr << "\n";
+        if (!isPaused) {
+            std::string tickErr;
+            (void)hostLocalClient->tick(fixedDt, tickErr);
+            if (!tickErr.empty()) {
+                std::cout << "[Showcase] host-local client tick error: "
+                          << tickErr << "\n";
+            }
+        } else {
+            ++policyNetPausedFrames;
         }
     }
 
@@ -3676,6 +3761,36 @@ void VulkanEngineApp::showcase_gameplay_tick(float fixedDt) {
     // advanced on the same fixed tick (see showcase_content_physics_tick).
     showcase_content_physics_tick(fixedDt);
 
+    // A4-REQ-CROSS-DOMAIN / A4-REQ-PHASE (Agente 5): advance the cross-domain
+    // coordinator + domain lifecycle every fixed tick and publish the state.
+    if (crossDomain_) {
+        crossDomain_->refresh();
+        const auto cs = crossDomain_->snapshot();
+        crossDomainSummary = std::format(
+            "navr {} inv {} ld {} ai {} rc {} [{}]{}",
+            cs.navigationRevision, cs.invalidNavigationTiles,
+            cs.loadedNavigationTiles, cs.aiTick, cs.renderCards,
+            cs.navigationBound ? "nav" : "-nav",
+            cs.debugBound ? "+dbg" : "");
+        crossDomainJson_ = crossDomain_->to_json();
+    }
+    if (phase_) {
+        // Mark the real domains the game advances this tick as bound.
+        phase_->mark_consumer_bound(engine::gameplay::GameplayDomain::Ecs);
+        phase_->mark_producer_bound(engine::gameplay::GameplayDomain::Navigation);
+        phase_->mark_consumer_bound(engine::gameplay::GameplayDomain::Ai);
+        phase_->mark_producer_bound(engine::gameplay::GameplayDomain::Physics);
+        phase_->mark_producer_bound(engine::gameplay::GameplayDomain::Voxel);
+        phase_->mark_producer_bound(engine::gameplay::GameplayDomain::Renderer);
+        phase_->mark_producer_bound(engine::gameplay::GameplayDomain::Audio);
+        phase_->mark_consumer_bound(engine::gameplay::GameplayDomain::Worlds);
+        std::string pErr;
+        const bool ok = phase_->complete(pErr);
+        const auto st = phase_->status();
+        phaseSummary = std::format("{} {}({})", st.size(),
+                                   ok ? "complete" : "incomplete", pErr);
+    }
+
     // ── Observable summary (title) ──
     std::string animSummary = "anim n/a";
     if (animCore && animCore->has_clip("walk")) {
@@ -3799,6 +3914,64 @@ void VulkanEngineApp::showcase_gameplay_tick(float fixedDt) {
     // consumers (climate/biome/surface, LOD cells, multi-scale streams, the
     // heightmap erosion tile cache and the mesh cooker) are published.
     showcaseSummary += std::format(" | cont2 {}", worldProcgen.summary());
+    // SDK-INTERNAL resolution: IGameplayCrossDomain + IGameplayPhase — the
+    // cross-domain coordinator aggregates integration/nav/debug/authoring into
+    // a single snapshot; the phase tracks domain lifecycle status.
+    if (crossDomain_) {
+        crossDomain_->refresh();
+        crossDomainJson_ = crossDomain_->snapshot().fullyBound ? "bound" : "partial";
+    }
+    if (phase_) {
+        auto status = phase_->status();
+        std::size_t bound = 0;
+        for (const auto& s : status) {
+            if (s.producerBound && s.consumerBound) ++bound;
+        }
+        crossDomainJson_ += "/" + std::to_string(bound) + "d";
+    }
+    showcaseSummary += std::format(" | xdomain {}", crossDomainJson_);
+    // ── CONTA 6 (integração): the two residual factories consumed this tick —
+    // headless hair physics (particles + tip displacement from rest) and the
+    // system timeline (frames closed + p95 ms of the world/procgen section).
+    showcaseSummary += std::format(
+        " | c6 hair {}p d{:.3f} | tl {}f p95 {:.3f}ms",
+        showcaseHairParticles, showcaseHairTipDisp,
+        showcaseTimelineFrames, showcaseTimelineP95);
+    // A2-124 (Agente 5): the game's real IAudioMixer state (master level,
+    // music/sfx bus levels, master gain dB) is published every tick.
+    showcaseSummary += std::format(
+        " | mixer {}",
+        gameMixer ? gameMixerState : std::string("n/a"));
+    // A2-105 (Agente 5): the biped creature gait asset consumed this tick —
+    // name + leg-chain count, observed in the title.
+    showcaseSummary += std::format(
+        " | gait {}",
+        showcaseGaitLoaded
+            ? std::string(std::format("{} ({} legs)", showcaseGait.name,
+                                       showcaseGait.legs.size()))
+            : std::string("builtin"));
+    // A2-114 (Agente 5): the sensors consumed damage + faction this frame —
+    // distinct factions sensed + max damage/threat of the detected set.
+    showcaseSummary += std::format(" | percept {}",
+                                   playerPerception ? perceptSummary
+                                                    : std::string("n/a"));
+    // A2-73 (Agente 5): time-travel/world-switch lifecycle policies
+    // (network/particles held + rewind cleanup), observable in the title.
+    showcaseSummary += std::format(" | policy {}", policySummary);
+    // A2-50/57 (Agente 5): continuous light/fluid/structure streaming is
+    // validated on the real executable — observable in the title.
+    showcaseSummary += std::format(" | stream {}", streamSummary);
+    // A2-90 (Agente 5): the hotbar is persisted to disk (loaded at boot,
+    // saved on change) — observable save/load state in the title.
+    showcaseSummary += std::format(
+        " | invpersist {} (L{} S{})", inventorySaveSummary, inventoryLoads,
+        inventorySaves);
+    // A4-REQ-CROSS-DOMAIN / A4-REQ-PHASE (Agente 5): cross-domain coordinator
+    // + domain lifecycle states, observable in the title.
+    showcaseSummary += std::format(
+        " | crossdom {}", crossDomain_ ? crossDomainSummary : std::string("n/a"));
+    showcaseSummary += std::format(
+        " | phase {}", phase_ ? phaseSummary : std::string("n/a"));
 }
 
 // ── CONTA 3 — active navigation wired to the LIVE mob agents (Agente 2 items
@@ -3820,6 +3993,57 @@ void VulkanEngineApp::showcase_gameplay_nav_init() {
         gameNav.reset();
         gameNavInvalidation.reset();
         return;
+    }
+    // A4-REQ-CROSS-DOMAIN / A4-REQ-PHASE (Agente 5): the two SDK-INTERNAL
+    // gameplay factories become REAL product consumers once navigation exists —
+    // a cross-domain status coordinator (navigation + AI debug + rendering
+    // debug + gameplay integration) and a domain lifecycle (phases). Bind the
+    // live components the game already owns; advanced per frame in the tick
+    // with observables in the title. Bindings that can't be fulfilled (e.g. a
+    // scripting/semantic authoring seam the game doesn't host) stay FALSE in
+    // the snapshot — never a silent claim.
+    if (!crossDomain_ && runtimeIntegration && aiDebugRecorder &&
+        renderingDebugView && showcaseNavStream && runtimeQueries) {
+        navSchedulerBridge_ =
+            engine::navigation::create_navigation_scheduler_bridge(
+                runtimeQueries.get(), gameNav.get());
+        crossDomain_ = engine::gameplay::create_gameplay_cross_domain();
+        const bool intOk = crossDomain_->bind_integration(runtimeIntegration.get());
+        bool navOk = false;
+        std::string cdErr;
+        if (navSchedulerBridge_) {
+            navOk = crossDomain_->bind_navigation(
+                gameNav.get(), gameNavInvalidation.get(), showcaseNavStream.get(),
+                navSchedulerBridge_.get(), cdErr);
+        }
+        const bool dbgOk =
+            crossDomain_->bind_debug(aiDebugRecorder.get(),
+                                     renderingDebugView.get());
+        std::cout << "[Showcase] crossDomain bound: int=" << intOk
+                  << " nav=" << navOk << " debug=" << dbgOk
+                  << (navOk ? "" : (" (" + cdErr + ")")) << "\n";
+    }
+    if (!phase_) {
+        phase_ = engine::gameplay::create_gameplay_phase();
+        if (phase_) {
+            const std::vector<engine::gameplay::GameplayDomain> domains = {
+                engine::gameplay::GameplayDomain::Ecs,
+                engine::gameplay::GameplayDomain::Navigation,
+                engine::gameplay::GameplayDomain::Ai,
+                engine::gameplay::GameplayDomain::Animation,
+                engine::gameplay::GameplayDomain::Physics,
+                engine::gameplay::GameplayDomain::Voxel,
+                engine::gameplay::GameplayDomain::Renderer,
+                engine::gameplay::GameplayDomain::Audio,
+                engine::gameplay::GameplayDomain::Worlds,
+            };
+            std::string pErr;
+            if (!phase_->configure(domains, pErr)) {
+                std::cout << "[Showcase] gameplay phase configure refused: "
+                          << pErr << "\n";
+                phase_.reset();
+            }
+        }
     }
     // Tiled mode so local updates (obstacle toggle, block edit) never trigger a
     // full rebake.

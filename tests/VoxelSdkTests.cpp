@@ -13497,6 +13497,97 @@ void test_lod_terrain() {
 
 }  // namespace
 
+// A2-62 (Agente 5): transfer_via_portal in the JOGO (via the canonical
+// IWorldManager the game co-owns) preserves velocity AND network state on a
+// roundtrip — the guarantee the game needs so crossing a portal doesn't drop
+// the entity's motion or replication state (not just the server).
+void test_portal_velocity_network_roundtrip() {
+    using namespace engine::world;
+    using engine::entity::EntityId;
+    using engine::entity::Position;
+
+    auto manager = create_world_manager();
+    CHECK(manager != nullptr);
+    std::string error;
+    WorldSpec overworld;
+    overworld.name = "overworld";
+    overworld.seed = 3;
+    WorldSpec nether;
+    nether.name = "nether";
+    nether.seed = 4;
+    CHECK(manager->create_world(overworld, error));
+    CHECK(manager->create_world(nether, error));
+    auto* over = manager->world(overworld.name);
+    auto* neh = manager->world(nether.name);
+    CHECK(over && neh);
+    auto* overEntities = over->entity_world().get();
+    auto* nehEntities = neh->entity_world().get();
+    CHECK(overEntities && nehEntities);
+
+    const PortalSpec spec = [] {
+        PortalSpec p;
+        p.fromWorld = "overworld";
+        p.fromX = 100.0f; p.fromY = 64.0f; p.fromZ = 100.0f;
+        p.toWorld = "nether";
+        p.toX = 1000.0f; p.toY = 70.0f; p.toZ = 1000.0f;
+        p.yawDegrees = 0.0f;
+        return p;
+    }();
+    const uint32_t portalId = manager->create_portal(spec, error);
+    CHECK(portalId != 0);
+    // Reverse portal (nether -> overworld) for the roundtrip leg back.
+    const uint32_t backPortalId = manager->create_portal(
+        [] {
+            PortalSpec p;
+            p.fromWorld = "nether";
+            p.fromX = 1000.0f; p.fromY = 70.0f; p.fromZ = 1000.0f;
+            p.toWorld = "overworld";
+            p.toX = 100.0f; p.toY = 64.0f; p.toZ = 100.0f;
+            p.yawDegrees = 0.0f;
+            return p;
+        }(),
+        error);
+    CHECK(backPortalId != 0);
+
+    std::string spawnError;
+    const EntityId traveller = overEntities->spawn(
+        "vulkancraft:player", Position{ 105.0f, 67.0f, 100.0f }, spawnError);
+    CHECK(traveller.valid());
+    // Velocity + network state as real components (what the sim/replication
+    // store per entity).
+    engine::entity::ComponentData velocity;
+    velocity.type = "vulkancraft:velocity";
+    velocity.version = 1;
+    velocity.blob = R"({"vx":4.5,"vy":-1.2,"vz":2.0})";
+    engine::entity::ComponentData netstate;
+    netstate.type = "vulkancraft:net_state";
+    netstate.version = 1;
+    netstate.blob = R"({"world":1,"peer":7,"seq":2048})";
+    CHECK(overEntities->set_component(traveller, velocity));
+    CHECK(overEntities->set_component(traveller, netstate));
+
+    // Cross overworld -> nether.
+    const EntityId crossed =
+        manager->transfer_via_portal("overworld", traveller, portalId, error);
+    CHECK(crossed.valid());
+    engine::entity::ComponentData velA, netA;
+    CHECK(nehEntities->get_component(crossed, "vulkancraft:velocity", velA));
+    CHECK(nehEntities->get_component(crossed, "vulkancraft:net_state", netA));
+    CHECK(velA.blob == velocity.blob && velA.version == velocity.version);
+    CHECK(netA.blob == netstate.blob && netA.version == netstate.version);
+
+    // Roundtrip back nether -> overworld: velocity + network state preserved.
+    const EntityId back = manager->transfer_via_portal(
+        "nether", crossed, backPortalId, error);
+    CHECK(back.valid());
+    engine::entity::ComponentData velB, netB;
+    CHECK(overEntities->get_component(back, "vulkancraft:velocity", velB));
+    CHECK(overEntities->get_component(back, "vulkancraft:net_state", netB));
+    CHECK(velB.blob == velocity.blob);
+    CHECK(netB.blob == netstate.blob);
+    std::cout << "[portal] velocity+net-state preserved over roundtrip\n";
+}
+
 int main(int argc, char** argv) {
     // FALTANTES §25 — real process interruption: when this binary is spawned
     // as the "crash child" (env VC_TEST_CRASH_CHILD), it commits a save and
@@ -13614,6 +13705,7 @@ int main(int argc, char** argv) {
         test_replication_region_handoff();
         test_mob_behavior();
         test_world_manager();
+        test_portal_velocity_network_roundtrip();
         test_noise_graph_determinism();
         test_noise_graph_nodes();
         test_noise_graph_serialization();

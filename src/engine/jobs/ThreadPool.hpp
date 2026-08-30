@@ -53,14 +53,16 @@ public:
         }
     }
 
+    // Returns true if the task was accepted; false if the pool is shut down.
     template<class F>
-    void enqueue(F&& f) {
+    bool enqueue(F&& f) {
         {
             std::unique_lock<std::mutex> lock(queueMutex);
-            if (stop) return;
+            if (stop) return false;
             tasks.emplace(std::forward<F>(f));
         }
         condition.notify_one();
+        return true;
     }
 
     // If any queued job threw, returns the first recorded error message so the

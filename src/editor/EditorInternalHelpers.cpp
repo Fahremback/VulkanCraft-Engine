@@ -10,8 +10,12 @@
 // is exposed by EditorInternalHelpers.hpp so the current split stays modular.
 #include <cmath>
 #include <cstring>
+#include <cstdint>
 #include <fstream>
 #include <filesystem>
+#include <iomanip>
+#include <sstream>
+#include <string>
 #include <system_error>
 
 namespace Engine {
@@ -329,6 +333,32 @@ Rendering::MaterialGraph material_graph_from_asset(const MaterialAsset& mat) {
     }
     (void)graph.connect(emissive, emisOut, 0);
     return graph;
+}
+
+// ── SPIR-V fingerprint (C6-GRID-ARTIFACT-001) ─────────────────────────────
+// FNV-1a 64 over the raw SPIR-V words produces a stable, cheap digest that
+// distinguishes the canonical compile_shaders output (out/dev-shared/shaders)
+// from stale copies (build/, out/ag3/, out/mission-gate). It is logged at
+// editor boot by read_spv so the executed tree is auditable.
+uint64_t fnv1a_spirv(const std::vector<uint32_t>& spirv) {
+    uint64_t h = 1469598103934665603ull; // FNV offset basis
+    for (const uint32_t word : spirv) {
+        for (int b = 0; b < 4; ++b) {
+            const uint8_t byte = static_cast<uint8_t>((word >> (8 * b)) & 0xFF);
+            h ^= byte;
+            h *= 1099511628211ull; // FNV prime
+        }
+    }
+    return h;
+}
+
+void log_shader_fingerprint(const std::string& label, const std::string& path,
+                            const std::vector<uint32_t>& spirv) {
+    std::ostringstream oss;
+    oss << "[Editor][ShaderFingerprint] " << label << " path=" << path
+        << " words=" << spirv.size() << " fnv1a64=";
+    oss << std::hex << fnv1a_spirv(spirv) << std::dec;
+    std::cerr << oss.str() << std::endl;
 }
 
 } // namespace Engine

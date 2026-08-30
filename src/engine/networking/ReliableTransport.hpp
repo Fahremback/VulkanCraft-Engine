@@ -41,13 +41,27 @@ public:
         std::uint32_t maxRetransmits{5};
         std::size_t maxPayload{1200};      // fragment size (MTU budget)
         std::size_t receiveBuffer{8192};   // reorder window
+        // Hard limits against malformed/bloody fragments (DoS hardening):
+        //   • a single message may have at most this many fragments;
+        //   • the reorder/partial buffers may hold at most this many entries;
+        //   • an assembled message may not exceed this many bytes.
+        std::uint16_t maxFragments{4096};
+        std::size_t maxReorderEntries{4096};
+        std::size_t maxPartialEntries{1024};
+        std::size_t maxMessageSize{16u * 1024u * 1024u};
     };
 
     // Handles a fully reassembled, ordered message (after decompression).
     using MessageHandler = std::function<void(const std::byte* data, std::size_t size)>;
     using StatusHandler = std::function<void(Status)>;
 
-    explicit ReliableTransport(Config config = {});
+    // NOTE: using the nested aggregate `Config` as a by-value default argument
+    // inside the class body trips a MinGW g++-16 parsing quirk for aggregates
+    // with default member initializers ("could not convert"/"default member
+    // initializer required"). So the default-constructing ctor is declared
+    // without a default argument and defined out-of-line in the .cpp.
+    ReliableTransport();                    // default Config{}
+    explicit ReliableTransport(Config config);
     ~ReliableTransport();
 
     // Binds a local UDP socket (0 = ephemeral) and marks us listening.
@@ -79,6 +93,11 @@ public:
     [[nodiscard]] std::uint32_t received_bytes() const noexcept { return receivedBytes_; }
     [[nodiscard]] std::uint32_t retransmits() const noexcept { return retransmits_; }
     [[nodiscard]] std::uint32_t dropped_fragments() const noexcept { return droppedFragments_; }
+    // Fragments rejected by the malformed-fragment validation (bad fragment
+    // bounds, underflowing seq, oversized message, buffer caps reached). A
+    // non-zero (growable) counter means hostile/glitched input is being
+    // dropped instead of poisoning the reassembly buffers.
+    [[nodiscard]] std::uint32_t rejected_fragments() const noexcept { return rejectedFragments_; }
 
     void disconnect();
     // disconnect() + tears down the local socket and receive thread — the
@@ -113,6 +132,15 @@ private:
     struct OutgoingPacket {
         std::uint32_t seq{};
         std::vector<std::byte> payload;   // single fragment payload (pre-compression)
+        // EXACT bytes + flags that went on the wire for this fragment. A
+        // retransmission MUST repeat bit-for-bit the same datagram that was
+        // originally sent (same compression flag + same compressed bytes).
+        // Recomputing compression on retry is wrong: if the original was sent
+        // uncompressed (compression did not shrink it), re-marking it
+        // FLAG_COMPRESSED and resending the raw payload makes the receiver
+        // decompress plain bytes and corrupt the message under packet loss.
+        std::vector<std::byte> wirePayload;
+        std::uint16_t wireFlags{};
         std::uint16_t fragmentIndex{};    // kept so retransmits reassemble correctly
         std::uint16_t fragmentCount{};
         std::chrono::steady_clock::time_point lastSent{};
@@ -149,6 +177,11 @@ private:
     void retransmit(std::chrono::steady_clock::time_point now);
     void send_heartbeat(std::chrono::steady_clock::time_point now);
     void check_timeout(std::chrono::steady_clock::time_point now);
+    // Periodically evict stale out-of-order singletons and abandoned partials
+    // by age, independent of the current datagram (the old code only cleaned a
+    // partial when the SAME firstSeq was re-touched, leaving abandoned tables
+    // to grow forever). Counter-safety: bounded entries + bounded lifetimes.
+    void sweep_stale_buffers(std::chrono::steady_clock::time_point now);
     [[nodiscard]] std::uint32_t next_sequence() noexcept { return nextOutSeq_++; }
 
     Config config_;
@@ -162,6 +195,7 @@ private:
     std::uint32_t receivedBytes_{0};
     std::uint32_t retransmits_{0};
     std::uint32_t droppedFragments_{0};
+    std::uint32_t rejectedFragments_{0};
 
     mutable std::mutex mutex_;
     std::deque<OutgoingPacket> sendQueue_;
@@ -172,6 +206,7 @@ private:
     std::chrono::steady_clock::time_point lastSend_{};
     std::chrono::steady_clock::time_point lastReceive_{};
     std::chrono::steady_clock::time_point lastHeartbeat_{};
+    std::chrono::steady_clock::time_point lastSweep_{};
     bool handshakeSent_{false};
     std::uint32_t synRetries_{0};  // handshake SYN retries (loss-resilient connect)
     std::string peerTarget_;  // "ip:port" of the peer (server side, learned from SYN)

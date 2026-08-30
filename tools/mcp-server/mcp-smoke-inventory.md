@@ -204,7 +204,6 @@
   "engine/rendering/IVulkanLoader.hpp",
   "engine/rendering/IXrMath.hpp",
   "engine/scripting/ILuauSandbox.hpp",
-  "engine/scripting/IScriptingBridge.hpp",
   "engine/scripting/IVisualScriptGraph.hpp",
   "engine/scripting/IVisualScriptRuntime.hpp",
   "engine/scripting/IVisualScriptService.hpp",

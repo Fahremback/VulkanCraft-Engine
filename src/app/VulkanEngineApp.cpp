@@ -10,6 +10,7 @@
 #include <glm/gtc/constants.hpp>
 #include <array>
 #include <algorithm>
+#include <set>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -1554,6 +1555,35 @@ void VulkanEngineApp::init() {
         }
     }
 
+    // A2-124 (Agente 5): the game consumes the deterministic IAudioMixer too
+    // (same adapter the editor uses) — a real frame consumer, not a header.
+    // A master/music/sfx bus tree with a sidechain (sfx ducks music during
+    // loud events, e.g. block breaks/explosions). Inputs are fed per frame in
+    // draw() from the live audio activity; state is observable in the title.
+    gameMixer = engine::audio::create_audio_mixer();
+    if (!gameMixer) {
+        std::cout << "[VulkanEngineApp] audio mixer factory returned null\n";
+        gameMixerState = "n/a";
+    } else {
+        engine::audio::AudioMixerSpec mixSpec;
+        mixSpec.buses = { { "master", -3.0, "" },
+                          { "music", 0.0, "master" },
+                          { "sfx", 0.0, "master" } };
+        mixSpec.sidechains = { { "sfx", "music", 0.35, -9.0, 0.05, 0.25 } };
+        mixSpec.snapshots = { { "silent",
+                                { { "music", -60.0 }, { "sfx", -60.0 } } } };
+        std::string mixError;
+        if (!gameMixer->configure(mixSpec, mixError)) {
+            std::cout << "[VulkanEngineApp] audio mixer configure refused: "
+                      << mixError << "\n";
+            gameMixer.reset();
+            gameMixerState = "n/a";
+        } else {
+            std::cout << "[VulkanEngineApp] audio mixer configured (master + "
+                         "music/sfx buses, sfx->music sidechain)\n";
+        }
+    }
+
     // AGENTE 2 block I.112 (perception): the player's deterministic sensor
     // suite (vision cone + hearing + proximity) fed every frame by the live
     // mob ECS. Survives a configure refusal by staying null (the title shows
@@ -1930,6 +1960,28 @@ void VulkanEngineApp::init() {
         playerInventory->add(engine::registry::ItemStack{ firstName, 1 },
                              *playerItems, invError);
         playerInventorySummary = playerInventory->serialize_json();
+        // A2-90 (Agente 5): a persisted hotbar save (if present) is loaded at
+        // boot — the game is a real save/load consumer, not just in-memory.
+        {
+            std::ifstream save(std::string(VULKANCRAFT_SOURCE_DIR) +
+                               "/out/player_hotbar.json");
+            if (save) {
+                std::ostringstream buf;
+                buf << save.rdbuf();
+                std::string perr;
+                if (playerInventory->deserialize_json(buf.str(), *playerItems,
+                                                      perr)) {
+                    playerInventorySummary = playerInventory->serialize_json();
+                    ++inventoryLoads;
+                    inventorySaveSummary = "loaded";
+                    std::cout << "[VulkanEngineApp] hotbar loaded from "
+                                 "out/player_hotbar.json\n";
+                } else {
+                    std::cout << "[VulkanEngineApp] hotbar save refused: "
+                              << perr << "\n";
+                }
+            }
+        }
     }
 
     // AGENTE 2 block G.91 (recipes): the game's RecipeRegistry is bound to the
@@ -2029,6 +2081,31 @@ void VulkanEngineApp::init() {
     // data (see ShowcaseGameplay.cpp). Runs after every runtime/registry/ECS
     // dependency above is live, so each factory receives real inputs.
     showcase_gameplay_init();
+
+    // SDK-INTERNAL resolution: IGameplayCrossDomain + IGameplayPhase wired
+    // into the product. CrossDomain aggregates integration/nav/debug/authoring
+    // status into a single snapshot; Phase tracks domain lifecycle.
+    crossDomain_ = engine::gameplay::create_gameplay_cross_domain();
+    phase_ = engine::gameplay::create_gameplay_phase();
+    if (crossDomain_ && runtimeIntegration) {
+        crossDomain_->bind_integration(runtimeIntegration.get());
+    }
+    if (phase_) {
+        std::vector<engine::gameplay::GameplayDomain> domains = {
+            engine::gameplay::GameplayDomain::Ecs,
+            engine::gameplay::GameplayDomain::Voxel,
+            engine::gameplay::GameplayDomain::Physics,
+            engine::gameplay::GameplayDomain::Animation,
+            engine::gameplay::GameplayDomain::Renderer,
+            engine::gameplay::GameplayDomain::Multiplayer,
+            engine::gameplay::GameplayDomain::Navigation,
+            engine::gameplay::GameplayDomain::Audio,
+            engine::gameplay::GameplayDomain::Scripting,
+            engine::gameplay::GameplayDomain::Worlds,
+        };
+        std::string phaseError;
+        phase_->configure(domains, phaseError);
+    }
 
     isInitialized = true;
     std::cout << "[VulkanEngineApp] Vulkan 1.3 AAA Texture VulkanEngineApp Initialized Successfully!\n" << std::endl;
@@ -2407,10 +2484,18 @@ void VulkanEngineApp::refresh_gpu_features() {
     // vfx.y (debug view) and gi.w (sharpen) as the live product contract.
     float particleAlive = 0.0f;
     if (particleSystem && particleHandle >= 0) {
-        particleSimAccumulator += deltaTime;
-        if (particleSimAccumulator >= 1.0f / 60.0f) {
-            particleSystem->step(particleSimAccumulator);
-            particleSimAccumulator = 0.0f;
+        // A2-73 (Agente 5): paused HOLDS the particle sim (no step, keeping
+        // the effect's last state) — the same lifecycle the audio J.126 uses
+        // for voices. Un-pause resumes from the live effect. Observable:
+        // frames the particles were held, in the `policy` title segment.
+        if (!isPaused) {
+            particleSimAccumulator += deltaTime;
+            if (particleSimAccumulator >= 1.0f / 60.0f) {
+                particleSystem->step(particleSimAccumulator);
+                particleSimAccumulator = 0.0f;
+            }
+        } else {
+            ++policyParticlePausedFrames;
         }
         particleAlive = static_cast<float>(std::max(0, particleSystem->aliveCount(particleHandle)));
         // F.22: produce the REAL indirect + vertex data for the particle pass
@@ -4443,6 +4528,34 @@ void VulkanEngineApp::draw() {
             player.selectedBlock = selectedBlockBeforeLodInput;
         }
         world.update(player.position, worldRenderer, deltaTime);
+        // A2-50/57 (Agente 5): continuous light/fluid/structure streaming is
+        // observed every frame from the live world — real validation of the
+        // streaming pipeline, published as the `stream` title segment.
+        {
+            const engine::voxel::StreamingSnapshot snap = world.streaming_snapshot();
+            streamLightDirty = snap.lightDirtyChunks;
+            streamFluidCells = snap.activeFluidCells;
+            streamStructures = world.structure_populated_count();
+            streamSummary = std::format(
+                "light {} fluid {} structures {} ({} loaded, {} pending light)",
+                streamLightDirty, streamFluidCells, streamStructures,
+                snap.chunksLoaded, snap.pendingLightJobs);
+        }
+        // A2-90 (Agente 5): persist the hotbar whenever its serialized state
+        // changes on disk — a real save consumer (reload at boot restores it).
+        if (playerInventory && !isPaused) {
+            const std::string current = playerInventory->serialize_json();
+            if (!current.empty() && current != lastSavedHotbarJson) {
+                std::ofstream os(std::string(VULKANCRAFT_SOURCE_DIR) +
+                                 "/out/player_hotbar.json");
+                if (os) {
+                    os << current;
+                    lastSavedHotbarJson = current;
+                    ++inventorySaves;
+                    inventorySaveSummary = "saved";
+                }
+            }
+        }
         // LOTE 1 — observa os sistemas do mundo por frame (block entities,
         // scheduler, gerador data-driven, timeline/time-travel) e, uma vez no
         // boot, comprova o save unificado e um rewind temporal reais.
@@ -4455,6 +4568,19 @@ void VulkanEngineApp::draw() {
                 " tl=" + std::to_string(static_cast<int>(l1.timelineNodeCount)) +
                 " rew=" + std::to_string(static_cast<int>(l1.timeTravelRewinds)) +
                 " mg=" + std::to_string(static_cast<int>(l1.mergeCount)) + "]";
+            // A2-73 (Agente 5): a rewind is a world discontinuity — the
+            // non-reversible effects (particles held, network session gated) get
+            // a cleanup pass, counted and observable in the `policy` segment.
+            if (policyLastObservedRewinds != l1.timeTravelRewinds) {
+                if (l1.timeTravelRewinds > policyLastObservedRewinds) {
+                    ++policyRewindCleanups;
+                }
+                policyLastObservedRewinds = l1.timeTravelRewinds;
+                policySummary = std::format(
+                    "rewind clean {} (paused net {} part {})",
+                    policyRewindCleanups, policyNetPausedFrames,
+                    policyParticlePausedFrames);
+            }
             if (!lote1ProbeDone && lote1AttachTries < 30) {
                 ++lote1AttachTries;
                 worldLote1.try_attach_clocks(player.position.x, player.position.y,
@@ -4509,11 +4635,32 @@ void VulkanEngineApp::draw() {
                 if (glowId && brickId) {
                     const float px = player.position.x + 3.0f;
                     const float py = std::floor(player.position.y) + 1.0f;
-                    world.set_block_at(glm::vec3(px, py, player.position.z), *glowId);
-                    world.set_block_at(glm::vec3(px, py + 1.0f, player.position.z), *glowId);
-                    world.set_block_at(glm::vec3(px, py + 2.0f, player.position.z), *brickId);
-                    registryBlocksPlaced = true;
-                    std::cout << "[BlockRegistry] placed emissive registry blocks at spawn\n";
+                    // A2-48 (Agente 5): VoxelTransaction is the ONLY mutation
+                    // path in the game — same as break/place/build, which flow
+                    // through begin_transaction()/commit() in EngineLifecycle.
+                    // The emissive registry blocks are staged and committed
+                    // atomically (all-or-nothing), instead of raw set_block_at.
+                    // commit() validates a writable chunk for every edit, so
+                    // while the spawn chunk is still generating it refuses with
+                    // a diagnostic and registryBlocksPlaced stays false — the
+                    // same lazy retry as before, but through the single
+                    // transaction path with rollback/undo semantics available.
+                    std::string txError;
+                    auto tx = world.begin_transaction();
+                    tx->set_block(glm::vec3(px, py, player.position.z), *glowId);
+                    tx->set_block(glm::vec3(px, py + 1.0f, player.position.z), *glowId);
+                    tx->set_block(glm::vec3(px, py + 2.0f, player.position.z), *brickId);
+                    if (tx->commit(txError)) {
+                        registryBlocksPlaced = true;
+                        std::cout << "[BlockRegistry] placed emissive registry \n"
+                                     "blocks at spawn (atomic transaction)\n";
+                    } else {
+                        // Span chunks not generated yet — retried next frame;
+                        // the failure is explicit, never silenced.
+                        std::cout << "[BlockRegistry] spawn placement pending "
+                                     "(atomic transaction refused): "
+                                  << txError << "\n";
+                    }
                 }
             }
         }
@@ -4699,6 +4846,35 @@ void VulkanEngineApp::draw() {
             adaptiveMusic->tick(deltaTime, musicError);
             adaptiveMusicState = adaptiveMusic->current_state();
         }
+        // A2-124 (Agente 5): the real IAudioMixer is fed this frame from the
+        // LIVE audio activity — sfx input from the spatial voice count (mobs
+        // voicing), music input from the adaptive-music ambience layer gain.
+        // A loud event ducks music via the configured sidechain; the master
+        // level/gain are the observable `mixer` title segment.
+        if (gameMixer) {
+            std::string mixError;
+            // sfx level: fraction of the voice budget actively voicing (0..1).
+            const double sfxLevel = std::clamp(
+                static_cast<double>(spatialActiveSources) / 16.0, 0.0, 1.0);
+            // music level: ambience layer gain of the current adaptive state
+            // (day full, night lowered, combat dampened) — real, not constant.
+            double musicLevel = 0.8;
+            if (adaptiveMusic) {
+                // layer_gain is the current (intensity-applied) gain of the
+                // adaptive-music state for one layer — ambience drives the
+                // music bus. 0.0 for an unknown layer is handled by the core.
+                musicLevel = adaptiveMusic->layer_gain("ambience");
+            }
+            gameMixer->set_input("music", musicLevel, mixError);
+            gameMixer->set_input("sfx", sfxLevel, mixError);
+            gameMixer->tick(static_cast<double>(deltaTime), mixError);
+            gameMixerMasterDb = gameMixer->gain_db("master");
+            gameMixerMasterLevel = gameMixer->master_level();
+            gameMixerState = std::format(
+                "{:.3f}/{:.2f}/{:.2f}d{:.1f}",
+                gameMixerMasterLevel, gameMixer->bus_level("music"),
+                gameMixer->bus_level("sfx"), gameMixerMasterDb);
+        }
         // AGENTE 2 block I (steering): each LIVE mob ECS seeks the player
         // (seek, capped at max_speed) while the whole group separates — a
         // deterministic PDE-free flock. Purely computed per frame; the mob
@@ -4822,10 +4998,23 @@ void VulkanEngineApp::draw() {
                 s.loudness = 0.8f;
                 s.kind = "mob";
                 engine::entity::ComponentData cdata;
+                bool mobHostile = false;
                 if (mobEntities->get_component(
                         id, engine::entity::kMobComponentType, cdata)) {
-                    s.hostile = cdata.blob.find("\"hostile\":true") !=
-                                std::string::npos;
+                    mobHostile =
+                        cdata.blob.find("\"hostile\":true") !=
+                        std::string::npos;
+                }
+                s.hostile = mobHostile;
+                // A2-114 (Agente 5): feed real faction + damage into the
+                // sensors, not just hostile + kind. Faction comes from the
+                // showcase faction model (bandit = hostile alias); the
+                // damage/threat signal is the mob's health deficit (maxHealth
+                // - current), so an injured mob is sensed as a stronger threat.
+                s.faction = mobHostile ? "bandit" : "guard";
+                engine::entity::Health h;
+                if (mobEntities->get_health(id, h)) {
+                    s.damage = std::max(0.0f, h.max - h.value);
                 }
                 stimuli.push_back(s);
             });
@@ -4844,6 +5033,25 @@ void VulkanEngineApp::draw() {
                 nearestThreatDistance = playerPerception->nearest_threat(threat)
                     ? threat.distance
                     : -1.0f;
+                // A2-114: the sensors consumed damage + faction this frame —
+                // aggregate the distinct factions and the max damage/threat of
+                // the detected set for the `percept` title segment.
+                std::set<std::string> sensedFactions;
+                perceptMaxDamage = 0.0f;
+                for (const auto& d : dets) {
+                    if (!d.faction.empty()) sensedFactions.insert(d.faction);
+                    perceptMaxDamage = std::max(perceptMaxDamage, d.damage);
+                }
+                perceptFactions.clear();
+                for (const auto& f : sensedFactions) {
+                    if (!perceptFactions.empty()) perceptFactions += "/";
+                    perceptFactions += f;
+                }
+                perceptSummary =
+                    perceptFactions.empty()
+                        ? std::string("none")
+                        : std::string(perceptFactions) + " dmg " +
+                              std::to_string(static_cast<int>(perceptMaxDamage));
             }
         }
         // AGENTE 2 block I.114 (FSM): advance the deterministic mob combat

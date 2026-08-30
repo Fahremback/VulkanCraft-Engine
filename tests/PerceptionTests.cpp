@@ -305,6 +305,47 @@ void test_determinism() {
 
 }  // namespace
 
+// A2-114 (Agente 5): the sensors propagate real faction + damage signals into
+// the detections, not just hostile + kind — the game feeds faction/damage on
+// each stimulus and nearest_threat/nearest reading expose them.
+void test_faction_and_damage_sensed() {
+    auto p = create_perception();
+    PerceptionSpec spec;
+    spec.vision_range = 20.0f;  // wide cone: everything in front is seen
+    std::string err;
+    check(p->configure(spec, err), "configure");
+
+    PerceptionStimulus s;
+    s.id = 7;
+    s.position = Vec3{ 0, 0, 5 };
+    s.loudness = 1.0f;
+    s.hostile = true;
+    s.kind = "mob";
+    s.faction = "bandit";
+    s.damage = 42.0f;
+    std::string uerr;
+    check(p->update(Vec3{ 0, 0, 0 }, kForwardZ, { s }, 0.016f, uerr),
+          "update with faction+damage stimulus");
+
+    const auto dets = p->detections();
+    check(dets.size() == 1, "damage/faction stimulus detected");
+    const Detection* d = find_det(dets, 7);
+    check(d != nullptr && d->faction == "bandit",
+          "faction propagates into detection");
+    check(d != nullptr && d->damage == 42.0f,
+          "damage propagates into detection");
+    check(d != nullptr && d->hostile, "hostile propagates into detection");
+
+    // nearest_threat also exposes the sensed faction + damage (what the game
+    // reads for the percept title segment).
+    Detection threat;
+    check(p->nearest_threat(threat), "nearest_threat present");
+    check(threat.faction == "bandit" && threat.damage == 42.0f,
+          "nearest_threat carries faction+damage");
+    std::cout << "[percept] sensed faction=" << threat.faction
+              << " damage=" << threat.damage << "\n";
+}
+
 int main() {
     test_configure_all_or_nothing();
     test_spec_json_roundtrip();
@@ -316,6 +357,7 @@ int main() {
     test_memory_ttl();
     test_state_roundtrip();
     test_determinism();
+    test_faction_and_damage_sensed();
 
     if (g_failures == 0) {
         std::cout << "perception_tests: all checks passed\n";

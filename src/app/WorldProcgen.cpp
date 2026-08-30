@@ -33,6 +33,7 @@
 #include <cmath>
 #include <cstdint>
 #include <format>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -192,39 +193,85 @@ void build_surface_grid(const engine::voxel::IVoxelGenerator* gen, int gridW,
 
 void WorldProcgen::init(World& world) {
     std::string error;
+
     // ---- group 3: noise graph (height + caves/ores density) ----
+    // Classification: heightGraph = Required; climate axes, caves, ores =
+    // Required (the composed generator and LOD sampler need all of them to
+    // produce a coherent world).
+    error.clear();
     heightGraph_ = engine::procgen::create_noise_graph_from_spec(height_spec(), error);
+    if (!require_factory("heightGraph", error, !!heightGraph_)) return;
+
+    error.clear();
     auto temperature = engine::procgen::create_noise_graph_from_spec(axis_spec(1, 0.003f), error);
+    if (!require_factory("temperature", error, !!temperature)) return;
+
+    error.clear();
     auto moisture = engine::procgen::create_noise_graph_from_spec(axis_spec(2, 0.003f), error);
+    if (!require_factory("moisture", error, !!moisture)) return;
+
+    error.clear();
     auto continentalness = engine::procgen::create_noise_graph_from_spec(
         engine::procgen::NoiseGraphSpec{ 3, 0, { { "constant", { 0.5f }, {} } } }, error);
+    if (!require_factory("continentalness", error, !!continentalness)) return;
+
+    error.clear();
     auto erosionAxis = engine::procgen::create_noise_graph_from_spec(
         engine::procgen::NoiseGraphSpec{ 4, 0, { { "constant", { 0.0f }, {} } } }, error);
+    if (!require_factory("erosionAxis", error, !!erosionAxis)) return;
+
+    error.clear();
     auto weirdness = engine::procgen::create_noise_graph_from_spec(
         engine::procgen::NoiseGraphSpec{ 5, 0, { { "constant", { 0.0f }, {} } } }, error);
+    if (!require_factory("weirdness", error, !!weirdness)) return;
+
+    error.clear();
     auto river = engine::procgen::create_noise_graph_from_spec(
         engine::procgen::NoiseGraphSpec{ 6, 0, { { "constant", { 0.0f }, {} } } }, error);
+    if (!require_factory("river", error, !!river)) return;
 
+    error.clear();
     auto cavesGraph = engine::procgen::create_noise_graph_from_spec(density_spec(7, 0.05f), error);
+    if (!require_factory("cavesGraph", error, !!cavesGraph)) return;
+
+    error.clear();
     auto oresGraph = engine::procgen::create_noise_graph_from_spec(density_spec(8, 0.06f), error);
+    if (!require_factory("oresGraph", error, !!oresGraph)) return;
 
     // ---- group 1: climate sampler, biome registries, surface resolver ----
     climateSampler_ = engine::procgen::create_climate_sampler(
         temperature, moisture, continentalness, erosionAxis, weirdness, river);
+    if (!require_factory("climateSampler", {}, !!climateSampler_)) return;
+
     biomeRegistry_ = engine::procgen::create_biome_registry();
     biomeCount_ = biomeRegistry_ ? biomeRegistry_->biome_count() : 0;
+
+    error.clear();
     biomeRegistryJson_ =
         engine::procgen::create_biome_registry_from_json(kBiomesJson, error);
+    if (!require_factory("biomeRegistryJson", error, !!biomeRegistryJson_)) return;
     biomeCountJson_ = biomeRegistryJson_ ? biomeRegistryJson_->biome_count() : 0;
+
     // The surface resolver reads the data-driven registry: its per-biome
     // rules decide the top block (surface_block hook in the chunk build).
     surfaceResolver_ =
         engine::procgen::create_surface_resolver(biomeRegistryJson_);
+    // surfaceResolver is Optional: the generator has a fallback surface if
+    // the resolver is null, but we log the degradation.
+    if (!surfaceResolver_) {
+        std::cerr << "[WorldProcgen] surfaceResolver creation failed — "
+                     "using default surface rules\n";
+    }
 
     // ---- group 2: features (ore table, carver, decorators) ----
+    error.clear();
     oreTableJson_ = engine::procgen::create_ore_table_from_json(kOreJson, error);
+    if (!require_factory("oreTableJson", error, !!oreTableJson_)) return;
     oreRuleCount_ = oreTableJson_ ? oreTableJson_->rule_count() : 0;
+
+    error.clear();
     carverJson_ = engine::procgen::create_carver_from_json(kCarverJson, error);
+    if (!require_factory("carverJson", error, !!carverJson_)) return;
     carverRules_ = carverJson_ ? (carverJson_->spec().fluidMaxY > 0 ? 1u : 0u) : 0;
     engine::procgen::DecoratorSpec treeSpec;
     treeSpec.type = "tree";
@@ -236,16 +283,33 @@ void WorldProcgen::init(World& world) {
     treeSpec.biomeIndex = 5u;
     treeSpec.minHeight = 70;
     treeSpec.maxHeight = 319;
+    error.clear();
     decorator_ = engine::procgen::create_decorator(treeSpec, error);
     decoratorCount_ = decorator_ ? 1u : 0u;
+    // decorator (standalone) is Optional — the set provides the main hook.
+    if (!decorator_) {
+        std::cerr << "[WorldProcgen] standalone decorator creation failed — "
+                     "decorator set will still provide hooks\n";
+    }
+
+    error.clear();
     decoratorJson_ = engine::procgen::create_decorator_from_json(kDecoratorJson, error);
+    if (!decoratorJson_) {
+        std::cerr << "[WorldProcgen] JSON decorator creation failed\n";
+    }
+
+    error.clear();
     decoratorSetJson_ =
         engine::procgen::create_decorator_set_from_json(kDecoratorSetJson, error);
+    if (!require_factory("decoratorSetJson", error, !!decoratorSetJson_)) return;
     decoratorSetCount_ = decoratorSetJson_ ? decoratorSetJson_->decorator_count() : 0;
 
     // ---- group 3: graph density fields (consumed by both generators) ----
     cavesDensity_ = engine::procgen::create_graph_density_function(cavesGraph, 1.0f, 0.08f);
+    if (!require_factory("cavesDensity", {}, !!cavesDensity_)) return;
+
     oresDensity_ = engine::procgen::create_graph_density_function(oresGraph, 1.0f, 0.0f);
+    if (!require_factory("oresDensity", {}, !!oresDensity_)) return;
 
     // ---- group 1: data-driven climate voxel generator (the chunk driver) ----
     constexpr int kBaseHeight = 150;
@@ -254,21 +318,29 @@ void WorldProcgen::init(World& world) {
         heightGraph_, climateSampler_, biomeRegistryJson_, surfaceResolver_,
         cavesDensity_, oresDensity_, kBaseHeight, kAmplitude, oreTableJson_,
         carverJson_, decoratorSetJson_);
+    if (!require_factory("climateGenerator", {}, !!climateGenerator_)) return;
 
     // ---- group 3: graph voxel generator (coherent far terrain) ----
     graphGenerator_ = engine::procgen::create_graph_voxel_generator(
         heightGraph_, cavesDensity_, oresDensity_, kBaseHeight, kAmplitude);
+    if (!require_factory("graphGenerator", {}, !!graphGenerator_)) return;
 
     // ---- Register the composed generator on the app's LIVE world. Every
     // chunk World::update dispatches now samples the data-driven generator
     // (biome/climate/surface/ores/carver/decorators) — the real build path.
-    if (climateGenerator_) {
-        world.set_generator_override(climateGenerator_);
-    }
+    world.set_generator_override(climateGenerator_);
 
     // ---- group 4: heightmap erosion + tile cache (headless/offline) ----
+    // Optional: erosion degrades terrain detail but does not block world gen.
     erosion_ = engine::procgen::create_heightmap_erosion();
+    if (!erosion_) {
+        std::cerr << "[WorldProcgen] heightmap erosion not available — "
+                     "terrain will not be eroded\n";
+    }
     erosionCache_ = engine::procgen::create_tile_erosion_cache();
+    if (!erosionCache_) {
+        std::cerr << "[WorldProcgen] tile erosion cache not available\n";
+    }
     if (erosion_ && erosionCache_ && heightGraph_) {
         // Sample a real 32x32 heightmap tile from the height graph and erode
         // it through the tile cache (deterministic, keyed by seed+spec+tile).
@@ -306,7 +378,11 @@ void WorldProcgen::init(World& world) {
     erosionCacheSize_ = erosionCache_ ? erosionCache_->size() : 0;
 
     // ---- group 5: LOD sampler + multi-scale streaming + mesh cooker ----
+    // Optional: these degrade distant terrain quality but don't block world gen.
     lodSampler_ = engine::procgen::create_lod_terrain_sampler();
+    if (!lodSampler_) {
+        std::cerr << "[WorldProcgen] LOD terrain sampler not available\n";
+    }
     multiScale_ = engine::procgen::create_multi_scale_streaming();
     if (multiScale_) {
         std::vector<engine::procgen::ScaleLevel> levels = {
@@ -314,10 +390,31 @@ void WorldProcgen::init(World& world) {
         };
         std::string cfgError;
         if (!multiScale_->configure(levels, cfgError)) {
+            std::cerr << "[WorldProcgen] multi-scale config failed: "
+                      << cfgError << '\n';
             multiScale_.reset();
         }
+    } else {
+        std::cerr << "[WorldProcgen] multi-scale streaming not available\n";
     }
     meshCooker_ = engine::procgen::create_mesh_cooker();
+    if (!meshCooker_) {
+        std::cerr << "[WorldProcgen] mesh cooker not available\n";
+    }
+
+    // ---- group 6: mesh geometry post-processing (smooth/decimate) ----
+    // Optional: post-processes cooked terrain mesh for smoother LOD transitions.
+    {
+        Engine::Procgen::MeshGeometryConfig geomCfg;
+        geomCfg.maxVertices = 65536;
+        geomCfg.maxFaces = 131072;
+        std::string geomError;
+        geomProcessor_ = Engine::Procgen::create_mesh_geometry_processor(geomCfg, geomError);
+        if (!geomProcessor_) {
+            std::cerr << "[WorldProcgen] mesh geometry processor not available: "
+                      << geomError << '\n';
+        }
+    }
 
     samplerInitialized_ = true;
 }
@@ -451,6 +548,45 @@ void WorldProcgen::tick(World& world, float playerX, float playerZ) {
         }
     }
 
+    // ---- group 6: post-process cooked mesh with geometry processor ----
+    // Smooth the terrain mesh positions to reduce LOD seams. Runs only when
+    // the mesh cooker produced new data (every 120 ticks).
+    if (geomProcessor_ && !cookedPositions_.empty() && (tick % 120u == 0u)) {
+        Engine::Procgen::TriMesh triMesh;
+        const std::size_t vertCount = cookedPositions_.size() / 3;
+        triMesh.positions.reserve(vertCount);
+        for (std::size_t i = 0; i + 2 < cookedPositions_.size(); i += 3) {
+            triMesh.positions.emplace_back(
+                cookedPositions_[i], cookedPositions_[i + 1], cookedPositions_[i + 2]);
+        }
+        const std::size_t triCount = cookedIndices_.size() / 3;
+        triMesh.indices.reserve(triCount);
+        for (std::size_t i = 0; i + 2 < cookedIndices_.size(); i += 3) {
+            triMesh.indices.push_back({
+                cookedIndices_[i], cookedIndices_[i + 1], cookedIndices_[i + 2]});
+        }
+        std::string geomError;
+        Engine::Procgen::MeshHandle h =
+            geomProcessor_->upload_mesh(triMesh, geomError);
+        if (h != Engine::Procgen::InvalidMesh) {
+            // Apply one pass of Laplacian smoothing (lambda=0.3 = mild).
+            std::vector<glm::vec3> smoothed =
+                geomProcessor_->smooth_positions(h, 0.3f, geomError);
+            if (!smoothed.empty()) {
+                smoothedVertices_ = smoothed.size();
+                // Overwrite positions with smoothed result.
+                cookedPositions_.clear();
+                cookedPositions_.reserve(smoothed.size() * 3);
+                for (const glm::vec3& v : smoothed) {
+                    cookedPositions_.push_back(v.x);
+                    cookedPositions_.push_back(v.y);
+                    cookedPositions_.push_back(v.z);
+                }
+            }
+            geomProcessor_->release_mesh(h);
+        }
+    }
+
     // ---- group 4: observe the tile erosion cache every frame ----
     if (erosionCache_) {
         erosionCacheSize_ = erosionCache_->size();
@@ -462,14 +598,28 @@ std::string WorldProcgen::summary() const {
     return std::format(
         "procgen bio {}/{} plain {} len{} dec {}/{}/{}/{} cl {:.2f}/{:.2f} srf {} "
         "bm {} h {:.2f} car {} ore {} lod {} h {:.1f} str {}/{} er {}/{}/{} "
-        "cook {}/{}->{}/{} acmr {:.2f}",
+        "cook {}/{}->{}/{} acmr {:.2f} smooth {}",
         biomeCount_, biomeCountJson_, plainBiomeIndex_, plainBiomeSerializeLen_,
         decoratorCount_, decoratorSetCount_, decoratorPlaced_, decoratorJsonPlaced_,
         climateTemperature_, climateMoisture_, surfaceBlockAtPlayer_, biomeAtPlayer_,
         graphHeightAtPlayer_, carverRules_, oreRuleCount_, lodCells_,
         lodInterpHeight_, streamLevels_, streamCells_, erosionCacheSize_,
         erosionTileW_, erosionTileH_, cookInVertices_, cookInIndices_,
-        cookOutVertices_, cookOutIndices_, cookAcmr_);
+        cookOutVertices_, cookOutIndices_, cookAcmr_, smoothedVertices_);
+}
+
+bool WorldProcgen::require_factory(const char* name, const std::string& diag,
+                                   bool has_value) {
+    if (!has_value) {
+        std::cerr << "[WorldProcgen] REQUIRED factory '" << name
+                  << "' failed to initialize";
+        if (!diag.empty()) {
+            std::cerr << ": " << diag;
+        }
+        std::cerr << '\n';
+        return false;
+    }
+    return true;
 }
 
 }  // namespace app
