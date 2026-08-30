@@ -673,6 +673,21 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
         send_response(conn, out.str());
         return;
     }
+    if (method == "GET" && path == "/sdk-contracts") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.sdk_contracts.empty()) {
+            out << "{\"valid\":false,\"contracts\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"contracts\":" << snapshot.sdk_contracts << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
     if (method == "GET" && path == "/health") {
         send_response(conn, "ok", "text/plain");
         return;

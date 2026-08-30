@@ -89,6 +89,14 @@
 #include "engine/networking/INetworkRpc.hpp"
 #include "engine/packaging/IPackageManager.hpp"
 #include "engine/compiler/IEpisodeCompiler.hpp"
+#include "engine/jobs/IJobSystem.hpp"
+#include "engine/procgen/IJobRunner.hpp"
+#include "engine/procgen/IProcgenPreview.hpp"
+#include "engine/farm/IOfflineFarm.hpp"
+#include "engine/world/IHilbertCellIndex.hpp"
+#include "engine/voxel/IBlockEntityScripting.hpp"
+#include "engine/voxel/IVoxelWorld.hpp"
+#include "engine/audio/IAudioMixer.hpp"
 #include "engine/editor/IFileWatcher.hpp"
 #include "engine/editor/IFileChangeDebounce.hpp"
 #include "engine/editor/IPlayMode.hpp"
@@ -1351,6 +1359,54 @@ private:
     std::string m_packageCompilerSignature;   // last episode-compile signature
     bool m_packageCompilerVerified{ false };  // last episode-compile verify()
     void refresh_package_manifest();
+
+    // Conta 5 fechamento_global — real editor consumers of the previously
+    // TEST-ONLY SDK factories. Each contract is instantiated in the
+    // constructor and driven EVERY FRAME by refresh_sdk_contract_runtimes()
+    // with a real observable serialized into m_sdkContractJson (GET
+    // /sdk-contracts). The audit classifies a factory CONSUMED from a
+    // non-test call site calling the factory + real methods; these members
+    // are that evidence (jobs, procgen jobs + cancellation token + preview,
+    // farm cooker, hilbert cell index [plain + JSON], block-entity scripting
+    // and audio mixer).
+    std::shared_ptr<engine::jobs::IJobSystem> m_jobSystem;
+    std::uint64_t m_jobSystemSubmitted{ 0 };   // jobs submitted since boot
+    std::uint64_t m_jobSystemCompleted{ 0 };   // jobs drained to Completed
+    std::shared_ptr<engine::procgen::IProcgenJobs> m_procgenJobs;
+    std::shared_ptr<engine::procgen::ICancellationToken> m_cancelToken;
+    std::string m_procgenJobResult{ "none" }; // Completed|Cancelled|Failed
+    std::size_t m_procgenJobUnits{ 0 };        // units processed by the batch
+    std::shared_ptr<engine::procgen::IProcgenPreview> m_procgenPreview;
+    std::size_t m_previewSampleSize{ 16 };     // bounded preview grid
+    std::string m_previewTitle;
+    std::vector<std::string> m_previewLines;   // ASCII preview rows
+    std::vector<std::pair<std::string, std::string>> m_previewStats;
+    std::unique_ptr<Engine::Farm::IFarmCooker> m_farmCooker;
+    std::uint64_t m_farmCookedSignature{ 0 };  // last cooked asset signature
+    bool m_farmCookVerified{ false };          // verify() of that asset
+    std::unique_ptr<engine::world::IHilbertCellIndex> m_hilbertIndex;
+    std::unique_ptr<engine::world::IHilbertCellIndex> m_hilbertIndexJson;
+    std::uint64_t m_hilbertCellId{ 0 };        // cell_id for the editor focus
+    std::uint64_t m_hilbertParentId{ 0 };      // parent_cell of that cell
+    std::size_t m_hilbertCoverCells{ 0 };      // cover() count for the focus rect
+    // Block-entity scripting consumer: the engine owns the VM, the project
+    // owns the script content. The editor owns a real IVoxelWorld (the SDK's
+    // VoxelWorldFacade via create_default_voxel_world), binds the bridge to
+    // it and runs the registered script in the editor loop each frame.
+    std::unique_ptr<engine::voxel::IVoxelWorld> m_blockWorld;
+    std::unique_ptr<engine::voxel::IBlockEntityScripting> m_blockScripting;
+    std::size_t m_blockActiveInstances{ 0 };
+    std::uint64_t m_blockCompletedRuns{ 0 };
+    std::uint64_t m_blockFailedRuns{ 0 };
+    double m_blockScriptVariable{ 0.0 };       // live "count" from the instance
+    bool m_blockEntityBooted{ false };
+    std::unique_ptr<engine::audio::IAudioMixer> m_audioMixerC;
+    // Bus levels fed into the audio mixer each frame; master reflects the mix.
+    double m_audioMixerMaster{ 0.0 };
+    // The composed observable JSON for the SDK-contract consumers (serialized
+    // each frame by refresh_sdk_contract_runtimes, GET /sdk-contracts).
+    std::string m_sdkContractJson;
+    void refresh_sdk_contract_runtimes();
 
     // Content browser (plano agente 2 §B): the asset navigation model built
     // from the real AssetRegistry snapshot, exposed via GET /content-browser.

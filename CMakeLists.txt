@@ -1236,6 +1236,7 @@ vc_object_module(vc_sdk_core
     src/engine/sdk/CapabilityRegistry.cpp
     src/engine/sdk/VisualScriptRuntime.cpp
     src/engine/sdk/VisualScriptService.cpp
+    src/engine/sdk/LuauSandbox.cpp
     src/engine/sdk/AssetPipeline.cpp
     src/engine/sdk/Observability.cpp
     src/engine/sdk/PackageManager.cpp
@@ -6688,6 +6689,11 @@ vc_object_module(vc_app_runtime
     # animation/physics/simulation/gameplay factories consumed by the REAL
     # game loop live in this TU (same module as VulkanEngineApp.cpp).
     src/app/ShowcaseGameplay.cpp
+    # CONTA 2 (world/procgen — 18 factories): composes the data-driven world
+    # generator in the game executable and registers it on the LIVE World; the
+    # same TU must be part of vc_app_runtime so VulkanEngineGame links the
+    # composed generator + LOD/streaming/erosion/cooker consumers.
+    src/app/WorldProcgen.cpp
     # LOTE 1 — Mundo: block entities/scheduler/noise/save/time-travel (A2 46-73).
     # Wireado no jogo pelo VulkanEngineApp.cpp; mesmo módulo por quem consome.
     src/app/WorldSystems.cpp
@@ -6859,6 +6865,7 @@ add_executable(VulkanEngineEditor
     src/editor/EditorApplicationPlay.cpp
     src/editor/EditorApplicationAssets.cpp
     src/editor/EditorApplicationBootstrap.cpp
+    src/editor/EditorApplicationSdkRuntimes.cpp
     src/editor/EditorVisualPanels.cpp
     src/editor/BlockTextureAtlas.cpp
     src/editor/EditorControlApi.cpp
@@ -6884,6 +6891,10 @@ add_executable(VulkanEngineEditor
     src/engine/scripting/VisualScriptCanvas.cpp
     src/engine/scripting/VisualScriptGraph.cpp
     src/engine/networking/NetworkRuntime.cpp
+    # AI debug recorder (self-contained std) consumed by the editor play AI
+    # debug panel — kept out of vc_sdk_ai_motion so the Game's vendored
+    # coacd/behaviortree scoping is not dragged into the editor.
+    src/engine/sdk/AiDebugInfo.cpp
     ${IMGUI_SOURCES}
     ${VC_SDK_PUBLIC_OBJECTS}
     $<TARGET_OBJECTS:vc_core_runtime>

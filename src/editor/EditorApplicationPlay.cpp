@@ -2255,6 +2255,7 @@ void EditorApplication::tick_play_runtime(float deltaTime) {
         m_playRuntimeTick = sim.tick;
     }
 }
+}
 
 void EditorApplication::update_play_ai_focus() {
     // Entity selection for the AI debug consumer: if the editor's selected
@@ -2346,7 +2347,6 @@ void EditorApplication::feed_play_ai_debug() {
     m_playAiNodes = snap ? snap->nodes : std::vector<engine::ai::AiDebugNode>{};
     m_playAiBlackboard =
         snap ? snap->blackboard : std::vector<engine::ai::AiDebugBlackboard>{};
-}
 }
 
 void EditorApplication::teardown_play_runtime() {

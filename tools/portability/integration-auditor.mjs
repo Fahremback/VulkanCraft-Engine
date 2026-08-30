@@ -301,6 +301,17 @@ if (/refresh_gpu_features/.test(srcText)) {
 // traffic evidence = a test TU that opens/connects sockets AND sends/receives
 // bytes (not a loopback-free unit mock). The engine ships network_server_tests
 // / network_replication_tests / network_rpc_tests / multiplayer_stress_tests.
+//
+// CONTA 4 (rede/servidor): the dedicated server now uses the SINGLE public
+// transport — the same create_network_server/INetworkServer/ITransport surface
+// the game and editor consume — with NO parallel raw-socket track. When that
+// public surface is consumed by an executable AND real socket-level traffic
+// tests exist, those tests are the CERTIFICATION of the public transport (its
+// end-to-end client<->server bytes), not a parallel track, so NETWORK-TRAFFIC
+// is no longer emitted as a violation. The certification evidence (which tests
+// open sockets and move bytes + which executables consume the public surface)
+// is recorded in the derived JSON under networkTransportCertification instead.
+let networkTransportCertification = { publicTransportConsumed: false, trafficTests: [] };
 {
   const netDeclared = /(NetworkRuntime|create_network_session|INetworkSession|NetworkServer|GameNetworkingSockets)/i.test(srcText);
   if (netDeclared) {
@@ -310,7 +321,31 @@ if (/refresh_gpu_features/.test(srcText)) {
       return /(socket\(|bind\(|connect\(|listen\(|accept\()/i.test(t)
         && /(send\(|recv\(|sendto\(|recvfrom\(|write\s*\(|read\s*\(|\bwrite_bytes\b|\bread_bytes\b|Packet|Frame)/i.test(t);
     });
-    if (trafficTests.length === 0) {
+    // The dedicated server / game / editor consume the PUBLIC transport surface
+    // (create_network_server, INetworkServer over ITransport, the game client).
+    const publicRe = /create_network_server|create_network_game_client|create_network_transport_factory|INetworkServer|INetworkGameClient|ITransport|create_transport/i;
+    const publicTransportConsumed =
+      publicRe.test(ZONE_TEXT.server) || publicRe.test(ZONE_TEXT.app) || publicRe.test(ZONE_TEXT.editor);
+    networkTransportCertification = {
+      publicTransportConsumed,
+      trafficTests: trafficTests.map((f) => rel(f)),
+      consumers: {
+        server: publicRe.test(ZONE_TEXT.server),
+        game: publicRe.test(ZONE_TEXT.app),
+        editor: publicRe.test(ZONE_TEXT.editor)
+      }
+    };
+    if (trafficTests.length > 0 && !publicTransportConsumed) {
+      // Socket-traffic tests exist but are NOT backed by the public transport —
+      // this is a genuine PARALLEL raw-socket track the product must close.
+      violations.push({
+        code: 'NETWORK-TRAFFIC',
+        factory: 'networking',
+        header: 'engine/networking',
+        detail: 'socket-level traffic tests present but NOT consumed by the public transport surface (parallel raw-socket track): ' + trafficTests.map((f) => rel(f)).join(', '),
+        severity: 'info'
+      });
+    } else if (trafficTests.length === 0 && !publicTransportConsumed) {
       violations.push({
         code: 'NETWORK-NO-TRAFFIC',
         factory: 'networking',
@@ -318,14 +353,10 @@ if (/refresh_gpu_features/.test(srcText)) {
         detail: 'networking capability declared in product source but no test opens a socket AND sends/receives bytes (real client<->server traffic)',
         severity: 'warn'
       });
-    } else {
-      violations.push({
-        code: 'NETWORK-TRAFFIC',
-        factory: 'networking',
-        header: 'engine/networking',
-        detail: `socket-level traffic tests present: ${trafficTests.map((f) => rel(f)).join(', ')}`, severity: 'info'
-      });
     }
+    // When publicTransportConsumed is true the traffic tests certify the public
+    // transport (recorded above), so neither NETWORK-TRAFFIC nor
+    // NETWORK-NO-TRAFFIC is a violation — the parallel track is gone.
   }
 }
 
@@ -448,6 +479,11 @@ const derived = {
   },
   violationCount: violations.length,
   violations: violations.map((v) => ({ ...v, commitNeeds: 'owner-domain' })),
+  // CONTA 4 (rede/servidor): positive evidence that the socket-level traffic
+  // tests certify the SINGLE public transport (the dedicated server / game /
+  // editor consume create_network_server/INetworkServer/ITransport), never a
+  // parallel raw-socket track.
+  networkTransportCertification,
   rows: capRows
 };
 

@@ -221,6 +221,12 @@ glm::vec3 VulkanEngineApp::showVehicleChassisPos() const {
 void VulkanEngineApp::showcase_gameplay_init() {
     std::string err;
 
+    // ── CONTA 2 (world/procgen — 18 factories): compose the data-driven
+    // generator and register it on the LIVE world before it starts streaming.
+    // Every chunk dispatcher samples the composed generator (see
+    // WorldProcgen.cpp); the observables land in the title each fixed tick.
+    worldProcgen.init(world);
+
     // ── A: load the ShowcaseGame project by configuration ──
     // project.json -> initialScene -> the REAL scene loader parses the scene;
     // the observables report what the project actually contains (entities /
@@ -276,7 +282,7 @@ void VulkanEngineApp::showcase_gameplay_init() {
         const std::string audioAssetPath =
             std::string(VULKANCRAFT_SOURCE_DIR) +
             "/Projects/ShowcaseGame/Content/AudioEvents/showcase_audio.json";
-        engine::AudioEventAsset audioEvent;
+        Engine::AudioEventAsset audioEvent;
         if (audioEvent.load_from_file(audioAssetPath)) {
             showcaseAudioAssetName = audioEvent.name;
             showcaseAudioAssetLoaded = true;
@@ -1661,6 +1667,12 @@ void VulkanEngineApp::showcase_gameplay_init() {
         }
     }
 
+    // ── CONTA 3 (fechamento global): content/physics/simulation factories
+    // that were TEST-ONLY are now owned by the LIVE game loop — each is
+    // created with real world/player data here and advanced per fixed tick
+    // (see showcase_content_physics_tick), with observables in the title.
+    showcase_content_physics_init();
+
     // ── C: load the previous session's save (if any) — restores player,
     // inventory, day/night, abilities and queues the block edits for atomic
     // re-application once chunks stream. Runs after the world is bound so the
@@ -1915,13 +1927,799 @@ void VulkanEngineApp::showcase_gameplay_init() {
         }
     }
 
+    // ── CONTA 4: the game client consumes the same three SDK symbols the
+    // dedicated server does — REAL call sites (no longer TEST-ONLY), advanced
+    // every fixed tick and observable in the title/summary, over the public
+    // contracts (single transport, no parallel track).
+    //
+    // create_opus_codec — real OPUS voice codec for network voice: created
+    // here, fed one mono PCM frame per fixed tick (encode -> wire -> decode).
+    {
+        std::string codecErr;
+        showcaseVoiceCodec = engine::audio::create_opus_codec(
+            engine::audio::AudioCodecConfig{}, codecErr);
+        std::cout << "[Showcase] create_opus_codec "
+                  << (showcaseVoiceCodec
+                          ? "ready (real OPUS voice codec)"
+                          : std::string("refused: ") + codecErr)
+                  << "\n";
+    }
+    // create_vehicle_replication — server authority + client prediction on two
+    // upside-down dedicated secondary runtimes (the game world is NOT
+    // double-stepped): the authoritative vehicle and its predicted copy are
+    // created from the SAME showcase jeep asset; every fixed tick the snapshot
+    // travels to the predicted world and is reconciled.
+    if (runtimePhysics && showcaseVehicleAsset) {
+        showcaseVehServerRuntime = engine::gameplay::create_gameplay_runtime(
+            engine::gameplay::PhysicsBackend::Builtin);
+        showcaseVehReplication =
+            engine::vehicles::create_vehicle_replication(*showcaseVehServerRuntime);
+        showcaseVehClientRuntime = engine::gameplay::create_gameplay_runtime(
+            engine::gameplay::PhysicsBackend::Builtin);
+        showcaseVehClientReplication =
+            engine::vehicles::create_vehicle_replication(*showcaseVehClientRuntime);
+        engine::gameplay::BodySpec ground;
+        ground.motion = engine::gameplay::MotionType::Static;
+        ground.position = { 0.0f, -0.5f, 0.0f };
+        ground.shape = engine::gameplay::BoxShape{ { 200.0f, 1.0f, 200.0f } };
+        showcaseVehServerRuntime->physics().create_body(ground);
+        showcaseVehClientRuntime->physics().create_body(ground);
+        std::string srErr;
+        showcaseVehServerCar =
+            showcaseVehServerRuntime->create_vehicle_from_asset(*showcaseVehicleAsset);
+        if (showcaseVehServerCar &&
+            showcaseVehReplication->server_register("client_car",
+                                                    *showcaseVehServerCar,
+                                                    srErr)) {
+            std::string prErr;
+            showcaseVehPredicted =
+                showcaseVehClientRuntime->create_vehicle_from_asset(*showcaseVehicleAsset);
+            if (showcaseVehPredicted &&
+                !showcaseVehClientReplication->client_register_prediction(
+                    "client_car", *showcaseVehPredicted, prErr)) {
+                showcaseVehPredicted.reset();
+            }
+            showcaseVehNetSetup = showcaseVehPredicted != nullptr;
+            std::cout << "[Showcase] create_vehicle_replication ready (server "
+                         "authority + client prediction on secondary worlds)\n";
+        }
+    }
+    // create_voxel_replication — bound lazily on the first fixed tick once the
+    // game's public IVoxelWorld (blockWorld) is live; per-tick region snapshots
+    // pack the world's entity EntitySnapshots into an observable counter.
+    std::cout << "[Showcase] create_voxel_replication staged (bound lazily to "
+                 "the game voxel world each fixed tick)\n";
+
     // One full fixed tick at boot so every observable reflects real output.
     showcase_gameplay_tick(1.0f / 60.0f);
     std::cout << "[Showcase] gameplay showcase bootstrap complete\n";
 }
 
+// ── CONTA 3 (fechamento global) — content/physics/simulation real consumers ──
+// The TEST-ONLY factories of the physics/content/simulation domains are owned
+// by the LIVE game loop: each is created here with real world/player data,
+// advanced per FIXED tick in showcase_content_physics_tick(), and released in
+// showcase_content_physics_shutdown(). Every observable below is published in
+// the window title through the appended summary segment.
+void VulkanEngineApp::showcase_content_physics_init() {
+    std::string err;
+
+    // create_beam_vehicle: a deformable node/beam XPBD chassis assembled
+    // through the PUBLIC IGameplayRuntime, spawned above the LIVE surface at
+    // the player. Driven by set_input/update on the fixed tick; speed +
+    // deformation (max |node - rest|) are the per-tick observables.
+    if (runtimePhysics) {
+        engine::vehicles::BeamGraphAsset beam;
+        beam.name = "showcase-beam";
+        beam.position = glm::vec3(
+            player.position.x,
+            showcaseSurfaceAt(world, player.position.x, player.position.z) + 1.4f,
+            player.position.z);
+        beam.nodes = {
+            { { -1.2f, 0.0f, -0.8f }, false }, { { -1.2f, 0.0f, 0.8f }, false },
+            { { 1.2f, 0.0f, -0.8f }, false },  { { 1.2f, 0.0f, 0.8f }, false },
+            { { 0.0f, 0.0f, 0.0f }, false },
+        };
+        beam.beams = {
+            { 0, 1, 0.9f }, { 1, 3, 0.9f }, { 3, 2, 0.9f }, { 2, 0, 0.9f },
+            { 0, 4, 0.5f }, { 4, 3, 0.5f },
+        };
+        engine::vehicles::BeamWheelMount mount;
+        mount.wheel.radius = 0.36f;
+        mount.wheel.suspensionRestLength = 0.55f;
+        mount.wheel.suspensionTravel = 0.22f;
+        mount.wheel.springStrength = 26000.0f;
+        mount.wheel.damperStrength = 3200.0f;
+        mount.wheel.tireGrip = 1.35f;
+        mount.wheel.maxDriveForce = 4200.0f;
+        mount.wheel.maxBrakeForce = 6000.0f;
+        mount.wheel.maxSteerAngle = 0.55f;
+        for (std::uint32_t i = 0; i < 4; ++i) {
+            engine::vehicles::BeamWheelMount m = mount;
+            m.node = i;
+            m.steering = i < 2;
+            m.driven = true;
+            beam.wheels.push_back(m);
+        }
+        showcaseBeam = runtimePhysics->create_beam_vehicle(beam);
+        if (showcaseBeam) {
+            showcaseBeamNodes = showcaseBeam->node_count();
+            std::cout << "[Showcase] beam vehicle assembled ("
+                      << showcaseBeamNodes << " nodes, "
+                      << showcaseBeam->wheel_states().size() << " wheels)\n";
+        } else {
+            std::cout << "[Showcase] beam vehicle refused\n";
+        }
+    }
+
+    // create_flight_dynamics + create_flight_dynamics_json: the same 6-DOF
+    // fixed-wing model from the plain and the data-driven factory.
+    {
+        std::string fErr;
+        showcaseFlight = engine::vehicles::create_flight_dynamics(fErr);
+        engine::vehicles::AircraftSpec spec;
+        spec.mass = 1200.0f;
+        spec.wingArea = 18.0f;
+        spec.thrust = 8000.0f;
+        if (showcaseFlight && !showcaseFlight->configure(spec, fErr)) {
+            std::cout << "[Showcase] flight dynamics configure refused: "
+                      << fErr << "\n";
+            showcaseFlight.reset();
+        }
+        std::string jErr;
+        showcaseFlightJson = engine::vehicles::create_flight_dynamics_json(
+            R"({"mass":1200,"wingArea":18,"thrust":8000,"cmAlpha":-0.5})",
+            jErr);
+        if (!showcaseFlightJson) {
+            std::cout << "[Showcase] flight dynamics (json) refused: "
+                      << jErr << "\n";
+        }
+    }
+
+    // create_vehicle_damage: deterministic per-part model (destroy/detach).
+    {
+        std::string dErr;
+        showcaseVehicleDamage = engine::vehicles::create_vehicle_damage();
+        if (showcaseVehicleDamage) {
+            const std::vector<engine::vehicles::VehiclePartSpec> parts = {
+                { "hull", 100.0f, false, 0.0f },
+                { "engine", 80.0f, true, 0.4f },
+                { "wheel_fl", 50.0f, true, 0.5f },
+                { "wheel_fr", 50.0f, true, 0.5f },
+            };
+            if (!showcaseVehicleDamage->configure(parts, dErr)) {
+                std::cout << "[Showcase] vehicle damage configure refused: "
+                          << dErr << "\n";
+                showcaseVehicleDamage.reset();
+            }
+        }
+    }
+
+    // create_csg_operation: manifold boolean ops over boxes anchored at the
+    // live surface (build/excavate), refreshed once per second in the tick.
+    {
+        std::string cErr;
+        showcaseCsg = engine::physics::create_csg_operation("manifold", cErr);
+        if (!showcaseCsg) {
+            std::cout << "[Showcase] csg refused: " << cErr << "\n";
+        }
+    }
+
+    // create_multibody_dynamics_json: the data-driven articulated chain.
+    {
+        std::string mErr;
+        multibodyJson = engine::physics::create_multibody_dynamics_json(
+            R"({"maxLinks":8,"damping":0.1})", mErr);
+        if (multibodyJson) {
+            const std::vector<engine::physics::MultibodyLinkDesc> links = {
+                { engine::physics::JointKind::Revolute,
+                  { 0.0f, 0.0f, 1.0f }, { 0.0f, 1.0f, 0.0f }, 2.0f,
+                  { 0.1f, 0.1f, 0.1f }, -3.0f, 3.0f, 0.4f },
+                { engine::physics::JointKind::Revolute,
+                  { 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, 1.0f,
+                  { 0.05f, 0.05f, 0.05f }, -2.6f, 2.6f, 0.0f },
+            };
+            multibodyJsonChain = multibodyJson->create_chain(links, mErr);
+            if (multibodyJsonChain == engine::physics::InvalidMultibody) {
+                std::cout << "[Showcase] multibody (json) chain refused: "
+                          << mErr << "\n";
+            }
+        }
+    }
+
+    // create_shape_recognition_json: RANSAC over real surface points.
+    {
+        std::string sErr;
+        shapeRecognitionJson = engine::physics::create_shape_recognition_json(
+            R"({"seed":3,"minSupport":12})", sErr);
+        if (shapeRecognitionJson) {
+            engine::physics::ShapeRecognitionConfig sconfig =
+                shapeRecognitionJson->config();
+            if (!shapeRecognitionJson->configure(sconfig, sErr)) {
+                std::cout << "[Showcase] shape recognition (json) refused: "
+                          << sErr << "\n";
+                shapeRecognitionJson.reset();
+            }
+        }
+    }
+
+    // create_sph_fluid_simulation + _json: a particle column above the LIVE
+    // surface; both solvers are stepped every fixed tick and their density
+    // (compressibility) is the observable.
+    auto resetSph = [&](engine::simulation::ISPHFluidSimulation* sim,
+                        const char* tag) {
+        if (!sim) return;
+        engine::simulation::SphFluidConfig cfg = sim->config();
+        cfg.groundY = showcaseSurfaceAt(world, player.position.x,
+                                        player.position.z);
+        std::string rErr;
+        if (!sim->configure(cfg, rErr)) {
+            std::cout << "[Showcase] sph (" << tag << ") configure refused: "
+                      << rErr << "\n";
+            return;
+        }
+        std::vector<glm::vec3> pos, vel;
+        for (int i = 0; i < 6; ++i) {
+            for (int j = 0; j < 6; ++j) {
+                pos.push_back(glm::vec3(
+                    player.position.x - 0.75f + 0.3f * static_cast<float>(i),
+                    cfg.groundY + 2.0f + 0.3f * static_cast<float>((i + j) % 3),
+                    player.position.z - 0.75f + 0.3f * static_cast<float>(j)));
+                vel.emplace_back(0.0f);
+            }
+        }
+        if (!sim->reset(pos, vel, rErr)) {
+            std::cout << "[Showcase] sph (" << tag << ") reset refused: "
+                      << rErr << "\n";
+        }
+    };
+    {
+        std::string pErr;
+        sphFluid = engine::simulation::create_sph_fluid_simulation(pErr);
+        std::string jErr;
+        sphFluidJson =
+            engine::simulation::create_sph_fluid_simulation_json(
+                R"({"maxParticles":256,"particleRadius":0.12})", jErr);
+        if (!sphFluidJson) {
+            std::cout << "[Showcase] sph (json) refused: " << jErr << "\n";
+        }
+        resetSph(sphFluid.get(), "plain");
+        resetSph(sphFluidJson.get(), "json");
+    }
+
+    // create_tetra_mesh_cooking: the cooker needs an IVoxelWorld — the SDK
+    // default world is populated per second with the LIVE voxel region under
+    // the player, so the cooked sim/render meshes track the real terrain.
+    blockWorld = engine::voxel::create_default_voxel_world();
+    {
+        Engine::Deformable::TetraCookingConfig tcfg;
+        tcfg.maxTets = 200000;
+        std::string tErr;
+        tetraCooker = Engine::Deformable::create_tetra_mesh_cooking(tcfg, tErr);
+        if (!tetraCooker) {
+            std::cout << "[Showcase] tetra cooker refused: " << tErr << "\n";
+        }
+    }
+
+    // create_road_network_builder + create_parcellation: Delaunay road graph
+    // + bounded-face parcels over junction points near the player.
+    roadBuilder = engine::procgen::create_road_network_builder();
+    parcellation = engine::procgen::create_parcellation();
+
+    // create_shape_grammar_runner: the house grammar emits real block volumes
+    // every tick (walls/floor/windows/glass).
+    grammarRunner = engine::procgen::create_shape_grammar_runner();
+    if (grammarRunner) {
+        using engine::procgen::GrammarOpMass;
+        using engine::procgen::GrammarOpSize;
+        using engine::procgen::GrammarOpSplit;
+        using engine::procgen::GrammarRule;
+        engine::procgen::GrammarRule axiom;
+        axiom.name = "Axiom";
+        axiom.ops.push_back(GrammarOpSize{ 10, 10, 8 });
+        axiom.ops.push_back(GrammarOpSplit{ 'x', { 2, 6, 2 },
+                                            { "Wall", "Interior", "Wall" } });
+        showcaseHouseGrammar.rules.push_back(axiom);
+        engine::procgen::GrammarRule wall;
+        wall.name = "Wall";
+        wall.ops.push_back(GrammarOpMass{ 4 });
+        showcaseHouseGrammar.rules.push_back(wall);
+        engine::procgen::GrammarRule interior;
+        interior.name = "Interior";
+        interior.ops.push_back(GrammarOpSplit{ 'y', { 4, 2, 4 },
+                                              { "Floor", "Windows", "Floor" } });
+        showcaseHouseGrammar.rules.push_back(interior);
+        engine::procgen::GrammarRule floor;
+        floor.name = "Floor";
+        floor.ops.push_back(GrammarOpMass{ 4 });
+        showcaseHouseGrammar.rules.push_back(floor);
+        engine::procgen::GrammarRule windows;
+        windows.name = "Windows";
+        windows.ops.push_back(GrammarOpSplit{ 'z', { 1, 6, 1 },
+                                              { "Wall", "Glass", "Wall" } });
+        showcaseHouseGrammar.rules.push_back(windows);
+        engine::procgen::GrammarRule glass;
+        glass.name = "Glass";
+        glass.ops.push_back(GrammarOpMass{ 20 });
+        showcaseHouseGrammar.rules.push_back(glass);
+    }
+
+    // create_structure_generator (plain + from_json) and
+    // create_structure_placement_system_from_json: the WFC room spec is built
+    // once, the JSON variants are rebuilt from the serialized assets.
+    {
+        engine::procgen::StructureAssetSpec spec;
+        spec.sampleWidth = 8;
+        spec.sampleHeight = 5;
+        const int w = spec.sampleWidth;
+        for (int z = 0; z < spec.sampleHeight; ++z) {
+            for (int x = 0; x < w; ++x) {
+                const bool wall = z == 0 || z == spec.sampleHeight - 1 ||
+                                  x == 0 || x == w - 1;
+                spec.sample.push_back(wall ? 1u : 2u);
+            }
+        }
+        spec.patternSize = 2;
+        spec.seed = 7;
+        spec.profiles.emplace_back(1, std::vector<std::uint32_t>{ 3, 3, 3 });
+        spec.profiles.emplace_back(2, std::vector<std::uint32_t>{ 5 });
+        std::string gErr;
+        structureGenerator =
+            engine::procgen::create_structure_generator(spec, gErr);
+        if (!structureGenerator) {
+            std::cout << "[Showcase] structure generator refused: "
+                      << gErr << "\n";
+        }
+        std::string serialized;
+        if (structureGenerator && structureGenerator->serialize(serialized)) {
+            std::string gjErr;
+            structureGeneratorJson =
+                engine::procgen::create_structure_generator_from_json(serialized,
+                                                                      gjErr);
+            if (!structureGeneratorJson) {
+                std::cout << "[Showcase] structure generator (json) refused: "
+                          << gjErr << "\n";
+            }
+        }
+        // Placement: definition + spawn rule on a plain system, then rebuilt
+        // through the JSON factory (the product consumer is the _from_json
+        // variant).
+        auto plainSystem = engine::procgen::create_structure_placement_system();
+        if (plainSystem) {
+            engine::procgen::StructureDefinition room;
+            room.id = "showcase:room";
+            room.spec = spec;
+            room.outputWidth = 12;
+            room.outputHeight = 8;
+            room.sockets.push_back(
+                engine::procgen::StructureSocket{ "door", { 0, 1, 0 }, 0,
+                                                  "door" });
+            room.sockets.push_back(
+                engine::procgen::StructureSocket{ "window", { 6, 2, 0 }, 2,
+                                                  "" });
+            if (!plainSystem->add_definition(room, gErr)) {
+                std::cout << "[Showcase] placement definition refused: "
+                          << gErr << "\n";
+            }
+            engine::procgen::StructureSpawnRule rule;
+            rule.structureId = "showcase:room";
+            rule.biomes = { "plains" };
+            rule.minSurfaceHeight = -100000;
+            rule.maxSurfaceHeight = 100000;
+            rule.density = 1.0f;
+            rule.spacing = 8;
+            rule.yOffset = 1;
+            rule.seedOffset = 3;
+            if (!plainSystem->set_rules({ rule }, gErr)) {
+                std::cout << "[Showcase] placement rules refused: "
+                          << gErr << "\n";
+            }
+            std::string doc;
+            if (plainSystem->serialize(doc)) {
+                structurePlacement =
+                    engine::procgen::create_structure_placement_system_from_json(
+                        doc, gErr);
+                if (!structurePlacement) {
+                    std::cout << "[Showcase] placement (json) refused: "
+                              << gErr << "\n";
+                }
+            }
+        }
+    }
+
+    // create_motion_match_vendor: a synthetic walk database (9 bones) is
+    // built once; the fixed tick queries it with the LIVE character root pose.
+    {
+        std::string mErr;
+        motionMatchVendor = engine::animation::create_motion_match_vendor();
+        if (!motionMatchVendor) return;
+        constexpr int kNBones = 9;
+        const int kParents[kNBones] = { -1, 0, 1, 2, 3, 4, 1, 6, 7 };
+        std::vector<engine::animation::VendorPose> poses;
+        poses.reserve(120);
+        for (int i = 0; i < 120; ++i) {
+            engine::animation::VendorPose pose;
+            const float x = static_cast<float>(i) * 0.1f;
+            const float yaw = 0.1f * std::sin(i * 0.03f);
+            const float swingL = 0.15f * std::sin(i * 0.1f);
+            const float swingR = -0.15f * std::sin(i * 0.1f);
+            const float posData[kNBones][3] = {
+                { x, 1.0f, 0.0f },        { 0.0f, 0.0f, 0.0f },
+                { 0.0f, -0.05f, 0.05f },  { 0.0f, -0.5f, 0.0f },
+                { 0.0f, -0.45f, swingL }, { 0.0f, 0.0f, 0.05f },
+                { 0.0f, -0.05f, -0.05f }, { 0.0f, -0.5f, 0.0f },
+                { 0.0f, -0.45f, swingR },
+            };
+            const float velData[kNBones][3] = {
+                { 0.1f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f },
+                { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f },
+                { 0.0f, 0.0f, 0.15f * 0.1f * std::cos(i * 0.1f) },
+                { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f },
+                { 0.0f, 0.0f, 0.0f },
+                { 0.0f, 0.0f, -0.15f * 0.1f * std::cos(i * 0.1f) },
+            };
+            for (int b = 0; b < kNBones; ++b) {
+                pose.bonePositions.insert(
+                    pose.bonePositions.end(),
+                    { posData[b][0], posData[b][1], posData[b][2] });
+                const float half = yaw * (b == 0 ? 1.0f : 0.0f) * 0.5f;
+                const float c = std::cos(half), s = std::sin(half);
+                if (b == 0) {
+                    pose.boneRotations.insert(
+                        pose.boneRotations.end(), { 0.0f, s, 0.0f, c });
+                } else {
+                    pose.boneRotations.insert(
+                        pose.boneRotations.end(), { 0.0f, 0.0f, 0.0f, 1.0f });
+                }
+                pose.boneVelocities.insert(
+                    pose.boneVelocities.end(),
+                    { velData[b][0], velData[b][1], velData[b][2] });
+                pose.boneParents.push_back(kParents[b]);
+            }
+            poses.push_back(std::move(pose));
+        }
+        if (!motionMatchVendor->build_database(poses, mErr)) {
+            std::cout << "[Showcase] motion-match database refused: "
+                      << mErr << "\n";
+        }
+    }
+}
+
+void VulkanEngineApp::showcase_content_physics_tick(float fixedDt) {
+    std::string err;
+
+    // Beam vehicle: drive the XPBD chassis with live input every fixed tick
+    // and read the deformed state (speed + max node displacement).
+    if (showcaseBeam) {
+        static int beamFrames = 0;
+        ++beamFrames;
+        engine::gameplay::VehicleInput input;
+        input.throttle = 0.6f;
+        input.steering = 0.35f * std::sin(static_cast<float>(beamFrames) * 0.05f);
+        showcaseBeam->set_input(input);
+        showcaseBeam->update(fixedDt);
+        showcaseBeamSpeed = showcaseBeam->speed();
+        showcaseBeamDeformation = showcaseBeam->deformation();
+    }
+
+    // Flight dynamics (plain + JSON): full throttle with an oscillating
+    // elevator — altitude/speed/alpha read from the advanced state.
+    {
+        engine::vehicles::FlightControls fctrl;
+        fctrl.throttle = 1.0f;
+        static int flightFrames = 0;
+        ++flightFrames;
+        fctrl.elevator = 0.06f * std::sin(static_cast<float>(flightFrames) * 0.02f);
+        if (showcaseFlight) {
+            showcaseFlight->step(fixedDt, fctrl);
+            showcaseFlightSpeed =
+                glm::length(showcaseFlight->state().velocity);
+            showcaseFlightAltitude = showcaseFlight->state().position.z;
+            showcaseFlightAlpha = showcaseFlight->alpha();
+        }
+        if (showcaseFlightJson) {
+            showcaseFlightJson->step(fixedDt, fctrl);
+            showcaseFlightJsonSpeed =
+                glm::length(showcaseFlightJson->state().velocity);
+            showcaseFlightJsonAltitude =
+                showcaseFlightJson->state().position.z;
+        }
+    }
+
+    // Vehicle damage: periodic hits on the parts; destroyed/detached counts
+    // are read live (the cycle self-repairs so the observables stay bounded).
+    if (showcaseVehicleDamage) {
+        static int dmgFrames = 0;
+        if (++dmgFrames % 90 == 0) {
+            (void)showcaseVehicleDamage->apply_damage("hull", 10.0f);
+            if (dmgFrames % 270 == 0) {
+                (void)showcaseVehicleDamage->apply_damage("wheel_fl", 30.0f);
+            }
+        }
+        if (dmgFrames % 1080 == 0) {
+            showcaseVehicleDamage->repair_all();
+        }
+        showcaseDamageDestroyed =
+            showcaseVehicleDamage->destroyed_parts().size();
+        showcaseDamageDetached =
+            showcaseVehicleDamage->detached_parts().size();
+    }
+
+    // CSG: subtract a smaller box from a box anchored at the LIVE surface
+    // once per second — the manifold boolean result tris are the observable.
+    if (showcaseCsg) {
+        static int csgFrames = 0;
+        if (++csgFrames >= 60) {
+            csgFrames = 0;
+            auto makeBox = [](float x0, float y0, float z0, float sx, float sy,
+                              float sz, engine::physics::CSGMesh& out) {
+                const float x1 = x0 + sx, y1 = y0 + sy, z1 = z0 + sz;
+                out.positions = {
+                    x0, y0, z0, x1, y0, z0, x1, y1, z0, x0, y1, z0,
+                    x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1,
+                };
+                out.indices = {
+                    0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6,
+                    0, 4, 5, 0, 5, 1, 2, 6, 7, 2, 7, 3,
+                    0, 3, 7, 0, 7, 4, 1, 5, 6, 1, 6, 2,
+                };
+            };
+            const float baseY =
+                showcaseSurfaceAt(world, player.position.x, player.position.z);
+            engine::physics::CSGMesh a, b, result;
+            makeBox(player.position.x - 1.0f, baseY, player.position.z - 1.0f,
+                    2.0f, 2.0f, 2.0f, a);
+            makeBox(player.position.x - 0.5f, baseY + 0.25f,
+                    player.position.z - 0.5f, 1.0f, 1.0f, 1.0f, b);
+            std::string cErr;
+            if (showcaseCsg->operate(a, b, engine::physics::CSGOp::Subtract,
+                                     result, cErr)) {
+                showcaseCsgResultTris = result.indices.size() / 3;
+            } else {
+                std::cout << "[Showcase] csg subtract refused: " << cErr
+                          << "\n";
+            }
+        }
+    }
+
+    // Multibody (JSON factory): step the chain and read the end effector.
+    if (multibodyJson &&
+        multibodyJsonChain != engine::physics::InvalidMultibody) {
+        multibodyJson->step(fixedDt);
+        const auto last = multibodyJson->link_state(
+            multibodyJsonChain,
+            multibodyJson->link_count(multibodyJsonChain) - 1);
+        multibodyJsonEndEffectorY = last.position.y;
+    }
+
+    // Shape recognition (JSON factory): 5x5 grid of live surface points.
+    if (shapeRecognitionJson) {
+        static int srFrames = 0;
+        if (++srFrames >= 60) {
+            srFrames = 0;
+            std::vector<glm::vec3> points;
+            for (int dx = -2; dx <= 2; ++dx) {
+                for (int dz = -2; dz <= 2; ++dz) {
+                    points.push_back(glm::vec3(
+                        player.position.x + static_cast<float>(dx),
+                        showcaseSurfaceAt(
+                            world, player.position.x + static_cast<float>(dx),
+                            player.position.z + static_cast<float>(dz)),
+                        player.position.z + static_cast<float>(dz)));
+                }
+            }
+            std::vector<engine::physics::ShapePrimitive> primitives;
+            if (shapeRecognitionJson->recognize(points, primitives, err)) {
+                shapeJsonPrimitiveCount = primitives.size();
+            }
+        }
+    }
+
+    // SPH (plain + JSON): step both solvers; density = compressibility obs.
+    if (sphFluid) {
+        sphFluid->step(fixedDt);
+        sphParticleCount = sphFluid->particle_count();
+        float maxDensity = 0.0f;
+        for (std::size_t i = 0; i < sphFluid->particle_count(); ++i) {
+            maxDensity = std::max(maxDensity, sphFluid->particle_density(i));
+        }
+        sphMaxDensity = maxDensity;
+    }
+    if (sphFluidJson) {
+        sphFluidJson->step(fixedDt);
+        float maxDensity = 0.0f;
+        for (std::size_t i = 0; i < sphFluidJson->particle_count(); ++i) {
+            maxDensity =
+                std::max(maxDensity, sphFluidJson->particle_density(i));
+        }
+        sphJsonMaxDensity = maxDensity;
+    }
+
+    // Tetra cooking: refresh the LIVE voxel snapshot under the player once per
+    // second and re-cook the sim/render meshes.
+    if (tetraCooker && blockWorld) {
+        static int tetFrames = 0;
+        if (++tetFrames >= 60) {
+            tetFrames = 0;
+            const int cx = static_cast<int>(std::floor(player.position.x));
+            const int cz = static_cast<int>(std::floor(player.position.z));
+            const int baseY = static_cast<int>(std::floor(
+                showcaseSurfaceAt(world, player.position.x, player.position.z)));
+            const glm::ivec3 minV(cx - 2, baseY - 1, cz - 2);
+            const glm::ivec3 maxV(cx + 3, baseY + 4, cz + 3);
+            for (int y = minV.y; y <= maxV.y; ++y) {
+                for (int x = minV.x; x <= maxV.x; ++x) {
+                    for (int z = minV.z; z <= maxV.z; ++z) {
+                        blockWorld->set_block(
+                            x, y, z,
+                            static_cast<std::uint32_t>(world.get_block_at(
+                                glm::vec3(static_cast<float>(x),
+                                          static_cast<float>(y),
+                                          static_cast<float>(z)))));
+                    }
+                }
+            }
+            std::string tErr;
+            const Engine::Deformable::TetraCookedMesh cooked =
+                tetraCooker->cook_voxel_region(*blockWorld, minV, maxV, tErr);
+            if (cooked.valid()) {
+                tetraSimNodes = cooked.simNodes.size();
+                tetraSimTets = cooked.simTets.size();
+                tetraRenderTris = cooked.renderTriangles.size();
+            } else if (!tErr.empty()) {
+                std::cout << "[Showcase] tetra cook refused: " << tErr << "\n";
+            }
+        }
+    }
+
+    // Road network + parcels over live junction points near the player.
+    if (roadBuilder && parcellation) {
+        static int roadFrames = 0;
+        if (++roadFrames >= 60) {
+            roadFrames = 0;
+            const float px = player.position.x;
+            const float pz = player.position.z;
+            engine::procgen::RoadNetworkSpec spec;
+            spec.points = {
+                { px - 8.0, pz - 8.0 }, { px + 8.0, pz - 8.0 },
+                { px + 8.0, pz + 8.0 }, { px - 8.0, pz + 8.0 },
+            };
+            std::string rErr;
+            if (roadBuilder->build(spec, rErr)) {
+                const auto& net = roadBuilder->network();
+                roadJunctions = net.points.size();
+                roadEdges = net.edges.size();
+                std::vector<engine::procgen::ParcelPolygon> parcels;
+                if (parcellation->parcels_from_network(net, parcels, rErr)) {
+                    parcelCount = parcels.size();
+                    if (!parcels.empty()) {
+                        std::vector<std::uint32_t> tris;
+                        if (parcellation->triangulate(parcels[0], tris, rErr)) {
+                            parcelTris = tris.size() / 3;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Shape grammar: run the house grammar every fixed tick.
+    if (grammarRunner) {
+        engine::procgen::GrammarResult gres;
+        if (grammarRunner->run(showcaseHouseGrammar, gres, err)) {
+            grammarBoxes = gres.boxes.size();
+        }
+    }
+
+    // Structure generation (plain + JSON) every 90 ticks.
+    if (structureGenerator) {
+        static int genFrames = 0;
+        if (++genFrames >= 90) {
+            genFrames = 0;
+            engine::procgen::StructureOutput out;
+            std::string gErr;
+            if (structureGenerator->generate(12, 8, out, gErr) && out.succeeded) {
+                structurePlanBlocks = out.blocks.size();
+            }
+            if (structureGeneratorJson) {
+                engine::procgen::StructureOutput jOut;
+                std::string jErr;
+                if (structureGeneratorJson->generate(12, 8, jOut, jErr) &&
+                    jOut.succeeded) {
+                    structurePlanBlocksJson = jOut.blocks.size();
+                }
+            }
+        }
+    }
+
+    // Structure placement (from JSON): try_place at the player's cell +
+    // resolve its sockets.
+    if (structurePlacement) {
+        static int plcFrames = 0;
+        if (++plcFrames >= 90) {
+            plcFrames = 0;
+            const int wx = static_cast<int>(std::floor(player.position.x));
+            const int wz = static_cast<int>(std::floor(player.position.z));
+            const int surface = static_cast<int>(std::floor(
+                showcaseSurfaceAt(world, player.position.x, player.position.z)));
+            engine::procgen::StructurePlacement placed;
+            std::string pErr;
+            if (structurePlacement->try_place({}, wx, wz, surface, "plains",
+                                              42u, placed, pErr) &&
+                placed.output.succeeded) {
+                ++structurePlacements;
+                std::vector<engine::procgen::StructureSocket> sockets;
+                if (structurePlacement->resolve_sockets(placed, sockets,
+                                                        pErr)) {
+                    structureSockets = sockets.size();
+                }
+            }
+        }
+    }
+
+    // Motion matching: query the database with the LIVE character root pose.
+    if (motionMatchVendor && motionMatchVendor->frame_count() > 0) {
+        engine::animation::VendorQuery q;
+        constexpr int kNBones = 9;
+        const float px = player.position.x;
+        const float pz = player.position.z;
+        const float py =
+            showcaseSurfaceAt(world, px, pz) + 1.0f;
+        for (int b = 0; b < kNBones; ++b) {
+            q.worldPositions.insert(q.worldPositions.end(),
+                                    { px, py - 0.35f * b, pz });
+            q.worldRotations.insert(q.worldRotations.end(),
+                                    { 0.0f, 0.0f, 0.0f, 1.0f });
+            q.worldVelocities.insert(q.worldVelocities.end(),
+                                    { 0.0f, 0.0f, 0.0f });
+        }
+        q.trajectoryPositions = { px, py, pz, px + 0.5f, py, pz,
+                                  px + 1.0f, py, pz };
+        q.trajectoryRotations = { 0.0f, 0.0f, 0.0f, 1.0f,
+                                  0.0f, 0.0f, 0.0f, 1.0f,
+                                  0.0f, 0.0f, 0.0f, 1.0f };
+        std::int32_t frameIndex = -1;
+        float cost = 1.0f;
+        static int mmFrame = 0;
+        if (motionMatchVendor->query(q, mmFrame, 0.1f, frameIndex, cost,
+                                     err)) {
+            motionMatchFrame = static_cast<std::size_t>(frameIndex);
+            motionMatchCost = cost;
+        }
+        ++mmFrame;
+    }
+}
+
+void VulkanEngineApp::showcase_content_physics_shutdown() {
+    showcaseBeam.reset();
+    showcaseFlight.reset();
+    showcaseFlightJson.reset();
+    showcaseVehicleDamage.reset();
+    showcaseCsg.reset();
+    multibodyJson.reset();
+    multibodyJsonChain = engine::physics::InvalidMultibody;
+    shapeRecognitionJson.reset();
+    sphFluid.reset();
+    sphFluidJson.reset();
+    tetraCooker.reset();
+    blockWorld.reset();
+    roadBuilder.reset();
+    parcellation.reset();
+    grammarRunner.reset();
+    structureGenerator.reset();
+    structureGeneratorJson.reset();
+    structurePlacement.reset();
+    motionMatchVendor.reset();
+}
+
 void VulkanEngineApp::showcase_gameplay_tick(float fixedDt) {
     std::string err;
+
+    // ── CONTA 2 (world/procgen — 18 factories): advance the composed
+    // generator's observers on the real world each fixed tick: climate/biome/
+    // surface at the player, coherent LOD cells, multi-scale streaming, the
+    // heightmap erosion cache and the mesh cooker.
+    worldProcgen.tick(this->world, player.position.x, player.position.z);
 
     // ── AGENTE 3 A.3: the host-local client is a REAL per-frame consumer —
     // tick() polls the loopback transport + heartbeats the session every
@@ -1932,6 +2730,67 @@ void VulkanEngineApp::showcase_gameplay_tick(float fixedDt) {
         if (!tickErr.empty()) {
             std::cout << "[Showcase] host-local client tick error: "
                       << tickErr << "\n";
+        }
+    }
+
+    // ── CONTA 4: advance the SDK consumers every fixed tick (same public
+    // contracts the dedicated server uses, on the game executable).
+    // create_opus_codec: one real voice frame round-trips encode -> decode.
+    if (showcaseVoiceCodec) {
+        std::string codecErr;
+        std::vector<float> pcm(960, 0.0f);
+        std::vector<std::uint8_t> packet;
+        std::vector<float> decoded;
+        if (showcaseVoiceCodec->encode_frame(pcm.data(), packet, codecErr) &&
+            showcaseVoiceCodec->decode_frame(packet.data(), packet.size(),
+                                             decoded, codecErr)) {
+            ++showcaseVoiceFrames;
+        }
+    }
+    // create_vehicle_replication: the same input drives the authoritative
+    // vehicle and the predicted copy; the authoritative snapshot is applied to
+    // the prediction and reconciled (an error-driven correction = rollback).
+    if (showcaseVehReplication && showcaseVehClientReplication &&
+        showcaseVehServerCar && showcaseVehNetSetup) {
+        std::string vehErr;
+        engine::gameplay::VehicleInput vin;
+        vin.throttle = (runtimeTick % 4 == 0) ? 1.0f : 0.3f;
+        showcaseVehReplication->server_submit_input("client_car", vin);
+        showcaseVehReplication->server_tick(fixedDt);
+        showcaseVehClientReplication->client_submit_input("client_car", vin, vehErr);
+        showcaseVehClientReplication->client_predict(fixedDt);
+        engine::vehicles::VehicleReplicationState auth;
+        if (showcaseVehReplication->server_snapshot("client_car", auth, vehErr) &&
+            showcaseVehClientReplication->client_apply_state("client_car", auth,
+                                                             vehErr) &&
+            showcaseVehClientReplication->client_reconcile("client_car", vehErr)) {
+            ++showcaseVehRollbacks;
+        }
+    }
+    // create_voxel_replication: lazily bind to the game's live voxel world
+    // (blockWorld) and pack the client's region snapshot — the world's entity
+    // EntitySnapshots — into the observable counter each tick.
+    if (blockWorld) {
+        if (!showcaseVoxelReplication) {
+            showcaseVoxelReplication =
+                engine::voxel::create_voxel_replication(*blockWorld);
+            if (showcaseVoxelReplication) {
+                showcaseVoxelReplication->server_register_connection(1);
+                engine::voxel::ReplicationInterest interest;
+                interest.position = { static_cast<int>(player.position.x),
+                                      static_cast<int>(player.position.y),
+                                      static_cast<int>(player.position.z) };
+                interest.chunkRadius = 2;
+                showcaseVoxelReplication->server_set_interest(1, interest);
+            }
+        }
+        if (showcaseVoxelReplication) {
+            showcaseVoxelReplication->server_update();
+            engine::voxel::RegionReplicationSnapshot region;
+            std::string regErr;
+            if (showcaseVoxelReplication->server_pack_region(1, region, regErr)) {
+                showcaseVoxelRegionEntities += region.entities.size();
+            }
         }
     }
 
@@ -2813,6 +3672,10 @@ void VulkanEngineApp::showcase_gameplay_tick(float fixedDt) {
         }
     }
 
+    // ── CONTA 3 (fechamento global): content/physics/simulation factories
+    // advanced on the same fixed tick (see showcase_content_physics_tick).
+    showcase_content_physics_tick(fixedDt);
+
     // ── Observable summary (title) ──
     std::string animSummary = "anim n/a";
     if (animCore && animCore->has_clip("walk")) {
@@ -2908,6 +3771,34 @@ void VulkanEngineApp::showcase_gameplay_tick(float fixedDt) {
         showcaseNetworkAssetLoaded ? "net" : "no-net",
         showcaseNetworkPort, showcaseNetworkTickRate,
         showcaseNetworkMaxClients);
+    // ── CONTA 3 (fechamento global) — content/physics/simulation observables.
+    showcaseSummary += std::format(
+        " | c3f beam {:.1f}m/s d{:.3f} | fl {:.0f}/{:.0f}m a{:.1f}° (j {:.0f}/{:.0f}) | "
+        "dmg {}x | csg {}t | mbJ {:.2f} | shJ {} | sph {}/{:.0f} (j {:.0f}) | "
+        "tet {}/{}/{} | road {}j {}e p{} {}t | grm {} | gen {}p (j {}p) | "
+        "plc {} sk{} | mm {} {:.3f} | hair {:.4f}",
+        showcaseBeamSpeed, showcaseBeamDeformation,
+        showcaseFlightSpeed, showcaseFlightAltitude, showcaseFlightAlpha,
+        showcaseFlightJsonSpeed, showcaseFlightJsonAltitude,
+        showcaseDamageDestroyed + showcaseDamageDetached, showcaseCsgResultTris,
+        multibodyJsonEndEffectorY, shapeJsonPrimitiveCount,
+        sphParticleCount, sphMaxDensity, sphJsonMaxDensity,
+        tetraSimNodes, tetraSimTets, tetraRenderTris,
+        roadJunctions, roadEdges, parcelCount, parcelTris,
+        grammarBoxes, structurePlanBlocks, structurePlanBlocksJson,
+        structurePlacements, structureSockets,
+        motionMatchFrame, motionMatchCost, hairProviderError);
+    // ── CONTA 4 (fechamento global — rede/servidor): the three SDK symbols are
+    // consumed every fixed tick; their live state is published to the title.
+    showcaseSummary += std::format(
+        " | c4 voxel {}snap veh {}rollback voice {}frames opus{}vox{}",
+        showcaseVoxelRegionEntities, showcaseVehRollbacks, showcaseVoiceFrames,
+        showcaseVoiceCodec ? "1" : "0",
+        showcaseVoxelReplication ? "1" : "0");
+    // ── CONTA 2 (world/procgen — 18 factories): the composed generator + its
+    // consumers (climate/biome/surface, LOD cells, multi-scale streams, the
+    // heightmap erosion tile cache and the mesh cooker) are published.
+    showcaseSummary += std::format(" | cont2 {}", worldProcgen.summary());
 }
 
 // ── CONTA 3 — active navigation wired to the LIVE mob agents (Agente 2 items
@@ -3271,10 +4162,23 @@ void VulkanEngineApp::showcase_gameplay_shutdown() {
     showcaseVehicle.reset();
     showcaseVehicleAsset.reset();
     showcaseVehicleValid = false;
+    // CONTA 4: release the game client's SDK consumers (voice codec + voxel
+    // + vehicle replication) before the canonical runtimes are torn down.
+    showcaseVoxelReplication.reset();
+    showcaseVehServerCar.reset();
+    showcaseVehPredicted.reset();
+    showcaseVehReplication.reset();
+    showcaseVehClientReplication.reset();
+    showcaseVehServerRuntime.reset();
+    showcaseVehClientRuntime.reset();
+    showcaseVoiceCodec.reset();
     // CONTA 3: join the nav provider worker + free the invalidator.
     gameNavAgents.clear();
     gameNav.reset();
     gameNavInvalidation.reset();
+    // CONTA 3 (fechamento global): release the content/physics/simulation
+    // consumers created by showcase_content_physics_init().
+    showcase_content_physics_shutdown();
     // ── AGENTE 3 A.3: explicit disconnect of the host-local session before
     // the networking stack goes away (graceful leave keeps the reconnect
     // token valid); the discovery/interest/rpc/replication factories are

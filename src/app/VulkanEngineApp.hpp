@@ -140,6 +140,21 @@
 #include "engine/physics/IMultibodyDynamics.hpp"
 #include "engine/physics/IShapeRecognition.hpp"
 #include "engine/physics/IExplosion.hpp"
+#include "engine/physics/ICSGOperation.hpp"
+#include "engine/vehicles/IFlightDynamics.hpp"
+#include "engine/vehicles/IVehicleDamage.hpp"
+#include "engine/simulation/ISPHFluidSimulation.hpp"
+#include "engine/deformable/ITetraMeshCooking.hpp"
+#include "engine/procgen/IParcellation.hpp"
+#include "engine/procgen/IShapeGrammar.hpp"
+#include "engine/procgen/IStructureGenerator.hpp"
+#include "engine/procgen/IStructurePlacement.hpp"
+#include "engine/animation/IMotionMatchVendor.hpp"
+#include "engine/voxel/IVoxelWorld.hpp"
+#include "engine/voxel/IVoxelReplication.hpp"
+#include "engine/vehicles/IVehicleReplication.hpp"
+#include "engine/audio/IAudioCodec.hpp"
+#include "engine/hair/IHairProvider.hpp"
 #include "engine/capabilities/ICapabilityRegistry.hpp"
 #include "engine/director/IWorldDirector.hpp"
 #include "engine/registry/IEquipment.hpp"
@@ -151,6 +166,7 @@
 #include "engine/navigation/INavigationSchedulerBridge.hpp"
 #include "engine/procgen/IWorldFeatures.hpp"
 #include "engine/procgen/IWorldProfile.hpp"
+#include "WorldProcgen.hpp"
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -193,6 +209,11 @@ struct FrameData {
     // readback buffer live per frame so the previous frame's query results are
     // still valid while the current frame is being recorded/submitted.
     VkQueryPool timestampPool{ VK_NULL_HANDLE };
+    // True once this frame's command buffer (with its timestamp queries) has
+    // been submitted to the queue. Guards publish_timestamp_metrics against
+    // reading queries that were never submitted (which would make a
+    // VK_QUERY_RESULT_WAIT_BIT read block forever on the very first frames).
+    bool submitted{ false };
 };
 
 inline constexpr std::uint32_t kFrameTimestampSlots = 16;  // 2 * 8 timed passes
@@ -530,6 +551,28 @@ public:
     std::size_t hostLocalRelevantEntities{ 0 };
     std::uint32_t hostLocalPredictedBlocks{ 0 };
     std::size_t hostLocalRollbacks{ 0 };
+    // CONTA 4 — the game client consumes the SAME three SDK symbols the
+    // dedicated server does, over the same public contracts, every fixed tick:
+    //   create_opus_codec      -> real OPUS voice encode/decode on the net path
+    //   create_vehicle_replication -> server authority + client prediction on
+    //                                 the runtime's vehicle world
+    //   create_voxel_replication   -> per-tick region snapshots (incl. entity
+    //                                 EntitySnapshots) over the game's voxel world
+    std::unique_ptr<engine::audio::IAudioCodec> showcaseVoiceCodec;
+    std::size_t showcaseVoiceFrames{ 0 };
+    // Vehicle replication runs on two DEDICATED secondary gameplay runtimes
+    // (server-authority world + client-prediction world), so it never double-
+    // steps the game's own runtimePhysics/showcaseVehicle simulation.
+    std::unique_ptr<engine::gameplay::IGameplayRuntime> showcaseVehServerRuntime;
+    std::shared_ptr<engine::vehicles::IVehicleReplication> showcaseVehReplication;
+    std::unique_ptr<engine::gameplay::IVehicle> showcaseVehServerCar;
+    std::unique_ptr<engine::gameplay::IGameplayRuntime> showcaseVehClientRuntime;
+    std::shared_ptr<engine::vehicles::IVehicleReplication> showcaseVehClientReplication;
+    std::unique_ptr<engine::gameplay::IVehicle> showcaseVehPredicted;
+    std::size_t showcaseVehRollbacks{ 0 };
+    std::shared_ptr<engine::voxel::IVoxelReplication> showcaseVoxelReplication;
+    std::size_t showcaseVoxelRegionEntities{ 0 };
+    bool showcaseVehNetSetup{ false };
     std::string hostLocalNetSummary{ "net n/a" };
     // AGENTE 2 block A (showcase bootstrap): the game loads the ShowcaseGame
     // project by configuration (project.json -> initialScene -> scene entities/
@@ -739,6 +782,11 @@ public:
     std::shared_ptr<engine::procgen::IWorldProfile> showcaseWorldProfile;
     std::size_t showcaseWorldProfileSections{ 0 };
     std::size_t showcaseWorldProfileWorld{ 0 };
+    // CONTA 2 (world/procgen — 18 factories): the app-level composition module
+    // that registers the composed climate voxel generator on the LIVE `world`
+    // (so every chunk dispatch uses the data-driven generator) and publishes
+    // per-frame observables (biome/climate/surface/LOD/stream/erosion/cook).
+    app::WorldProcgen worldProcgen;
     // 108 skeleton real de asset: the character skeleton asset JSON exists in
     // the project (Content/Registry/showcase_character_skeleton.json, 7 bones)
     // and the motion database cooks the canonical skeleton from it — this
@@ -796,6 +844,88 @@ public:
     float multibodyEndEffectorY{ 0.0f };
     std::unique_ptr<engine::physics::IShapeRecognition> shapeRecognition;
     std::size_t shapePrimitiveCount{ 0 };
+    // ── CONTA 3 (fechamento global) — conteúdo/física/simulação real ──
+    // The TEST-ONLY factories of the physics/content/simulation domains are
+    // consumed by the LIVE game loop below (init -> fixed tick -> shutdown),
+    // each with per-tick state and observables in the window title.
+    // Beam vehicle: a deformable node/beam chassis via
+    // IGameplayRuntime::create_beam_vehicle (XPBD), driven per fixed tick.
+    std::unique_ptr<engine::gameplay::IBeamVehicle> showcaseBeam;
+    std::size_t showcaseBeamNodes{ 0 };
+    float showcaseBeamSpeed{ 0.0f };
+    float showcaseBeamDeformation{ 0.0f };
+    // Flight dynamics: 6-DOF fixed-wing model (plain + JSON factory).
+    std::unique_ptr<engine::vehicles::IFlightDynamics> showcaseFlight;
+    std::unique_ptr<engine::vehicles::IFlightDynamics> showcaseFlightJson;
+    float showcaseFlightAltitude{ 0.0f };
+    float showcaseFlightSpeed{ 0.0f };
+    float showcaseFlightAlpha{ 0.0f };
+    float showcaseFlightJsonAltitude{ 0.0f };
+    float showcaseFlightJsonSpeed{ 0.0f };
+    // Vehicle damage: per-part damage model (separates/destroys parts).
+    std::unique_ptr<engine::vehicles::IVehicleDamage> showcaseVehicleDamage;
+    std::size_t showcaseDamageDestroyed{ 0 };
+    std::size_t showcaseDamageDetached{ 0 };
+    // CSG: manifold boolean ops on real voxel-derived meshes (build/excavate).
+    std::unique_ptr<engine::physics::ICSGOperation> showcaseCsg;
+    std::size_t showcaseCsgResultTris{ 0 };
+    // Multibody + shape recognition via their JSON factories (the plain ones
+    // are already consumed above; the _json variants are the TEST-ONLY gap).
+    std::unique_ptr<engine::physics::IMultibodyDynamics> multibodyJson;
+    engine::physics::MultibodyHandle multibodyJsonChain{ engine::physics::InvalidMultibody };
+    float multibodyJsonEndEffectorY{ 0.0f };
+    std::unique_ptr<engine::physics::IShapeRecognition> shapeRecognitionJson;
+    std::size_t shapeJsonPrimitiveCount{ 0 };
+    // SPH fluid simulation (plain + JSON factory) over live world columns.
+    std::unique_ptr<engine::simulation::ISPHFluidSimulation> sphFluid;
+    std::unique_ptr<engine::simulation::ISPHFluidSimulation> sphFluidJson;
+    std::size_t sphParticleCount{ 0 };
+    float sphMaxDensity{ 0.0f };
+    float sphJsonMaxDensity{ 0.0f };
+    // Tetrahedral mesh cooking over the LIVE voxel region near the player.
+    std::unique_ptr<Engine::Deformable::ITetraMeshCooking> tetraCooker;
+    std::size_t tetraSimNodes{ 0 };
+    std::size_t tetraSimTets{ 0 };
+    std::size_t tetraRenderTris{ 0 };
+    // Parcellation / road network over real junction points near the player.
+    std::shared_ptr<engine::procgen::IRoadNetworkBuilder> roadBuilder;
+    std::shared_ptr<engine::procgen::IParcellation> parcellation;
+    std::size_t roadJunctions{ 0 };
+    std::size_t roadEdges{ 0 };
+    std::size_t parcelCount{ 0 };
+    std::size_t parcelTris{ 0 };
+    // Shape grammar runner: emits real block volumes per tick.
+    std::shared_ptr<engine::procgen::IShapeGrammarRunner> grammarRunner;
+    engine::procgen::ShapeGrammar showcaseHouseGrammar;
+    std::size_t grammarBoxes{ 0 };
+    // Structure generator (plain + from_json) and placement system from JSON.
+    std::shared_ptr<engine::procgen::IStructureGenerator> structureGenerator;
+    std::shared_ptr<engine::procgen::IStructureGenerator> structureGeneratorJson;
+    std::size_t structurePlanBlocks{ 0 };
+    std::size_t structurePlanBlocksJson{ 0 };
+    std::shared_ptr<engine::procgen::IStructurePlacementSystem> structurePlacement;
+    std::size_t structurePlacements{ 0 };
+    std::size_t structureSockets{ 0 };
+    // Tetra cooking + CSG operate over a live snapshot of the voxel region
+    // near the player (copied from the streaming World into a public
+    // IVoxelWorld via the SDK default factory — the cook/operate consume the
+    // same blocks the player stands on, refreshed per second).
+    std::unique_ptr<engine::voxel::IVoxelWorld> blockWorld;
+    // Hair provider: the PUBLIC StrandSolver (Engine::Hair::create_hair_provider)
+    // is the REAL CPU source of the GPU hair ribbon render (VulkanEngineApp.cpp
+    // draw_character reads ITS node positions every frame — not a private
+    // strand); constraint_error is the per-frame solver-convergence observable.
+    std::unique_ptr<Engine::Hair::IHairProvider> hairProvider;
+    Engine::Hair::HairStrandBodyHandle hairProviderBody{
+        Engine::Hair::InvalidHairBody };
+    float hairProviderError{ 0.0f };
+    // Motion-matching vendor queried with the live character pose.
+    std::unique_ptr<engine::animation::IMotionMatchVendor> motionMatchVendor;
+    std::size_t motionMatchFrame{ 0 };
+    float motionMatchCost{ 0.0f };
+    void showcase_content_physics_init();
+    void showcase_content_physics_tick(float fixedDt);
+    void showcase_content_physics_shutdown();
     // AGENTE 2 block B (skin via asset registry): the character skin is a REAL
     // IAssetPipeline import -> validate -> cook -> cache round trip (the
     // registry path); the cooked skin layout (name + UV origin/size) is applied
@@ -1002,6 +1132,12 @@ public:
     std::unique_ptr<Engine::Rendering::IProbeGrid> probeGrid;
     std::unique_ptr<Engine::Rendering::IReSTIRDI> restirDi;
     std::unique_ptr<Engine::Rendering::ITemporalDenoiser> temporalDenoiser;
+    // Two-factory integration: the _json factory validates the data-driven
+    // config (config() accessor feeds the live base-factory core). Keeps both
+    // create_restir_di(+_json) and create_temporal_denoiser(+_json) as real
+    // product consumers without a second parallel core running.
+    std::unique_ptr<Engine::Rendering::IReSTIRDI> diConfigProbe;
+    std::unique_ptr<Engine::Rendering::ITemporalDenoiser> denoiserConfigProbe;
     std::unique_ptr<Engine::Rendering::IRenderingDebugView> renderingDebugView;
     // A.3/A.4/E.5/H: the Lumen-style surface cache, the material-card capture
     // and the Embree-backed software tracer are REAL product producers. The
@@ -1024,6 +1160,13 @@ public:
     // the registry instead of only builtin enum decisions, and emissive
     // catalog blocks actually emit light into the world.
     std::unique_ptr<engine::registry::BlockRegistry> blockRegistry;
+    // C.1: the PUBLIC per-face block material resolver is the single source of
+    // variant-key / render-policy math for the runtime block table. Both the
+    // base factory instance and the _json config probe are real product
+    // consumers (create_block_material_resolver(+_json) each have a call site
+    // in init_block_registry).
+    std::unique_ptr<Engine::Rendering::IBlockMaterialResolver> blockMaterialResolver;
+    std::unique_ptr<Engine::Rendering::IBlockMaterialResolver> blockMaterialResolverJsonProbe;
     std::string blockRegistryError;
     std::uint32_t registryBlockCount{ 0 };
     std::uint32_t registryEmissiveCount{ 0 };
@@ -1067,6 +1210,14 @@ public:
     std::unique_ptr<Engine::Rendering::IAtmosphereScattering> atmosphere;
     std::unique_ptr<Engine::Rendering::IVolumeClouds> volumeClouds;
     std::unique_ptr<Engine::Rendering::IMaterialShading> materialShading;
+    // Two-factory integration: the _json factory validates the data-driven
+    // config and is kept as a real product consumer; the BASE factory is the
+    // live per-frame core the renderer uses. The probe's config() (see below)
+    // matches the live core's configure_json so there is no second parallel
+    // core running.
+    std::unique_ptr<Engine::Rendering::IToneMapping> toneConfigProbe;
+    std::unique_ptr<Engine::Rendering::IVolumeClouds> volumeCloudsConfigProbe;
+    std::unique_ptr<Engine::Rendering::IMaterialShading> materialShadingConfigProbe;
     // C.20/vkfft seam: the deterministic ocean FFT cores (IFftCore + the
     // Tessendorf ocean-surface synthesizer) are driven each frame over the
     // real world time and produce the actual height field that deforms the
@@ -1076,10 +1227,16 @@ public:
     std::unique_ptr<Engine::Rendering::IFftOceanSurface> fftOcean;
     std::uint32_t oceanFftVertices{ 0 };
     float oceanFftPeakHeight{ 0.0f };
+    // Two-factory config probes: the _json factory validates the data-driven
+    // config consumed by the live base-factory cores (both symbols have a real
+    // call site; no parallel second core).
+    std::unique_ptr<Engine::Rendering::IFftCore> fftCoreConfigProbe;
+    std::unique_ptr<Engine::Rendering::IFftOceanSurface> fftOceanConfigProbe;
     // A.12: FSR-style edge-adaptive spatial upscaler — a real frame producer:
     // each frame it upscales the sampled scene (via tone-mapped color grid)
     // and publishes the output size to the feature contract.
     std::unique_ptr<Engine::Rendering::ISpatialUpscaler> spatialUpscaler;
+    std::unique_ptr<Engine::Rendering::ISpatialUpscaler> spatialUpscalerConfigProbe;
     std::uint32_t upscaleOutWidth{ 0 };
     std::uint32_t upscaleOutHeight{ 0 };
     std::uint32_t upscaleSrcPixels{ 0 };
@@ -1088,6 +1245,7 @@ public:
     // frame for the water/clear-coat/material surfaces and publishes the
     // screen/probe blend weights (per-roughness) to the reflection contract.
     std::unique_ptr<Engine::Rendering::IReflectionModel> reflectionModel;
+    std::unique_ptr<Engine::Rendering::IReflectionModel> reflectionModelConfigProbe;
     std::uint32_t reflectionScreenWeightPct{ 0 };
     std::uint32_t reflectionProbeWeightPct{ 0 };
     float reflectionWaterFresnel{ 0.0f };
@@ -1101,6 +1259,12 @@ public:
     // composition instead of staying SDK-only. Config is data-driven from the
     // showcase JSON assets.
     std::unique_ptr<Engine::Rendering::IGlobalIlluminationProvider> globalIllumination;
+    // Two-factory integration: giCore is the live headless IGiCore created via
+    // create_gi_core and driven per frame over the real terrain; giConfigProbe
+    // is the _json config probe. Both create_gi_core(+_json) are real product
+    // consumers.
+    std::unique_ptr<Engine::Rendering::IGiCore> giCore;
+    std::unique_ptr<Engine::Rendering::IGiCore> giConfigProbe;
     std::unique_ptr<Engine::Rendering::IDiffuseGlobalIllumination> diffuseGi;
     std::unique_ptr<Engine::Rendering::IReflectionProvider> reflectionProvider;
     std::shared_ptr<engine::assets::ISceneLayers> sceneLayers;
@@ -1248,6 +1412,7 @@ public:
     // (WorldRenderer::set_scene_culling). Its per-draw observable counts
     // (visible/culled/occluded-detail/LOD split) are published in the title.
     std::unique_ptr<Engine::Rendering::ISceneCulling> sceneCulling;
+    std::unique_ptr<Engine::Rendering::ISceneCulling> sceneCullingConfigProbe;
     // AGENT-1 I.1: the seven public rendering factories that were ONLY
     // linked/tested in isolation are wired into the real game executable with
     // real data + observable state — see init() "RenderProviders" block.

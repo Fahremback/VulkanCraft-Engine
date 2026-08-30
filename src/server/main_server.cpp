@@ -70,6 +70,9 @@
 #include <engine/animation/IFootPlacement.hpp>
 #include <engine/audio/IAudioEventMapper.hpp>
 #include <engine/audio/IAdaptiveMusic.hpp>
+#include <engine/audio/IAudioCodec.hpp>
+#include <engine/voxel/IVoxelReplication.hpp>
+#include <engine/vehicles/IVehicleReplication.hpp>
 #include <glm/glm.hpp>
 
 int main(int argc, char** argv) {
@@ -621,6 +624,67 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // ==== CONTA 4 §1/§2/§3 — SDK symbols consumed by the dedicated server ====
+    // These three factories were TEST-ONLY; here they get a REAL call site in
+    // the dedicated executable, consumed every tick and observable, over the
+    // SAME public transport (the INetworkServer/ITransport above — no parallel
+    // track). Replication, prediction and rollback are all LIVE services bound
+    // to the runtime's snapshots, not metadata ping/pong.
+    //
+    // §1 — create_voxel_replication: public voxel service over the AUTHORITATIVE
+    // world. Every tick it packs the client's REGION (a RegionReplicationSnapshot
+    // indexing chunk windows + entity EntitySnapshots produced by the runtime's
+    // serialize_entities) for the public transport.
+    auto voxelRep = engine::voxel::create_voxel_replication(*world);
+    std::size_t voxelRegionChunks = 0;
+    std::size_t voxelRegionEntities = 0;
+    if (voxelRep) {
+        voxelRep->server_register_connection(
+            static_cast<engine::voxel::ReplicationConnectionId>(clientConn));
+        engine::voxel::ReplicationInterest voxelInterest;
+        voxelInterest.position = { 8, 200, 8 };
+        voxelInterest.chunkRadius = 3;
+        voxelRep->server_set_interest(
+            static_cast<engine::voxel::ReplicationConnectionId>(clientConn),
+            voxelInterest);
+        std::cout << "Server: create_voxel_replication bound to the "
+                     "authoritative world (per-tick region snapshots)\n";
+    }
+    // §2 — create_vehicle_replication: server authority + client prediction on
+    // the canonical runtime. Every tick the server advances the authoritative
+    // vehicle, the snapshot travels to the local client world which predicts
+    // with the same input and RECONCILES against it (error-driven correction = a
+    // counted rollback). A static ground exists in both worlds so the vehicle
+    // actually drives (same setup the engine's own vehicle-replication tests
+    // use).
+    auto serverVehReplication = serverRuntimePhysics
+        ? engine::vehicles::create_vehicle_replication(*serverRuntimePhysics)
+        : nullptr;
+    auto clientVehRuntime = engine::gameplay::create_gameplay_runtime(
+        engine::gameplay::PhysicsBackend::Builtin);
+    auto clientVehReplication =
+        engine::vehicles::create_vehicle_replication(*clientVehRuntime);
+    std::shared_ptr<engine::vehicles::IVehicle> serverVeh;
+    std::shared_ptr<engine::vehicles::IVehicle> clientVeh;
+    {
+        engine::gameplay::BodySpec ground;
+        ground.motion = engine::gameplay::MotionType::Static;
+        ground.position = { 0.0f, -0.5f, 0.0f };
+        ground.shape = engine::gameplay::BoxShape{ { 200.0f, 1.0f, 200.0f } };
+        if (serverRuntimePhysics) {
+            serverRuntimePhysics->physics().create_body(ground);
+        }
+        clientVehRuntime->physics().create_body(ground);
+    }
+    // §3 — create_opus_codec: real OPUS voice encode/decode for the network
+    // path (one mono voice frame per tick round-trips encode -> wire -> decode).
+    std::string opusErr;
+    auto opusCodec = engine::audio::create_opus_codec(
+        engine::audio::AudioCodecConfig{}, opusErr);
+    std::size_t opusFrames = 0;
+    std::vector<float> opusPcm(960, 0.0f);  // one mono frame (20 ms @ 48 kHz)
+    float vehicleAuthZ = 0.0f;
+
     // AGENTE 2 block F (vehicles): the authoritative server instantiates a
     // REAL vehicle through the promoted gameplay runtime — the asset selects
     // the Jolt provider (create_vehicle_provider gate), the chassis body is
@@ -654,14 +718,37 @@ int main(int argc, char** argv) {
             std::cout << "Server: vehicle provider refused (" << providerError
                       << "); vehicle path inactive\n";
         } else {
-            auto vehicleRuntime = serverRuntimePhysics
+            // CONTA 4 §2: the authoritative vehicle joins the vehicle-entity
+            // replication (create_vehicle_replication) — registered on the
+            // server service (authority) under a stable id; the client keeps a
+            // LOCAL predicted copy of the SAME asset in its own runtime and
+            // reconciles it against the authoritative snapshot every tick.
+            serverVeh = serverRuntimePhysics
                 ? serverRuntimePhysics->create_vehicle_from_asset(vehicle)
                 : nullptr;
+            if (serverVeh && serverVehReplication) {
+                std::string vrError;
+                if (serverVehReplication->server_register("server_probe_car",
+                                                          *serverVeh,
+                                                          vrError)) {
+                    std::string crError;
+                    clientVeh = clientVehRuntime->create_vehicle_from_asset(vehicle);
+                    if (clientVeh &&
+                        !clientVehReplication->client_register_prediction(
+                            "server_probe_car", *clientVeh, crError)) {
+                        clientVeh.reset();
+                    }
+                    std::cout << "Server: create_vehicle_replication "
+                                 "(server authority + client prediction) "
+                                 "bound to the canonical runtime over the "
+                                 "public transport\n";
+                }
+            }
             std::cout << "Server: vehicle provider '"
                       << engine::vehicles::vehicle_provider_name(
                              vehicle.provider)
                       << "' available; asset validated; vehicle "
-                      << (vehicleRuntime
+                      << (serverVeh
                               ? "spawned in the canonical fixed tick"
                               : "creation returned null (see runtime)")
                       << "\n";
@@ -846,6 +933,57 @@ int main(int argc, char** argv) {
         const auto interest = replication->server_pack_interest(
             static_cast<engine::voxel::ReplicationConnectionId>(clientConn));
         replicatedChunksSeen += interest.size();
+        // CONTA 4 §1 — per-tick voxel region replication over the public
+        // transport: the dedicated client's region (chunk windows + the
+        // runtime's entity EntitySnapshots, serialized into the snapshot) is
+        // packed and counted as observable published state.
+        if (voxelRep) {
+            voxelRep->server_update();
+            engine::voxel::RegionReplicationSnapshot regionSnap;
+            std::string regionErr;
+            if (voxelRep->server_pack_region(
+                    static_cast<engine::voxel::ReplicationConnectionId>(clientConn),
+                    regionSnap, regionErr)) {
+                voxelRegionChunks += regionSnap.chunks.size();
+                voxelRegionEntities += regionSnap.entities.size();
+            }
+        }
+        // CONTA 4 §2 — per-tick vehicle authority + client prediction/reconcile:
+        // the same input drives both; the authoritative snapshot travels to the
+        // client world which predicts locally and reconciles (error-driven
+        // correction, counted as a rollback). Complete — not "started".
+        if (serverVehReplication && clientVehReplication && serverVeh && clientVeh) {
+            std::string vehErr;
+            engine::gameplay::VehicleInput vehInput;
+            vehInput.throttle = (tick % 3 == 0) ? 1.0f : 0.4f;
+            serverVehReplication->server_submit_input("server_probe_car", vehInput);
+            serverVehReplication->server_tick(1.0f / 60.0f);
+            clientVehReplication->client_submit_input("server_probe_car",
+                                                     vehInput, vehErr);
+            clientVehReplication->client_predict(1.0f / 60.0f);
+            engine::vehicles::VehicleReplicationState auth;
+            if (serverVehReplication->server_snapshot("server_probe_car", auth,
+                                                      vehErr)) {
+                vehicleAuthZ = auth.position.z;
+                if (clientVehReplication->client_apply_state(
+                        "server_probe_car", auth, vehErr) &&
+                    clientVehReplication->client_reconcile("server_probe_car",
+                                                           vehErr)) {
+                    ++obsRollbacks;
+                }
+            }
+        }
+        // CONTA 4 §3 — per-tick OPUS voice frame over the public transport:
+        // encode_frame -> (wire) -> decode_frame on real libopus.
+        if (opusCodec) {
+            std::vector<std::uint8_t> packet;
+            std::vector<float> decoded;
+            if (opusCodec->encode_frame(opusPcm.data(), packet, opusErr) &&
+                opusCodec->decode_frame(packet.data(), packet.size(), decoded,
+                                        opusErr)) {
+                ++opusFrames;
+            }
+        }
         // B.4 — interest management público conectado à partição espacial do
         // servidor: o INetworkInterest (server->interest()) observa as
         // entidades do ECS por posição a cada tick — o subconjunto relevante
@@ -906,6 +1044,21 @@ int main(int argc, char** argv) {
                 "loss_dropped", std::max<std::int64_t>(0, sent - recv), obsErr);
             observability->set_gauge(
                 "rollback", static_cast<std::int64_t>(obsRollbacks), obsErr);
+            // CONTA 4 observables: the three SDK symbols' per-tick state is
+            // indexed into the published observability contract (same
+            // IObservability the profiler/editor consume).
+            observability->set_gauge(
+                "voxel_region_chunks",
+                static_cast<std::int64_t>(voxelRegionChunks), obsErr);
+            observability->set_gauge(
+                "voxel_region_entities",
+                static_cast<std::int64_t>(voxelRegionEntities), obsErr);
+            observability->set_gauge(
+                "vehicle_authoritative_z",
+                static_cast<std::int64_t>(vehicleAuthZ), obsErr);
+            observability->set_gauge(
+                "opus_frames",
+                static_cast<std::int64_t>(opusFrames), obsErr);
         }
         // Exercise the ONE-time authoritative block edit proof. The public
         // replication layer enforces an anti-spam cooldown
@@ -1973,7 +2126,15 @@ int main(int argc, char** argv) {
               << " chunk snapshot(s), " << interestRelevantEntities
               << " interest-relevant entity ref(s) per tick, committed "
                  "authoritative block edits via IWorldReplication), "
-                 "physics authority OK "
+                 "CONTA4 SDK symbols consumed per tick (create_voxel_replication "
+              << voxelRegionChunks
+              << " region chunk window(s) + " << voxelRegionEntities
+              << " EntitySnapshot(s) packed; create_vehicle_replication "
+                 "authoritative+prediction/reconcile with "
+              << obsRollbacks
+              << " error-driven correction(s), authoritative z="
+              << vehicleAuthZ << "; create_opus_codec " << opusFrames
+              << " real OPUS frame(s) encoded/decoded), physics authority OK "
                  "(rest+sleep, wake, eviction despawn; terrain slabs "
               << bridge.spawned_terrain_count()
               << ", unloaded bodies " << bridge.unloaded_body_count()

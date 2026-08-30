@@ -817,6 +817,13 @@ void EditorApplication::main_loop() {
                 refresh_visual_script_lifecycle();
                 run_luau_sandbox();
                 cook_showcase_assets();
+                // Conta 5 fechamento_global: drive the previously TEST-ONLY
+                // SDK factories (jobs, procgen jobs + cancellable token +
+                // preview, farm cooker, hilbert cell index [plain + JSON],
+                // block-entity scripting and audio mixer) as real editor
+                // consumers every frame and publish the observable.
+                refresh_sdk_contract_runtimes();
+                api.sdk_contracts = m_sdkContractJson;
                 refresh_profiler();
                 api.profiler = m_profilerJson;
                 refresh_undo();

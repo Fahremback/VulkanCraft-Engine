@@ -48,7 +48,7 @@ void VulkanEngineApp::run() {
             ++hbFrame;
             const double hbNow = glfwGetTime();
             if (hbFrame <= 3 && hbLast == 0.0) {
-                std::cout << "[HB] first-frame reached before draw, delta=" << deltaTime << '\n';
+                std::cout << "[HB] first-frame reached before draw, delta=" << deltaTime << '\n' << std::flush;
                 hbLast = hbNow;
             } else if (hbNow - hbLast >= 5.0) {
                 std::cout << "[HB] frame=" << hbFrame
@@ -57,7 +57,7 @@ void VulkanEngineApp::run() {
                           << " worldChunks=" << world.chunks.size()
                           << " runtimeTick=" << runtimeTick
                           << " blockEnts=" << world.block_entities().size()
-                          << '\n';
+                          << '\n' << std::flush;
                 hbLast = hbNow;
             }
         }
@@ -513,7 +513,7 @@ void VulkanEngineApp::run() {
                       << " tick=" << runtimeTick
                       << " blockEnts=" << world.block_entities().size()
                       << " l1=" << worldLote1GameShow
-                      << "\n";
+                      << "\n" << std::flush;
             statsStart = statsNow;
             statsFrames = 0;
         }

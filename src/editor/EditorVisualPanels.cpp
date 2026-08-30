@@ -189,10 +189,10 @@ void EditorApplication::draw_ai_debug_panel() {
         const bool focusValid = focusIt != m_playNavAgents.end();
         ImGui::Text("%s %s", tr("Foco:", "Focus:"),
                     focusValid ? focusId.to_string().c_str()
-                               : tr("(auto: primeiro vivo)", "(auto: first live)").c_str());
+                               : tr("(auto: primeiro vivo)", "(auto: first live)"));
         if (ImGui::BeginCombo(tr("Selecionar entidade", "Select entity"),
                               focusValid ? focusId.to_string().c_str()
-                                         : tr("Auto", "Auto").c_str())) {
+                                         : tr("Auto", "Auto"))) {
             for (const auto& [id, agent] : m_playNavAgents) {
                 (void)agent;
                 const bool selected = (m_playAiFocus == id);

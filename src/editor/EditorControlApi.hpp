@@ -160,6 +160,12 @@ struct EditorApiState {
     // IRenderProviderRegistry) — REAL per-pass timings + provider selection
     // recorded by the viewport render loop, via GET /render-diagnostics.
     std::string render_diagnostics;
+    // The SDK-contract-runtimes JSON (Conta 5 fechamento_global) — the editor
+    // is a REAL consumer of the previously TEST-ONLY factories (jobs, procgen
+    // jobs + cancellation token + preview, farm cooker, hilbert cell index
+    // [plain + JSON], block-entity scripting, audio mixer), driven every frame
+    // by refresh_sdk_contract_runtimes(). Observed via GET /sdk-contracts.
+    std::string sdk_contracts;
 };
 
 class EditorControlApi {

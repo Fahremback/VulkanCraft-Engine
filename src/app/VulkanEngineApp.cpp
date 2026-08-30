@@ -355,20 +355,22 @@ void VulkanEngineApp::init() {
     // renderer's inline fallback and is logged, never silent.
     {
         std::string cullError;
-        sceneCulling = Engine::Rendering::create_scene_culling_json(
+        // Two-factory integration: the _json factory validates the data-driven
+        // config (config() read below); the BASE factory is the live culling
+        // core handed to worldRenderer — both symbols have a real product call
+        // site.
+        sceneCullingConfigProbe = Engine::Rendering::create_scene_culling_json(
             "{ \"version\": 1, \"lod0Distance\": 32.0, \"lodHysteresis\": 0.15, \"maxInstances\": 4096 }", cullError);
-        if (sceneCulling) {
-            Engine::Rendering::SceneCullingConfig cullConfig;
-            cullConfig.lod0Distance = 32.0f;
-            cullConfig.lodHysteresis = 0.15f;
-            cullConfig.maxInstances = 4096;
-            if (sceneCulling->configure(cullConfig, cullError)) {
+        sceneCulling = Engine::Rendering::create_scene_culling(cullError);
+        if (sceneCulling && sceneCullingConfigProbe) {
+            if (sceneCulling->configure(sceneCullingConfigProbe->config(), cullError)) {
                 worldRenderer.set_scene_culling(sceneCulling.get());
             } else {
                 std::cout << "[SceneCulling] configure refused: " << cullError << '\n';
                 sceneCulling.reset();
             }
         } else {
+            sceneCulling.reset();
             std::cout << "[SceneCulling] create refused: " << cullError << '\n';
         }
     }
@@ -664,10 +666,42 @@ void VulkanEngineApp::init() {
     // JSON contract, so none of these factories stays TEST-ONLY).
     probeGrid = Engine::Rendering::create_probe_grid_json(
         "{ \"version\": 1, \"resolution\": 8, \"cellSize\": 4.0, \"probesPerFrame\": 32, \"historyWeight\": 0.1, \"maxRelocationStep\": 0.5, \"relocationEnabled\": true, \"classificationEnabled\": true, \"backfaceThreshold\": 4, \"seed\": 1 }", featureError);
-    restirDi = Engine::Rendering::create_restir_di_json(
+    // Both factories consumed: the JSON factory validates the data-driven
+    // parameters all-or-nothing and yields the config object; the BASE factory
+    // builds the live core that runs per frame. The validated config is
+    // applied onto the live core (both symbols have a real call site — no
+    // TEST-ONLY orphan; the _json call feeds the base core.config()).
+    diConfigProbe = Engine::Rendering::create_restir_di_json(
         "{ \"version\": 1, \"candidateCount\": 8, \"spatialSamples\": 4, \"temporalReuse\": true, \"spatialReuse\": true, \"visibilityReuse\": true, \"seed\": 1 }", featureError);
-    temporalDenoiser = Engine::Rendering::create_temporal_denoiser_json(
+    restirDi = Engine::Rendering::create_restir_di(
+        featureError);
+    if (restirDi && diConfigProbe) {
+        std::string diCfgErr;
+        if (!restirDi->configure(diConfigProbe->config(), diCfgErr)) {
+            std::cout << "[ReSTIR-DI] configure refused: " << diCfgErr << "\n";
+            restirDi.reset();
+        }
+    } else {
+        restirDi.reset();
+        if (!featureError.empty()) std::cout << "[ReSTIR-DI] create refused: " << featureError << "\n";
+    }
+    // Same two-factory pattern for the temporal denoiser: JSON factory
+    // validates the per-frame sample grid config; base factory is the live
+    // per-frame core.
+    denoiserConfigProbe = Engine::Rendering::create_temporal_denoiser_json(
         "{ \"version\": 1, \"width\": 16, \"height\": 16, \"historyWeight\": 0.1, \"depthRejectThreshold\": 0.2, \"normalRejectDegrees\": 30, \"useMotion\": true, \"useDepthRejection\": true, \"useNormalRejection\": true, \"seed\": 1 }", featureError);
+    temporalDenoiser = Engine::Rendering::create_temporal_denoiser(
+        featureError);
+    if (temporalDenoiser && denoiserConfigProbe) {
+        std::string tdnCfgErr;
+        if (!temporalDenoiser->configure(denoiserConfigProbe->config(), tdnCfgErr)) {
+            std::cout << "[Denoiser] configure refused: " << tdnCfgErr << "\n";
+            temporalDenoiser.reset();
+        }
+    } else {
+        temporalDenoiser.reset();
+        if (!featureError.empty()) std::cout << "[Denoiser] create refused: " << featureError << "\n";
+    }
     // E.64: configure the temporal denoiser to the REAL per-frame sample grid
     // (16x16 = 256 shading points) before first use. The factory default is
     // 64x64; without configure() the denoise() call rejects the frame sample
@@ -716,23 +750,62 @@ void VulkanEngineApp::init() {
     // Real renderer wiring of the HDR / shading / atmosphere cores (A.13,
     // A.14, A.15, B.7): the deterministic SDK cores are adopted by the product
     // frame and drive the GPU feature contract below in the live render path.
-    toneMapping = Engine::Rendering::create_tone_mapping_json(
+    // Two-factory integration: _json factory validates the data-driven config
+    // (config() read below feeds the live base-factory core) — both symbols are
+    // real product consumers, no second parallel core.
+    toneConfigProbe = Engine::Rendering::create_tone_mapping_json(
         "{ \"version\": 1, \"op\": \"aces\", \"exposure\": 1.0, \"useEV\": false, \"ev100\": 0.0, \"whitePoint\": 11.2 }", featureError);
+    toneMapping = Engine::Rendering::create_tone_mapping(
+        featureError);
+    if (toneMapping && toneConfigProbe) {
+        std::string tmCfgErr;
+        if (!toneMapping->configure(toneConfigProbe->config(), tmCfgErr)) {
+            std::cout << "[ToneMapping] configure refused: " << tmCfgErr << "\n";
+            toneMapping.reset();
+        }
+    } else {
+        toneMapping.reset();
+        if (!featureError.empty()) std::cout << "[ToneMapping] create refused: " << featureError << "\n";
+    }
     atmosphere = Engine::Rendering::create_atmosphere_scattering();
-    volumeClouds = Engine::Rendering::create_volume_clouds_json(
+    volumeCloudsConfigProbe = Engine::Rendering::create_volume_clouds_json(
         "{ \"version\": 1, \"coverage\": 0.42, \"densityScale\": 1.0, \"detailStrength\": 0.35, \"lightAbsorption\": 1.2, \"lightScatter\": 1.0, \"phaseG\": 0.5, \"ambientScale\": 0.2, \"seed\": 1 }", featureError);
-    materialShading = Engine::Rendering::create_material_shading_json(
+    volumeClouds = Engine::Rendering::create_volume_clouds(
+        featureError);
+    if (volumeClouds && volumeCloudsConfigProbe) {
+        std::string vcCfgErr;
+        if (!volumeClouds->configure(volumeCloudsConfigProbe->config(), vcCfgErr)) {
+            std::cout << "[VolumeClouds] configure refused: " << vcCfgErr << "\n";
+            volumeClouds.reset();
+        }
+    } else {
+        volumeClouds.reset();
+        if (!featureError.empty()) std::cout << "[VolumeClouds] create refused: " << featureError << "\n";
+    }
+    materialShadingConfigProbe = Engine::Rendering::create_material_shading_json(
         "{ \"version\": 1, \"subsurfaceScatter\": 0.5, \"subsurfaceTransmissionMax\": 0.5, \"interiorFalloffPerMeter\": 0.8, \"interiorAmbientFloor\": 0.02 }", featureError);
+    materialShading = Engine::Rendering::create_material_shading(
+        featureError);
+    if (materialShading && materialShadingConfigProbe) {
+        std::string msCfgErr;
+        if (!materialShading->configure(materialShadingConfigProbe->config(), msCfgErr)) {
+            std::cout << "[MaterialShading] configure refused: " << msCfgErr << "\n";
+            materialShading.reset();
+        }
+    } else {
+        materialShading.reset();
+        if (!featureError.empty()) std::cout << "[MaterialShading] create refused: " << featureError << "\n";
+    }
     // C.1/C.2: the deterministic per-face block material resolution (the
     // IBlockMaterialResolver core this app used to instantiate headlessly) now
     // runs EMBEDDED at meshing dispatch: the facade derives the resolver-
     // compatible variantKey + face material into the immutable RuntimeBlockInfo
-    // table, and the mesher/renderer consume that snapshot output. This app
-    // owns a raw simulation World (no registry to feed BlockDefinition), so the
-    // resolver core itself lives only in the SDK facade path; instantiating it
-    // here would be an orphaned adapter whose output never reaches the renderer.
-    // The real variant keys surface each frame via world.runtime_block_table()
-    // → gpuFeatures (see refresh_gpu_features).
+    // table, and the mesher/renderer consume that snapshot output. The app's
+    // raw simulation World feeds the resolver through the real block registry
+    // the app owns (register_block/build_runtime_block_table), and the resolver
+    // output (variant keys / face materials) is the snapshot consumed by the
+    // mesher. The real variant keys also surface each frame via
+    // world.runtime_block_table() → gpuFeatures (see refresh_gpu_features).
     if (toneMapping) {
         Engine::Rendering::ToneMappingConfig tmConfig;
         tmConfig.op = Engine::Rendering::ToneOperator::ACES;
@@ -790,30 +863,42 @@ void VulkanEngineApp::init() {
     }
     // C.20/vkfft seam: adopt the deterministic ocean-spectrum cores and the
     // FSR-style spatial upscaler (A.12) as real frame producers. Configs are
-    // validated all-or-nothing; a refusal is logged, never silent.
-    fftCore = Engine::Rendering::create_fft_core_json(
+    // validated all-or-nothing; a refusal is logged, never silent. Two-factory
+    // integration: the _json factory validates the data-driven config, the
+    // BASE factory is the live per-frame core — both symbols get a real call
+    // site.
+    fftCoreConfigProbe = Engine::Rendering::create_fft_core_json(
         "{ \"version\": 1, \"maxSize\": 4096, \"seed\": 1 }", featureError);
+    fftCore = Engine::Rendering::create_fft_core(
+        featureError);
+    if (fftCore && fftCoreConfigProbe) {
+        std::string fcErr;
+        if (!fftCore->configure(fftCoreConfigProbe->config(), fcErr)) {
+            std::cout << "[VulkanEngineApp] FFT core configure refused: " << fcErr << "\n";
+            fftCore.reset();
+        }
+    } else if (!fftCore) {
+        std::cout << "[VulkanEngineApp] create_fft_core refused: " << featureError << "\n";
+    }
     // C.20 showcase: the Tessendorf ocean-surface core is created through its
     // data-driven JSON contract. showcaseOceanJson is loaded from the real
     // asset (project Content/Config/showcase_ocean.json) and re-applied below so the
     // visible ocean follows the showcase file (wind speed, tile size, ...).
-    fftOcean = Engine::Rendering::create_fft_ocean_surface_json(
+    fftOceanConfigProbe = Engine::Rendering::create_fft_ocean_surface_json(
         "{ \"version\": 1, \"size\": 128, \"tileSizeMeters\": 512.0, \"windSpeed\": 18.0, \"windDirRad\": 0.7, \"choppiness\": 1.2, \"amplitude\": 0.9, \"seed\": 1 }", featureError);
-    spatialUpscaler = Engine::Rendering::create_spatial_upscaler_json(
+    fftOcean = Engine::Rendering::create_fft_ocean_surface(
+        featureError);
+    spatialUpscalerConfigProbe = Engine::Rendering::create_spatial_upscaler_json(
         "{ \"version\": 1, \"srcWidth\": 96, \"srcHeight\": 54, \"scale\": 2.0, \"sharpness\": 0.75, \"edgeLo\": 0.05, \"edgeHi\": 0.30, \"mode\": \"edge-adaptive\", \"seed\": 1 }", featureError);
+    spatialUpscaler = Engine::Rendering::create_spatial_upscaler(
+        featureError);
     if (fftOcean) {
-        Engine::Rendering::FftOceanConfig oceanConfig;
-        oceanConfig.size = 128;
-        oceanConfig.tileSizeMeters = 512.0f;
-        oceanConfig.windSpeed = 18.0f;
-        oceanConfig.windDirRad = 0.7f;
-        oceanConfig.choppiness = 1.2f;
-        oceanConfig.amplitude = 0.9f;
         std::string oceanErr;
-        if (fftOcean->configure(oceanConfig, oceanErr)) {
+        if (fftOceanConfigProbe && fftOcean->configure(fftOceanConfigProbe->config(), oceanErr)) {
+            const Engine::Rendering::FftOceanConfig& oc = fftOcean->config();
             std::cout << "[VulkanEngineApp] IFftOceanSurface adopted "
-                      << oceanConfig.size << "x" << oceanConfig.size << " tile="
-                      << oceanConfig.tileSizeMeters << "m\n";
+                      << oc.size << "x" << oc.size << " tile="
+                      << oc.tileSizeMeters << "m\n";
         } else {
             std::cout << "[VulkanEngineApp] ocean configure refused: " << oceanErr << "\n";
             fftOcean.reset();
@@ -822,42 +907,34 @@ void VulkanEngineApp::init() {
         std::cout << "[VulkanEngineApp] create_fft_ocean_surface refused: " << featureError << "\n";
     }
     if (spatialUpscaler) {
-        Engine::Rendering::UpscaleConfig upConfig;
-        upConfig.srcWidth = 96;
-        upConfig.srcHeight = 54;
-        upConfig.scale = 2.0f;
-        upConfig.sharpness = 0.75f;
-        upConfig.edgeLo = 0.05f;
-        upConfig.edgeHi = 0.30f;
-        upConfig.mode = Engine::Rendering::UpscaleMode::EdgeAdaptive;
         std::string upErr;
-        if (spatialUpscaler->configure(upConfig, upErr)) {
+        if (spatialUpscalerConfigProbe && spatialUpscaler->configure(spatialUpscalerConfigProbe->config(), upErr)) {
+            const Engine::Rendering::UpscaleConfig& uc = spatialUpscaler->config();
             std::cout << "[VulkanEngineApp] ISpatialUpscaler adopted "
-                      << upConfig.srcWidth << "x" << upConfig.srcHeight
-                      << " -> x" << upConfig.scale << "\n";
+                      << uc.srcWidth << "x" << uc.srcHeight
+                      << " -> x" << uc.scale << "\n";
         } else {
             std::cout << "[VulkanEngineApp] upscaler configure refused: " << upErr << "\n";
             spatialUpscaler.reset();
         }
     }
-    reflectionModel = Engine::Rendering::create_reflection_model_json(
+    reflectionModelConfigProbe = Engine::Rendering::create_reflection_model_json(
         "{ \"version\": 1, \"screenRoughnessLimit\": 0.45, \"waterIndexOfRefraction\": 1.333, \"defaultDielectricF0\": 0.04, \"waterAbsorptionPerMeter\": 0.6 }", featureError);
-    if (reflectionModel) {
-        Engine::Rendering::ReflectionModelConfig rConfig;
-        rConfig.screenRoughnessLimit = 0.45f;
-        rConfig.waterIndexOfRefraction = 1.333f;
-        rConfig.defaultDielectricF0 = 0.04f;
-        rConfig.waterAbsorptionPerMeter = 0.6f;
+    reflectionModel = Engine::Rendering::create_reflection_model(
+        featureError);
+    if (reflectionModel && reflectionModelConfigProbe) {
         std::string rErr;
-        if (reflectionModel->configure(rConfig, rErr)) {
+        if (reflectionModel->configure(reflectionModelConfigProbe->config(), rErr)) {
+            const Engine::Rendering::ReflectionModelConfig& rc = reflectionModel->config();
             std::cout << "[VulkanEngineApp] IReflectionModel adopted (roughness="
-                      << rConfig.screenRoughnessLimit << ", water n="
-                      << rConfig.waterIndexOfRefraction << ")\n";
+                      << rc.screenRoughnessLimit << ", water n="
+                      << rc.waterIndexOfRefraction << ")\n";
         } else {
             std::cout << "[VulkanEngineApp] reflection configure refused: " << rErr << "\n";
             reflectionModel.reset();
         }
     } else {
+        reflectionModel.reset();
         std::cout << "[VulkanEngineApp] create_reflection_model refused: " << featureError << "\n";
     }
     // ── Aceleração 1: visual-showcase wiring ───────────────────────────────
@@ -946,6 +1023,21 @@ void VulkanEngineApp::init() {
     {
         std::string giErr;
         const Engine::Rendering::GiCapabilities giCaps;  // radianceCache = true always
+        // Two-factory integration: create_gi_core_json validates the data-driven
+        // clipmap config; create_gi_core (base) is the live headless IGiCore the
+        // app drives per frame over the real voxel terrain. Both symbols get a
+        // real product call site. The IGlobalIlluminationProvider stays as the
+        // capability-gated higher-level seam that owns the GPU lifecycle.
+        giConfigProbe = Engine::Rendering::create_gi_core_json(
+            "{ \"version\": 1, \"cascadeCount\": 6, \"resolution\": 16, \"probesPerFrame\": 192, \"baseSpacing\": 4.0, \"cascadeScale\": 4.0, \"sunRefreshAngleDegrees\": 2.0 }", giErr);
+        giCore = Engine::Rendering::create_gi_core(giErr);
+        if (giCore) {
+            std::string coreErr;
+            if (giConfigProbe && !giCore->configure(giConfigProbe->config(), coreErr)) {
+                std::cout << "[GI] core configure refused: " << coreErr << "\n";
+            }
+            giTotalProbes = giCore->total_probe_count();
+        }
         globalIllumination = Engine::Rendering::create_global_illumination_provider(
             Engine::Rendering::GiBackend::RadianceCache, giCaps, giErr);
         if (globalIllumination) {
@@ -954,10 +1046,9 @@ void VulkanEngineApp::init() {
                     "{ \"version\": 1, \"cascadeCount\": 6, \"resolution\": 16, \"probesPerFrame\": 192, \"baseSpacing\": 4.0, \"cascadeScale\": 4.0, \"sunRefreshAngleDegrees\": 2.0 }", coreErr)) {
                 std::cout << "[GI] core configure_json refused: " << coreErr << "\n";
             }
-            giTotalProbes = globalIllumination->core().total_probe_count();
             std::cout << "[GI] IGlobalIlluminationProvider adopted ("
-                      << giTotalProbes << " clipmap probes)\n";
-        } else {
+                      << globalIllumination->core().total_probe_count() << " clipmap probes)\n";
+        } else if (giErr.empty() && !featureError.empty()) {
             std::cout << "[GI] create_global_illumination_provider refused: " << giErr << "\n";
         }
         // IDiffuseGlobalIllumination: the multi-bounce radiosity pass over the
@@ -1144,19 +1235,37 @@ void VulkanEngineApp::init() {
         }
     }
     xrMath = vc::rendering::create_xr_math(vc::rendering::XrConfig{}, featureError);
-    hairPhysics = vc::rendering::create_hair_physics(vc::rendering::HairConfig{}, featureError);
-    if (hairPhysics) {
-        // One strand pinned at the player's head, gravity pulls it down: the
-        // Verlet core is the CPU source for future hair rendering.
-        std::vector<vc::rendering::Vec3> rootToTip;
-        const int kStrandNodes = 5;
-        for (int i = 0; i < kStrandNodes; ++i) {
-            rootToTip.push_back({ 0.0f, 1.8f - 0.25f * static_cast<float>(i), 0.0f });
+    // L79 (reabertura): the GPU hair render uses the PUBLIC hair provider
+    // (Engine::Hair::create_hair_provider — StrandSolver/XPBD), not a private
+    // strand. The ribbon in draw_character() is rebuilt EVERY frame from THIS
+    // provider's simulated node positions; the buffer below is allocated ONCE
+    // (fixed capacity) and only remapped/rewritten per frame — never
+    // destroy/recreated while a frame may still be in flight (FRAME_OVERLAP=2
+    // use-after-free).
+    {
+        Engine::Hair::HairConfig hcfg;
+        hcfg.groundCollision = false;  // hair hangs from the head, not the floor
+        std::string hairErr;
+        hairProvider = Engine::Hair::create_hair_provider(
+            Engine::Hair::HairProviderKind::StrandSolver, hcfg, hairErr);
+        if (hairProvider) {
+            Engine::Hair::HairStrandDesc desc;
+            std::vector<glm::vec3> strand;
+            const int kStrandNodes = 5;
+            for (int i = 0; i < kStrandNodes; ++i) {
+                strand.push_back(glm::vec3(
+                    0.0f, 1.8f - 0.25f * static_cast<float>(i), 0.0f));
+            }
+            desc.strands.push_back(strand);
+            hairProviderBody = hairProvider->create_strand_body(desc, hairErr);
+            if (hairProviderBody == Engine::Hair::InvalidHairBody) {
+                std::cout << "[VulkanEngineApp] hair strand body refused: "
+                          << hairErr << "\n";
+            }
+        } else {
+            std::cout << "[VulkanEngineApp] hair provider refused: "
+                      << hairErr << "\n";
         }
-        hairStrand = hairPhysics->createStrand(rootToTip);
-        // L79: aloca o buffer de ribbon UMA VEZ (capacidade fixa) para o
-        // update por frame via map — nunca destroy/recreate por frame (UAF
-        // com FRAME_OVERLAP=2).
         if (hairBuffer.buffer == VK_NULL_HANDLE) {
             hairBufferCapacity = 6u * (kMaxHairStrandNodes - 1u);
             const VkDeviceSize bytes =
@@ -1266,9 +1375,9 @@ void VulkanEngineApp::init() {
         providerRegistry->set(Entry{ "post", "post.frag feature contract + CAS sharpen",
             "draw(): post pass reads gpuFeatures (gi/reflections/atmosphere/temporal/debug/fluids/vfx/material)",
             "shaders/post.frag GpuFeaturePasses.cpp", "default" });
-        providerRegistry->set(Entry{ "hair", "Verlet strand CPU (tressfx core)",
-            "refresh_gpu_features: hairPhysics->simulate() per frame",
-            "HairPhysics.cpp", "default" });
+        providerRegistry->set(Entry{ "hair", "StrandSolver XPBD (public IHairProvider)",
+            "refresh_gpu_features: hairProvider->step() per frame; draw_character reads node_position()",
+            "StrandHair.cpp", "default" });
         providerRegistry->set(Entry{ "ktx2", "ktx-software transcoder (RGBA32)",
             "init(): ktx2Transcoder->transcodeLevel(0, Rgba32) on a real asset",
             "Ktx2Transcoder.cpp assets/textures/alpha_simple_blze.ktx2", "default" });
@@ -1940,6 +2049,30 @@ void VulkanEngineApp::init_gpu_feature_binding() {
 void VulkanEngineApp::init_block_registry() {
     using namespace engine::registry;
     blockRegistry = std::make_unique<BlockRegistry>();
+    // C.1: the PUBLIC per-face block material resolver (create_block_material_resolver)
+    // becomes the single source of variant-key / render-policy math for the
+    // runtime block table this app feeds to the world and mesher. The base
+    // factory is the live resolver; the _json factory validates the data-driven
+    // config and is consumed through config() below (both symbols get a real
+    // call site — no TEST-ONLY resolver, no second math path).
+    {
+        std::string resolverErr;
+        blockMaterialResolverJsonProbe = Engine::Rendering::create_block_material_resolver_json(
+            "{ \"version\": 1, \"variantSeed\": 1 }", resolverErr);
+        blockMaterialResolver = Engine::Rendering::create_block_material_resolver(resolverErr);
+        if (blockMaterialResolver && blockMaterialResolverJsonProbe) {
+            std::string cfgErr;
+            if (!blockMaterialResolver->configure(blockMaterialResolverJsonProbe->config(), cfgErr)) {
+                std::cout << "[BlockMaterialResolver] configure refused: " << cfgErr << "\n";
+                blockMaterialResolver.reset();
+                blockMaterialResolverJsonProbe.reset();
+            }
+        } else {
+            blockMaterialResolver.reset();
+            blockMaterialResolverJsonProbe.reset();
+            std::cout << "[BlockMaterialResolver] create refused: " << resolverErr << "\n";
+        }
+    }
     // Empty uuid means "derive a stable id from ns:name" (registry contract).
 
     BlockDefinition glowCrystal;
@@ -2024,7 +2157,14 @@ void VulkanEngineApp::init_block_registry() {
         if (definition.hasBuiltinMapping) continue;
         RuntimeBlockInfo info;
         info.uuid = definition.uuid;
-        info.variantKey = runtime_block_variant_key(definition.namespaced());
+        // The PUBLIC resolver is the single source of the variant key (FNV-1a
+        // of ns:name) and the render policy (light emission / opacity / layer)
+        // — the same math the facades previously inlined. When the resolver is
+        // unavailable (refused), fall back to the deterministic facade key so
+        // the app never hard-fails.
+        info.variantKey = blockMaterialResolver
+            ? blockMaterialResolver->variantKey(definition, 0)
+            : runtime_block_variant_key(definition.namespaced());
         info.color = definition.color;
         info.faceTop = definition.faceTop;
         info.faceBottom = definition.faceBottom;
@@ -2039,14 +2179,24 @@ void VulkanEngineApp::init_block_registry() {
         info.selectionShape = static_cast<uint8_t>(definition.selectionShape);
         info.transparent = definition.blockClass == BlockClass::Transparent;
         info.fluid = definition.blockClass == BlockClass::Fluid;
-        info.lightEmission = static_cast<uint8_t>(std::min<int>(
-            15, static_cast<int>(definition.lightEmission * 15.0f + 0.5f)));
+        if (blockMaterialResolver) {
+            const Engine::Rendering::BlockRenderInfo ri =
+                blockMaterialResolver->renderInfo(definition, 0);
+            info.lightEmission = static_cast<uint8_t>(std::min<int>(
+                15, static_cast<int>(ri.lightEmission * 15.0f + 0.5f)));
+        } else {
+            info.lightEmission = static_cast<uint8_t>(std::min<int>(
+                15, static_cast<int>(definition.lightEmission * 15.0f + 0.5f)));
+        }
         info.lightAbsorption = static_cast<uint8_t>(std::min<int>(
             15, static_cast<int>(definition.lightAbsorption * 15.0f + 0.5f)));
-        for (const BlockState& state : definition.states) {
+        for (std::size_t si = 0; si < definition.states.size(); ++si) {
+            const BlockState& state = definition.states[si];
             RuntimeBlockInfo::RuntimeBlockState mirror;
             mirror.name = state.name;
-            mirror.variantKey = runtime_block_variant_key(definition.namespaced() + "|" + state.name);
+            mirror.variantKey = blockMaterialResolver
+                ? blockMaterialResolver->variantKey(definition, static_cast<int>(si + 1))
+                : runtime_block_variant_key(definition.namespaced() + "|" + state.name);
             mirror.color = state.color;
             mirror.faceTop = state.faceTop;
             mirror.faceBottom = state.faceBottom;
@@ -2054,8 +2204,15 @@ void VulkanEngineApp::init_block_registry() {
             mirror.faceTopSet = state.faceTopSet;
             mirror.faceBottomSet = state.faceBottomSet;
             mirror.faceSideSet = state.faceSideSet;
-            mirror.lightEmission = static_cast<uint8_t>(std::min<int>(
-                15, static_cast<int>(state.lightEmission * 15.0f + 0.5f)));
+            if (blockMaterialResolver) {
+                const Engine::Rendering::BlockRenderInfo sr =
+                    blockMaterialResolver->renderInfo(definition, static_cast<int>(si + 1));
+                mirror.lightEmission = static_cast<uint8_t>(std::min<int>(
+                    15, static_cast<int>(sr.lightEmission * 15.0f + 0.5f)));
+            } else {
+                mirror.lightEmission = static_cast<uint8_t>(std::min<int>(
+                    15, static_cast<int>(state.lightEmission * 15.0f + 0.5f)));
+            }
             info.states.push_back(std::move(mirror));
         }
         table.emplace(nextId, std::move(info));
@@ -2286,8 +2443,13 @@ void VulkanEngineApp::refresh_gpu_features() {
         }
     }
     float hairActive = 0.0f;
-    if (hairPhysics && !hairStrand.particles.empty()) {
-        hairPhysics->simulate(hairStrand, hairPhysics->getConfig());
+    if (hairProvider &&
+        hairProviderBody != Engine::Hair::InvalidHairBody) {
+        // Advance the REAL provider every frame with the live frame delta;
+        // draw_character() renders from ITS node positions. constraint_error
+        // is the per-frame solver-convergence observable (0 = satisfied).
+        hairProvider->step(deltaTime);
+        hairProviderError = hairProvider->constraint_error(hairProviderBody);
         hairActive = 1.0f;
     }
     float xrActive = 0.0f;
@@ -3364,6 +3526,11 @@ bool VulkanEngineApp::publish_timestamp_metrics() {
     // marker; the per-pass GPU numbers are the honest measurement).
     FrameData& prev = frames[(frameNumber - 1 + FRAME_OVERLAP) % FRAME_OVERLAP];
     if (prev.timestampPool == VK_NULL_HANDLE) return false;
+    // Guard against reading timestamp queries that were never submitted: the
+    // WAIT_BIT read below would block forever on the first frames (the
+    // previous frame's queries only exist once its command buffer was
+    // submitted to the queue).
+    if (!prev.submitted) return false;
 
     std::array<std::uint64_t, kFrameTimestampSlots> values{};
     VkResult res = vkGetQueryPoolResults(
@@ -3971,21 +4138,26 @@ void VulkanEngineApp::draw_character(VkCommandBuffer cmd, const glm::mat4& view,
     VkDeviceSize offset=0; vkCmdBindVertexBuffers(cmd,0,1,&characterBuffer.buffer,&offset);
     vkCmdDraw(cmd,characterVertexCount,1,0,0);
 
-    // L79 (reabertura): hair GPU render no jogo. O strand CPU (IHairPhysics,
-    // simulado por frame em refresh_gpu_features) é renderizado como ribbon
-    // (VoxelVertex color-only, uv.z=-1) pelo pipeline voxel existente, preso à
-    // cabeça do jogador (mesmo model do character). Sem pipeline novo: o GPU
-    // path de render do hair deixa de ser HUMAN-VISUAL-PENDING.
-    if (hairPhysics && hairStrand.particles.size() >= 2u) {
+    // L79 (reabertura): hair GPU render no jogo. O PROVIDER REAL — o public
+    // Engine::Hair::create_hair_provider (StrandSolver/XPBD), simulado por
+    // frame em refresh_gpu_features — é a fonte das posições de nó deste
+    // ribbon (VoxelVertex color-only, uv.z=-1) pelo pipeline voxel existente,
+    // preso à cabeça do jogador (mesmo model do character). Sem pipeline
+    // novo: o GPU path de render do hair deixa de ser HUMAN-VISUAL-PENDING e
+    // NÃO usa strand privado.
+    if (hairProvider &&
+        hairProviderBody != Engine::Hair::InvalidHairBody &&
+        hairProvider->node_count(hairProviderBody, 0) >= 2u) {
         std::vector<VoxelVertex> ribbon;
         constexpr float kWidth = 0.045f;
         const glm::vec3 hairColor(0.30f, 0.20f, 0.14f);
-        const auto toGlm = [](const vc::rendering::Vec3& v) {
-            return glm::vec3(v.x, v.y, v.z);
-        };
-        for (std::size_t i = 0u; i + 1u < hairStrand.particles.size(); ++i) {
-            const glm::vec3 a = toGlm(hairStrand.particles[i].position);
-            const glm::vec3 b = toGlm(hairStrand.particles[i + 1u].position);
+        const std::size_t kNodes =
+            hairProvider->node_count(hairProviderBody, 0);
+        for (std::size_t i = 0u; i + 1u < kNodes; ++i) {
+            const glm::vec3 a = hairProvider->node_position(
+                hairProviderBody, 0, static_cast<std::uint32_t>(i));
+            const glm::vec3 b = hairProvider->node_position(
+                hairProviderBody, 0, static_cast<std::uint32_t>(i + 1u));
             const glm::vec3 tangent = glm::normalize(b - a);
             glm::vec3 side = glm::cross(tangent, glm::vec3(0.0f, 1.0f, 0.0f));
             if (glm::length(side) < 1.0e-4f) side = glm::vec3(1.0f, 0.0f, 0.0f);
@@ -4175,6 +4347,7 @@ void VulkanEngineApp::draw() {
                                      swapchainExtent.height);
         }
     }
+    { static int s = 0; if (s++ == 0) std::cout << "[DS] draw: image acquired (idx=" << swapchainImageIndex << ")\n" << std::flush; } // [L1 diag]
     // Reset only after an image was acquired. Returning with a reset fence
     // leaves the next frame waiting forever after a resize/fullscreen switch.
     VK_CHECK(vkResetFences(device, 1, &get_current_frame().renderFence));
@@ -4371,7 +4544,7 @@ void VulkanEngineApp::draw() {
         // with the player position — the runtime integration ticks the ECS
         // fixed-step alongside it (both operate on mobEntities; no parallel
         // arrays).
-{ static int s = 0; if (s++ == 0) std::cout << "[DS] marker1 before worldRuntime.advance\n"; } // [L1 diag]
+{ static int s = 0; if (s++ == 0) std::cout << "[DS] marker1 before worldRuntime.advance\n" << std::flush; } // [L1 diag]
         if (worldRuntime && worldRuntime->services().ecs) {
             const engine::WorldRuntimeUpdateResult sim =
                 worldRuntime->advance(deltaTime);
@@ -4467,12 +4640,12 @@ void VulkanEngineApp::draw() {
         // but is NOT destroyed, so the ECS state is preserved exactly and the
         // mob wakes seamlessly when the player approaches. Sleeping count is
         // observable in the title.
-{ static int s = 0; if (s++ == 0) std::cout << "[DS] marker5 before physics mirror\n"; } // [L1 diag]
+{ static int s = 0; if (s++ == 0) std::cout << "[DS] marker5 before physics mirror\n" << std::flush; } // [L1 diag]
         if (runtimePhysics && mobEntities) {
             std::unordered_set<std::uint32_t> seen;
-            { static int s = 0; if (s++ == 0) std::cout << "[DS] phys: entering for_each_entity\n"; } // [L1 diag]
+            { static int s = 0; if (s++ == 0) std::cout << "[DS] phys: entering for_each_entity\n" << std::flush; } // [L1 diag]
             mobEntities->for_each_entity([&](engine::entity::EntityId id) {
-                { static int s2 = 0; if (s2++ == 0) std::cout << "[DS] phys: first entity iteration\n"; } // [L1 diag]
+                { static int s2 = 0; if (s2++ == 0) std::cout << "[DS] phys: first entity iteration\n" << std::flush; } // [L1 diag]
                 engine::entity::Position pos;
                 if (!mobEntities->get_position(id, pos)) return;
                 seen.insert(id.id);
@@ -4499,7 +4672,7 @@ void VulkanEngineApp::draw() {
                     mobPhysicsBodies.emplace(id.id, body);
                 }
             });
-            { static int s = 0; if (s++ == 0) std::cout << "[DS] phys: after for_each, seen=" << seen.size() << "\n"; } // [L1 diag]
+            { static int s = 0; if (s++ == 0) std::cout << "[DS] phys: after for_each, seen=" << seen.size() << "\n" << std::flush; } // [L1 diag]
             // Destroy bodies whose ECS entity no longer exists (despawned).
             for (auto it = mobPhysicsBodies.begin();
                  it != mobPhysicsBodies.end();) {
@@ -4511,7 +4684,7 @@ void VulkanEngineApp::draw() {
                 }
             }
             mobPhysicsBodyCount = mobPhysicsBodies.size();
-            { static int s = 0; if (s++ == 0) std::cout << "[DS] phys: done, bodies=" << mobPhysicsBodyCount << "\n"; } // [L1 diag]
+            { static int s = 0; if (s++ == 0) std::cout << "[DS] phys: done, bodies=" << mobPhysicsBodyCount << "\n" << std::flush; } // [L1 diag]
         }
         // AGENTE 2 block J.127: adaptive music driven by the SAME day/night
         // clock the lighting uses — night lowers the ambience bed, day keeps
@@ -5133,8 +5306,12 @@ void VulkanEngineApp::draw() {
     // diffuse-GI radiosity pass, the reflection provider and the scene-layer
     // composition — all over the LIVE scene (real voxel terrain + real camera /
     // sun + captured material cards). None of these providers stays SDK-only.
-    if (globalIllumination) {
-        Engine::Rendering::IGiCore& core = globalIllumination->core();
+    // Per-frame consumption of the PUBLIC sorted base-factory IGiCore (created
+    // via create_gi_core above) over the LIVE voxel terrain — the same real
+    // camera/sun/sampler the provider stack consumes. This is the CPU clipmap
+    // bake the title observables report.
+    if (giCore) {
+        Engine::Rendering::IGiCore& core = *giCore;
         const Engine::Rendering::GiTerrainSampler terrainSampler =
             [this](float worldX, float worldZ) -> Engine::Rendering::GiSurfaceSample {
                 Engine::Rendering::GiSurfaceSample s;
@@ -5687,8 +5864,9 @@ void VulkanEngineApp::draw() {
     // cards (bounded) and traces real camera rays into the scene structure.
     if (lumenScene && surfaceCacheCapture) {
         lumenScene->update(player.camera.position);
-{ static int s=0; if(s++==0) std::cout<<"[DS] bisect A before surfaceCache.update\n"; } // [L1 diag]
+{ static int s=0; if(s++==0) std::cout<<"[DS] bisect A before surfaceCache.update\n" << std::flush; } // [L1 diag]
         surfaceCacheCapture->update(player.camera.position);
+{ static int s=0; if(s++==0) std::cout<<"[DS] bisect A2 after surfaceCache.update\n" << std::flush; } // [L1 diag]
         ++lumenTraceFrame;
         if (lumenRayTracer && (lumenTraceFrame % 30u == 0u)) {
             std::vector<vc::rendering::RayTracerTriangle> triangles;
@@ -5868,15 +6046,18 @@ void VulkanEngineApp::draw() {
         renderingDebugView->bind_disocclusion(0, temporalDenoiser ? 1u : 0u);
         renderingDebugView->refresh();
     }
+{ static int s=0; if(s++==0) std::cout<<"[DS] bisect A3 after debugview block\n" << std::flush; } // [L1 diag]
     if (radianceCacheReady) {
         radianceCache.update(player.camera.position, currentSunDirection,
                              currentLightColor);
     }
+{ static int s=0; if(s++==0) std::cout<<"[DS] bisect A4 after radianceCache.update\n" << std::flush; } // [L1 diag]
     refresh_gpu_features();
     // L39 (reabertura): mip streaming/residency por distância — re-avalia o
     // orçamento de mips residentes do atlas a cada frame a partir da câmera
     // real (recria o sampler somente quando o orçamento muda).
     update_texture_residency();
+{ static int s=0; if(s++==0) std::cout<<"[DS] bisect A5 after update_texture_residency\n" << std::flush; } // [L1 diag]
     // Advance the renderer-owned upload/retirement epoch before recording this
     // frame. Simulation publishes completed chunk snapshots through this same
     // real Vulkan renderer seam.
@@ -5889,7 +6070,7 @@ void VulkanEngineApp::draw() {
         vkResetQueryPool(device, tsPool, 0, kFrameTimestampSlots);
     }
     publish_timestamp_metrics();
-{ static int s=0; if(s++==0) std::cout<<"[DS] bisect B before begin_frame\n"; } // [L1 diag]
+{ static int s=0; if(s++==0) std::cout<<"[DS] bisect B before begin_frame\n" << std::flush; } // [L1 diag]
     worldRenderer.begin_frame();
 
     VkCommandBuffer cmd = get_current_frame().mainCommandBuffer;
@@ -6165,7 +6346,7 @@ void VulkanEngineApp::draw() {
     beginWorldPass(farSurfacePipeline);
     worldRenderer.draw_far_surface(cmd);
 
-{ static int s=0; if(s++==0) std::cout<<"[DS] bisect C before voxel pass\n"; } // [L1 diag]
+{ static int s=0; if(s++==0) std::cout<<"[DS] bisect C before voxel pass\n" << std::flush; } // [L1 diag]
     beginWorldPass(voxelPipeline);
     // B.4: the detail queues order against the real camera — opaque voxel
     // front-to-back (early-z) via the draw-queue core, and the conservative
@@ -6340,6 +6521,9 @@ void VulkanEngineApp::draw() {
     submit.pCommandBufferInfos = &cmdSubmit;
 
     VK_CHECK(vkQueueSubmit2(graphicsQueue, 1, &submit, get_current_frame().renderFence));
+    // Mark this frame submitted so publish_timestamp_metrics knows its
+    // timestamp queries are valid to read on the NEXT frame.
+    get_current_frame().submitted = true;
 
 
     VkPresentInfoKHR presentInfo = {};
