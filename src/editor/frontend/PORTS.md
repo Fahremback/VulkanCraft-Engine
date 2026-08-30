@@ -1,7 +1,7 @@
 # Manifest de portes do frontend
 
 <!-- VULKANCRAFT-EXECUTION-AUTHORITY -->
-> **AUTORIDADE DE EXECUÇÃO:** este arquivo é requisito, evidência ou histórico. Antes de agir, leia `agentes/FONTE_UNICA.md`, `agentes/EXECUCAO_TOTAL_6_AGENTES.md` e o `task_plan.md` atual do seu agente. Em conflito, eles vencem. Este arquivo não transfere tarefas nem autoriza `DONE`.
+> **CONTEXTO TÉCNICO:** consulte `../../../task_plan.md`, `../../../agentes/FONTE_UNICA.md`, `../../../agentes/EXECUCAO_FINAL_5_AGENTES.md` e o plano atual do agente.
 
 Registro arquivo-a-arquivo do código copiado das engines doadoras (decisão normativa:
 [`docs/EDITOR_FRONTEND_WICKED_EZENGINE.md`](../../docs/EDITOR_FRONTEND_WICKED_EZENGINE.md)).
@@ -133,4 +133,3 @@ bash build_shell.sh smoke 8321                    # gate headless contra editor 
 **Docks de ferramenta ao vivo ENTREGUE (final 12)**: docks do /qt-doc com endpoint GET próprio exibem dados vivos do editor e mostram o **JSON vivo formatado** (QPlainTextEdit read-only, `live_endpoint_for` → /profiler ·/window-mode ·/layout ·/camera ·/gizmo ·/undo ·/publish ·/onboarding ·/retargeting ·/timeline-editor ·/ui-doc; todos confirmados HTTP 200). Dos 42 docks, `camera` e `profiler` alcançam endpoint dedicado — mapeamento completo, 2 alcançam dock. Smoke **26/26** (dev + deploy).
 
 **Estado atual do shell visual**: cache de QPixmap no viewport, empacotamento release. O shell está funcional de ponta a ponta: docks (+ ferramenta ao vivo em camera/profiler), tema, comandos, navegação hierarchy→inspector, content browser e viewport ao vivo.
-

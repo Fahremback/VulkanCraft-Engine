@@ -79,6 +79,8 @@ static std::string stageArg(ShaderStage s) {
     if (s == ShaderStage::Vertex)   return "-fshader-stage=vert";
     if (s == ShaderStage::Fragment) return "-fshader-stage=frag";
     if (s == ShaderStage::Compute)  return "-fshader-stage=comp";
+    if (s == ShaderStage::Task)     return "-fshader-stage=task";
+    if (s == ShaderStage::Mesh)     return "-fshader-stage=mesh";
     return "";
 }
 

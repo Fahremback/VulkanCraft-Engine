@@ -1,5 +1,6 @@
 #include "EditorApplication.hpp"
 #include "EditorInternalHelpers.hpp"
+#include "../engine/scene/SceneComponentIntegration.hpp"
 #include "frontend/ForgeTheme.hpp"
 #include "frontend/IconsFontAwesome6.h"
 #include "frontend/FontAwesomeV6.h"
@@ -333,6 +334,13 @@ void EditorApplication::init_imgui() {
 }
 
 void EditorApplication::init_default_scene() {
+    // AGENTE 2 block B: register the builtin component descriptors through the
+    // Scene<->ECS integration layer (SceneComponentIntegration was an orphaned
+    // adapter with zero consumers). This makes the editor's component surface
+    // (typed + generic reflection) available to serialization, undo/redo,
+    // plugin components and network replication — the same component identity
+    // the SDK/MCP-authored components use.
+    SceneComponentIntegration::register_builtin_components();
     m_editorScene = std::make_unique<Scene>("Untitled Scene");
     m_playMode.set_editor_scene(m_editorScene.get());
     m_activeScenePath.clear();
@@ -780,6 +788,10 @@ void EditorApplication::main_loop() {
                 }
                 if (m_gizmoLocal) api.gizmoMode += ":local";
                 api.snap = m_snapTranslate;
+                api.grid = m_showGrid;
+                api.gizmos = m_showGizmos;
+                api.colliders = m_showColliders;
+                api.selectedDebugOverlay = m_selectedDebugOverlay;
                 api.camTargetX = m_editorCamera.orbitTarget.x;
                 api.camTargetY = m_editorCamera.orbitTarget.y;
                 api.camTargetZ = m_editorCamera.orbitTarget.z;
@@ -792,7 +804,19 @@ void EditorApplication::main_loop() {
                 api.shortcuts = m_shortcutDocMarkdown;
                 refresh_play_mode();
                 api.play_mode = m_playModeJson;
+                // Feed the headless UI runtimes (inventory grid, crafting,
+                // confirmation) from the live editor state each frame.
+                refresh_ui_runtimes();
                 api.command_index = m_commandIndexJson;
+                api.inventory_grid = m_inventoryGridJson;
+                refresh_network_debug();
+                api.network_debug = m_networkDebugJson;
+                refresh_package_manifest();
+                api.package_manifest = m_packageManifestJson;
+                api.cooked_assets_json = m_cookAssetsJson;
+                refresh_visual_script_lifecycle();
+                run_luau_sandbox();
+                cook_showcase_assets();
                 refresh_profiler();
                 api.profiler = m_profilerJson;
                 refresh_undo();
@@ -818,6 +842,8 @@ void EditorApplication::main_loop() {
                 api.launcher = m_projectLauncherJson;
                 refresh_retargeting();
                 api.retargeting = m_retargetingJson;
+                refresh_render_diagnostics();
+                api.render_diagnostics = m_renderDiagnosticsJson;
                 refresh_qt_doc();
                 api.qt_doc = m_qtDocJson;
                 api.qt_theme = m_qtThemeJson;
@@ -829,6 +855,12 @@ void EditorApplication::main_loop() {
                     case VMStatus::Completed: api.scriptState = "completed"; break;
                     case VMStatus::Error: api.scriptState = "error"; break;
                 }
+                // Conta 5 §2: append the Luau sandbox consumer's live state
+                // (a real product consumer, driven each frame by run_luau_sandbox).
+                api.scriptState += std::string("|luau:") +
+                    (m_luauSandbox ? "sandboxed" : "none") + ":" +
+                    std::to_string(m_luauSandboxExecutions) +
+                    (m_luauSandboxIoLocked ? ":io-locked" : "");
                 m_controlApi.publish_state(api);
             }
             update_editor_camera(deltaTime);

@@ -8,7 +8,9 @@ set "JOBS=%~2"
 set "MODE=%~3"
 set "PAUSE_MODE=%~4"
 
-if not defined TARGET set "TARGET=VulkanEngineGame"
+rem Development means editing inside the engine. Standalone game, server,
+rem cooker and package builder are explicit export targets, never the default.
+if not defined TARGET set "TARGET=VulkanEngineEditor"
 if not defined JOBS set "JOBS=0"
 if not exist "%ENGINE_ROOT%\out\artifacts\build" mkdir "%ENGINE_ROOT%\out\artifacts\build"
 set "LOG=%ENGINE_ROOT%\out\artifacts\build\build-dev-shared-%TARGET%.log"

@@ -1,8 +1,7 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)]
     [ValidatePattern('^[A-Za-z0-9_]+$')]
-    [string]$Target,
+    [string]$Target = 'VulkanEngineEditor',
 
     [ValidateRange(0, 32)]
     [int]$Jobs = 0,

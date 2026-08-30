@@ -135,7 +135,10 @@ bool decode_pos_body(std::string_view& s, glm::ivec3& out) {
     return get_i32(s, out.x) && get_i32(s, out.y) && get_i32(s, out.z);
 }
 std::string encode_snapshot_body(const ChunkReplicationSnapshot& s) {
+    // Reserve the exact frame size (5 header u32 + 4 bytes per block) so the
+    // hot chunk-streaming path never reallocates the string mid-append.
     std::string out;
+    out.reserve(20 + s.blocks.size() * 4);
     put_i32(out, s.chunkX);
     put_i32(out, s.chunkZ);
     put_i32(out, s.minY);
@@ -165,6 +168,8 @@ bool decode_snapshot_body(std::string_view& s, ChunkReplicationSnapshot& out) {
 }
 std::string encode_batch_body(const ReplicationBatch& b) {
     std::string out;
+    // 3 header u32 + 28 bytes per delta + 12 bytes per rejected position.
+    out.reserve(12 + b.deltas.size() * 28 + b.rejected.size() * 12);
     put_u32(out, b.sequence);
     put_u32(out, static_cast<std::uint32_t>(b.deltas.size()));
     put_u32(out, static_cast<std::uint32_t>(b.rejected.size()));
@@ -238,6 +243,14 @@ bool get_blob(std::string_view& s, std::vector<std::uint8_t>& out) {
 }
 std::string encode_entity_body(const engine::entity::EntitySnapshot& e) {
     std::string out;
+    // 4 len + type + 3 f32 pos + 3 f32 (health value/max, tick) + u32
+    // components + 4 len + stableId, then one variable block per component.
+    std::size_t estimated = 4 + e.type.size() + 12 + 12 + 4 + 4 +
+                            e.stableId.size();
+    for (const engine::entity::ComponentData& c : e.components) {
+        estimated += 4 + c.type.size() + 4 + 4 + c.blob.size();
+    }
+    out.reserve(estimated);
     put_string(out, e.type);
     put_f32(out, e.position.x);
     put_f32(out, e.position.y);
@@ -278,7 +291,24 @@ bool decode_entity_body(std::string_view& s, engine::entity::EntitySnapshot& out
     return true;
 }
 std::string encode_region_body(const RegionReplicationSnapshot& r) {
+    // Estimate the frame size up front (header + chunk/entity/block-entity/
+    // cell payloads) so a full region resync allocates once, not geometrically.
+    std::size_t estimated = 4 + 12 + 4 + 4 + 4 + 4 + 4;
+    for (const ChunkReplicationSnapshot& c : r.chunks) {
+        estimated += 20 + c.blocks.size() * 4;
+    }
+    for (const BlockEntityReplicationState& be : r.blockEntities) {
+        estimated += 12 + 4 + be.typeId.size() + 4 + be.blob.size();
+    }
+    estimated += r.cells.size() * 15;  // 3 i32 + fluid + sky + block
+    for (const engine::entity::EntitySnapshot& e : r.entities) {
+        estimated += 4 + e.type.size() + 12 + 12 + 4 + 4 + e.stableId.size();
+        for (const engine::entity::ComponentData& c : e.components) {
+            estimated += 4 + c.type.size() + 4 + 4 + c.blob.size();
+        }
+    }
     std::string out;
+    out.reserve(estimated);
     put_u32(out, r.sequence);
     put_i32(out, r.origin.x);
     put_i32(out, r.origin.y);
@@ -393,6 +423,12 @@ bool decode_region_body(std::string_view& s, RegionReplicationSnapshot& out) {
 // ---- palette body codec (identity negotiation, FALTANTES item 1) ----
 std::string encode_palette_body(const ReplicationPalette& p) {
     std::string out;
+    std::size_t estimated = 4;
+    for (const ReplicationPaletteEntry& entry : p.entries) {
+        estimated += 4 + 4 + entry.uuid.size() + 4 + entry.namespacedName.size() +
+                     4 + entry.definitionJson.size();
+    }
+    out.reserve(estimated);
     put_u32(out, static_cast<std::uint32_t>(p.entries.size()));
     for (const ReplicationPaletteEntry& entry : p.entries) {
         put_u32(out, entry.runtimeId);

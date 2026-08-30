@@ -48,7 +48,7 @@
       "default": 50,
       "type": "number"
     },
-    "cast_shadows": {
+    "castShadows": {
       "description": "\"cast_shadows\" config field",
       "default": true,
       "type": "boolean"

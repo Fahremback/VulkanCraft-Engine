@@ -1,5 +1,7 @@
 #include "engine/rendering/vulkan/MaterialPipeline.hpp"
 
+#include "engine/rendering/IShaderCompiler.hpp"
+
 #include <array>
 #include <cstring>
 #include <fstream>
@@ -168,7 +170,11 @@ GlslGenerationResult material_graph_to_glsl(const MaterialGraph& graph) {
     out << "    float metallic = 0.0;\n";
     out << "    vec3 emissive = vec3(0.0);\n";
     out << "    float opacity = 1.0;\n";
-    out << "    vec3 normal = vec3(0.0, 0.0, 1.0);\n\n";
+    // The Normal output defaults to the interpolated world normal, so graphs
+    // that never drive it render exactly as before; a graph that connects a
+    // texture/expression to the Normal output overrides it (world-space
+    // normal override — the pipeline has no tangents for TBN).
+    out << "    vec3 normal = normalize(vNormal);\n\n";
 
     // Emit per-instruction GLSL from the IR. IR operands reference registers
     // (MaterialIRInstruction::result), not instruction indices — StoreOutput
@@ -219,8 +225,16 @@ GlslGenerationResult material_graph_to_glsl(const MaterialGraph& graph) {
             case MaterialIROp::StoreOutput: {
                 const std::string src = reg(0);
                 if (ins.symbol == "BaseColor") out << "    baseColor = " << src << ".rgb;\n";
-                else if (ins.symbol == "Roughness") out << "    roughness = " << src << ";\n";
-                else if (ins.symbol == "Metallic") out << "    metallic = " << src << ";\n";
+                else if (ins.symbol == "Roughness" || ins.symbol == "Metallic") {
+                    // Float sinks fed directly from a texture sample (vec4)
+                    // take a single channel (.r) — mirrors the Opacity .a
+                    // handling; a float expression stays as-is.
+                    const auto tit = regTypes.find(ins.operands[0]);
+                    const bool fromTex = tit != regTypes.end() &&
+                                         tit->second == MaterialValueType::Vec4;
+                    out << "    " << (ins.symbol == "Roughness" ? "roughness" : "metallic")
+                        << " = " << src << (fromTex ? ".r" : "") << ";\n";
+                }
                 else if (ins.symbol == "Emissive") out << "    emissive = " << src << ".rgb;\n";
                 else if (ins.symbol == "Opacity") {
                     // Opacity fed directly from a texture sample is a vec4:
@@ -230,7 +244,11 @@ GlslGenerationResult material_graph_to_glsl(const MaterialGraph& graph) {
                                          tit->second == MaterialValueType::Vec4;
                     out << "    opacity = " << src << (fromTex ? ".a" : "") << ";\n";
                 }
-                else if (ins.symbol == "Normal") out << "    normal = normalize(" << src << ");\n";
+                else if (ins.symbol == "Normal") {
+                    // .rgb swizzle mirrors BaseColor: valid for both Vec4
+                    // texture samples and Vec3 expressions driving the output.
+                    out << "    normal = normalize(" << src << ".rgb);\n";
+                }
                 break;
             }
         }
@@ -242,8 +260,9 @@ GlslGenerationResult material_graph_to_glsl(const MaterialGraph& graph) {
     out << "    if (opacity < 0.05) discard;\n";
 
     // Real lighting: directional sun + point lights from LightComponents,
-    // written into the LightParams UBO by the caller every frame.
-    out << "\n    vec3 n = normalize(vNormal);\n";
+    // written into the LightParams UBO by the caller every frame. The graph's
+    // Normal output (when driven) replaces the interpolated world normal.
+    out << "\n    vec3 n = normal;\n";
     out << "    vec3 lightAccum = vec3(0.0);\n";
     out << "    if (lights.sunDirection.w > 0.5) {\n";
     out << "        float ndl = max(dot(n, -lights.sunDirection.xyz), 0.0);\n";
@@ -283,7 +302,35 @@ GlslGenerationResult material_graph_to_glsl(const MaterialGraph& graph) {
     out << "        float ndl = max(dot(n, L), 0.0);\n";
     out << "        lightAccum += ndl * att * facing * lights.areaLightColor[i].rgb;\n";
     out << "    }\n";
-    out << "    vec3 lit = baseColor * (0.22 + 0.78 * lightAccum);\n";
+    // C.40: shared PBR lighting model. roughness/metallic (driven by the
+    // graph's Roughness/Metallic outputs or PBR params) were previously dead
+    // in a pure-Lambert out = baseColor*(0.22+0.78*lightAccum). Now a real
+    // Cook-Torrance specular (GGX D, Smith G, Schlick F) consumes them for the
+    // sun (the dominant real light), and the diffuse term is weighted by
+    // (1 - metallic): the split the MeshAsset PBR params already encode. This
+    // keeps mesh/personagem/primitive materials on a single shared model.
+    // Defaults (roughness .5, metallic 0) add a subtle dielectric specular and
+    // keep the ambient floor + approximate brightness of the prior Lambert path.
+    out << "    vec3 V = normalize(lights.cameraPosition.xyz - vWorldPos);\n";
+    out << "    vec3 H = normalize(-lights.sunDirection.xyz + V);\n";
+    out << "    float NdotH = max(dot(n, H), 0.0);\n";
+    out << "    float NdotV = max(dot(n, V), 0.0001);\n";
+    out << "    float NdotLsun = max(dot(n, -lights.sunDirection.xyz), 0.0);\n";
+    out << "    float rPbr = clamp(roughness, 0.04, 1.0);\n";
+    out << "    float rPbr2 = rPbr * rPbr;\n";
+    out << "    float D = rPbr2 / (3.14159 * pow(max(NdotH * NdotH * (rPbr2 - 1.0) + 1.0, 1e-4), 2.0));\n";
+    out << "    float k = (rPbr + 1.0) * (rPbr + 1.0) / 8.0;\n";
+    out << "    float G = (NdotLsun / (NdotLsun * (1.0 - k) + k)) * (NdotV / (NdotV * (1.0 - k) + k));\n";
+    out << "    vec3 F0 = mix(vec3(0.04), baseColor, metallic);\n";
+    out << "    float VdotH = max(dot(V, H), 0.0);\n";
+    out << "    vec3 F = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);\n";
+    out << "    // Specular is gated on the sun being enabled (same flag as the\n";
+    out << "    // Lambert block above), so a disabled sun adds no specular.\n";
+    out << "    vec3 spec = vec3(0.0);\n";
+    out << "    if (lights.sunDirection.w > 0.5)\n";
+    out << "        spec = (D * G * F) / (4.0 * NdotV * NdotLsun + 1e-4) * lights.sunColor.rgb * computeShadow(vWorldPos);\n";
+    out << "    vec3 diff = baseColor * (1.0 - metallic) * (0.78 * lightAccum);\n";
+    out << "    vec3 lit = baseColor * 0.22 + diff + spec;\n";
     out << "    outColor = vec4(lit + emissive, opacity);\n";
     out << "}\n";
     result.source = out.str();
@@ -312,23 +359,29 @@ MaterialGraph material_graph_from_pbr(const MaterialAsset& material) {
     return graph;
 }
 
-// ─── VulkanMaterialPipeline ───
-namespace {
-
-VkShaderModule create_module(VkDevice device, const std::vector<uint32_t>& spirv) {
-    VkShaderModuleCreateInfo info{};
-    info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    info.codeSize = spirv.size() * sizeof(uint32_t);
-    info.pCode = spirv.data();
-    VkShaderModule module = VK_NULL_HANDLE;
-    vkCreateShaderModule(device, &info, nullptr, &module);
-    return module;
-}
-
-} // namespace
-
 std::vector<uint32_t> compile_glsl_to_spirv(const std::string& source, VkShaderStageFlagBits stage) {
-    // Write the source to a temp file and invoke glslc.
+    // The slang contract (C.15 IShaderCompiler) is the PRODUCT's shader
+    // compilation path: every material-graph shader the engine compiles at
+    // runtime goes through this public core (glslc + spirv-val), instead of a
+    // private system() call. Falls back to the legacy temp-file glslc path if
+    // the toolchain is unavailable, so the game still boots on minimal setups.
+    {
+        std::string compilerError;
+        std::unique_ptr<vc::rendering::IShaderCompiler> compiler =
+            vc::rendering::create_shader_compiler(compilerError);
+        if (compiler) {
+            vc::rendering::ShaderCompilerConfig config;
+            std::string compileError;
+            vc::rendering::ShaderStage shaderStage =
+                (stage == VK_SHADER_STAGE_VERTEX_BIT)
+                    ? vc::rendering::ShaderStage::Vertex
+                    : vc::rendering::ShaderStage::Fragment;
+            std::vector<uint32_t> spirv = compiler->compile(
+                source.c_str(), shaderStage, config, compileError);
+            if (!spirv.empty()) return spirv;
+        }
+    }
+    // Legacy fallback: write the source to a temp file and invoke glslc.
     const std::filesystem::path tmp = std::filesystem::temp_directory_path() / "vc_material_tmp";
     const std::string stageArg = (stage == VK_SHADER_STAGE_VERTEX_BIT) ? "vert" : "frag";
     const std::filesystem::path srcFile = std::filesystem::path(tmp.string() + "." + stageArg);
@@ -357,237 +410,6 @@ std::vector<uint32_t> compile_glsl_to_spirv(const std::string& source, VkShaderS
     std::filesystem::remove(srcFile, ec);
     std::filesystem::remove(spvFile, ec);
     return spirv;
-}
-
-VulkanMaterialPipeline::~VulkanMaterialPipeline() {
-    destroy();
-}
-
-bool VulkanMaterialPipeline::create(VkDevice device, VkFormat colorFormat, VkFormat depthFormat,
-                                    const MaterialGraph& graph, std::string* error) {
-    destroy();
-    device_ = device;
-    colorFormat_ = colorFormat;
-    depthFormat_ = depthFormat;
-
-    const GlslGenerationResult gen = material_graph_to_glsl(graph);
-    if (!gen) {
-        lastError_ = "material graph GLSL generation failed";
-        if (error) *error = lastError_;
-        return false;
-    }
-    glsl_ = gen.source;
-    uniformNames_ = gen.uniformNames;
-    uniformTypes_ = gen.uniformTypes;
-    sourceHash_ = std::hash<std::string>{}(glsl_);
-
-    // Vertex shader (fixed: fullscreen triangle with UVs).
-    const std::string vertSrc = R"(
-#version 450
-layout(location = 0) out vec2 vUv;
-void main() {
-    vec2 pos[3] = vec2[3](vec2(-1,-1), vec2(3,-1), vec2(-1,3));
-    vUv = pos[gl_VertexIndex] * 0.5 + 0.5;
-    gl_Position = vec4(pos[gl_VertexIndex], 0.0, 1.0);
-}
-)";
-    std::vector<uint32_t> vertSpv = compile_glsl_to_spirv(vertSrc, VK_SHADER_STAGE_VERTEX_BIT);
-    std::vector<uint32_t> fragSpv = compile_glsl_to_spirv(glsl_, VK_SHADER_STAGE_FRAGMENT_BIT);
-    if (vertSpv.empty() || fragSpv.empty()) {
-        lastError_ = "glslc compile failed (is glslc on PATH?)";
-        if (error) *error = lastError_;
-        return false;
-    }
-    vertModule_ = create_module(device_, vertSpv);
-    fragModule_ = create_module(device_, fragSpv);
-    if (vertModule_ == VK_NULL_HANDLE || fragModule_ == VK_NULL_HANDLE) {
-        lastError_ = "VkShaderModule creation failed";
-        if (error) *error = lastError_;
-        return false;
-    }
-
-    // Descriptor set layout: binding 0 = material params UBO.
-    VkDescriptorSetLayoutBinding uboBinding{};
-    uboBinding.binding = 0;
-    uboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    uboBinding.descriptorCount = 1;
-    uboBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo dslInfo{};
-    dslInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dslInfo.bindingCount = 1;
-    dslInfo.pBindings = &uboBinding;
-    if (vkCreateDescriptorSetLayout(device_, &dslInfo, nullptr, &descriptorSetLayout_) != VK_SUCCESS) {
-        lastError_ = "descriptor set layout creation failed";
-        if (error) *error = lastError_;
-        return false;
-    }
-
-    VkPushConstantRange pushRange{};
-    pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    pushRange.offset = 0;
-    pushRange.size = 16;
-
-    VkPipelineLayoutCreateInfo layoutInfo{};
-    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layoutInfo.setLayoutCount = 1;
-    layoutInfo.pSetLayouts = &descriptorSetLayout_;
-    layoutInfo.pushConstantRangeCount = 1;
-    layoutInfo.pPushConstantRanges = &pushRange;
-    if (vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &layout_) != VK_SUCCESS) {
-        lastError_ = "pipeline layout creation failed";
-        if (error) *error = lastError_;
-        return false;
-    }
-
-    // Shaders + layout ready; the graphics pipeline itself requires the real
-    // render pass and is created by build_pipeline().
-    lastError_.clear();
-    return true;
-}
-
-bool VulkanMaterialPipeline::build_pipeline(VkRenderPass renderPass, uint32_t subpass) {
-    if (renderPass == VK_NULL_HANDLE) {
-        lastError_ = "build_pipeline requires a real VkRenderPass";
-        return false;
-    }
-    if (pipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device_, pipeline_, nullptr);
-        pipeline_ = VK_NULL_HANDLE;
-    }
-
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vertModule_;
-    stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = fragModule_;
-    stages[1].pName = "main";
-
-    VkPipelineVertexInputStateCreateInfo vertexInput{};
-    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    VkPipelineInputAssemblyStateCreateInfo assembly{};
-    assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo viewportState{};
-    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewportState.viewportCount = 1;
-    viewportState.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo raster{};
-    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
-    raster.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo multisample{};
-    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo depth{};
-    depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth.depthTestEnable = VK_TRUE;
-    depth.depthWriteEnable = VK_TRUE;
-    depth.depthCompareOp = VK_COMPARE_OP_LESS;
-
-    VkPipelineColorBlendAttachmentState blend{};
-    blend.colorWriteMask = 0xF;
-    blend.blendEnable = VK_FALSE;
-
-    VkPipelineColorBlendStateCreateInfo colorBlend{};
-    colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    colorBlend.attachmentCount = 1;
-    colorBlend.pAttachments = &blend;
-
-    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{};
-    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamic.dynamicStateCount = 2;
-    dynamic.pDynamicStates = dynamicStates;
-
-    VkGraphicsPipelineCreateInfo pipelineInfo{};
-    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pipelineInfo.stageCount = 2;
-    pipelineInfo.pStages = stages;
-    pipelineInfo.pVertexInputState = &vertexInput;
-    pipelineInfo.pInputAssemblyState = &assembly;
-    pipelineInfo.pViewportState = &viewportState;
-    pipelineInfo.pRasterizationState = &raster;
-    pipelineInfo.pMultisampleState = &multisample;
-    pipelineInfo.pDepthStencilState = &depth;
-    pipelineInfo.pColorBlendState = &colorBlend;
-    pipelineInfo.pDynamicState = &dynamic;
-    pipelineInfo.layout = layout_;
-    pipelineInfo.renderPass = renderPass;
-    pipelineInfo.subpass = subpass;
-
-    if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline_) != VK_SUCCESS) {
-        lastError_ = "vkCreateGraphicsPipelines failed";
-        return false;
-    }
-    lastError_.clear();
-    return true;
-}
-
-void VulkanMaterialPipeline::destroy() {
-    if (device_ == VK_NULL_HANDLE) return;
-    if (pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(device_, pipeline_, nullptr);
-    if (layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(device_, layout_, nullptr);
-    if (descriptorSetLayout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device_, descriptorSetLayout_, nullptr);
-    if (vertModule_ != VK_NULL_HANDLE) vkDestroyShaderModule(device_, vertModule_, nullptr);
-    if (fragModule_ != VK_NULL_HANDLE) vkDestroyShaderModule(device_, fragModule_, nullptr);
-    pipeline_ = VK_NULL_HANDLE;
-    layout_ = VK_NULL_HANDLE;
-    descriptorSetLayout_ = VK_NULL_HANDLE;
-    vertModule_ = VK_NULL_HANDLE;
-    fragModule_ = VK_NULL_HANDLE;
-}
-
-void VulkanMaterialPipeline::write_parameters(std::byte* uboMemory, std::size_t capacity) const {
-    std::size_t offset = 0;
-    for (size_t i = 0; i < uniformNames_.size() && offset + 16 <= capacity; ++i) {
-        // Defaults are written as zeroed floats; callers override with real values.
-        std::memset(uboMemory + offset, 0, 16);
-        offset += 16;
-    }
-}
-
-bool VulkanMaterialPipeline::poll_reload() {
-    const std::size_t currentHash = std::hash<std::string>{}(glsl_);
-    if (currentHash != sourceHash_) {
-        sourceHash_ = currentHash;
-        return reload();
-    }
-    return false;
-}
-
-bool VulkanMaterialPipeline::reload() {
-    // Recompile the fragment shader module from the stored GLSL source.
-    ++buildId_;
-    if (device_ == VK_NULL_HANDLE || glsl_.empty()) {
-        lastError_ = "reload requires an existing pipeline with GLSL source";
-        return false;
-    }
-    std::vector<uint32_t> fragSpv = compile_glsl_to_spirv(glsl_, VK_SHADER_STAGE_FRAGMENT_BIT);
-    if (fragSpv.empty()) {
-        lastError_ = "glslc recompile failed";
-        return false;
-    }
-    VkShaderModule newModule = create_module(device_, fragSpv);
-    if (newModule == VK_NULL_HANDLE) {
-        lastError_ = "VkShaderModule rebuild failed";
-        return false;
-    }
-    // Swap module (pipeline rebuild requires the caller's render pass; the
-    // module swap is the hot-reload primitive available at this layer).
-    if (fragModule_ != VK_NULL_HANDLE) vkDestroyShaderModule(device_, fragModule_, nullptr);
-    fragModule_ = newModule;
-    sourceHash_ = std::hash<std::string>{}(glsl_);
-    lastError_.clear();
-    return true;
 }
 
 // ─── VulkanRenderGraphExecutor ───

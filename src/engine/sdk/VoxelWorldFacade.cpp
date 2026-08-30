@@ -50,6 +50,7 @@ build_runtime_block_table(const engine::registry::BlockRegistry& registry) {
         if (definition.hasBuiltinMapping) continue;
         RuntimeBlockInfo info;
         info.uuid = definition.uuid;
+        info.variantKey = runtime_block_variant_key(definition.namespaced());
         info.color = definition.color;
         // Per-face material + occlusion + render layer (FALTANTES §14).
         info.faceTop = definition.faceTop;
@@ -98,6 +99,7 @@ build_runtime_block_table(const engine::registry::BlockRegistry& registry) {
         for (const engine::registry::BlockState& state : definition.states) {
             RuntimeBlockInfo::RuntimeBlockState mirror;
             mirror.name = state.name;
+            mirror.variantKey = runtime_block_variant_key(definition.namespaced() + "|" + state.name);
             mirror.color = state.color;
             mirror.faceTop = state.faceTop;
             mirror.faceBottom = state.faceBottom;
@@ -1022,7 +1024,17 @@ public:
                                     static_cast<float>(edit.position.z));
                 if (world_.can_touch_chunk_at(pos)) continue;
                 bool writable = false;
-                for (int frame = 0; frame < 600; ++frame) {
+                // Same wall-clock tolerance as the tests' boot_world (30 s):
+                // the sim steps are deterministic, but the async generation
+                // workers run on real time and can be starved under machine
+                // load — a tight frame budget (600 x 2 ms) used to flake the
+                // B-311 commit under contention. Keep the bounded wait and the
+                // deterministic rollback as the ultimate diagnostic, but give
+                // the in-flight generator the same headroom boot_world gets.
+                const auto waitStart = std::chrono::steady_clock::now();
+                while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - waitStart).count() <
+                       30000) {
                     update(playerPos_, 1.0f / 60.0f);
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
                     if (world_.can_touch_chunk_at(pos)) { writable = true; break; }

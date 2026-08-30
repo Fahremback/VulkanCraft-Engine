@@ -37,8 +37,10 @@ struct ReflectionCapabilities {
     bool rayTraced{ false };   // hardware ray tracing present
 };
 
-// Per-surface inputs that decide the reflection mode.
-struct ReflectionSurface {
+// Per-surface inputs that decide the reflection mode. Named distinctly from
+// IReflectionModel::ReflectionSurface (the richer per-surface shading inputs)
+// so both public headers can be included in one TU without a type collision.
+struct ReflectionSurfaceInput {
     float roughness{ 0.5f };  // [0, 1]
     float clearCoat{ 0.0f };  // [0, 1] — clear-coat layer
     float metalness{ 0.0f };  // [0, 1]
@@ -69,7 +71,7 @@ public:
     // Decides the mode for one surface. Deterministic: a pure function of the
     // material inputs, the capability and the config. Always falls back to
     // None when no backend is available; never claims an unavailable backend.
-    virtual ReflectionBackend resolve_mode(const ReflectionSurface& surface) const = 0;
+    virtual ReflectionBackend resolve_mode(const ReflectionSurfaceInput& surface) const = 0;
 
     // Debug view + profiler: the last frame's mode distribution (count of
     // surfaces per backend) and screen-ray spend.

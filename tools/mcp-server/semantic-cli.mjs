@@ -2,14 +2,16 @@
 // Semantic Engine API CLI (task_plan Agente 5 §4/§8 — "fachada semântica única
 // para editor, CLI, MCP e automação" + "cada capacidade pública acessível
 // coerentemente por C++, reflection, scripting visual, CLI e MCP"). The
-// Semantic Engine API has 37 tools; registry-cli.mjs only exposes the 15
-// asset-authoring kinds. This CLI exposes the FULL semantic surface WITHOUT a
+// Semantic Engine API has 65 tools (auto-derived from semanticToolDefinitions);
+// registry-cli.mjs only exposes the 28 asset-authoring kinds (6 registry + the
+// vehicle/ability/mission/world_profile/gait/simulation_lod/prefab/particle
+// kinds + 13 config kinds incl. network). This CLI exposes the FULL semantic surface WITHOUT a
 // running MCP server — every command goes through the SAME factories
 // (callSemanticTool in game-authoring.mjs) the MCP server uses, so the CLI can
 // never drift from what the MCP surface accepts.
 //
 // Usage:
-//   node semantic-cli.mjs tools                          list the 37 semantic tools + schemas
+//   node semantic-cli.mjs tools                          list all 65 semantic tools + schemas
 //   node semantic-cli.mjs schema <tool>                  print the input schema for a tool
 //   node semantic-cli.mjs call <tool> '<json-args>' [--engine <root>]
 //                                                       call a tool (exit 0 success, 2 isError, 3 driver error)

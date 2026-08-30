@@ -8,14 +8,15 @@
 //   • Real-VM bridge: attach(ScriptVM&), from_script_program() conversion
 //   • ScriptHotReload: mtime+size detection, recompile + program swap,
 //     global-state preservation, reload listeners
-//   • EditorRuntimeBridge: separate Play World, scene copy/restore,
-//     N-tick simulation, editor world integrity
+//   • PlayModeManager: separate Play World (Scene::clone_for_play), scene
+//     copy/restore, N-tick simulation, editor world integrity (the legacy
+//     EditorRuntimeBridge adapter was removed — test-only, 0 product users)
 //
 // Sources required when wiring this into CMake:
 //   tests/ScriptDebuggerTests.cpp
 //   src/engine/scripting/ScriptDebugger.cpp
 //   src/engine/scripting/ScriptHotReload.cpp
-//   src/editor/EditorRuntimeBridge.cpp
+//   src/engine/editor/play_mode/PlayMode.hpp
 //   src/engine/scripting/ScriptRuntime.cpp
 //   src/engine/core/uuid/UUID.cpp
 //   src/engine/scene/Scene.cpp
@@ -26,16 +27,19 @@
 
 #include "../src/engine/scripting/ScriptDebugger.hpp"
 #include "../src/engine/scripting/ScriptHotReload.hpp"
-#include "../src/editor/EditorRuntimeBridge.hpp"
+#include "../src/engine/editor/play_mode/PlayMode.hpp"
 #include "../src/engine/scene/Scene.hpp"
 #include "../src/engine/core/uuid/UUID.hpp"
 
 #include <glm/glm.hpp>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -409,82 +413,124 @@ int main() {
     }
 
     // =====================================================================
-    // D) EditorRuntimeBridge
+    // D) Play-mode isolation — PlayModeManager (canonical editor contract).
+    // The legacy EditorRuntimeBridge adapter duplicated this state machine
+    // with 0 product consumers (test-only) and was REMOVED; the product
+    // drives PlayModeManager directly. The play world is a separate copy
+    // (clone_for_play) and the editor scene stays intact.
     // =====================================================================
-    section("bridge: Play World is a separate copy; editor stays intact");
+    const auto scene_signature = [](const Scene& scene) -> std::string {
+        std::vector<Engine::UUID> ids;
+        ids.reserve(scene.get_entities().size());
+        for (const auto& [id, entity] : scene.get_entities()) {
+            (void)entity;
+            ids.push_back(id);
+        }
+        std::sort(ids.begin(), ids.end());
+        std::string signature;
+        for (const auto& id : ids) {
+            const Entity* entity = scene.find_entity_by_id_const(id);
+            if (!entity) continue;
+            signature += id.to_string();
+            signature += '|';
+            signature += entity->get_name();
+            signature += '|';
+            const auto it = scene.transformComponents.find(id);
+            if (it != scene.transformComponents.end()) {
+                const auto& t = it->second;
+                char buffer[160];
+                std::snprintf(buffer, sizeof(buffer),
+                              "%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g;",
+                              t.position.x, t.position.y, t.position.z,
+                              t.rotation.x, t.rotation.y, t.rotation.z,
+                              t.scale.x, t.scale.y, t.scale.z);
+                signature += buffer;
+            }
+            signature += '\n';
+        }
+        return std::to_string(std::hash<std::string>{}(signature));
+    };
+
+    section("play-mode: Play World is a separate copy; editor stays intact");
     {
+        PlayModeManager manager;
         Scene editor("Editor Scene");
         const Entity cube = editor.create_entity("Cube");
         editor.transformComponents[cube.get_id()].position = { 1.0f, 2.0f, 3.0f };
         CHECK(editor.get_entities().size() == 1);
 
+        const std::string editorSignature = scene_signature(editor);
+        manager.set_editor_scene(&editor);
+        CHECK(manager.get_state() == PlayState::Edit);
+
         int tickCount = 0;
-        EditorRuntimeBridge bridge;
-        bridge.set_tick_callback([&](Scene* world, float) {
+        auto tickOnce = [&](Scene* world, float) {
             ++tickCount;
             if (!world->transformComponents.empty()) {
                 auto& t = world->transformComponents.begin()->second;
                 t.position.x += 1.0f;
             }
-        });
+        };
 
-        CHECK(bridge.mode() == EditorRuntimeBridge::Mode::Edit);
-        CHECK(bridge.enter_play(editor));
-        CHECK(bridge.mode() == EditorRuntimeBridge::Mode::Playing);
-
-        Scene* playWorld = bridge.play_world();
+        // start_play clones the editor scene into a separate Play World.
+        manager.start_play(&editor);
+        CHECK(manager.get_state() == PlayState::Play);
+        Scene* playWorld = manager.get_active_scene();
         CHECK(playWorld != nullptr && playWorld != &editor);
         CHECK(playWorld->get_name() == "Editor Scene [PLAY]");
         CHECK(playWorld->get_entities().size() == 1);
         CHECK(near(playWorld->transformComponents.begin()->second.position.x, 1.0f));
         CHECK(near(editor.transformComponents.at(cube.get_id()).position.x, 1.0f));
-        CHECK(bridge.editor_world_intact());
+        CHECK(scene_signature(editor) == editorSignature);
 
-        // Pause + step frame runs exactly one tick on the Play World only.
-        CHECK(bridge.pause());
-        CHECK(bridge.mode() == EditorRuntimeBridge::Mode::Paused);
-        CHECK(bridge.step_frame(1.0f / 60.0f));
-        CHECK(bridge.ticks_elapsed() == 1);
+        // Pause + step_frame runs exactly one tick on the Play World only.
+        manager.pause_play();
+        CHECK(manager.get_state() == PlayState::Pause);
+        manager.step_frame(1.0f / 60.0f, tickOnce);
+        CHECK(tickCount == 1);
         CHECK(near(playWorld->transformComponents.begin()->second.position.x, 2.0f));
         CHECK(near(editor.transformComponents.at(cube.get_id()).position.x, 1.0f));
+        CHECK(scene_signature(editor) == editorSignature);
 
-        CHECK(bridge.resume());
-        CHECK(bridge.mode() == EditorRuntimeBridge::Mode::Playing);
-        CHECK(bridge.exit_play());
-        CHECK(bridge.mode() == EditorRuntimeBridge::Mode::Edit);
-        CHECK(bridge.play_world() == nullptr);
+        // Pause toggles back to Play (the editor's play/pause button path).
+        manager.pause_play();
+        CHECK(manager.get_state() == PlayState::Play);
+        manager.stop_play();
+        CHECK(manager.get_state() == PlayState::Edit);
+        CHECK(manager.get_active_scene() == nullptr); // play world destroyed
+        CHECK(near(editor.transformComponents.at(cube.get_id()).position.x, 1.0f));
+        CHECK(scene_signature(editor) == editorSignature);
 
-        // simulate_ticks from Edit: clone → N ticks → restore.
-        CHECK(bridge.simulate_ticks(editor, 5, 1.0f / 60.0f) == 5);
+        // N-tick burst from Edit: clone → pause → tick N times → restore Edit.
+        manager.start_play(&editor);
+        playWorld = manager.get_active_scene();
+        manager.pause_play();
+        CHECK(manager.get_state() == PlayState::Pause);
+        for (int i = 0; i < 5; ++i) manager.step_frame(1.0f / 60.0f, tickOnce);
         CHECK(tickCount == 6);
-        CHECK(bridge.mode() == EditorRuntimeBridge::Mode::Edit);
+        CHECK(near(playWorld->transformComponents.begin()->second.position.x, 6.0f));
         CHECK(near(editor.transformComponents.at(cube.get_id()).position.x, 1.0f));
-        CHECK(bridge.editor_world_intact());
+        manager.stop_play();
+        CHECK(manager.get_state() == PlayState::Edit);
 
-        // simulate_ticks while already playing just ticks the Play World.
-        CHECK(bridge.enter_play(editor));
-        playWorld = bridge.play_world();
-        CHECK(bridge.simulate_ticks(editor, 3, 1.0f / 60.0f) == 3);
-        CHECK(bridge.mode() == EditorRuntimeBridge::Mode::Playing);
-        CHECK(near(playWorld->transformComponents.begin()->second.position.x, 4.0f));
-        CHECK(near(editor.transformComponents.at(cube.get_id()).position.x, 1.0f));
-
-        // External editor edits are detected.
+        // External editor edits are detected via the scene signature.
+        manager.start_play(&editor);
         editor.transformComponents.at(cube.get_id()).position.x = 99.0f;
-        CHECK(!bridge.editor_world_intact());
+        CHECK(scene_signature(editor) != editorSignature);
         editor.transformComponents.at(cube.get_id()).position.x = 1.0f;
-        CHECK(bridge.editor_world_intact());
+        CHECK(scene_signature(editor) == editorSignature);
+        manager.stop_play();
+        CHECK(manager.get_state() == PlayState::Edit);
 
-        // Double enter is guarded; simulate mode round-trips.
-        CHECK(!bridge.enter_play(editor)); // still Playing
-        CHECK(bridge.exit_play());
-        CHECK(bridge.enter_simulate(editor));
-        CHECK(bridge.mode() == EditorRuntimeBridge::Mode::Simulating);
-        CHECK(bridge.pause());
-        CHECK(bridge.resume());
-        CHECK(bridge.mode() == EditorRuntimeBridge::Mode::Simulating);
-        CHECK(bridge.exit_play());
-        CHECK(bridge.mode() == EditorRuntimeBridge::Mode::Edit);
+        // Simulate mode round-trips through the canonical manager.
+        manager.start_simulate(&editor);
+        CHECK(manager.get_state() == PlayState::Simulate);
+        manager.pause_play();
+        CHECK(manager.get_state() == PlayState::Pause);
+        manager.pause_play(); // toggle resumes (canonical manager behavior)
+        CHECK(manager.get_state() == PlayState::Play);
+        manager.stop_play();
+        CHECK(manager.get_state() == PlayState::Edit);
     }
 
     std::cout << "All script debugger / hot reload / bridge checks passed.\n";

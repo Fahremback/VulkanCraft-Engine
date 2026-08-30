@@ -53,8 +53,9 @@ function run(name, cmd, argsList) {
 console.log(`# §11 platform gate (AGENT-6) — ${new Date().toISOString()}`);
 console.log(`skip-build=${SKIP_BUILD} skip-spaces=${SKIP_SPACES}\n`);
 
-if (!existsSync(join(ROOT, 'build'))) {
-  fail('build/ not found — configure first (or use --skip-build for non-parity steps)');
+const buildRoot = process.env.VC_BUILD_DIR || 'out/dev-shared';
+if (!existsSync(join(ROOT, buildRoot)) && !existsSync(join(ROOT, 'build'))) {
+  fail(`${buildRoot} not found — configure first (or use --skip-build for non-parity steps)`);
 }
 
 let failures = 0;

@@ -11,16 +11,17 @@ import { readdirSync, statSync, existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
 const ROOT = process.cwd();
-const buildDir = process.env.VC_BUILD_DIR || 'build';
+// Canonical shared tree (out/dev-shared, single-config Ninja); VC_BUILD_DIR
+// overrides. The old in-source `build/` tree is legacy — gates resolve here.
+const buildDir = process.env.VC_BUILD_DIR || 'out/dev-shared';
 const problems = [];
 
 // Outputs that must be at least as new as the newest source under their dep
 // roots. Scans are bounded: public headers + core src for the SDK manifests,
 // src/engine/sdk + src/simulation/voxel for the world-save header, and the
-// whole src/ for the built exes in build/Release and out/release.
+// whole src/ for the built exes in the canonical tree (VC_BUILD_DIR).
 // The world-save codegen follows VC_BUILD_DIR like the built exes below
-// (the old hardcoded 'out/release/generated' path matched no active build
-// tree — the generated header lives in each build dir's generated/).
+// (the generated header lives in each build dir's generated/).
 const OUTPUTS = [
   { label: 'SDK_API_INVENTORY.md (anti-drift manifest)', path: 'docs/SDK_API_INVENTORY.md', deps: ['src/engine/public', 'schema/registry'] },
   { label: 'SDK_CAPABILITY_MATRIX.md (capability manifest)', path: 'docs/SDK_CAPABILITY_MATRIX.md', deps: ['src/engine/public', 'tools/mcp-server'] },

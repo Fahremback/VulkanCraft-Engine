@@ -1,0 +1,2920 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "type_name": "apply_particle_asset",
+      "category": "mutation",
+      "description": "Apply a particle asset (Content/Particles/<name>.particle) to an entity's ParticleEmitter component in a scene — the com",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "scene",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "entity_id",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "asset",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.apply_particle_asset"
+    },
+    {
+      "type_name": "author_ability_asset",
+      "category": "authoring",
+      "description": "Author a data-driven ability (FALTANTES §19) as a versioned JSON document in Content/Abilities/, mirroring exactly the p",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "id",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "version",
+          "type": "Int",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "cooldown_seconds",
+          "type": "Float",
+          "required": false,
+          "default": "0"
+        },
+        {
+          "name": "cancelable",
+          "type": "Bool",
+          "required": false,
+          "default": "true"
+        },
+        {
+          "name": "interruptible",
+          "type": "Bool",
+          "required": false,
+          "default": "true"
+        },
+        {
+          "name": "attributes",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "tags",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "cost",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "conditions",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "targeting",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "effects",
+          "type": "Any",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_ability_asset"
+    },
+    {
+      "type_name": "author_block_entity",
+      "category": "authoring",
+      "description": "Author a block entity definition (Content/BlockEntities/<name>.json) mirroring IVoxelBlockEntity: type_id (namespaced), ",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "type_id",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "data_version",
+          "type": "Int",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "script_id",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "components",
+          "type": "Any",
+          "required": false,
+          "default": "[]"
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_block_entity"
+    },
+    {
+      "type_name": "author_block_transaction",
+      "category": "authoring",
+      "description": "Author a block transaction document (Content/Transactions/<name>.json) mirroring IVoxelWorld BlockEdit[] + TransactionLi",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "edits",
+          "type": "Any",
+          "required": true
+        },
+        {
+          "name": "max_edits",
+          "type": "Int",
+          "required": false,
+          "default": "0"
+        },
+        {
+          "name": "max_box_volume",
+          "type": "Int",
+          "required": false,
+          "default": "0"
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_block_transaction"
+    },
+    {
+      "type_name": "author_chunk_config",
+      "category": "authoring",
+      "description": "Author a chunk streaming config (Content/Chunks/<name>.json) mirroring IVoxelStreaming budgets: chunk_budget, memory_bud",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "chunk_budget",
+          "type": "Int",
+          "required": false,
+          "default": "16"
+        },
+        {
+          "name": "memory_budget_bytes",
+          "type": "Int",
+          "required": false,
+          "default": "0"
+        },
+        {
+          "name": "far_lod_percent",
+          "type": "Int",
+          "required": false,
+          "default": "0"
+        },
+        {
+          "name": "worker_threads",
+          "type": "Int",
+          "required": false,
+          "default": "0"
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_chunk_config"
+    },
+    {
+      "type_name": "author_fluid_simulation",
+      "category": "authoring",
+      "description": "Author a fluid simulation config (Content/FluidSims/<name>.json) mirroring FluidConfig (IFluidSimulation): grid_size, ce",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "grid_size",
+          "type": "Int",
+          "required": false,
+          "default": "64"
+        },
+        {
+          "name": "cell_size",
+          "type": "Float",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "gravity",
+          "type": "Float",
+          "required": false,
+          "default": "9.81"
+        },
+        {
+          "name": "dt",
+          "type": "Float",
+          "required": false,
+          "default": "0.0166667"
+        },
+        {
+          "name": "solver_iterations",
+          "type": "Int",
+          "required": false,
+          "default": "4"
+        },
+        {
+          "name": "damping",
+          "type": "Float",
+          "required": false,
+          "default": "0.999"
+        },
+        {
+          "name": "viscosity",
+          "type": "Float",
+          "required": false,
+          "default": "0.001"
+        },
+        {
+          "name": "surface_tension",
+          "type": "Float",
+          "required": false,
+          "default": "0"
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_fluid_simulation"
+    },
+    {
+      "type_name": "author_gait_asset",
+      "category": "authoring",
+      "description": "Author a data-driven gait asset (FALTANTES item 23 — animações) as a versioned JSON document in Content/Animations/, mir",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "version",
+          "type": "Int",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "cycleDuration",
+          "type": "Float",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "stanceFraction",
+          "type": "Float",
+          "required": false,
+          "default": "0.6"
+        },
+        {
+          "name": "stepHeight",
+          "type": "Float",
+          "required": false,
+          "default": "0.25"
+        },
+        {
+          "name": "maxStride",
+          "type": "Float",
+          "required": false,
+          "default": "0.5"
+        },
+        {
+          "name": "legPhases",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "legs",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_gait_asset"
+    },
+    {
+      "type_name": "author_gi_config",
+      "category": "authoring",
+      "description": "Author a global-illumination config (Content/GI/<name>.json) mirroring GiClipmapConfig (IGlobalIlluminationProvider) + D",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "cascade_count",
+          "type": "Int",
+          "required": false,
+          "default": "6"
+        },
+        {
+          "name": "resolution",
+          "type": "Int",
+          "required": false,
+          "default": "16"
+        },
+        {
+          "name": "probes_per_frame",
+          "type": "Int",
+          "required": false,
+          "default": "192"
+        },
+        {
+          "name": "base_spacing",
+          "type": "Float",
+          "required": false,
+          "default": "4"
+        },
+        {
+          "name": "cascade_scale",
+          "type": "Float",
+          "required": false,
+          "default": "4"
+        },
+        {
+          "name": "sun_refresh_angle_degrees",
+          "type": "Float",
+          "required": false,
+          "default": "2"
+        },
+        {
+          "name": "bounces",
+          "type": "Int",
+          "required": false,
+          "default": "2"
+        },
+        {
+          "name": "skylight",
+          "type": "Any",
+          "required": false,
+          "default": "[0.05,0.07,0.1]"
+        },
+        {
+          "name": "max_distance",
+          "type": "Float",
+          "required": false,
+          "default": "128"
+        },
+        {
+          "name": "intensity",
+          "type": "Float",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_gi_config"
+    },
+    {
+      "type_name": "author_inventory",
+      "category": "authoring",
+      "description": "Author an inventory asset (Content/Inventories/<name>.json) mirroring engine/registry/Inventory.hpp serialize_json: slot",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "slots",
+          "type": "Any",
+          "required": true
+        },
+        {
+          "name": "filters",
+          "type": "Any",
+          "required": false,
+          "default": "[]"
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_inventory"
+    },
+    {
+      "type_name": "author_mission_asset",
+      "category": "authoring",
+      "description": "Author a data-driven mission (FALTANTES item 23) as a versioned JSON document in Content/Missions/, mirroring exactly th",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "id",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "version",
+          "type": "Int",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "objectives",
+          "type": "Any",
+          "required": true
+        },
+        {
+          "name": "dialogue",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "unlockConditions",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "reward",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "repeatable",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_mission_asset"
+    },
+    {
+      "type_name": "author_ocean_config",
+      "category": "authoring",
+      "description": "Author an FFT ocean surface config (Content/Ocean/<name>.json) mirroring FftOceanConfig (IFftOceanSurface): size (power ",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "size",
+          "type": "Int",
+          "required": false,
+          "default": "64"
+        },
+        {
+          "name": "tile_size_meters",
+          "type": "Float",
+          "required": false,
+          "default": "256"
+        },
+        {
+          "name": "wind_speed",
+          "type": "Float",
+          "required": false,
+          "default": "18"
+        },
+        {
+          "name": "wind_dir_rad",
+          "type": "Float",
+          "required": false,
+          "default": "0.7"
+        },
+        {
+          "name": "choppiness",
+          "type": "Float",
+          "required": false,
+          "default": "1.2"
+        },
+        {
+          "name": "amplitude",
+          "type": "Float",
+          "required": false,
+          "default": "0.9"
+        },
+        {
+          "name": "seed",
+          "type": "Int",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_ocean_config"
+    },
+    {
+      "type_name": "author_post_processing",
+      "category": "authoring",
+      "description": "Author a post-processing config (Content/PostProcess/<name>.json) mirroring ToneMappingConfig (IToneMapping) + CasConfig",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "operator",
+          "type": "String",
+          "required": false,
+          "default": "aces"
+        },
+        {
+          "name": "exposure",
+          "type": "Float",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "use_ev",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "ev100",
+          "type": "Float",
+          "required": false,
+          "default": "0"
+        },
+        {
+          "name": "white_point",
+          "type": "Float",
+          "required": false,
+          "default": "11.2"
+        },
+        {
+          "name": "sharpness",
+          "type": "Float",
+          "required": false,
+          "default": "0.4"
+        },
+        {
+          "name": "clamp_values",
+          "type": "Bool",
+          "required": false,
+          "default": "true"
+        },
+        {
+          "name": "quality",
+          "type": "String",
+          "required": false,
+          "default": "high"
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_post_processing"
+    },
+    {
+      "type_name": "author_registry_asset",
+      "category": "authoring",
+      "description": "Author a registry asset (block/item/fluid/recipe/biome/structure) as a versioned JSON document in Content/Registry/<kind",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "kind",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "id",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "namespace",
+          "type": "String",
+          "required": false,
+          "default": "vulkancraft"
+        },
+        {
+          "name": "version",
+          "type": "Int",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "class",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "hardness",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "light_emission",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "light_absorption",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "opaque",
+          "type": "Bool",
+          "required": false
+        },
+        {
+          "name": "collidable",
+          "type": "Bool",
+          "required": false
+        },
+        {
+          "name": "builtin_id",
+          "type": "Int",
+          "required": false
+        },
+        {
+          "name": "color",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "tags",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "drops",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "states",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "transitions",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "fluid",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "sound_place",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "sound_break",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "sound_step",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "sound_hit",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "particle_break",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "tool",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "tool_tier",
+          "type": "Int",
+          "required": false
+        },
+        {
+          "name": "resistance",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "friction",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "bounciness",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "density",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "behavior",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "max_stack",
+          "type": "Int",
+          "required": false
+        },
+        {
+          "name": "durability",
+          "type": "Int",
+          "required": false
+        },
+        {
+          "name": "icon",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "model",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "use_cooldown",
+          "type": "Int",
+          "required": false
+        },
+        {
+          "name": "use_mode",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "equip_slot",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "attack_damage",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "armor",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "block",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "viscosity",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "range",
+          "type": "Int",
+          "required": false
+        },
+        {
+          "name": "tick_interval",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "source",
+          "type": "Bool",
+          "required": false
+        },
+        {
+          "name": "falling",
+          "type": "Bool",
+          "required": false
+        },
+        {
+          "name": "evaporation",
+          "type": "Bool",
+          "required": false
+        },
+        {
+          "name": "damage_per_tick",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "compressible",
+          "type": "Bool",
+          "required": false
+        },
+        {
+          "name": "station",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "time",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "energy",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "fuel",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "conditions",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "inputs",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "outputs",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "byproducts",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "biomes",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "sample_width",
+          "type": "Int",
+          "required": false
+        },
+        {
+          "name": "sample_height",
+          "type": "Int",
+          "required": false
+        },
+        {
+          "name": "sample",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "pattern_size",
+          "type": "Int",
+          "required": false
+        },
+        {
+          "name": "symmetry",
+          "type": "Int",
+          "required": false
+        },
+        {
+          "name": "periodic_output",
+          "type": "Bool",
+          "required": false
+        },
+        {
+          "name": "ground",
+          "type": "Bool",
+          "required": false
+        },
+        {
+          "name": "seed",
+          "type": "Int",
+          "required": false
+        },
+        {
+          "name": "profiles",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_registry_asset"
+    },
+    {
+      "type_name": "author_render_graph",
+      "category": "authoring",
+      "description": "Author a render graph asset (Content/RenderGraphs/<name>.json) mirroring IRenderGraph: resources (name/kind/byte_size/wi",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "resources",
+          "type": "Any",
+          "required": true
+        },
+        {
+          "name": "passes",
+          "type": "Any",
+          "required": true
+        },
+        {
+          "name": "dependencies",
+          "type": "Any",
+          "required": false,
+          "default": "[]"
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_render_graph"
+    },
+    {
+      "type_name": "author_simulation_lod_spec",
+      "category": "authoring",
+      "description": "Author a data-driven simulation LOD spec (FALTANTES §20) as a versioned JSON document in Content/SimulationLod/, mirrori",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "version",
+          "type": "Int",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "cellSize",
+          "type": "Float",
+          "required": false,
+          "default": "16"
+        },
+        {
+          "name": "fullRadius",
+          "type": "Float",
+          "required": false,
+          "default": "48"
+        },
+        {
+          "name": "falloffRadius",
+          "type": "Float",
+          "required": false,
+          "default": "320"
+        },
+        {
+          "name": "dayLengthSeconds",
+          "type": "Float",
+          "required": false,
+          "default": "240"
+        },
+        {
+          "name": "daysPerSeason",
+          "type": "Int",
+          "required": false,
+          "default": "30"
+        },
+        {
+          "name": "tiers",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_simulation_lod_spec"
+    },
+    {
+      "type_name": "author_vehicle_asset",
+      "category": "authoring",
+      "description": "Author a vehicle assembly (vehicle = rigid wheeled VehicleAsset; beam = node/beam deformable BeamGraphAsset) as a versio",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "kind",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "id",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "version",
+          "type": "Int",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "provider",
+          "type": "String",
+          "required": false,
+          "default": "jolt"
+        },
+        {
+          "name": "vehicle_kind",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "position",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "rotation",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "chassis",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "wheels",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "drivetrain",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "propulsion",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "seats",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "power",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "mass",
+          "type": "Float",
+          "required": false
+        },
+        {
+          "name": "nodes",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "beams",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "solver",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_vehicle_asset"
+    },
+    {
+      "type_name": "author_world_asset",
+      "category": "authoring",
+      "description": "Author a world asset (Content/Worlds/<name>.json) mirroring IWorldManager.WorldSpec: seed, rules_json (well-formed JSON)",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "seed",
+          "type": "Int",
+          "required": false,
+          "default": "0"
+        },
+        {
+          "name": "rules_json",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "profile",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "save_path",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "portals",
+          "type": "Any",
+          "required": false,
+          "default": "[]"
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_world_asset"
+    },
+    {
+      "type_name": "author_world_profile_asset",
+      "category": "authoring",
+      "description": "Author a data-driven world profile (FALTANTES item 23 — geração procedural) as a versioned JSON document in Content/Prof",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "version",
+          "type": "Int",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "height",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "baseHeight",
+          "type": "Int",
+          "required": false,
+          "default": "0"
+        },
+        {
+          "name": "amplitude",
+          "type": "Int",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "climate",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "biomes",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "caves",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "ores",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "carver",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "decorators",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "structures",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.author_world_profile_asset"
+    },
+    {
+      "type_name": "create_audio_event",
+      "category": "authoring",
+      "description": "Create a native VulkanEngine audio-event asset with pitch variation and spatial settings.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "clip",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "volume",
+          "type": "Float",
+          "required": false,
+          "default": "1"
+        },
+        {
+          "name": "min_pitch",
+          "type": "Float",
+          "required": false,
+          "default": "0.9"
+        },
+        {
+          "name": "max_pitch",
+          "type": "Float",
+          "required": false,
+          "default": "1.1"
+        },
+        {
+          "name": "max_distance",
+          "type": "Float",
+          "required": false,
+          "default": "100"
+        },
+        {
+          "name": "spatial",
+          "type": "Bool",
+          "required": false,
+          "default": "true"
+        },
+        {
+          "name": "looping",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.create_audio_event"
+    },
+    {
+      "type_name": "create_entity",
+      "category": "authoring",
+      "description": "Create an entity with Transform and optional engine components in a scene.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "scene",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "transform",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "components",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.create_entity"
+    },
+    {
+      "type_name": "create_game_project",
+      "category": "authoring",
+      "description": "Create a portable game project using engine-owned scene/component/script formats, without modifying engine source code.",
+      "inputs": [
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "version",
+          "type": "String",
+          "required": false,
+          "default": "0.1.0"
+        },
+        {
+          "name": "profile",
+          "type": "String",
+          "required": false,
+          "default": "Development"
+        },
+        {
+          "name": "platform",
+          "type": "String",
+          "required": false,
+          "default": "windows-x64"
+        },
+        {
+          "name": "plugins",
+          "type": "Any",
+          "required": false,
+          "default": "[]"
+        },
+        {
+          "name": "initial_scene",
+          "type": "String",
+          "required": false,
+          "default": "Initial"
+        },
+        {
+          "name": "starter_scene",
+          "type": "Bool",
+          "required": false,
+          "default": "true"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.create_game_project"
+    },
+    {
+      "type_name": "create_light_asset",
+      "category": "authoring",
+      "description": "Author a light asset (Content/Lights/<name>.json) mirroring the Light component schema + game_capabilities light types: ",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "type",
+          "type": "String",
+          "required": false,
+          "default": "directional"
+        },
+        {
+          "name": "color",
+          "type": "Any",
+          "required": false,
+          "default": "[1,1,1]"
+        },
+        {
+          "name": "intensity",
+          "type": "Float",
+          "required": false,
+          "default": "1000"
+        },
+        {
+          "name": "range",
+          "type": "Float",
+          "required": false,
+          "default": "50"
+        },
+        {
+          "name": "cast_shadows",
+          "type": "Bool",
+          "required": false,
+          "default": "true"
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.create_light_asset"
+    },
+    {
+      "type_name": "create_material",
+      "category": "authoring",
+      "description": "Create a native VulkanEngine PBR material asset in a game project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "albedo",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "roughness",
+          "type": "Float",
+          "required": false,
+          "default": "0.5"
+        },
+        {
+          "name": "metallic",
+          "type": "Float",
+          "required": false,
+          "default": "0"
+        },
+        {
+          "name": "emissive",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "texture_ids",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.create_material"
+    },
+    {
+      "type_name": "create_particle_asset",
+      "category": "authoring",
+      "description": "Author a reusable particle emitter asset under Content/Particles/<name>.particle — the emitter fields are EXACTLY the pu",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.create_particle_asset"
+    },
+    {
+      "type_name": "create_physics_material",
+      "category": "authoring",
+      "description": "Create a native VulkanEngine physics-material asset.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "friction",
+          "type": "Float",
+          "required": false,
+          "default": "0.5"
+        },
+        {
+          "name": "restitution",
+          "type": "Float",
+          "required": false,
+          "default": "0.1"
+        },
+        {
+          "name": "density",
+          "type": "Float",
+          "required": false,
+          "default": "1000"
+        },
+        {
+          "name": "hardness",
+          "type": "Float",
+          "required": false,
+          "default": "0.5"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.create_physics_material"
+    },
+    {
+      "type_name": "create_prefab",
+      "category": "authoring",
+      "description": "Extract a reusable entity set (prefab) from an existing scene into Content/Prefabs/<name>.prefab — the entity documents ",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "scene",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "entity_ids",
+          "type": "Any",
+          "required": true
+        },
+        {
+          "name": "root_entity",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.create_prefab"
+    },
+    {
+      "type_name": "create_scene",
+      "category": "authoring",
+      "description": "Create a VulkanEngine scene inside an existing game project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "starter_entities",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.create_scene"
+    },
+    {
+      "type_name": "create_shader_asset",
+      "category": "authoring",
+      "description": "Author a shader asset (Content/Shaders/<name>.json) mirroring IShaderCompiler.ShaderCompilerConfig: GLSL source, stage, ",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "source",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "stage",
+          "type": "String",
+          "required": false,
+          "default": "fragment"
+        },
+        {
+          "name": "target_env",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "opt_level",
+          "type": "Int",
+          "required": false,
+          "default": "0"
+        },
+        {
+          "name": "defines",
+          "type": "Any",
+          "required": false,
+          "default": "[]"
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.create_shader_asset"
+    },
+    {
+      "type_name": "create_visual_script",
+      "category": "authoring",
+      "description": "Create or replace a typed VulkanEngine visual-script graph in a project without modifying engine code.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "scene_companion",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        },
+        {
+          "name": "nodes",
+          "type": "Any",
+          "required": true
+        },
+        {
+          "name": "links",
+          "type": "Any",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.create_visual_script"
+    },
+    {
+      "type_name": "game_capabilities",
+      "category": "project",
+      "description": "Return the stable game-authoring capabilities, component schemas, light types, and visual-script node kinds exposed by t",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.game_capabilities"
+    },
+    {
+      "type_name": "inspect_ability_assets",
+      "category": "query",
+      "description": "List and validate every ability asset under Content/Abilities for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_ability_assets"
+    },
+    {
+      "type_name": "inspect_block_entities",
+      "category": "query",
+      "description": "List and validate every block entity definition under Content/BlockEntities for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_block_entities"
+    },
+    {
+      "type_name": "inspect_block_transactions",
+      "category": "query",
+      "description": "List and validate every block transaction under Content/Transactions for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_block_transactions"
+    },
+    {
+      "type_name": "inspect_chunk_configs",
+      "category": "query",
+      "description": "List and validate every chunk config under Content/Chunks for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_chunk_configs"
+    },
+    {
+      "type_name": "inspect_fluid_simulations",
+      "category": "query",
+      "description": "List and validate every fluid simulation config under Content/FluidSims for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_fluid_simulations"
+    },
+    {
+      "type_name": "inspect_gait_assets",
+      "category": "query",
+      "description": "List and validate every gait asset under Content/Animations for a project (structural diagnostics mirroring GaitAsset::l",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_gait_assets"
+    },
+    {
+      "type_name": "inspect_game_project",
+      "category": "query",
+      "description": "Inspect a project's portable manifest, scenes, scripts, assets, and validation status.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_game_project"
+    },
+    {
+      "type_name": "inspect_gi_configs",
+      "category": "query",
+      "description": "List and validate every GI config under Content/GI for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_gi_configs"
+    },
+    {
+      "type_name": "inspect_inventories",
+      "category": "query",
+      "description": "List and validate every inventory asset under Content/Inventories for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_inventories"
+    },
+    {
+      "type_name": "inspect_light_assets",
+      "category": "query",
+      "description": "List and validate every light asset under Content/Lights for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_light_assets"
+    },
+    {
+      "type_name": "inspect_mission_assets",
+      "category": "query",
+      "description": "List and validate every mission asset under Content/Missions for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_mission_assets"
+    },
+    {
+      "type_name": "inspect_ocean_configs",
+      "category": "query",
+      "description": "List and validate every ocean config under Content/Ocean for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_ocean_configs"
+    },
+    {
+      "type_name": "inspect_particle_assets",
+      "category": "query",
+      "description": "List and validate every particle asset under Content/Particles for a project (structural diagnostics mirroring create_pa",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_particle_assets"
+    },
+    {
+      "type_name": "inspect_post_processings",
+      "category": "query",
+      "description": "List and validate every post-processing config under Content/PostProcess for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_post_processings"
+    },
+    {
+      "type_name": "inspect_prefabs",
+      "category": "query",
+      "description": "List and validate every prefab under Content/Prefabs for a project (structural diagnostics: format/version/entities with",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_prefabs"
+    },
+    {
+      "type_name": "inspect_registry_assets",
+      "category": "query",
+      "description": "List and validate every registry asset (block/item/fluid/recipe/biome/structure) under Content/Registry for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_registry_assets"
+    },
+    {
+      "type_name": "inspect_render_graphs",
+      "category": "query",
+      "description": "List and validate every render graph asset under Content/RenderGraphs for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_render_graphs"
+    },
+    {
+      "type_name": "inspect_scene",
+      "category": "query",
+      "description": "Return a compact entity/component map for a project scene.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "scene",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_scene"
+    },
+    {
+      "type_name": "inspect_shader_assets",
+      "category": "query",
+      "description": "List and validate every shader asset under Content/Shaders for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_shader_assets"
+    },
+    {
+      "type_name": "inspect_simulation_lod_specs",
+      "category": "query",
+      "description": "List and validate every simulation LOD spec under Content/SimulationLod for a project (structural diagnostics mirroring ",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_simulation_lod_specs"
+    },
+    {
+      "type_name": "inspect_vehicle_assets",
+      "category": "query",
+      "description": "List and validate every vehicle assembly asset (rigid vehicle / beam) under Content/Vehicles for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_vehicle_assets"
+    },
+    {
+      "type_name": "inspect_world_assets",
+      "category": "query",
+      "description": "List and validate every world asset under Content/Worlds for a project.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_world_assets"
+    },
+    {
+      "type_name": "inspect_world_profile_assets",
+      "category": "query",
+      "description": "List and validate every world profile under Content/Profiles for a project (top-level structural diagnostics).",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.inspect_world_profile_assets"
+    },
+    {
+      "type_name": "instantiate_prefab",
+      "category": "authoring",
+      "description": "Insert a prefab (Content/Prefabs/<name>.prefab) into a target scene with FRESH UUIDs — internal Hierarchy.parent_id link",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "scene",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "prefab",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "offset",
+          "type": "Any",
+          "required": false
+        },
+        {
+          "name": "parent_id",
+          "type": "String",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.instantiate_prefab"
+    },
+    {
+      "type_name": "list_game_projects",
+      "category": "query",
+      "description": "List portable game projects authored under engine/Projects.",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.list_game_projects"
+    },
+    {
+      "type_name": "remove_component",
+      "category": "mutation",
+      "description": "Remove one component from a scene entity. Transform cannot be removed.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "scene",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "entity_id",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "component",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.remove_component"
+    },
+    {
+      "type_name": "remove_entity",
+      "category": "mutation",
+      "description": "Remove one entity from a scene by UUID, including hierarchy references to it.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "scene",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "entity_id",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.remove_entity"
+    },
+    {
+      "type_name": "run_batch",
+      "category": "semantic",
+      "description": "Transactional command bus: apply N authoring operations (author_registry_asset, author_vehicle_asset, author_ability_ass",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "operations",
+          "type": "Any",
+          "required": true
+        },
+        {
+          "name": "dry_run",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.run_batch"
+    },
+    {
+      "type_name": "set_component",
+      "category": "mutation",
+      "description": "Add or update one engine component on a scene entity. Values use the schema returned by game_capabilities.",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "scene",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "entity_id",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "component",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "values",
+          "type": "Any",
+          "required": true
+        },
+        {
+          "name": "replace",
+          "type": "Bool",
+          "required": false,
+          "default": "false"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.set_component"
+    },
+    {
+      "type_name": "stage_asset",
+      "category": "authoring",
+      "description": "Copy a source asset into a portable project Assets directory and write import metadata. Cooking remains the engine's res",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "source",
+          "type": "String",
+          "required": true
+        },
+        {
+          "name": "destination",
+          "type": "String",
+          "required": false
+        },
+        {
+          "name": "import_settings",
+          "type": "Any",
+          "required": false,
+          "default": "{}"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.stage_asset"
+    },
+    {
+      "type_name": "validate_game_project",
+      "category": "validation",
+      "description": "Validate the portable project, scenes, entity UUIDs, components, hierarchy, scripts, registry assets, and asset metadata",
+      "inputs": [
+        {
+          "name": "project",
+          "type": "String",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type": "Any",
+          "required": false
+        }
+      ],
+      "reflection_type": "semantic.validate_game_project"
+    }
+  ]
+}

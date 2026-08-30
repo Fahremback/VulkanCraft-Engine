@@ -418,7 +418,11 @@ void EditorApplication::create_offscreen_buffers(uint32_t w, uint32_t h) {
 void EditorApplication::create_shadow_map() {
     destroy_shadow_map();
     const VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
-    create_image(m_shadowMap.size, m_shadowMap.size, depthFormat,
+    // L47 cascatas: o mapa vira um atlas 2x2 (cada tile = m_shadowMap.size),
+    // com uma cascata por tile. O framebuffer cobre o atlas inteiro e cada
+    // cascata grava no seu viewport de tile dentro do mesmo render pass.
+    const uint32_t atlasSize = m_shadowMap.size * 2u;
+    create_image(atlasSize, atlasSize, depthFormat,
                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_shadowMap.image, m_shadowMap.memory);
     m_shadowMap.view = create_image_view(m_shadowMap.image, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
@@ -450,8 +454,8 @@ void EditorApplication::create_shadow_map() {
     fbInfo.renderPass = m_shadowMap.renderPass;
     fbInfo.attachmentCount = 1;
     fbInfo.pAttachments = &m_shadowMap.view;
-    fbInfo.width = m_shadowMap.size;
-    fbInfo.height = m_shadowMap.size;
+    fbInfo.width = m_shadowMap.size * 2u;
+    fbInfo.height = m_shadowMap.size * 2u;
     fbInfo.layers = 1;
     if (vkCreateFramebuffer(m_device, &fbInfo, nullptr, &m_shadowMap.framebuffer) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create shadow framebuffer");
@@ -920,12 +924,24 @@ void EditorApplication::init_scene_pipeline() {
     m_scenePipeline = create_scene_pipeline(m_device, m_offscreen.renderPass, m_scenePipelineLayout,
                                             m_viewportVertShader, m_viewportFragShader, m_viewportSamples,
                                             false, true, true);
+    // Selection outlines (wireframe boxes) and gizmos TEST depth (LEQUAL) like
+    // the grid: they win the coplanar tie with their own entity surface (drawn
+    // after -> equal depth passes, no z-fighting) but are occluded by real
+    // geometry in FRONT of them, so a wall between camera and the selected
+    // entity hides the outline/gizmo instead of drawing through it
+    // (agente4 C.3 "respeitar depth"). Same LEQUAL semantics as m_gridPipeline.
     m_wireframePipeline = create_scene_pipeline(m_device, m_offscreen.renderPass, m_scenePipelineLayout,
                                                 m_viewportVertShader, m_viewportFragShader, m_viewportSamples,
-                                                true, false, false);
+                                                true /*wireframe*/, true /*depthTest*/, false /*cull*/,
+                                                false, false, false,
+                                                true /*lessOrEqualDepth*/, false /*depthBias*/,
+                                                false /*depthWrite*/);
     m_gizmoPipeline = create_scene_pipeline(m_device, m_offscreen.renderPass, m_scenePipelineLayout,
                                             m_viewportVertShader, m_viewportFragShader, m_viewportSamples,
-                                            false, false, false);
+                                            false /*wireframe*/, true /*depthTest*/, false /*cull*/,
+                                            false, false, false,
+                                            true /*lessOrEqualDepth*/, false /*depthBias*/,
+                                            false /*depthWrite*/);
     // Pick stays 1x (its render pass is 1x — sample counts must match).
     m_pickPipeline = create_scene_pipeline(m_device, m_offscreen.pickRenderPass, m_scenePipelineLayout,
                                            m_viewportVertShader, m_pickFragShader, VK_SAMPLE_COUNT_1_BIT,
@@ -1322,6 +1338,30 @@ glm::mat4 editor_face_view_proj(int face, const glm::vec3& position, float range
 
 } // namespace
 
+// Direction the scene light points TOWARD (sun->scene), derived from the
+// editor-sensible convention that MOVING the directional light must visibly
+// change the illumination (it used to be rotation-only, so dragging the sun
+// icon had zero effect). The light looks from its world position back toward
+// the scene origin, so picking the sun up and placing it somewhere changes the
+// angle of the light. When the object sits at (or near) the origin there is no
+// meaningful look direction, so the classic yaw/pitch from rotation.y/x is
+// used as a fallback (keeps authored scenes that never moved the sun intact).
+// Declared in EditorApplication.hpp so the diffuse-light entry filler in
+// EditorApplicationAssets.cpp shares the exact same formula.
+glm::vec3 editor_sun_direction(const TransformComponent& t) {
+    const glm::vec3 p = t.position;
+    if (glm::length(p) > 1e-3f) {
+        // Light ray is sun -> scene, i.e. opposite the look-from vector
+        // (object position acts as the sun's world location).
+        return glm::normalize(-p);
+    }
+    const float yaw = glm::radians(t.rotation.y);
+    const float pitch = glm::radians(t.rotation.x);
+    return glm::normalize(glm::vec3(
+        std::cos(pitch) * std::sin(yaw), std::sin(pitch),
+        std::cos(pitch) * std::cos(yaw)));
+}
+
 // Depth-only render pass + comparison sampler, mirroring the sun map exactly
 // (final layout SHADER_READ_ONLY so the viewport can sample without barriers).
 // Defined at Engine scope to match the forward declarations at the top of this
@@ -1376,8 +1416,75 @@ void draw_line_list(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// L47 (reabertura): gera kShadowCascadeCount cascatas do sol para o editor.
+// Cada outVP[c] projeta o slice do frustum da câmera real em espaço de luz,
+// com profundidade remapeada para [0,1] (mesmo depthRemap do shadow pass).
+// outSplit[0..2] = view-depth splits (xyz do sunCascadeSplits). O atlas 2x2
+// é renderizado por cascata no lightBox viewport; o mesmo VP tile-local que
+// grava o tile é o que vai ao UBO (sunCascadeVP), pois o computeShadow do
+// shader aplica `suv = suv*0.5 + tileOff` a esse VP sem transforma extra.
+// ---------------------------------------------------------------------------
+static void editor_build_sun_cascades(const glm::vec3& camPos, const glm::vec3& camFront,
+                                      const glm::vec3& camUp, float aspect,
+                                      float fovDeg, float zNear, float zFar,
+                                      const glm::vec3& sunDir,
+                                      glm::mat4 outVP[Engine::Rendering::kShadowCascadeCount],
+                                      float outSplit[Engine::Rendering::kShadowCascadeCount - 1]) {
+    constexpr int kCC = Engine::Rendering::kShadowCascadeCount;
+    const float lambda = 0.5f;  // practical split (blend log/linear)
+    float splits[kCC + 1];
+    splits[0] = zNear;
+    for (int i = 1; i <= kCC; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(kCC);
+        const float plog = zNear * std::pow(zFar / zNear, t);
+        const float plin = zNear + (zFar - zNear) * t;
+        splits[i] = glm::mix(plin, plog, lambda);
+    }
+    for (int i = 0; i < kCC - 1; ++i) outSplit[i] = splits[i + 1];
+
+    const glm::vec3 F = glm::normalize(camFront);
+    const glm::vec3 R = glm::normalize(glm::cross(F, camUp));
+    const glm::vec3 U = glm::normalize(glm::cross(R, F));
+    const float tanHalfV = std::tan(glm::radians(fovDeg) * 0.5f);
+    const glm::vec3 L = glm::normalize(-sunDir);  // light travelling direction
+    const glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
+    glm::mat4 depthRemap(1.0f);
+    depthRemap[2][2] = 0.5f;
+    depthRemap[2][3] = 0.5f;
+
+    for (int c = 0; c < kCC; ++c) {
+        const float zn = splits[c], zf = splits[c + 1];
+        const float hn = tanHalfV * zn, wn = hn * aspect;
+        const float hf = tanHalfV * zf, wf = hf * aspect;
+        const glm::vec3 cn = camPos + F * zn, cf = camPos + F * zf;
+        glm::vec3 corners[8];
+        corners[0] = cn - R * wn - U * hn; corners[1] = cn + R * wn - U * hn;
+        corners[2] = cn + R * wn + U * hn; corners[3] = cn - R * wn + U * hn;
+        corners[4] = cf - R * wf - U * hf; corners[5] = cf + R * wf - U * hf;
+        corners[6] = cf + R * wf + U * hf; corners[7] = cf - R * wf + U * hf;
+        glm::vec3 center(0.0f);
+        for (int i = 0; i < 8; ++i) center += corners[i];
+        center /= 8.0f;
+        const glm::mat4 lightView = glm::lookAt(center + L * (zf - zn), center, worldUp);
+        glm::vec3 lmin(1e30f), lmax(-1e30f);
+        for (int i = 0; i < 8; ++i) {
+            const glm::vec4 lv = lightView * glm::vec4(corners[i], 1.0f);
+            lmin = glm::min(lmin, glm::vec3(lv));
+            lmax = glm::max(lmax, glm::vec3(lv));
+        }
+        // Em view space de luz, o lookAt olha para -z; converte o range para
+        // near/far positivos do ortho.
+        const float ortNear = glm::max(0.1f, -lmax.z);
+        const float ortFar = glm::max(ortNear + 1.0f, -lmin.z);
+        const glm::mat4 ortho = glm::ortho(lmin.x, lmax.x, lmin.y, lmax.y, ortNear, ortFar);
+        outVP[c] = depthRemap * ortho * lightView;
+    }
+}
+
 void EditorApplication::record_shadow_pass(VkCommandBuffer cmd, const Scene* scene) {
     m_shadowMap.enabled = false;
+    m_sunCascadeCount = 0u;
     if (m_shadowMap.pipeline == VK_NULL_HANDLE) return;
 
     // Sun direction from the scene's directional sun (or a fixed default).
@@ -1388,11 +1495,7 @@ void EditorApplication::record_shadow_pass(VkCommandBuffer cmd, const Scene* sce
             if (!is_directional_sun(light)) continue;
             const auto tit = scene->transformComponents.find(id);
             if (tit != scene->transformComponents.end()) {
-                const float yaw = glm::radians(tit->second.rotation.y);
-                const float pitch = glm::radians(tit->second.rotation.x);
-                sunDir = glm::normalize(glm::vec3(
-                    std::cos(pitch) * std::sin(yaw), std::sin(pitch),
-                    std::cos(pitch) * std::cos(yaw)));
+                sunDir = editor_sun_direction(tit->second);
             }
             hasSun = true;
             break;
@@ -1400,41 +1503,66 @@ void EditorApplication::record_shadow_pass(VkCommandBuffer cmd, const Scene* sce
     }
     if (!hasSun) return;
 
-    // Ortho fit around the camera, depth remapped to [0,1] so the shared
-    // computeShadow (sc.z in [0,1] after the divide) matches the stored depth.
-    const glm::vec3 lightDir = glm::normalize(-sunDir);
-    // Anchor the shadow projection to the orbit target instead of the camera
-    // position.  During a slow orbit the camera position changes every frame;
-    // fitting the shadow map to that moving point makes the sun/shadow sample
-    // slide across the world (the same shimmer that was visible in the grid).
-    // The target only changes on an actual pan, so illumination remains fixed
-    // while the user rotates or zooms the viewport camera.
-    const glm::vec3 center = m_editorCamera.orbitTarget;
-    constexpr float kExtent = 35.0f;
-    const glm::mat4 lightView = glm::lookAt(center + lightDir * 80.0f, center, glm::vec3(0, 1, 0));
-    const glm::mat4 lightProj = glm::ortho(-kExtent, kExtent, -kExtent, kExtent, 0.1f, 200.0f);
-    glm::mat4 depthRemap(1.0f);
-    depthRemap[2][2] = 0.5f;
-    depthRemap[2][3] = 0.5f;
-    m_shadowMap.viewProj = depthRemap * lightProj * lightView;
+    // L47 cascatas: 4 VPs + splits reais preenchidos (não mais só template).
+    // O atlas 2x2 (tile = m_shadowMap.size) recebe uma cascata por tile.
+    const float aspect = static_cast<float>(m_offscreen.width) / std::max(1u, m_offscreen.height);
+    const float cascadeFar = std::max(m_editorCamera.nearPlane + 1.0f, 350.0f);
+    float split[Engine::Rendering::kShadowCascadeCount - 1]{};
+    editor_build_sun_cascades(m_editorCamera.position, m_editorCamera.get_front(),
+                              m_editorCamera.get_up(), aspect,
+                              m_editorCamera.fov, m_editorCamera.nearPlane, cascadeFar,
+                              sunDir, m_sunCascadeVP, split);
+    m_sunCascadeSplits = glm::vec4(split[0], split[1], split[2],
+                                   static_cast<float>(Engine::Rendering::kShadowCascadeCount));
+    // Cascade 0 também alimenta o single-map de fallback (sunViewProj) dos
+    // shaders que não amostram cascatas (ex.: editor_viewport.frag). Como o
+    // mapa agora é um atlas 2x2 com a cascade0 no tile superior-esquerdo
+    // (UV [0,0.5]^2), o sunViewProj projeta a cascade0 nesse tile: escala x/y
+    // de 0.5 + translação -0.5 (z fica intacto p/ comparação de profundidade).
+    // sun_shadow do editor_viewport.frag usa suv.xy DIRETO como UV (espera
+    // [0,1]) — o VP antigo embutia o remap NDC->UV. Com o atlas 2x2 e a
+    // cascade0 no tile topo-esquerdo ([0,0.5]^2), o remap correto sobre o NDC
+    // [-1,1] da cascade0 é u = 0.25*ndc + 0.25 (scale 0.25, trans +0.25).
+    // (scale 0.5 + trans -0.5 daria [-1,0] e o check <0.002 apagaria a sombra
+    // sempre — corrigido aqui.)
+    glm::mat4 tile0ndc(1.0f);
+    tile0ndc[0][0] = 0.25f; tile0ndc[1][1] = 0.25f;
+    tile0ndc[3][0] = 0.25f; tile0ndc[3][1] = 0.25f;
+    m_shadowMap.viewProj = tile0ndc * m_sunCascadeVP[0];
+    m_sunCascadeCount = static_cast<std::uint32_t>(Engine::Rendering::kShadowCascadeCount);
     m_shadowMap.enabled = true;
 
+    const uint32_t tile = m_shadowMap.size;
+    const uint32_t atlas = tile * 2u;
     VkRenderPassBeginInfo info{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     info.renderPass = m_shadowMap.renderPass;
     info.framebuffer = m_shadowMap.framebuffer;
     info.renderArea.offset = { 0, 0 };
-    info.renderArea.extent = { m_shadowMap.size, m_shadowMap.size };
+    info.renderArea.extent = { atlas, atlas };
     VkClearValue clear;
     clear.depthStencil = { 1.0f, 0 };
     info.clearValueCount = 1;
     info.pClearValues = &clear;
     vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
-    set_viewport_scissor(cmd, m_shadowMap.size, m_shadowMap.size);
-    // Casters (BUG-EDITOR-SHADOWS-001): meshes + cube placeholders + terrain +
-    // voxel volumes — everything the scene pass draws as a real surface.
-    draw_shadow_casters(cmd, m_shadowMap.pipelineLayout, m_shadowMap.pipeline,
-                        VK_SHADER_STAGE_VERTEX_BIT, sizeof(glm::mat4), m_shadowMap.viewProj,
-                        nullptr, scene);
+    // Renderiza cada cascata no seu tile do atlas com o VP tile-local dela.
+    for (std::uint32_t c = 0; c < m_sunCascadeCount; ++c) {
+        VkViewport vp{};
+        vp.x = static_cast<float>((c % 2) * tile);
+        vp.y = static_cast<float>((c / 2) * tile);
+        vp.width = static_cast<float>(tile);
+        vp.height = static_cast<float>(tile);
+        vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        VkRect2D sc{};
+        sc.offset = { static_cast<int32_t>(vp.x), static_cast<int32_t>(vp.y) };
+        sc.extent = { tile, tile };
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+        // Casters (BUG-EDITOR-SHADOWS-001): meshes + cube placeholders + terrain
+        // + voxel volumes — tudo o que o scene pass desenha como superfície.
+        draw_shadow_casters(cmd, m_shadowMap.pipelineLayout, m_shadowMap.pipeline,
+                            VK_SHADER_STAGE_VERTEX_BIT, sizeof(glm::mat4), m_sunCascadeVP[c],
+                            nullptr, scene);
+    }
     vkCmdEndRenderPass(cmd);
 
     // BUG-EDITOR-SHADOWS-002: spot tiles and the point slot-0 face atlas ride
@@ -1457,10 +1585,7 @@ void collect_editor_shadow_lights(const Scene* scene, EditorShadowLightSlots& ou
         const auto tit = scene->transformComponents.find(id);
         if (tit != scene->transformComponents.end()) {
             position = tit->second.position;
-            const float yaw = glm::radians(tit->second.rotation.y);
-            const float pitch = glm::radians(tit->second.rotation.x);
-            dir = glm::normalize(glm::vec3(std::cos(pitch) * std::sin(yaw), std::sin(pitch),
-                                           std::cos(pitch) * std::cos(yaw)));
+            dir = editor_sun_direction(tit->second);
         }
         if (is_directional_sun(light)) {
             if (!out.sun) {
@@ -1682,10 +1807,7 @@ void EditorApplication::update_gi_probes(const Scene* scene) {
             if (!is_directional_sun(light)) continue;
             const auto tit = scene->transformComponents.find(id);
             if (tit != scene->transformComponents.end()) {
-                const float yaw = glm::radians(tit->second.rotation.y);
-                const float pitch = glm::radians(tit->second.rotation.x);
-                sunDir = glm::normalize(glm::vec3(std::cos(pitch) * std::sin(yaw), std::sin(pitch),
-                                                  std::cos(pitch) * std::cos(yaw)));
+                sunDir = editor_sun_direction(tit->second);
             }
             sunColor = light.color * (light.intensity / 10000.0f);
             hasSun = true;
@@ -1831,7 +1953,14 @@ void EditorApplication::update_shadow_ubo(const Scene* scene) {
 void EditorApplication::render_scene_to_offscreen(VkCommandBuffer cmd) {
     Scene* renderScene = m_playMode.get_active_scene();
     if (!renderScene) renderScene = m_editorScene.get();
+
+    // --- Render diagnostics (agente 4 §C/D): REAL per-pass CPU timings from
+    // the actual render loop recorded through the public IRenderPassMetrics
+    // consumer (a real call site in the frame loop, closed once per frame).
+    register_render_providers();
+    const auto t0 = std::chrono::steady_clock::now();
     record_shadow_pass(cmd, renderScene);
+    auto tShadow = std::chrono::steady_clock::now();
 
     build_viewport_render_graph();
     if (!m_viewportRenderGraphExecutor.valid() || m_offscreen.framebuffer == VK_NULL_HANDLE) return;
@@ -1851,9 +1980,24 @@ void EditorApplication::render_scene_to_offscreen(VkCommandBuffer cmd) {
     // pass, runs the content callback, ends — same executor the game uses.
     m_viewportRenderGraphExecutor.record(cmd, 0, { m_offscreen.width, m_offscreen.height });
 
+    auto tScene = std::chrono::steady_clock::now();
+
     // Env-probe cubemap capture: recorded AFTER the viewport pass so the
     // command buffer is free to open its own 6-face render passes.
     record_env_capture(cmd, renderScene);
+
+    auto tEnv = std::chrono::steady_clock::now();
+    if (m_renderMetrics) {
+        const auto ms = [](const auto& a, const auto& b) -> double {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        m_renderMetrics->recordPass("shadow", ms(t0, tShadow), 0.0);
+        m_renderMetrics->recordPass("scene", ms(tShadow, tScene), 0.0);
+        m_renderMetrics->recordPass("env", ms(tScene, tEnv), 0.0);
+        m_renderMetrics->recordMemory("viewport",
+            static_cast<std::uint64_t>(m_offscreen.width) * m_offscreen.height * 4);
+        m_renderMetrics->endFrame();
+    }
 }
 
 void EditorApplication::build_viewport_render_graph() {
@@ -1905,11 +2049,7 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                 if (!is_directional_sun(light)) continue;
                 const auto tit = renderScene->transformComponents.find(id);
                 if (tit != renderScene->transformComponents.end()) {
-                    const float yaw = glm::radians(tit->second.rotation.y);
-                    const float pitch = glm::radians(tit->second.rotation.x);
-                    sunDir = glm::normalize(glm::vec3(
-                        std::cos(pitch) * std::sin(yaw), std::sin(pitch),
-                        std::cos(pitch) * std::cos(yaw)));
+                    sunDir = editor_sun_direction(tit->second);
                 }
                 break;
             }
@@ -2274,6 +2414,31 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                                0, sizeof(spc), &spc);
             vkCmdDraw(cmd, cloud.count, 1, 0, 0);
         }
+    }
+
+    // Play-world particles (I.1): the ParticleSimulation's real per-particle
+    // render data (uploaded into m_playParticleVB by upload_play_particles)
+    // drawn as POINT_LIST through the splat pipeline — the sim's output
+    // reaches a real GPU pass. Positions are world-space, so mvp = viewProj.
+    if (m_splatPipeline != VK_NULL_HANDLE && m_playParticleVB.buffer != VK_NULL_HANDLE &&
+        m_playParticleVertexCount > 0) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_splatPipeline);
+        const VkDeviceSize off = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &m_playParticleVB.buffer, &off);
+        // Particle size from the real sim (uv.x carries size per particle);
+        // splat push takes a single px size — use the max over the frame.
+        float particleSizePx = 8.0f;
+        const std::vector<Engine::Gameplay::ParticleRenderData> pdata =
+            m_playParticles.render_data();
+        for (const Engine::Gameplay::ParticleRenderData& p : pdata) {
+            particleSizePx = std::max(particleSizePx, p.size * 32.0f);
+        }
+        const SplatPushConstants ppc{ viewProj,
+            glm::vec4(particleSizePx, static_cast<float>(m_offscreen.height), 1.0f, 0.0f) };
+        vkCmdPushConstants(cmd, m_splatPipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(ppc), &ppc);
+        vkCmdDraw(cmd, m_playParticleVertexCount, 1, 0, 0);
     }
 
     // Env probe: the captured cubemap previewed on a reflective sphere at the

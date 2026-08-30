@@ -10,6 +10,17 @@ namespace vc::rendering {
 
 static constexpr double PI = 3.14159265358979323846;
 
+bool Geodetic::operator==(const Geodetic& o) const {
+    // Compare component-wise. Radians/heights are exact doubles, so an exact
+    // comparison is meaningful; consumers doing fuzzy tolerance checks compare
+    // the numeric fields themselves.
+    return longitude == o.longitude && latitude == o.latitude && height == o.height;
+}
+
+bool EcefPosition::operator==(const EcefPosition& o) const {
+    return x == o.x && y == o.y && z == o.z;
+}
+
 // ─── Config ───────────────────────────────────────
 
 bool EllipsoidConfig::validate() const {
@@ -41,8 +52,6 @@ public:
           a2_(cfg.semiMajorAxis * cfg.semiMajorAxis),
           b2_(cfg.semiMinorAxis * cfg.semiMinorAxis),
           e2_((a2_ - b2_) / a2_) {} // Eccentricity squared.
-
-    bool operator==(const Geodetic& o) const { return false; } // stub
 
     EcefPosition geodeticToEcef(const Geodetic& geo) const override {
         double cosLat = std::cos(geo.latitude);

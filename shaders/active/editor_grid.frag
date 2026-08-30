@@ -115,12 +115,33 @@ void main() {
     // distance cutoff — it runs to the horizon.
     // ----------------------------------------------------------------------
     vec3 rayOrigin = nearPoint;
-    vec3 rayDirection = farPoint - nearPoint;
+    // BUG-EDITOR-GRID-005 (orbit jitter): the ray target is unprojected from
+    // clipZ = 1.0, i.e. the FULL far plane (farPlane = 50000 by default). That
+    // target can sit tens of thousands of units away, and fp32 keeps only ~1e-7
+    // RELATIVE precision there. Rotating the camera perturbs the far corners by
+    // a few ULPs of a huge number, and subtracting farPoint - nearPoint spreads
+    // that absolute error into every component of the intersection point -- so
+    // the analytic grid shivers while meshes (which project precise local
+    // vertices) stay rock solid. Fix: normalize the direction FIRST and do all
+    // of the remaining math on a unit vector, so the magnitude-50000 error is
+    // confined to the initial normalize instead of leaking into t and p.
+    vec3 rawDir = farPoint - nearPoint;
+    float rawLen = length(rawDir);
+    vec3 rayDirection = rawLen > 1e-9 ? (rawDir / rawLen) : vec3(0.0, -1.0, 0.0);
+
+    // A1-G-GRID-RIGHT-SKEW-UNDERSIDE (underside face): the grid plane only
+    // exists on the side facing UP. A ray striking Y=0 from BELOW (camera
+    // under the plane looking up) must produce NO grid. The plane is only
+    // visible when the view ray is travelling downward, i.e. its Y component
+    // is strictly negative. Requiring rayDirection.y < -epsilon rejects the
+    // underside entirely; those fragments get zero alpha and background depth
+    // (handled by `valid` below). t >= 0 keeps the intersection in front of
+    // the camera.
     float denom = rayDirection.y;
-    bool valid = abs(denom) > 1e-6;
-    float safeDenom = valid ? denom : 1.0;
+    bool above = denom < -1e-6;            // striking from above -> ray points down
+    float safeDenom = above ? denom : -1.0;
     float t = -rayOrigin.y / safeDenom;
-    valid = valid && t >= 0.0;
+    bool valid = above && t >= 0.0;
     float safeT = valid ? t : 0.0; // keep the ray math finite for the quad
 
     vec3 p = rayOrigin + safeT * rayDirection;
@@ -143,7 +164,9 @@ void main() {
     // already retires every frequency before it reaches the subpixel zone, so
     // no radial MAX_DISTANCE cutoff is needed — the grid is infinite.
     // ----------------------------------------------------------------------
-    vec3 ray = normalize(farPoint - nearPoint);
+    // Reuse the direction normalized above (identical ray, no second
+    // large-difference normalize).
+    vec3 ray = rayDirection;
     float incidence = abs(ray.y);
     if (isnan(incidence) || isinf(incidence)) incidence = 1.0;
     float horizonFade = smoothstep(0.001, 0.006, incidence);
@@ -193,10 +216,20 @@ void main() {
     // camera moved slowly.  Project the actual point with the same matrix as
     // the scene.  Vulkan raster depth is already clip.z / clip.w (0..1).
     // ----------------------------------------------------------------------
+    // Depth derived EXACTLY from the scene's view-projection (A1-G: grid depth
+    // participation). Underside/invalid fragments write the background depth so
+    // they never occlude the world and produce no grid below the plane.
     vec4 clipPoint = pc.viewProj * vec4(p, 1.0);
     float safeClipW = abs(clipPoint.w) > 1e-6 ? clipPoint.w : 1.0;
     float gridDepth = clipPoint.z / safeClipW;
-    if (!valid || isnan(gridDepth) || isinf(gridDepth)) gridDepth = 1.0;
+    if (!valid || isnan(gridDepth) || isinf(gridDepth)) {
+        // Background depth: no grid, no occlusion from below.
+        gl_FragDepth = 1.0;
+        // Premultiplied alpha — matches the grid pipeline blend
+        // (srcColor = ONE, dstColor = ONE_MINUS_SRC_ALPHA).
+        outColor = vec4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
 
     // ----------------------------------------------------------------------
     // BUG-EDITOR-GRID-003 (coplanar tie dance): geometry that lies EXACTLY on
@@ -215,6 +248,7 @@ void main() {
     // any range — never visible against geometry that is actually in front.
     // ----------------------------------------------------------------------
     gridDepth -= gridDepth * 1.2e-6;
+    if (isnan(gridDepth) || isinf(gridDepth)) gridDepth = 1.0;
     gl_FragDepth = clamp(gridDepth, 0.0, 1.0);
 
     // Premultiplied alpha — matches the grid pipeline blend

@@ -158,6 +158,30 @@ int main() {
         CHECK(e1.x == e2.x && e1.y == e2.y && e1.z == e2.z, "deterministic ECEF");
     }
 
+    // 15. Geodetic/Ecef operator== (declared in the public contract; previously
+    // only a fake private stub returned false, and the struct operators were
+    // declared but never defined).
+    std::printf("[ellipsoid] test equality operators\n");
+    {
+        CHECK(Geodetic{} == Geodetic{}, "default geodetic equal");
+        CHECK(!(Geodetic{} != Geodetic{}), "default geodetic not-unequal");
+        Geodetic a; a.longitude = 1.0; a.latitude = 0.5; a.height = 10.0;
+        Geodetic b = a;
+        CHECK(a == b, "copied geodetic equal");
+        Geodetic c = a; c.height = 11.0;
+        CHECK(a != c, "different height unequal");
+        Geodetic d = a; d.latitude = -0.5;
+        CHECK(a != d, "different latitude unequal");
+        Geodetic e = a; e.longitude = 2.0;
+        CHECK(a != e, "different longitude unequal");
+
+        CHECK(EcefPosition{} == EcefPosition{}, "default ecef equal");
+        EcefPosition p{ 1.0, 2.0, 3.0 };
+        CHECK(p == EcefPosition{ 1.0, 2.0, 3.0 }, "ecef componentwise equal");
+        CHECK(p != EcefPosition{ 1.0, 2.0, 4.0 }, "ecef z unequal");
+        CHECK(p != EcefPosition{ 1.0, 3.0, 3.0 }, "ecef y unequal");
+    }
+
     std::printf("\n[ellipsoid] Results: %d passed, %d failed\n", g_passed, g_failed);
     if (g_failed > 0) { std::printf("[ellipsoid] FAILED\n"); return 1; }
     std::printf("[ellipsoid] ALL PASSED\n");

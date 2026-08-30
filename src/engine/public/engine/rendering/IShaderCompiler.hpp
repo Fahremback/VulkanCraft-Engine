@@ -20,6 +20,8 @@ enum class ShaderStage : uint32_t {
     Vertex   = 0x00000001,
     Fragment = 0x00000004,
     Compute  = 0x00000020,
+    Task     = 0x00000040,   // VK_SHADER_STAGE_TASK_BIT_EXT (GL_EXT_mesh_shader)
+    Mesh     = 0x00000080,   // VK_SHADER_STAGE_MESH_BIT_EXT (GL_EXT_mesh_shader)
 };
 
 // Compilation configuration — all-or-nothing (NaN/limits refused).

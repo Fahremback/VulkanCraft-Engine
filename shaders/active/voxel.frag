@@ -16,12 +16,38 @@ layout (binding = 3) uniform sampler2DShadow shadowMap;
 layout (binding = 4) uniform sampler2D opaqueSceneSampler;
 layout (binding = 5) uniform sampler2D opaqueDepthSampler;
 
+// GPU feature contract (set 1): same layout as GpuRenderFeatures. material.y
+// carries the materialShading interior ambient floor so enclosed spaces stay
+// "really dark" without ever collapsing to pitch black, while exterior
+// exposure is untouched (the floor only lifts the ambient when sky visibility
+// is near zero). Declared only here — other shaders sharing the pipeline
+// layout simply don't statically use this set.
+layout (set = 1, binding = 0) uniform GpuFeaturesBlock {
+    vec4 gi;
+    vec4 reflections;
+    vec4 atmosphere;
+    vec4 temporal;
+    vec4 debug;
+    vec4 fluids;
+    vec4 vfx;
+    vec4 material;    // x data-driven fraction, y interior ambient floor, z variant seed, w subsurface max
+    vec4 debugCounts;
+    vec4 extent;
+} gpuFeatures;
+
 layout (push_constant) uniform PushConstants {
     mat4 mvp;
     vec4 cameraPos;
     vec4 sunDirection;
     vec4 sunColor;
     vec4 environment;
+    // L45 (reabertura): luzes point/spot reais do jogo (2 point + 1 spot).
+    vec4 pointLightPos[2];
+    vec4 pointLightColor[2];
+    vec4 spotLightPos;
+    vec4 spotLightDir;
+    vec4 spotLightParam;
+    vec4 spotLightColor;
 } push;
 
 const float PI = 3.14159265359;
@@ -503,6 +529,39 @@ void main() {
         vec3 color = mix(transmittedColor, reflectionColor, reflectionWeight);
         color *= mix(.66,1.0,shadowVisibility);
         if (waterfall) color = mix(color, scattering*1.35 + reflectionColor*.22, .34);
+
+        // F.1 espuma/bordas: onde a coluna d'água real é rasa (costa, obstáculos,
+        // queda de cachoeira) as ondas quebram em espuma animada. `columnDepth`
+        // vem do fundo opaco real (reconstruído do depth buffer), então a espuma
+        // acompanha a batimetria verdadeira em vez de um padrão sintético; o
+        // movimento vem do relógio do mundo (push.environment.x) em duas escalas
+        // para não congelar nem estriar. Aerial LOD suprime para a superfície
+        // distante não virar uma malha branca por aliasing.
+        float shoreFoam = 1.0 - smoothstep(0.55, 3.6, columnDepth);
+        // L75 (reabertura): o simulador fluido alimenta a água visível pela
+        // primeira vez — gpuFeatures.fluids.w = magnitude do fluxo real e
+        // .z = nível real. Transporte: a velocidade de fase da espuma acelera
+        // com o fluxo (advecta), e a magnitude também modula a cobertura da
+        // espuma e a turbulência; o nível real afina a faixa de quebra da costa.
+        float realFlow = clamp(gpuFeatures.fluids.w, 0.0, 1.0);
+        float realLevel = clamp(gpuFeatures.fluids.z, 0.0, 1.0);
+        float foamAdvect = push.environment.x * (1.2 + realFlow * 3.2);
+        float foamWaveA = 0.5 + 0.5 * sin(fragWorldPos.x * 1.55 + fragWorldPos.z * 1.18 - foamAdvect * 1.9);
+        float foamWaveB = 0.5 + 0.5 * sin(fragWorldPos.z * 2.31 - fragWorldPos.x * 0.87 + foamAdvect * 2.7);
+        float foamMask = shoreFoam * mix(0.85, 1.3, realFlow)
+                       * pow(clamp(foamWaveA * foamWaveB, 0.0, 1.0), 2.2);
+        // Nível real: quando o simulador está cheio (flood), a faixa de quebra
+        // da costa afunda (a água cobre o fundo raso), reduzindo a espuma de
+        // borda conforme realLevel 0..1.
+        foamMask *= 1.0 - smoothstep(0.7, 1.0, realLevel);
+        if (waterfall) {
+            // Base da queda: espuma contínua onde a água aterrissa.
+            foamMask = max(foamMask, smoothstep(0.35, 1.6, opticalDepth) * 0.45);
+        }
+        foamMask *= (1.0 - aerialWaterLod) * surfaceLight * shadowVisibility;
+        foamMask = clamp(foamMask, 0.0, 1.0);
+        vec3 foamTint = srgbToLinear(vec3(205.0, 224.0, 232.0) / 255.0);
+        color = mix(color, foamTint, foamMask * 0.8);
         // Alpha > 1 marca a superfície para o pós-processamento sem alterar RGB.
         outColor = vec4(max(color, vec3(0.0)), 2.0);
         return;
@@ -662,6 +721,15 @@ void main() {
     vec3 nightSkyLight = vec3(.018,.032,.075)*skylightDirection;
     vec3 daySkyLight = vec3(.115,.165,.225)*skylightDirection;
     vec3 ambient = baseColor*mix(nightSkyLight,daySkyLight,push.environment.y)*ao;
+    // D.7: interior policy — enclosed spaces (sky visibility near zero) keep a
+    // small configured floor (gpuFeatures.material.y, 0.02 by default) so they
+    // render "really dark" but never collapse to pure black; the floor only
+    // engages when the surface barely sees the sky, so exterior exposure is
+    // not destroyed by the clamp.
+    float interiorFloor = max(gpuFeatures.material.y, 0.0);
+    float skyVisibility = max(skylightDirection, ambientCoefficients.y);
+    float enclosed = smoothstep(0.12, 0.03, skyVisibility);
+    ambient = max(ambient, baseColor * interiorFloor * enclosed);
     float groundFacing = pow(clamp(-flatNormal.y,0.0,1.0),.45);
     vec3 groundBounce = mix(vec3(.018,.014,.012),vec3(.105,.077,.043),push.environment.y);
     ambient += baseColor*groundBounce*(.18+groundFacing*.82)*ao;
@@ -685,8 +753,54 @@ void main() {
     }
     if (isGrassBlade) ambient = baseColor * mix(vec3(.020,.043,.030),vec3(.105,.155,.075),push.environment.y);
     float directShadow = isPlayerSkin ? mix(.30,1.0,shadowVisibility) : mix(.075,1.0,shadowVisibility);
+    // L73 (reabertura): sombras de nuvem no mundo. A cobertura agora vem do
+    // CAMPO DE OCLUSÃO REAL do IVolumeClouds (gpuFeatures.atmosphere.z): uma
+    // marcha vertical do núcleo por célula do grid ao redor da câmera, acumulada
+    // com reprojeção temporal e invalidada em resize/corte/teleport/rebase
+    // (NUNCA a antiga flag de presença `cloudAmbient`). O padrão espacial de
+    // baixa frequência no espaço do mundo projeta essa oclusão real, e a
+    // suavização da borda usa a confiança de reprojeção temporal (temporal.x,
+    // a convergência real do denoiser, que é zerada nos MESMOS eventos que o
+    // campo de nuvem) — amacia a borda conforme o histórico converge.
+    if (!isViewModel) {
+        float cloudCoverage = clamp(gpuFeatures.atmosphere.z, 0.0, 1.0);
+        float cloudPattern = 0.5 + 0.5 * sin(fragWorldPos.x * 0.0081 + fragWorldPos.z * 0.0063)
+                                   * cos(fragWorldPos.z * 0.0047 - fragWorldPos.x * 0.0092);
+        float cloudShadow = mix(1.0, 0.38, cloudCoverage * smoothstep(0.32, 0.82, cloudPattern));
+        cloudShadow = mix(cloudShadow, 1.0, clamp(gpuFeatures.temporal.x, 0.0, 1.0) * 0.45);
+        directShadow *= cloudShadow;
+    }
     ambient *= mix(.62,1.0,shadowVisibility);
-    vec3 color = ambient + (diffuse + specular) * sunColor * ndl * directShadow * 1.28;
+    vec3    color = ambient + (diffuse + specular) * sunColor * ndl * directShadow * 1.28;
+    // L45 (reabertura): luzes point/spot REAIS do jogo — atenuação quadrática
+    // por range + cone cos(inner/outer) do spot, acumuladas no BRDF difuso+
+    // especular igual ao sol (real, não sintético).
+    for (int i = 0; i < 2; ++i) {
+        if (push.pointLightColor[i].w <= 0.5) continue;
+        vec3 toL = push.pointLightPos[i].xyz - fragWorldPos;
+        float dist = length(toL);
+        float range = max(push.pointLightPos[i].w, 0.01);
+        if (dist > range) continue;
+        vec3 lightDirP = toL / max(dist, 0.001);
+        float att = max(1.0 - (dist * dist) / (range * range), 0.0);
+        float ndlP = max(dot(normal, lightDirP), 0.0);
+        color += (diffuse + specular * 0.6) * push.pointLightColor[i].rgb * ndlP * att;
+    }
+    if (push.spotLightColor.w > 0.5 && push.spotLightDir.w > 0.5) {
+        vec3 toL = push.spotLightPos.xyz - fragWorldPos;
+        float dist = length(toL);
+        float range = max(push.spotLightPos.w, 0.01);
+        if (dist <= range) {
+            vec3 lightDirP = toL / max(dist, 0.001);
+            float cosAng = dot(-lightDirP, normalize(push.spotLightDir.xyz));
+            float cosInner = max(push.spotLightParam.x, 0.0);
+            float cosOuter = max(push.spotLightParam.y, cosInner + 0.001);
+            float cone = clamp((cosAng - cosOuter) / (cosInner - cosOuter), 0.0, 1.0);
+            float att = max(1.0 - (dist * dist) / (range * range), 0.0);
+            float ndlP = max(dot(normal, lightDirP), 0.0);
+            color += (diffuse + specular * 0.6) * push.spotLightColor.rgb * ndlP * att * cone * cone;
+        }
+    }
     color += baseColor * vec3(0.28, 0.22, 0.10) * max(-dot(normal, sunDir), 0.0) * subsurface;
     color += baseColor * emission * 4.0;
 

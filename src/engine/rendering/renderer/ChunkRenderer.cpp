@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <vector>
 
 ChunkRenderResource* ChunkRenderer::find(ChunkId id) {
     const auto found = resources_.find(id);
@@ -84,9 +85,10 @@ void ChunkRenderer::upload(ChunkMeshResult result, VkDevice device, VmaAllocator
     resource.grassInstanceCount = mesh.pendingGrassInstanceCount;
     resource.foliageInstanceCount = mesh.pendingFoliageInstanceCount;
     // The mesh snapshot is already resolved from the registry on the worker;
-    // retain a stable count for GPU/debug telemetry without re-reading the
-    // registry from the render thread.
-    resource.materialVariantCount = resource.vertexCount > 0 ? 1u : 0u;
+    // expose the REAL material variant list the mesher deduped (resolver-
+    // compatible keys, embedded at dispatch). The GPU material buffer carries
+    // these actual registry-derived variants instead of a synthetic count.
+    resource.materialVariantCount = static_cast<uint32_t>(mesh.materialVariants.size());
     resource.materialRecordCount = resource.materialVariantCount;
     if (resource.materialRecordCount > 0) {
         VkBufferCreateInfo materialInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -99,12 +101,16 @@ void ChunkRenderer::upload(ChunkMeshResult result, VkDevice device, VmaAllocator
                                  &resource.materialBuffer, &resource.materialAllocation, nullptr));
         void* materialMapped = nullptr;
         VK_CHECK(vmaMapMemory(allocator, resource.materialAllocation, &materialMapped));
-        const glm::vec4 materialRecord(
-            static_cast<float>(resource.dynamicMaterialVertexCount),
-            static_cast<float>(resource.emissiveVertexCount),
-            static_cast<float>(resource.vertexCount), 1.0f);
-        std::memcpy(materialMapped, &materialRecord, sizeof(materialRecord));
-        VK_CHECK(vmaFlushAllocation(allocator, resource.materialAllocation, 0, sizeof(materialRecord)));
+        // Host-visible staging copy of the distinct variant keys (u32 each
+        // viewed as a single vec4 channel per record).
+        std::vector<glm::vec4> records;
+        records.reserve(mesh.materialVariants.size());
+        for (const std::uint32_t key : mesh.materialVariants) {
+            records.push_back(glm::vec4(static_cast<float>(key), 0.0f, 0.0f, 1.0f));
+        }
+        std::memcpy(materialMapped, records.data(), records.size() * sizeof(glm::vec4));
+        VK_CHECK(vmaFlushAllocation(allocator, resource.materialAllocation, 0,
+                                    records.size() * sizeof(glm::vec4)));
         vmaUnmapMemory(allocator, resource.materialAllocation);
     }
     resource.dynamicMaterialVertexCount = 0u;

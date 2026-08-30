@@ -75,7 +75,16 @@ void ParticleSimulation::spawn(EmitterSlot& slot) {
     freeParticles_.pop_back();
     Particle& particle = particles_[index];
     const auto& emitter = slot.description;
-    particle.position = particle.previousPosition = emitter.position;
+    if (emitter.positionSpread > 0.0f) {
+        // Uniform disc of `positionSpread` around the emitter position — wide
+        // spawn regions (rain/dust) need no grid of point emitters.
+        const float azimuth = random_unit() * glm::two_pi<float>();
+        const float radius = emitter.positionSpread * std::sqrt(random_unit());
+        particle.position = particle.previousPosition =
+            emitter.position + glm::vec3(std::cos(azimuth) * radius, 0.0f, std::sin(azimuth) * radius);
+    } else {
+        particle.position = particle.previousPosition = emitter.position;
+    }
     particle.velocity = random_direction(emitter.direction, emitter.coneAngle) * glm::mix(emitter.speedMin, emitter.speedMax, random_unit());
     particle.color = emitter.colorStart;
     particle.size = emitter.sizeStart;

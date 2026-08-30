@@ -2,6 +2,8 @@
 #include "engine/gameplay/IGameplayEventRouter.hpp"
 #include "engine/gameplay/IGameplaySystemWiring.hpp"
 
+#include <glm/glm.hpp>
+
 #include <algorithm>
 #include <cmath>
 
@@ -50,6 +52,12 @@ public:
         return true;
     }
 
+    bool set_world_focus(float x, float y, float z) override {
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
+        worldFocus_ = glm::vec3(x, y, z);
+        return true;
+    }
+
     void advance(float deltaSeconds) override {
         if (!std::isfinite(deltaSeconds) || deltaSeconds <= 0.0f || fixedDelta_ <= 0.0f) return;
         accumulator_ = std::min(accumulator_ + deltaSeconds, fixedDelta_ * 8.0f);
@@ -65,7 +73,7 @@ public:
             }
             if (worlds_) {
                 for (const auto& name : worlds_->world_names()) {
-                    worlds_->update_world(name, glm::vec3(0.0f), fixedDelta_);
+                    worlds_->update_world(name, worldFocus_, fixedDelta_);
                 }
             }
             if (router_) {
@@ -123,6 +131,7 @@ private:
     IGameplayEventRouter* router_{nullptr};
     IGameplaySystemWiring* systemWiring_{nullptr};
     float fixedDelta_{1.0f / 60.0f};
+    glm::vec3 worldFocus_{0.0f};
     std::size_t queryBudget_{1};
     float accumulator_{0.0f};
     std::uint64_t tick_{0};

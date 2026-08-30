@@ -8,11 +8,12 @@ import { existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
 const ROOT = process.cwd();
+import { resolveExe } from './exe-resolve.mjs';
 const CURL = join(ROOT, 'external', 'solutions', 'curl');
 const INCLUDE = join(CURL, 'include');
 const PROBE = join(ROOT, 'tools', 'portability', 'curl-probe.c');
 const LIB = join(CURL, 'build-gate', 'lib', 'Release', 'libcurl.lib');
-const EXE = join(ROOT, 'build', 'Release', 'curl-probe.exe');
+const EXE = resolveExe(ROOT, 'curl-probe');
 
 if (!existsSync(LIB)) {
   console.error('[curl-gate] FAIL: static lib missing — build it with:');

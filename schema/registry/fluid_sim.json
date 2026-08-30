@@ -14,16 +14,6 @@
       "default": 1,
       "type": "integer"
     },
-    "grid_size": {
-      "description": "NxN heightfield, > 0",
-      "default": 64,
-      "type": "integer"
-    },
-    "cell_size": {
-      "description": "world units per cell, > 0",
-      "default": 1,
-      "type": "number"
-    },
     "gravity": {
       "description": "> 0",
       "default": 9.81,
@@ -33,11 +23,6 @@
       "description": "time step, > 0",
       "default": 0.0166667,
       "type": "number"
-    },
-    "solver_iterations": {
-      "description": "Jacobi iterations per step, > 0",
-      "default": 4,
-      "type": "integer"
     },
     "damping": {
       "description": "velocity damping [0, 1]",
@@ -49,7 +34,22 @@
       "default": 0.001,
       "type": "number"
     },
-    "surface_tension": {
+    "gridSize": {
+      "description": "NxN heightfield, > 0",
+      "default": 64,
+      "type": "integer"
+    },
+    "cellSize": {
+      "description": "world units per cell, > 0",
+      "default": 1,
+      "type": "number"
+    },
+    "solverIterations": {
+      "description": "Jacobi iterations per step, > 0",
+      "default": 4,
+      "type": "integer"
+    },
+    "surfaceTension": {
       "description": "surface tension coefficient >= 0",
       "default": 0,
       "type": "number"

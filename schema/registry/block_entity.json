@@ -14,20 +14,6 @@
       "default": 1,
       "type": "integer"
     },
-    "type_id": {
-      "description": "stable namespaced type id, e.g. 'project:furnace'",
-      "type": "string"
-    },
-    "data_version": {
-      "description": "project-owned data version >= 1",
-      "default": 1,
-      "type": "integer"
-    },
-    "script_id": {
-      "description": "optional project-owned script id (e.g. 'project:door_open')",
-      "default": "",
-      "type": "string"
-    },
     "components": {
       "description": "[{ type: inventory|script|custom, version, blob (opaque payload string) }]",
       "default": [],
@@ -35,10 +21,24 @@
       "items": {
         "type": "object"
       }
+    },
+    "typeId": {
+      "description": "stable namespaced type id, e.g. 'project:furnace'",
+      "type": "string"
+    },
+    "dataVersion": {
+      "description": "project-owned data version >= 1",
+      "default": 1,
+      "type": "integer"
+    },
+    "scriptId": {
+      "description": "optional project-owned script id (e.g. 'project:door_open')",
+      "default": "",
+      "type": "string"
     }
   },
   "required": [
     "name",
-    "type_id"
+    "typeId"
   ]
 }

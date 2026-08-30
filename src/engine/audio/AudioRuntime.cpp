@@ -395,8 +395,16 @@ bool Mixer::is_active(VoiceId id) const noexcept {
 void Mixer::render_voice(Voice& voice, std::span<float> destination, std::size_t frameCount) {
     if (voice.description.clip) {
         auto snap = voice.description.clip->snapshot();
-        if (!snap || snap->samples.empty()) return;
+        if (!snap || snap->samples.empty()) {
+            voice.level = 0.0f;
+            return;
+        }
         
+        // Live per-voice level meter: RMS of the samples actually written to
+        // this block (post-gain, post-pan). Read by voice_level() on the
+        // game/editor thread to drive audio-linked particles/effects.
+        double sumSq = 0.0;
+        std::size_t writtenSamples = 0;
         std::size_t srcChannels = snap->channels;
         for (std::size_t i = 0; i < frameCount; ++i) {
             std::size_t idx = static_cast<std::size_t>(voice.cursor);
@@ -426,14 +434,31 @@ void Mixer::render_voice(Voice& voice, std::span<float> destination, std::size_t
             }
             
             float totalGain = voice.description.gain * distanceGain;
-            destination[i * outputChannels_] += sampleL * totalGain;
+            const float writtenL = sampleL * totalGain;
+            destination[i * outputChannels_] += writtenL;
+            sumSq += static_cast<double>(writtenL) * writtenL;
+            ++writtenSamples;
             if (outputChannels_ > 1) {
-                destination[i * outputChannels_ + 1] += sampleR * totalGain;
+                const float writtenR = sampleR * totalGain;
+                destination[i * outputChannels_ + 1] += writtenR;
+                sumSq += static_cast<double>(writtenR) * writtenR;
+                ++writtenSamples;
             }
             
             voice.cursor += voice.description.pitch;
         }
+        voice.level = writtenSamples > 0
+            ? static_cast<float>(std::sqrt(sumSq / static_cast<double>(writtenSamples)))
+            : 0.0f;
+    } else {
+        voice.level = 0.0f;
     }
+}
+
+float Mixer::voice_level(VoiceId id) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = voices_.find(id);
+    return it != voices_.end() && it->second.active ? it->second.level : 0.0f;
 }
 
 bool Mixer::bus_exists(BusId id) const noexcept {

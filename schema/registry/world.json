@@ -19,18 +19,8 @@
       "default": 0,
       "type": "integer"
     },
-    "rules_json": {
-      "description": "optional opaque rules document (must be well-formed JSON when non-empty)",
-      "default": "",
-      "type": "string"
-    },
     "profile": {
       "description": "name of a world profile asset in Content/Profiles (WorldSpec.profileJson)",
-      "default": "",
-      "type": "string"
-    },
-    "save_path": {
-      "description": "default persistence location for load_world/save_world",
       "default": "",
       "type": "string"
     },
@@ -41,6 +31,16 @@
       "items": {
         "type": "object"
       }
+    },
+    "rulesJson": {
+      "description": "optional opaque rules document (must be well-formed JSON when non-empty)",
+      "default": "",
+      "type": "string"
+    },
+    "savePath": {
+      "description": "default persistence location for load_world/save_world",
+      "default": "",
+      "type": "string"
     }
   },
   "required": [

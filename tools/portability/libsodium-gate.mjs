@@ -10,11 +10,12 @@ import { existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
 const ROOT = process.cwd();
+import { resolveExe } from './exe-resolve.mjs';
 const SODIUM = join(ROOT, 'external', 'solutions', 'libsodium');
 const INCLUDE = join(SODIUM, 'src', 'libsodium', 'include');
 const PROBE = join(ROOT, 'tools', 'portability', 'libsodium-probe.cpp');
 const LIB = join(SODIUM, 'bin', 'x64', 'Release', 'v143', 'static', 'libsodium.lib');
-const EXE = join(ROOT, 'build', 'Release', 'libsodium-probe.exe');
+const EXE = resolveExe(ROOT, 'libsodium-probe');
 
 if (!existsSync(LIB)) {
   console.error('[libsodium-gate] FAIL: static lib missing — build it with the MSVC solution:');

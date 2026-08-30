@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { callSemanticTool, semanticToolDefinitions, listProjects, inspectProject } from "./game-authoring.mjs";
 import { callControlApiTool, controlApiToolDefinitions } from "./control-api.mjs";
 import { callPublicRuntimeTool, publicRuntimeTools } from "./contract-runtime.mjs";
+import { createJobManager } from "./authoring-jobs.mjs";
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ENGINE_ROOT = path.resolve(SERVER_DIR, "..", "..");
@@ -394,17 +395,35 @@ function createFile(args) {
 const GAME_RUN_ROOT = path.join(ENGINE_ROOT, "Projects", ".runs");
 // Build root is repo-relative and overridable via VC_BUILD_DIR — the same
 // convention used by fast-gate.mjs / freshness-gate.mjs / ci-matrix.mjs /
-// build-shared.ps1, so the server works against any agent's tree (default
-// `build/`, the legacy main tree). Multi-config generators put binaries in
-// <root>/Release/...; single-config trees keep them at the root.
-const BUILD_REL = process.env.VC_BUILD_DIR || "build";
-const RUNNABLE_EXES = new Map([
-  ["VulkanEngineGame", `${BUILD_REL}/Release/VulkanEngineGame.exe`],
-  ["VulkanEngineEditor", `${BUILD_REL}/Release/VulkanEngineEditor.exe`],
-  ["VulkanEngineServer", `${BUILD_REL}/Release/VulkanEngineServer.exe`],
-  ["VulkanEngineCooker", `${BUILD_REL}/Release/VulkanEngineCooker.exe`],
-  ["vulkan_craft", `${BUILD_REL}/Release/vulkan_craft.exe`]
+// build-shared.ps1, so the server works against any agent's
+// tree. The canonical shared tree is `out/dev-shared` (single-config Ninja,
+// binaries at the root); older multi-config generators place them in
+// <root>/Release/. `resolveExePath` falls back across both layouts so run_game
+// and package_game work no matter which generator produced the tree.
+const BUILD_REL = process.env.VC_BUILD_DIR || "out/dev-shared";
+const RUNNABLE_NAMES = new Set([
+  "VulkanEngineGame", "VulkanEngineEditor", "VulkanEngineServer",
+  "VulkanEngineCooker", "VulkanPackageBuilder", "VulkanProjectGenerator",
+  "VulkanShaderCompiler"
 ]);
+function exeRelative(name) {
+  // Ninja/single-config keeps the binary at the tree root; MSBuild puts it in
+  // <root>/<config>/. Return the first that exists, else a best-effort path.
+  const candidates = [
+    `${BUILD_REL}/${name}.exe`,
+    `${BUILD_REL}/Release/${name}.exe`,
+    `${BUILD_REL}/RelWithDebInfo/${name}.exe`,
+    `${BUILD_REL}/Debug/${name}.exe`
+  ];
+  return candidates.find((rel) => fs.existsSync(path.join(ENGINE_ROOT, rel))) ?? candidates[0];
+}
+function resolveExeOrThrow(name, noun = "exe") {
+  if (!RUNNABLE_NAMES.has(name)) throw new Error(`unknown ${noun} '${name}'; allowed: ${[...RUNNABLE_NAMES].sort().join(", ")}`);
+  const rel = exeRelative(name);
+  const abs = path.join(ENGINE_ROOT, rel);
+  if (!fs.existsSync(abs)) throw new Error(`not built: ${rel} (rode build_game primeiro)`);
+  return abs;
+}
 
 function tailLines(filePath, count) {
   const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
@@ -413,10 +432,7 @@ function tailLines(filePath, count) {
 
 async function runGameTool(args) {
   const exe = String(args.exe ?? "VulkanEngineGame");
-  const exeRelative = RUNNABLE_EXES.get(exe);
-  if (!exeRelative) throw new Error(`unknown exe '${exe}'; allowed: ${[...RUNNABLE_EXES.keys()].join(", ")}`);
-  const exePath = path.join(ENGINE_ROOT, exeRelative);
-  if (!fs.existsSync(exePath)) throw new Error(`not built: ${exeRelative} (rode build_game primeiro)`);
+  const exePath = resolveExeOrThrow(exe);
   const seconds = Math.min(Math.max(Number(args.seconds ?? 10), 1), 120);
   const extraArgs = Array.isArray(args.args) ? args.args.map(String) : [];
 
@@ -457,6 +473,68 @@ async function runGameTool(args) {
 }
 
 // task_plan Agente 5 §4 item 3 — "cobrir ... empacotar projetos". The engine's
+// Conta 5 §3/§4 — transitive content collection for a project package.
+// Enumerates a project's packaged content (Content/ + Config/plugins + license
+// + schema files) and returns, for each file, its RELATIVE path and a content
+// ID (SHA-256 over the file bytes) — the cook-once/cooking-by-ID contract:
+// editor, cooker and package all reference the SAME id so nothing is duplicated.
+// Known non-shippable artifacts (old builds, personal files, implicit checkout)
+// are EXCLUDED: Intermediate/, Build/, Package/, .git/, *.pdb, *.ilk, *.exp,
+// vc-project/solution files and editor cache dirs.
+const SHIPPABLE_ARTIFACT_EXCLUDES = new Set([
+  "Intermediate", "Build", "Package", "packages",
+  "node_modules", "cmake-build-debug", "cmake-build-release",
+  "build", "out", "DerivedDataCache", "__pycache__",
+  "intermediate", ".freebuff", ".agents", ".vscode"
+]);
+const SHIPPABLE_ARTIFACT_SUFFIXES = [".pdb", ".ilk", ".exp", ".lastbuildstate", ".tlog", ".vcxproj", ".sln", ".suo", ".user"];
+function collect_showcase_content(projectRoot, projectName) {
+  const collected = [];       // { relative, asset_id, bytes }
+  const seen = new Set();      // relative-path dedup (cook-once by id)
+  const walk = (dir, relPrefix) => {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const name = entry.name;
+      if (SHIPPABLE_ARTIFACT_EXCLUDES.has(name)) continue;          // old builds / caches
+      if (SHIPPABLE_ARTIFACT_SUFFIXES.some((s) => name.toLowerCase().endsWith(s))) continue; // personal/cache artifacts
+      if (name === ".git") continue;
+      const rel = relPrefix ? `${relPrefix}/${name}` : name;
+      const full = path.join(dir, name);
+      if (entry.isDirectory()) walk(full, rel);
+      else if (entry.isFile() && !seen.has(rel)) {
+        seen.add(rel);
+        let bytes;
+        try { bytes = fs.readFileSync(full); } catch { continue; }
+        if (bytes.length > 0) {
+          collected.push({
+            relative: rel.split(path.sep).join("/"),
+            asset_id: `showcase:${projectName}:${crypto.createHash("sha256").update(bytes).digest("hex")}`,
+            bytes
+          });
+        }
+      }
+    }
+  };
+  walk(path.join(projectRoot, "Content"), "Content");
+  // Declared plugin config / license / schema files next to the project (not
+  // under Content) that the package ships too.
+  for (const extra of ["Config/Plugins.ini", "LICENSE", "LICENSE.txt", "ThirdPartyNotices.txt", "schema"]) {
+    const full = path.join(projectRoot, extra);
+    if (fs.existsSync(full)) {
+      const rel = extra.split(path.sep).join("/");
+      if (fs.statSync(full).isDirectory()) walk(full, rel);
+      else if (!seen.has(rel)) {
+        seen.add(rel);
+        const bytes = fs.readFileSync(full);
+        if (bytes.length > 0) {
+          collected.push({ relative: rel, asset_id: `showcase:${projectName}:${crypto.createHash("sha256").update(bytes).digest("hex")}`, bytes });
+        }
+      }
+    }
+  }
+  return collected;
+}
+
 // VulkanPackageBuilder (C++) publishes a distributable package: Bin/<exe> +
 // Content/ + PackageManifest.txt, all-or-nothing (staging + rename; removes the
 // staging dir on failure). This tool drives it through the same run/log
@@ -468,10 +546,7 @@ function packageGameTool(args) {
   const projectRoot = path.join(ENGINE_ROOT, "Projects", project);
   if (!fs.existsSync(path.join(projectRoot, "project.json"))) throw new Error(`project '${project}' does not exist`);
   const exe = String(args.exe ?? "VulkanEngineGame");
-  const exeRelative = RUNNABLE_EXES.get(exe);
-  if (!exeRelative) throw new Error(`unknown exe '${exe}'; allowed: ${[...RUNNABLE_EXES.keys()].join(", ")}`);
-  const exePath = path.join(ENGINE_ROOT, exeRelative);
-  if (!fs.existsSync(exePath)) throw new Error(`not built: ${exeRelative} (rode build_game primeiro)`);
+  const exePath = resolveExeOrThrow(exe);
   const contentDir = path.join(projectRoot, "Content");
   if (!fs.existsSync(contentDir)) throw new Error(`project has no Content dir: ${contentDir}`);
   const platform = String(args.platform ?? "windows-x64");
@@ -482,7 +557,7 @@ function packageGameTool(args) {
   const logPath = path.join(GAME_RUN_ROOT, `${name}.log`);
   const output = path.join(projectRoot, "Package");
   const stream = fs.createWriteStream(logPath, { flags: "a" });
-  const child = spawn(path.join(ENGINE_ROOT, BUILD_REL, "Release", "VulkanPackageBuilder.exe"),
+  const child = spawn(resolveExeOrThrow("VulkanPackageBuilder", "exe"),
     [exePath, contentDir, output, platform, configuration],
     { cwd: ENGINE_ROOT, windowsHide: true });
   child.stdout.on("data", (chunk) => stream.write(chunk));
@@ -508,6 +583,10 @@ function packageGameTool(args) {
         signal: signal ?? null,
         log: path.relative(ENGINE_ROOT, logPath).replaceAll(path.sep, "/"),
         output: `Projects/${project}/Package`,
+        // Conta 5 §3/§4: the transitive content manifest with per-file content
+        // IDs (cook-once — editor/cooker/package reference the SAME id), with
+        // old builds / personal / cache artifacts excluded.
+        content: collect_showcase_content(projectRoot, project),
         manifest,
         tail
       });
@@ -556,36 +635,95 @@ function readGameLogTool(args) {
   };
 }
 
+// A5 / task_plan §C -- "implementar de ponta a ponta o serviço e a operação
+// build_game ... agendando o target mínimo afetado". build-scheduler.mjs
+// resolves the MINIMAL set of CMake targets affected by a set of changed source
+// files (module->exe via VC_SDK_PUBLIC_OBJECTS + $<TARGET_OBJECTS>), so a call
+// can avoid needlessly relinking every executable. This shells out to the
+// standalone scheduler so the server owns the process lifecycle and never blocks
+// its own event loop while building.
+function schedulerMinimalExes(changedFiles) {
+  try {
+    const scheduler = path.join(ENGINE_ROOT, "tools/portability/build-scheduler.mjs");
+    const result = spawnSync(process.execPath, [scheduler, "--changed", ...changedFiles], {
+      cwd: ENGINE_ROOT, encoding: "utf8", windowsHide: true, maxBuffer: 16 * 1024 * 1024, timeout: 30_000
+    });
+    if (result.status !== 0 || result.error) return { error: "scheduler failed", affected: [] };
+    const parsed = JSON.parse(result.stdout);
+    return { changed: parsed.changed ?? [], affected: parsed.affected_executables ?? [], error: null };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error), affected: [] };
+  }
+}
+
+function resolveBuildTargets(args) {
+  // build_game / start_build both honour an explicit target list. When the
+  // caller passes `minimal: true`, the operation schedules the minimal set of
+  // affected executables (from build-scheduler.mjs) so a small source change no
+  // longer relinks every exe. `minimal` is implicit for ALL_BUILD + changed files.
+  if (Array.isArray(args.targets) && args.targets.length > 0) {
+    for (const t of args.targets) {
+      if (![...KNOWN_TARGETS].has(t) && t !== "ALL_BUILD") throw new Error(`unknown target '${t}'`);
+    }
+    return { targets: args.targets, via: "explicit", logTail: "" };
+  }
+  const known = new Set([...KNOWN_TARGETS]);
+  const exe = String(args.exe ?? "VulkanEngineGame");
+  if (!known.has(exe)) throw new Error(`unknown target '${exe}'`);
+  const changed = Array.isArray(args.changed_files) && args.changed_files.length > 0 ? args.changed_files.map(String) : null;
+  if (changed && exe === "ALL_BUILD") {
+    const s = schedulerMinimalExes(changed);
+    const affected = s.affected.filter((t) => ["VulkanEngineGame", "VulkanEngineEditor", "VulkanEngineServer",
+      "VulkanEngineCooker"].includes(t));
+    if (affected.length === 0) {
+      return { targets: ["ALL_BUILD"], via: "fallback-all", scheduler: s, logTail: "scheduler: no affected exe; fallback ALL_BUILD" };
+    }
+    return { targets: affected, via: "scheduler-minimal", scheduler: s, logTail: `scheduler: ${affected.join(", ")}` };
+  }
+  if (exe === "ALL_BUILD") return { targets: ["ALL_BUILD"], via: "all" };
+  return { targets: [exe], via: "single", logTail: `target: ${exe}` };
+}
+
+const KNOWN_TARGETS = new Set(["VulkanEngineGame", "VulkanEngineEditor", "VulkanEngineServer",
+  "VulkanEngineCooker", "ALL_BUILD"]);
+
 function buildGameTool(args) {
   // Synchronous builds remain an explicit legacy operation; long work must use start_build.
   if (args.async === true) return startBuildTool(args);
-  const exe = String(args.exe ?? "VulkanEngineGame");
-  const known = new Set(["VulkanEngineGame", "VulkanEngineEditor", "VulkanEngineServer",
-    "VulkanEngineCooker", "vulkan_craft", "ALL_BUILD"]);
-  if (!known.has(exe)) throw new Error(`unknown target '${exe}'`);
   const config = String(args.config ?? "Release");
   if (!KNOWN_CONFIGS.has(config)) {
     throw new Error(`unknown configuration '${config}'; supported: ${[...KNOWN_CONFIGS].sort().join(", ")}`);
   }
   const buildRoot = path.join(ENGINE_ROOT, BUILD_REL);
   if (!fs.existsSync(buildRoot)) throw new Error(`build dir not found: ${buildRoot}`);
+  const plan = resolveBuildTargets(args);
+  const targets = plan.targets;
 
   fs.mkdirSync(GAME_RUN_ROOT, { recursive: true });
-  const name = `build-${exe}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
+  const label = targets.join("+");
+  const name = `build-${label}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
   const logPath = path.join(GAME_RUN_ROOT, name);
-  const argsList = ["--build", BUILD_REL, "--config", config];
-  if (exe !== "ALL_BUILD") argsList.push("--target", exe);
-  // Bounded: a hung build must never wedge the MCP server forever.
-  const result = spawnSync("cmake", argsList, { cwd: ENGINE_ROOT, encoding: "utf8", windowsHide: true, maxBuffer: 32 * 1024 * 1024, timeout: 15 * 60 * 1000 });
-  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+  const outChunks = [];
+  let anyTimedOut = false;
+  for (const t of targets) {
+    const argsList = ["--build", BUILD_REL, "--config", config];
+    if (t !== "ALL_BUILD") argsList.push("--target", t);
+    // Bounded: a hung build must never wedge the MCP server forever.
+    const result = spawnSync("cmake", argsList, { cwd: ENGINE_ROOT, encoding: "utf8", windowsHide: true, maxBuffer: 32 * 1024 * 1024, timeout: 15 * 60 * 1000 });
+    outChunks.push(`===== build ${t} =====${os.EOL}${result.stdout ?? ""}${result.stderr ?? ""}`);
+    if (result.error?.code === "ETIMEDOUT") anyTimedOut = true;
+    if (result.status && result.status !== 0) break;
+  }
+  const output = outChunks.join(os.EOL);
   fs.writeFileSync(logPath, output, "utf8");
   const lines = output.split(/\r?\n/);
   const errors = lines.filter((line) => /\berror\b/i.test(line)).slice(0, 20);
   return {
-    target: exe,
+    targets,
+    via: plan.via,
     log: path.relative(ENGINE_ROOT, logPath).replaceAll(path.sep, "/"),
-    status: result.error ? (result.error.code === "ETIMEDOUT" ? "timeout" : "error") : result.status,
-    timed_out: result.error?.code === "ETIMEDOUT",
+    status: anyTimedOut ? "timeout" : (errors.length ? 1 : 0),
+    timed_out: anyTimedOut,
     errors: errors.length,
     error_lines: errors,
     tail: lines.slice(-60).join("\n")
@@ -690,23 +828,23 @@ const BUILD_JOBS = new Map();
 let nextBuildJobId = 1;
 
 function startBuildTool(args) {
-  const exe = String(args.exe ?? "VulkanEngineGame");
-  const known = new Set(["VulkanEngineGame", "VulkanEngineEditor", "VulkanEngineServer",
-    "VulkanEngineCooker", "vulkan_craft", "ALL_BUILD"]);
-  if (!known.has(exe)) throw new Error(`unknown target '${exe}'`);
   const config = String(args.config ?? "Release");
   const buildRoot = path.join(ENGINE_ROOT, BUILD_REL);
   if (!fs.existsSync(buildRoot)) throw new Error(`build dir not found: ${buildRoot}`);
+  const plan = resolveBuildTargets(args);
+  const targets = plan.targets;
 
   fs.mkdirSync(GAME_RUN_ROOT, { recursive: true });
   const jobId = nextBuildJobId++;
-  const name = `build-${exe}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
+  const label = targets.join("+");
+  const name = `build-${label}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
   const logPath = path.join(GAME_RUN_ROOT, name);
 
   const job = {
     job_id: jobId,
-    exe,
-    config,
+    exe: label,
+    via: plan.via,
+    targets: targets,
     status: "running",
     log: path.relative(ENGINE_ROOT, logPath).replaceAll(path.sep, "/"),
     started_at: new Date().toISOString(),
@@ -731,14 +869,43 @@ function startBuildTool(args) {
     return { job_id: jobId, status: "running", log: job.log, poll_with: "build_status" };
   }
 
-  const argsList = ["--build", BUILD_REL, "--config", config];
-  if (exe !== "ALL_BUILD") argsList.push("--target", exe);
-
-  const child = spawn("cmake", argsList, { cwd: ENGINE_ROOT, windowsHide: true });
+  job.targets = targets;
+  const child = spawn(process.execPath, ["-e", `
+const { spawn } = require("node:child_process");
+const path = require("node:path");
+const ROOT = process.env.VC_ENGINE_ROOT;
+const BUILD_REL = process.env.VC_BUILD_REL;
+const CONFIG = process.env.VC_CFG;
+const TARGETS = JSON.parse(process.env.VC_TARGETS);
+const LOG = process.env.VC_LOG;
+const fs = require("node:fs");
+let idx = 0;
+(function next() {
+  if (idx >= TARGETS.length) { process.exit(0); }
+  const t = TARGETS[idx++];
+  const args = ["--build", BUILD_REL, "--config", CONFIG];
+  if (t !== "ALL_BUILD") args.push("--target", t);
+  const c = spawn("cmake", args, { cwd: ROOT, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  c.stdout.on("data", d => { fs.appendFileSync(LOG, d); });
+  c.stderr.on("data", d => { fs.appendFileSync(LOG, d); });
+  c.on("error", e => { fs.appendFileSync(LOG, "[build] " + e.message + "\n"); process.exit(1); });
+  c.on("exit", code => {
+    fs.appendFileSync(LOG, \"\\n===== done \" + t + \" exit=\" + code + \" =====\\n\");
+    if (code !== 0) process.exit(code);
+    next();
+  });
+})();
+`], { cwd: ENGINE_ROOT, windowsHide: true, env: {
+    ...process.env,
+    VC_ENGINE_ROOT: ENGINE_ROOT,
+    VC_BUILD_REL: BUILD_REL,
+    VC_CFG: config,
+    VC_TARGETS: JSON.stringify(targets),
+    VC_LOG: logPath
+  } });
   job.child = child;
   const stream = fs.createWriteStream(logPath, { flags: "a" });
-  child.stdout.on("data", (chunk) => stream.write(chunk));
-  child.stderr.on("data", (chunk) => stream.write(chunk));
+  stream.write(`${os.EOL}===== build targets: ${targets.join(" + ")} (via ${plan.via}) =====${os.EOL}`);
   child.on("error", (error) => {
     job.status = "error";
     job.error = error.message;
@@ -772,14 +939,16 @@ function startBuildTool(args) {
 // artifacts object exposes the total — real granular progress per target.
 function jobArtifacts(job) {
   const artifacts = { log: job.log, binaries: [], bytes_total: 0 };
-  if (job.status === "succeeded" && job.exe !== "ALL_BUILD") {
-    const exePath = path.join(ENGINE_ROOT, BUILD_REL, job.config, `${job.exe}.exe`);
-    if (fs.existsSync(exePath)) {
-      const rel = path.relative(ENGINE_ROOT, exePath).replaceAll(path.sep, "/");
-      const bytes = fs.statSync(exePath).size;
-      artifacts.binaries.push({ path: rel, bytes });
-      artifacts.bytes_total += bytes;
-    }
+  if (job.status !== "succeeded") return artifacts;
+  const targets = (job.targets && job.targets.length ? job.targets : [job.exe])
+    .filter((t) => t !== "ALL_BUILD" && RUNNABLE_NAMES.has(t));
+  for (const t of targets) {
+    const exePath = path.join(ENGINE_ROOT, exeRelative(t));
+    if (!fs.existsSync(exePath)) continue;
+    const rel = path.relative(ENGINE_ROOT, exePath).replaceAll(path.sep, "/");
+    const bytes = fs.statSync(exePath).size;
+    artifacts.binaries.push({ path: rel, bytes });
+    artifacts.bytes_total += bytes;
   }
   return artifacts;
 }
@@ -866,6 +1035,159 @@ function listBuildJobsTool() {
       };
     });
   return { jobs };
+}
+
+// task_plan Agente 4 §F ("jobs assíncronos") — the SAME long-operation job
+// pattern as builds, but domain-agnostic: import, cook, package, server and
+// other long authoring operations can run as jobs with status/cancel/retry
+// without blocking the stdio/event loop. The manager is generic
+// (authoring-jobs.mjs); this file only supplies the process-bound tasks
+// (run_game / package_game) so cancellation can actually kill the child.
+const AUTHORING_JOBS = createJobManager({
+  onEvent: (job) => emitEvent("game.status_changed", {
+    job_id: job.job_id, kind: job.kind, status: job.status
+  })
+});
+
+function runGameJobTask(args) {
+  return async (signal) => {
+    const exe = String(args.exe ?? "VulkanEngineGame");
+    const exePath = resolveExeOrThrow(exe);
+    const seconds = Math.min(Math.max(Number(args.seconds ?? 10), 1), 120);
+    const extraArgs = Array.isArray(args.args) ? args.args.map(String) : [];
+    fs.mkdirSync(GAME_RUN_ROOT, { recursive: true });
+    const name = `job-run-${exe}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    const logPath = path.join(GAME_RUN_ROOT, `${name}.log`);
+    const stream = fs.createWriteStream(logPath, { flags: "a" });
+    const child = spawn(exePath, extraArgs, { cwd: ENGINE_ROOT, windowsHide: true });
+    child.stdout.on("data", (chunk) => stream.write(chunk));
+    child.stderr.on("data", (chunk) => stream.write(chunk));
+    signal.onAbort(() => { try { child.kill(); } catch { /* already gone */ } });
+    const outcome = await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        child.kill();
+        resolve({ terminated: "timeout", exit_code: null });
+      }, seconds * 1000);
+      child.on("exit", (code, sig) => {
+        clearTimeout(timer);
+        resolve({ terminated: "exit", exit_code: code, signal: sig });
+      });
+      child.on("error", (error) => {
+        clearTimeout(timer);
+        resolve({ terminated: "error", error: error.message });
+      });
+    });
+    stream.end();
+    const tail = tailLines(logPath, 80);
+    return {
+      exe,
+      log: path.relative(ENGINE_ROOT, logPath).replaceAll(path.sep, "/"),
+      log_lines: tail.split("\n").length,
+      duration_seconds: seconds,
+      ...outcome,
+      tail
+    };
+  };
+}
+
+function packageGameJobTask(args) {
+  return async (signal) => {
+    const project = String(args.project ?? "").trim();
+    if (!project) throw new Error("project is required");
+    const projectRoot = path.join(ENGINE_ROOT, "Projects", project);
+    if (!fs.existsSync(path.join(projectRoot, "project.json"))) throw new Error(`project '${project}' does not exist`);
+    const exe = String(args.exe ?? "VulkanEngineGame");
+    const exePath = resolveExeOrThrow(exe);
+    const contentDir = path.join(projectRoot, "Content");
+    if (!fs.existsSync(contentDir)) throw new Error(`project has no Content dir: ${contentDir}`);
+    const platform = String(args.platform ?? "windows-x64");
+    const configuration = String(args.configuration ?? "Shipping");
+    fs.mkdirSync(GAME_RUN_ROOT, { recursive: true });
+    const name = `job-package-${project}-${exe}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    const logPath = path.join(GAME_RUN_ROOT, `${name}.log`);
+    const output = path.join(projectRoot, "Package");
+    const stream = fs.createWriteStream(logPath, { flags: "a" });
+    const builder = resolveExeOrThrow("VulkanPackageBuilder", "exe");
+    const child = spawn(builder, [exePath, contentDir, output, platform, configuration], { cwd: ENGINE_ROOT, windowsHide: true });
+    child.stdout.on("data", (chunk) => stream.write(chunk));
+    child.stderr.on("data", (chunk) => stream.write(chunk));
+    signal.onAbort(() => { try { child.kill(); } catch { /* already gone */ } });
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        child.kill();
+        stream.end();
+        resolve({ exe, project, status: "timeout", log: path.relative(ENGINE_ROOT, logPath).replaceAll(path.sep, "/") });
+      }, 120000);
+      child.on("exit", (code, sig) => {
+        clearTimeout(timer);
+        stream.end();
+        const tail = tailLines(logPath, 40);
+        const manifestPath = path.join(output, "PackageManifest.txt");
+        const manifest = fs.existsSync(manifestPath) ? readText(manifestPath).content : null;
+        resolve({
+          exe,
+          project,
+          status: code === 0 ? "published" : "failed",
+          exit_code: code,
+          signal: sig ?? null,
+          log: path.relative(ENGINE_ROOT, logPath).replaceAll(path.sep, "/"),
+          output: `Projects/${project}/Package`,
+          manifest,
+          tail
+        });
+      });
+      child.on("error", (error) => {
+        clearTimeout(timer);
+        stream.end();
+        reject(error);
+      });
+    });
+  };
+}
+
+function startAuthoringJobTool(args) {
+  const kind = String(args.kind ?? "");
+  const tool = args.tool ? String(args.tool) : null;
+  const callArgs = (args.arguments && typeof args.arguments === "object" && !Array.isArray(args.arguments))
+    ? args.arguments : {};
+  let task;
+  if (kind === "run_game") {
+    task = runGameJobTask(callArgs);
+  } else if (kind === "package_game") {
+    task = packageGameJobTask(callArgs);
+  } else if (kind === "tool") {
+    if (!tool) throw new Error("kind 'tool' requires 'tool' (an MCP tool name to run in background)");
+    if (["start_job", "job_status", "cancel_job", "retry_job", "list_jobs"].includes(tool)) {
+      throw new Error(`'${tool}' is a job-control tool and cannot run as a background job`);
+    }
+    // Cooperative cancellation: toolCall is not interruptible mid-flight, so a
+    // cancel marks the job cancelled and the late result is discarded.
+    task = async (signal) => {
+      const result = await toolCall(tool, callArgs);
+      if (signal.aborted) return { discarded: true, reason: "job cancelled" };
+      return result;
+    };
+  } else {
+    throw new Error(`unknown job kind '${kind}'; supported: run_game, package_game, tool`);
+  }
+  const job = AUTHORING_JOBS.start(kind, { tool, arguments: callArgs }, task);
+  return { ...job, poll_with: "job_status" };
+}
+
+function authoringJobStatusTool(args) {
+  return AUTHORING_JOBS.status(Number(args.job_id));
+}
+
+function authoringJobCancelTool(args) {
+  return AUTHORING_JOBS.cancel(Number(args.job_id));
+}
+
+function authoringJobRetryTool(args) {
+  return AUTHORING_JOBS.retry(Number(args.job_id));
+}
+
+function authoringJobsListTool() {
+  return { jobs: AUTHORING_JOBS.list() };
 }
 
 const TOOLS = [
@@ -1002,24 +1324,28 @@ const TOOLS = [
   },
   {
     name: "build_game",
-    description: "Build a Release target (cmake --build) and store the full output in Projects/.runs; returns status, error lines and tail. Use before run_game when the exe is stale.",
+    description: "Build a Release target (cmake --build) and store the full output in Projects/.runs; returns status, error lines and tail. Pass exe=ALL_BUILD with changed_files to schedule only the minimal affected executables via build-scheduler.mjs. Use before run_game when the exe is stale.",
     inputSchema: {
       type: "object",
       properties: {
-        exe: { type: "string", default: "VulkanEngineGame", description: "Target: VulkanEngineGame, VulkanEngineEditor, VulkanEngineServer, VulkanEngineCooker, vulkan_craft or ALL_BUILD" },
-        config: { type: "string", default: "Release", description: "Build configuration: Release, Debug, RelWithDebInfo or MinSizeRel (validated by the server; invalid configs fail the job deterministically on every generator)" }
+        exe: { type: "string", default: "VulkanEngineGame", description: "Target: VulkanEngineGame, VulkanEngineEditor, VulkanEngineServer, VulkanEngineCooker or ALL_BUILD" },
+        config: { type: "string", default: "Release", description: "Build configuration: Release, Debug, RelWithDebInfo or MinSizeRel (validated by the server; invalid configs fail the job deterministically on every generator)" },
+        targets: { type: "array", items: { type: "string" }, description: "Explicit ordered list of targets to build instead of the single exe. Building more than one is the scheduling path for composer work." },
+        changed_files: { type: "array", items: { type: "string" }, description: "Source files changed since last build; when exe=ALL_BUILD, drives the minimal-target scheduler so only affected executables relink." }
       },
       additionalProperties: false
     }
   },
   {
     name: "start_build",
-    description: "Start a build asynchronously and return a job id immediately (the synchronous build_game blocks the server for the whole build). Poll build_status for progress and cancel_build to abort.",
+    description: "Start a build asynchronously and return a job id immediately (the synchronous build_game blocks the server for the whole build). Supports ALL_BUILD + changed_files for minimal-target scheduling. Poll build_status for progress and cancel_build to abort.",
     inputSchema: {
       type: "object",
       properties: {
-        exe: { type: "string", default: "VulkanEngineGame", description: "Target: VulkanEngineGame, VulkanEngineEditor, VulkanEngineServer, VulkanEngineCooker, vulkan_craft or ALL_BUILD" },
-        config: { type: "string", default: "Release", description: "Build configuration: Release, Debug, RelWithDebInfo or MinSizeRel" }
+        exe: { type: "string", default: "VulkanEngineGame", description: "Target: VulkanEngineGame, VulkanEngineEditor, VulkanEngineServer, VulkanEngineCooker or ALL_BUILD" },
+        config: { type: "string", default: "Release", description: "Build configuration: Release, Debug, RelWithDebInfo or MinSizeRel" },
+        targets: { type: "array", items: { type: "string" }, description: "Explicit ordered list of targets to build. Preferred over exe for multi-target scheduling." },
+        changed_files: { type: "array", items: { type: "string" }, description: "Source files changed since last build; when exe=ALL_BUILD, drives the minimal-target scheduler." }
       },
       additionalProperties: false
     }
@@ -1089,7 +1415,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        exe: { type: "string", default: "VulkanEngineGame", description: "VulkanEngineGame, VulkanEngineEditor, VulkanEngineServer, VulkanEngineCooker or vulkan_craft" },
+        exe: { type: "string", default: "VulkanEngineGame", description: "VulkanEngineGame, VulkanEngineEditor, VulkanEngineServer or VulkanEngineCooker" },
         seconds: { type: "integer", minimum: 1, maximum: 120, default: 10 },
         args: { type: "array", items: { type: "string" }, description: "Extra CLI arguments passed to the executable" }
       },
@@ -1128,6 +1454,55 @@ const TOOLS = [
       },
       additionalProperties: false
     }
+  },
+  {
+    name: "start_job",
+    description: "Start a long authoring operation as an async job (queued -> running -> succeeded|failed|cancelled). kind=run_game and kind=package_game spawn the real process and are kill-cancellable; kind=tool runs any other MCP tool in the background (cooperative cancel). Poll with job_status; cancel_job kills process jobs; retry_job re-runs a failed/cancelled job (max 3 attempts).",
+    inputSchema: {
+      type: "object",
+      required: ["kind"],
+      properties: {
+        kind: { type: "string", enum: ["run_game", "package_game", "tool"], description: "run_game: bounded process run (kill-cancellable); package_game: VulkanPackageBuilder (kill-cancellable); tool: any other MCP tool by name" },
+        tool: { type: "string", description: "tool name when kind=tool" },
+        arguments: { type: "object", description: "arguments for the operation/tool (same shape as the tool's own input schema)" }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "job_status",
+    description: "Poll an authoring job started with start_job: status, attempts, error, result (for process jobs the result carries the log path and tail once finished).",
+    inputSchema: {
+      type: "object",
+      required: ["job_id"],
+      properties: { job_id: { type: "integer" } },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "cancel_job",
+    description: "Cancel a queued/running authoring job. Process jobs (run_game/package_game) kill the child immediately; tool jobs become cancelled and the late result is discarded.",
+    inputSchema: {
+      type: "object",
+      required: ["job_id"],
+      properties: { job_id: { type: "integer" } },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "retry_job",
+    description: "Re-run a failed/cancelled authoring job with the same payload (max 3 attempts; the retried job starts as queued again).",
+    inputSchema: {
+      type: "object",
+      required: ["job_id"],
+      properties: { job_id: { type: "integer" } },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "list_jobs",
+    description: "List all authoring jobs started with start_job, newest first, with status/attempts/payload.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false }
   }
 ];
 
@@ -1418,7 +1793,11 @@ const RESOURCE_MAP = new Map([
   // §5 item 3 ("tests"): DYNAMIC resource — the registered ctest tests of the
   // current build tree (ctest -N lists them WITHOUT executing — fast and
   // deterministic). Sentinel "__tests__" is special-cased in resources/read.
-  ["engine://tests", "__tests__"]
+  ["engine://tests", "__tests__"],
+  // task_plan Agente 4 §F ("jobs"): DYNAMIC resource — the live authoring
+  // jobs (start_job/job_status/cancel_job/retry_job/list_jobs). Sentinel
+  // "__jobs__" is special-cased in resources/read.
+  ["engine://jobs", "__jobs__"]
 ]);
 
 // FALTANTES item 5 (MCP server) — limits + audit: every tools/call is recorded
@@ -1525,6 +1904,11 @@ async function toolCall(name, args = {}) {
     case "audit_log": result = auditLogTool(args); break;
     case "run_game": result = await runGameTool(args); break;
     case "package_game": result = await packageGameTool(args); break;
+    case "start_job": result = startAuthoringJobTool(args); break;
+    case "job_status": result = authoringJobStatusTool(args); break;
+    case "cancel_job": result = authoringJobCancelTool(args); break;
+    case "retry_job": result = authoringJobRetryTool(args); break;
+    case "list_jobs": result = authoringJobsListTool(); break;
     case "list_game_logs": result = listGameLogsTool(); break;
     case "read_game_log": result = readGameLogTool(args); break;
     default: throw new Error(`unknown tool '${name}'`);
@@ -1686,6 +2070,17 @@ async function handleRequest(message) {
           jsonrpc: "2.0",
           id,
           result: { contents: [{ uri: params.uri, mimeType: "application/json", text: JSON.stringify(metrics, null, 2) }] }
+        };
+      }
+      if (file === "__jobs__") {
+        // task_plan Agente 4 §F — dynamic authoring jobs resource: the live
+        // job list from the SAME manager the job tools use (single source).
+        const jobs = AUTHORING_JOBS.list();
+        const payload = { jobs };
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: { contents: [{ uri: params.uri, mimeType: "application/json", text: JSON.stringify(payload, null, 2) }] }
         };
       }
       const source = readText(file);

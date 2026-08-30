@@ -238,6 +238,7 @@ EditorApplication::~EditorApplication() {
         m_softBodies.clear();
         for (auto& [id, cloud] : m_splatClouds) { (void)id; destroy_buffer(cloud.vb); }
         m_splatClouds.clear();
+        destroy_buffer(m_playParticleVB);
         for (auto& [id, pb] : m_paintBuffers) { (void)id; destroy_buffer(pb.vb); }
         m_paintBuffers.clear();
         if (m_envCapture.valid) {

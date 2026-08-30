@@ -90,64 +90,6 @@ static_assert(sizeof(MaterialPushConstants) == 128);
 [[nodiscard]] std::vector<uint32_t> compile_glsl_to_spirv(const std::string& source,
                                                           VkShaderStageFlagBits stage);
 
-// ─── Material → Vulkan pipeline ───
-// Owns a VkPipeline + pipeline layout + descriptor set layout built from a
-// material definition. Shader sources are compiled to SPIR-V via glslc
-// (ShaderCompiler tool). Supports hot reload: poll() recompiles when the
-// generated source hash changes and rebuilds the pipeline.
-class VulkanMaterialPipeline final {
-public:
-    VulkanMaterialPipeline() = default;
-    ~VulkanMaterialPipeline();
-
-    VulkanMaterialPipeline(const VulkanMaterialPipeline&) = delete;
-    VulkanMaterialPipeline& operator=(const VulkanMaterialPipeline&) = delete;
-
-    // Creates the pipeline from the material graph. device/swapchain must be valid.
-    bool create(VkDevice device, VkFormat colorFormat, VkFormat depthFormat,
-                const MaterialGraph& graph, std::string* error = nullptr);
-    // Second phase: build the graphics pipeline against the real render pass.
-    // Returns false if the render pass is null.
-    bool build_pipeline(VkRenderPass renderPass, uint32_t subpass = 0);
-    void destroy();
-
-    [[nodiscard]] bool valid() const noexcept { return pipeline_ != VK_NULL_HANDLE; }
-    [[nodiscard]] VkPipeline pipeline() const noexcept { return pipeline_; }
-    [[nodiscard]] VkPipelineLayout layout() const noexcept { return layout_; }
-    [[nodiscard]] VkDescriptorSetLayout descriptor_set_layout() const noexcept { return descriptorSetLayout_; }
-    [[nodiscard]] const std::string& glsl_source() const noexcept { return glsl_; }
-
-    // Writes parameter values into the UBO storage (client-provided buffer).
-    void write_parameters(std::byte* uboMemory, std::size_t capacity) const;
-
-    // Recompiles if the material's generated source changed; returns true when
-    // the pipeline was rebuilt (hot reload happened).
-    bool poll_reload();
-
-    // Explicit hot reload: recompile + rebuild pipeline. Returns true on success.
-    bool reload();
-
-    // Timestamp helpers for hot-reload status UI.
-    [[nodiscard]] std::uint64_t build_id() const noexcept { return buildId_; }
-    [[nodiscard]] std::string last_error() const noexcept { return lastError_; }
-
-private:
-    VkDevice device_{VK_NULL_HANDLE};
-    VkFormat colorFormat_{VK_FORMAT_UNDEFINED};
-    VkFormat depthFormat_{VK_FORMAT_UNDEFINED};
-    VkShaderModule vertModule_{VK_NULL_HANDLE};
-    VkShaderModule fragModule_{VK_NULL_HANDLE};
-    VkPipelineLayout layout_{VK_NULL_HANDLE};
-    VkPipeline pipeline_{VK_NULL_HANDLE};
-    VkDescriptorSetLayout descriptorSetLayout_{VK_NULL_HANDLE};
-    std::string glsl_;
-    std::size_t sourceHash_{0};
-    std::uint64_t buildId_{0};
-    std::string lastError_;
-    std::vector<std::string> uniformNames_;
-    std::vector<MaterialValueType> uniformTypes_;
-};
-
 // ─── Render Graph → Vulkan executor ───
 // Executes a compiled RenderGraph on real Vulkan resources. The graph's
 // compiled pass order drives the command stream: each pass begins its real

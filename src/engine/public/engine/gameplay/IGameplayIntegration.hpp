@@ -47,6 +47,12 @@ public:
     virtual bool attach_audio_mapper(audio::IAudioEventMapper* audio) = 0;
     virtual bool attach_event_router(IGameplayEventRouter* router) = 0;
     virtual bool attach_tick_source(std::uint64_t tick) = 0;
+    // Sets the world-streaming focus used when the integration advances every
+    // attached IWorldManager world (fixed focus was a real defect: a consumer
+    // binding `worlds` got its chunks streamed around (0,0,0), evicting the
+    // actual play/server focus). Default remains (0,0,0) for compatibility;
+    // jogo/play-mode/servidor must set the real focus before binding worlds.
+    virtual bool set_world_focus(float x, float y, float z) = 0;
     virtual void advance(float deltaSeconds) = 0;
     virtual GameplayIntegrationSnapshot snapshot() const = 0;
     virtual void reset() = 0;

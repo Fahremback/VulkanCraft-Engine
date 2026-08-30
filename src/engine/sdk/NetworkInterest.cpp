@@ -153,11 +153,14 @@ bool parse_position(const std::string& s, std::size_t& i, NetworkPosition& out) 
     return haveX && haveY && haveZ;
 }
 
-double distance(const NetworkPosition& a, const NetworkPosition& b) {
+// Squared euclidean distance — used by compute() to compare against
+// radius² (sqrt is monotonic, so the relevance decision is bit-identical
+// while avoiding one std::sqrt per (observer, entity) pair per tick).
+double distance_squared(const NetworkPosition& a, const NetworkPosition& b) {
     const double dx = a.x - b.x;
     const double dy = a.y - b.y;
     const double dz = a.z - b.z;
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
+    return dx * dx + dy * dy + dz * dz;
 }
 
 }  // namespace
@@ -202,10 +205,18 @@ public:
         for (const auto& okv : observers_) {
             InterestResult r;
             r.observer_id = okv.first;
-            for (const auto& ekv : entities_) {
-                if (okv.second.always_relevant ||
-                    distance(okv.second.position, ekv.second.position) <= okv.second.radius) {
-                    r.entity_ids.push_back(ekv.first);
+            r.entity_ids.reserve(entities_.size());
+            if (okv.second.always_relevant) {
+                for (const auto& ekv : entities_) r.entity_ids.push_back(ekv.first);
+            } else {
+                // Squared-distance compare: same decision as sqrt(d) <= radius,
+                // no per-pair square root on the hot interest path.
+                const double radiusSq = okv.second.radius * okv.second.radius;
+                for (const auto& ekv : entities_) {
+                    if (distance_squared(okv.second.position, ekv.second.position) <=
+                        radiusSq) {
+                        r.entity_ids.push_back(ekv.first);
+                    }
                 }
             }
             results.push_back(std::move(r));

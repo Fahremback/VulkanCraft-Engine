@@ -388,6 +388,24 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
         send_response(conn, out.str());
         return;
     }
+    if (method == "GET" && path == "/render-diagnostics") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        // Snapshot is the composed render-diagnostics JSON (real per-pass
+        // timings from the viewport render loop + provider registry). Empty
+        // means the render loop has not produced a frame yet.
+        std::ostringstream out;
+        if (snapshot.render_diagnostics.empty()) {
+            out << "{\"valid\":false,\"diagnostics\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"diagnostics\":" << snapshot.render_diagnostics << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
     if (method == "GET" && path == "/undo") {
         EditorApiState snapshot;
         {
@@ -411,6 +429,66 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
             out << "{\"valid\":false,\"browser\":\"\"}";
         } else {
             out << "{\"valid\":true,\"browser\":" << snapshot.content_browser << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/inventory-grid") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.inventory_grid.empty()) {
+            out << "{\"valid\":false,\"grid\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"grid\":" << snapshot.inventory_grid << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/network-debug") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.network_debug.empty()) {
+            out << "{\"valid\":false,\"network\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"network\":" << snapshot.network_debug << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/package-manifest") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.package_manifest.empty()) {
+            out << "{\"valid\":false,\"packages\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"packages\":" << snapshot.package_manifest << "}";
+        }
+        send_response(conn, out.str());
+        return;
+    }
+    if (method == "GET" && path == "/cook") {
+        EditorApiState snapshot;
+        {
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            snapshot = m_live;
+        }
+        std::ostringstream out;
+        if (snapshot.cooked_assets_json.empty()) {
+            out << "{\"valid\":false,\"cook\":\"\"}";
+        } else {
+            out << "{\"valid\":true,\"cook\":" << snapshot.cooked_assets_json << "}";
         }
         send_response(conn, out.str());
         return;
@@ -629,6 +707,8 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
                       "\"cameraTarget\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
                       "\"vsync\":%s,\"shadowQuality\":%d,\"terrainValid\":%s,"
                       "\"terrainVertices\":%zu,\"terrainTriangles\":%zu,\"meshEdited\":%s,"
+                      "\"renderView\":{\"grid\":%s,\"gizmos\":%s,\"colliders\":%s},"
+                      "\"selectedDebugOverlay\":\"%s\","
                       "\"settingsPath\":\"%s\",\"selectedEntity\":\"%s\","
                       "\"gizmoMode\":\"%s\",\"snap\":%.3f,\"lastSelfTest\":\"%s\",\"scriptState\":\"%s\"}",
                       s.state.c_str(), s.fps, s.entities, s.orbitDistance,
@@ -638,7 +718,11 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
                       s.camTargetX, s.camTargetY, s.camTargetZ,
                       s.vsync ? "true" : "false", s.shadowQuality,
                       s.terrainValid ? "true" : "false", s.terrainVertices, s.terrainTriangles,
-                      s.meshEdited ? "true" : "false", settingsPathJson.c_str(),
+                      s.meshEdited ? "true" : "false",
+                      s.grid ? "true" : "false", s.gizmos ? "true" : "false",
+                      s.colliders ? "true" : "false",
+                      s.selectedDebugOverlay.c_str(),
+                      settingsPathJson.c_str(),
                       selectedJson.c_str(), gizmoJson.c_str(), s.snap,
                       selfTestJson.c_str(), scriptJson.c_str());
         send_response(conn, body);
@@ -770,6 +854,8 @@ void EditorControlApi::handle_request(uint64_t connRaw, const std::string& rawRe
         else if (path.rfind("/terrain/", 0) == 0) cmd = "terrain " + slash_args(path, 9);
         else if (path.rfind("/graphics/", 0) == 0) cmd = "graphics " + slash_args(path, 10);
         else if (path == "/save-settings") cmd = "save-settings";
+        else if (path.rfind("/render-view/", 0) == 0) cmd = "render-view " + slash_args(path, 13);
+        else if (path.rfind("/render-debug/", 0) == 0) cmd = "render-debug " + slash_args(path, 14);
         else if (path.rfind("/project/", 0) == 0) cmd = "project " + path.substr(9);
         else if (path.rfind("/mesh/", 0) == 0) cmd = "mesh " + path.substr(6);
         // ---- Dev --------------------------------------------------------------

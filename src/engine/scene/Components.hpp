@@ -39,6 +39,12 @@ struct LightComponent {
     float range{ 50.0f };
     bool castShadows{ true };
     LightType type{ LightType::Directional };
+    // Spot outer cone half-angle in radians (agente 4 — B.3): drives the real
+    // spotLightParams (cos inner/outer) fed to the shared LightUboData. The
+    // default 45° (π/4) matches the cone the editor/game previously
+    // hardcoded, so existing scenes and lights render identically. Appended
+    // LAST so legacy 5-field aggregate initializers stay valid.
+    float coneAngle{ 0.78539816339f };
 };
 
 // True when the light acts as the directional sun (drives the shadow map and
@@ -212,10 +218,12 @@ struct VoxelVolumeComponent {
 
 // ---------------------------------------------------------------------------
 // Wicked-port component set (frontend; PORTS.md). Each struct is authored in
-// its dedicated editor panel. Runtime integration status is noted per struct:
-// where the play world does not simulate the feature yet, the panel carries an
-// explicit TODO(frontend-port) comment and the data is still serialized so a
-// future runtime pass can consume it.
+// its dedicated editor panel and serialized with the scene. The play world
+// (EditorApplicationPlay) simulates every component below at runtime:
+// colliders map to physics shapes, constraints/springs to point-to-point
+// forces, force fields to body forces, splines to Catmull-Rom followers,
+// soft bodies to a verlet grid, weather to rain particles, and env probes to
+// 6-face captures.
 // ---------------------------------------------------------------------------
 
 // Collision shape authored in the Collider panel. The play world maps this to
@@ -231,8 +239,9 @@ struct ColliderComponent {
     bool enabled{ true };
 };
 
-// Physics joint authored in the Constraint panel. Runtime integration:
-// TODO(frontend-port) — map to a Jolt/Bullet constraint in the play world.
+// Physics joint authored in the Constraint panel. The play world simulates it
+// as a soft point-to-point spring between the entity anchor and the target
+// body anchor, broken when the required force exceeds breakForce.
 enum class ConstraintType : uint8_t { Fixed = 0, Hinge = 1, Spring = 2, Point = 3 };
 struct ConstraintComponent {
     ConstraintType type{ ConstraintType::Fixed };
@@ -243,8 +252,9 @@ struct ConstraintComponent {
     bool enabled{ true };
 };
 
-// Cloth/soft body authored in the Soft Body panel. Runtime integration:
-// TODO(frontend-port) — soft body solver in the physics backend.
+// Cloth/soft body authored in the Soft Body panel. The play world simulates
+// the grid with a verlet soft-body solver (stiffness/drag/gravity) and
+// renders it as a mesh.
 struct SoftBodyComponent {
     uint32_t detail{ 8 };
     float mass{ 1.0f };
@@ -256,8 +266,8 @@ struct SoftBodyComponent {
     bool enabled{ true };
 };
 
-// Spring dynamics authored in the Spring panel. Runtime integration:
-// TODO(frontend-port) — spring/constraint solver in the physics backend.
+// Spring dynamics authored in the Spring panel. The play world pulls the
+// body back toward the authored rest anchor each tick (stiffness/drag forces).
 struct SpringComponent {
     float stiffness{ 0.5f };
     float drag{ 0.1f };
@@ -282,8 +292,8 @@ struct DecalComponent {
     bool enabled{ true };
 };
 
-// Catmull-Rom path authored in the Spline panel. Runtime integration:
-// TODO(frontend-port) — spline follower/mesh generator in the play world.
+// Catmull-Rom path authored in the Spline panel. The play world drives the
+// entity (and its kinematic body) along the path each tick (looped or clamped).
 struct SplineComponent {
     std::vector<glm::vec3> points{ { 0.0f, 0.0f, 0.0f }, { 1.0f, 0.0f, 0.0f }, { 2.0f, 0.0f, 0.0f } };
     bool looped{ false };
@@ -294,8 +304,8 @@ struct SplineComponent {
     bool enabled{ true };
 };
 
-// Physics zone authored in the Force Field panel. Runtime integration:
-// TODO(frontend-port) — force evaluation against play physics bodies.
+// Physics zone authored in the Force Field panel. The play world applies the
+// configured force (gravity/push/wind/vortex) to every dynamic body in range.
 enum class ForceFieldType : uint8_t { Gravity = 0, Push = 1, Wind = 2, Vortex = 3 };
 struct ForceFieldComponent {
     ForceFieldType type{ ForceFieldType::Gravity };
@@ -315,8 +325,9 @@ struct EnvProbeComponent {
     bool enabled{ true };
 };
 
-// Global weather/sky authored in the Weather panel. Runtime integration:
-// TODO(frontend-port) — sky/fog/atmosphere pass in the renderer.
+// Global weather/sky authored in the Weather panel. The play world drives a
+// real rain curtain from rainAmount; sun/fog/sky values feed the game's
+// atmosphere pass and the editor's sky rendering.
 struct WeatherComponent {
     glm::vec3 sunColor{ 1.0f, 0.95f, 0.85f };
     float fogDensity{ 0.001f };
@@ -349,7 +360,7 @@ struct HairParticleComponent {
 
 // ---------------------------------------------------------------------------
 // Runtime-wired component set (added by the frontend port): each of these
-// used to be a TODO(frontend-port) and now has REAL runtime behaviour:
+// used to be frontend-port-only and now has REAL runtime behaviour:
 //   - Layer: per-entity named layer; the editor/play world skip rendering,
 //     physics and picking of hidden/locked layers.
 //   - Paint: per-vertex colors painted on a mesh in the viewport.

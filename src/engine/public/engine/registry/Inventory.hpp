@@ -44,6 +44,10 @@ struct SlotFilter {
 
 class Inventory {
 public:
+    // Default: an EMPTY inventory (zero slots). Provided so the inventory can
+    // live as a member initialized later (e.g. editor play-mode grid, which
+    // assigns a sized inventory once the runtimes are created).
+    Inventory() = default;
     explicit Inventory(int slotCount);
 
     int slot_count() const noexcept { return static_cast<int>(slots_.size()); }

@@ -19,6 +19,12 @@ void SoundEngine::register_sound(const std::string& name, const std::string& pat
     soundFiles[name] = asset(path.c_str());
 }
 
+bool SoundEngine::register_audio_asset(const std::string& name, const std::string& path) {
+    if (name.empty() || path.empty() || !std::filesystem::exists(path)) return false;
+    soundFiles[name] = path;
+    return true;
+}
+
 void SoundEngine::start_loop(const std::string& name, const std::string& path) {
     if (!engine) return;
     auto* sound = new ma_sound{};

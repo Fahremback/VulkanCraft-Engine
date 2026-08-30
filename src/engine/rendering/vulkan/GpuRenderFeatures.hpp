@@ -19,7 +19,8 @@ struct alignas(16) GpuRenderFeatures {
     glm::vec4 debug{0.0f};       // x mode, y cards, z probes, w tracing
     glm::vec4 fluids{0.0f};      // x enabled, y level, z flow x, w flow z
     glm::vec4 vfx{0.0f};         // x enabled, y particle count, z hair, w xr
-    glm::vec4 material{0.0f};    // x data-driven, y emissive scale, z roughness, w metallic
+    glm::vec4 material{0.0f};    // x data-driven fraction, y interior ambient floor (materialShading config),
+                                // z representative variant seed, w subsurface transmission max
     glm::vec4 debugCounts{0.0f}; // x cards, y probes, z captures, w temporal confidence
     glm::vec4 extent{0.0f};      // x render width, y render height (z/w unused) — the
                                  // temporal history is laid out row-major with a

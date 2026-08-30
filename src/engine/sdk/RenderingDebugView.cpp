@@ -134,7 +134,16 @@ public:
         snapshot_.sunRevision = sunRevision;
     }
     void add_trace_path(const DebugTracePath& path) override {
+        // Bounded ring: the product drives the software tracer every frame, so
+        // the debug model must not grow without limit. Keeps the newest paths
+        // (drop from the front) — a bounded history the editor/profiler renders.
+        constexpr std::size_t kMaxTracePaths = 128;
         snapshot_.tracePaths.push_back(path);
+        if (snapshot_.tracePaths.size() > kMaxTracePaths) {
+            snapshot_.tracePaths.erase(snapshot_.tracePaths.begin(),
+                                       snapshot_.tracePaths.begin() +
+                                           (snapshot_.tracePaths.size() - kMaxTracePaths));
+        }
     }
     void bind_disocclusion(std::uint32_t pixels, std::uint32_t confidence) override {
         snapshot_.disoccludedPixels = pixels;

@@ -11,9 +11,10 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 
 const ROOT = process.cwd();
+import { resolveExe } from './exe-resolve.mjs';
 const SENTRY = join(ROOT, 'external', 'solutions', 'sentry-native');
 const E2E = join(ROOT, 'tools', 'portability', 'observability-sentry-e2e.cpp');
-const EXE = join(ROOT, 'build', 'Release', 'observability-sentry-e2e.exe');
+const EXE = resolveExe(ROOT, 'observability-sentry-e2e');
 
 const SENTRY_LIB = join(SENTRY, 'build-gate', 'Release', 'sentry.lib');
 if (!existsSync(SENTRY_LIB)) {
@@ -35,7 +36,7 @@ const bat = [
   'if errorlevel 1 exit /b 1',
   w(EXE)
 ].join('\r\n');
-const batPath = join(ROOT, 'build', 'observability-sentry-e2e.bat');
+const batPath = join(ROOT, process.env.VC_BUILD_DIR || 'out/dev-shared', 'observability-sentry-e2e.bat');
 const { writeFileSync } = await import('fs');
 writeFileSync(batPath, bat, 'utf8');
 

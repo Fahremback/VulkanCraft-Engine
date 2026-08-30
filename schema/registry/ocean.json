@@ -19,21 +19,6 @@
       "default": 64,
       "type": "integer"
     },
-    "tile_size_meters": {
-      "description": "world size of the tile [16, 8192]",
-      "default": 256,
-      "type": "number"
-    },
-    "wind_speed": {
-      "description": "wind speed m/s [0.5, 40]",
-      "default": 18,
-      "type": "number"
-    },
-    "wind_dir_rad": {
-      "description": "main wave direction (radians), finite",
-      "default": 0.7,
-      "type": "number"
-    },
     "choppiness": {
       "description": "horizontal displacement scale [0, 4]",
       "default": 1.2,
@@ -48,6 +33,21 @@
       "description": "deterministic phase seed",
       "default": 1,
       "type": "integer"
+    },
+    "tileSizeMeters": {
+      "description": "world size of the tile [16, 8192]",
+      "default": 256,
+      "type": "number"
+    },
+    "windSpeed": {
+      "description": "wind speed m/s [0.5, 40]",
+      "default": 18,
+      "type": "number"
+    },
+    "windDirRad": {
+      "description": "main wave direction (radians), finite",
+      "default": 0.7,
+      "type": "number"
     }
   },
   "required": [

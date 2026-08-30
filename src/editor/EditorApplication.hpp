@@ -44,14 +44,51 @@
 #include "../engine/gameplay/DestructionRuntime.hpp"
 #include "../engine/audio/AudioRuntime.hpp"
 #include "engine/navigation/INavigationProvider.hpp"
+#include "engine/navigation/INavigationSchedulerBridge.hpp"
+#include "engine/navigation/INavInvalidation.hpp"
+#include "engine/ai/IAiDebugInfo.hpp"
+#include "engine/entity/IEntityWorld.hpp"
+#include "engine/world/IWorldRuntime.hpp"
+#include "engine/world/IWorldManager.hpp"
+#include "engine/gameplay/IGameplayRuntime.hpp"
+#include "engine/gameplay/IGameplayIntegration.hpp"
+#include "engine/gameplay/IGameplayBindings.hpp"
+#include "engine/gameplay/IGameplaySystemWiring.hpp"
+#include "engine/gameplay/IGameplayEvents.hpp"
+#include "engine/gameplay/IGameplayMetrics.hpp"
+#include "engine/gameplay/IGameplayEventRouter.hpp"
+#include "engine/gameplay/IDayNightCycle.hpp"
+#include "engine/navigation/IAsyncQueryScheduler.hpp"
+#include "engine/audio/IAudioEventMapper.hpp"
 #include "../engine/editor/ui/EditorGUI.hpp"
 #include "EditorControlApi.hpp"
 #include "EditorPlugin.hpp"
 #include "ProjectTemplate.hpp"
 #include "EditorLayout.hpp"
 #include "engine/ui/IUiDoc.hpp"
+#include "engine/ui/ILayout.hpp"
+#include "engine/ui/IViewport.hpp"
+#include "engine/ui/IWidgets.hpp"
+#include "engine/ui/IConfirmation.hpp"
+#include "engine/ui/ICrafting.hpp"
+#include "engine/ui/IInventoryGrid.hpp"
+#include "engine/ui/ITextShaper.hpp"
+#include "engine/ui/IJsonSchema.hpp"
+#include "engine/registry/ItemRegistry.hpp"
+#include "engine/registry/Inventory.hpp"
+#include "engine/registry/RecipeRegistry.hpp"
+#include "engine/scripting/IVisualScriptService.hpp"
+#include "engine/scripting/ILuauSandbox.hpp"
+#include "engine/assets/IAssetCooker.hpp"
+#include "engine/scripting/IVisualScriptRuntime.hpp"
+#include "engine/plugins/IPluginIsolationRuntime.hpp"
+#include "engine/plugins/IPluginManifestCodec.hpp"
 #include "engine/editor/IMessageCatalog.hpp"
 #include "engine/editor/IShortcutDoc.hpp"
+#include "engine/networking/INetworkSession.hpp"
+#include "engine/networking/INetworkRpc.hpp"
+#include "engine/packaging/IPackageManager.hpp"
+#include "engine/compiler/IEpisodeCompiler.hpp"
 #include "engine/editor/IFileWatcher.hpp"
 #include "engine/editor/IFileChangeDebounce.hpp"
 #include "engine/editor/IPlayMode.hpp"
@@ -70,6 +107,9 @@
 #include "engine/editor/IProjectLauncher.hpp"
 #include "engine/editor/IRetargeting.hpp"
 #include "engine/profiling/IFrameProfiler.hpp"
+#include "engine/rendering/IRenderPassMetrics.hpp"
+#include "engine/rendering/IRenderProviderRegistry.hpp"
+#include "engine/rendering/IRenderingDebugView.hpp"
 #include "WindowClamp.hpp"
 #include "tools/WickedToolsPanel.hpp"
 
@@ -84,6 +124,12 @@ struct PlayNavAgent {
     bool reached{ true };
     std::vector<glm::vec3> path;
     std::size_t waypoint{ 0 };
+
+    // L118 async path query: a pending begin_async_path request id (0 = none)
+    // that repaths via poll_async_path instead of the blocking find_path, so
+    // the play loop never stalls on a slow query and the request is
+    // cancellable. In-flight requests are cancelled before a new one starts.
+    std::uint64_t asyncRequestId{ 0 };
 
     void set_path(std::vector<glm::vec3> points);
     void update(float deltaTime);
@@ -285,6 +331,15 @@ struct EditorShadowLightSlots {
     } point0{};
 };
 void collect_editor_shadow_lights(const Scene* scene, EditorShadowLightSlots& out);
+
+// Direction the scene's directional sun points TOWARD (sun->scene). Derived
+// from the light's world POSITION (it looks back at the scene origin), so
+// moving the sun icon in the editor changes the illumination instead of being
+// rotation-only. Falls back to yaw/pitch from rotation when the object sits at
+// the origin (keeps authored scenes that never moved the sun intact). Shared by
+// the shadow pass, collect_editor_shadow_lights, fill_scene_light_entries and
+// the sky so diffuse light, shadow map and sky never disagree.
+glm::vec3 editor_sun_direction(const TransformComponent& t);
 
 // -----------------------------------------------------------------------
 // GPU buffer for procedural geometry
@@ -520,6 +575,14 @@ private:
     // ---- Offscreen Viewport Rendering ----
     OffscreenTarget m_offscreen;
     EditorShadowMap m_shadowMap;
+    // Reaberto L47 — cascatas do sol no editor: os VPs por cascata e os view-
+    // depth splits preenchem o LightUboData (sunCascadeVP/sunCascadeSplits)
+    // que antes ficavam só no template do shader (matrizes identidade/zero).
+    // Computados por frame em record_shadow_pass a partir da câmera real +
+    // sol; o atlas 2x2 (tile = m_shadowMap.size) é renderizado por cascata.
+    glm::mat4 m_sunCascadeVP[4]{ glm::mat4(1.0f) };
+    glm::vec4 m_sunCascadeSplits{ 0.0f, 0.0f, 0.0f, 0.0f };  // xyz = splits, w = count
+    std::uint32_t m_sunCascadeCount{ 0u };
     EditorSpotShadowMap m_spotShadow;
     EditorPointShadowMap m_pointShadow;
     GPUBuffer m_editorShadowUbo;
@@ -1129,6 +1192,12 @@ private:
     // exposed via GET /play-mode.
     std::string m_playModeJson;
     void refresh_play_mode();
+    // The PUBLIC play-mode machine (engine/editor/IPlayMode): the editor
+    // reconciles it to the live PlayModeManager every frame and serializes
+    // its snapshot into GET /play-mode — the contract has a real consumer
+    // (its commands are driven and its refusal semantics exercised) instead
+    // of remaining an orphaned public interface.
+    std::unique_ptr<engine::editor::IPlayMode> m_playModeContract;
 
     // Command index (plano agente 2 §B): the palette's data-driven command
     // catalog (id/label/category/keywords/action). Built once and exposed
@@ -1148,6 +1217,63 @@ private:
     std::string m_qtThemeJson;
     void build_qt_theme();
 
+    // Engine/ui gap-factory consumers (Aceleração 4 §C): the headless,
+    // data-driven UI contracts had NO product consumers — they were only
+    // exercised by SDK tests. The editor instantiates each real runtime and
+    // feeds it live state so the contracts participate in the editor loop
+    // instead of remaining orphaned public interfaces. m_uiDocJson already
+    // climbs the resulting UI surface via GET /ui-doc; these members hold the
+    // live runtime instances that back it.
+    std::unique_ptr<engine::ui::IUiLayout> m_uiLayoutRuntime;
+    std::unique_ptr<engine::ui::IUiViewport> m_uiViewportRuntime;
+    std::unique_ptr<engine::ui::IUiWidgets> m_uiWidgetsRuntime;
+    std::unique_ptr<engine::ui::IUiConfirmation> m_uiConfirmationRuntime;
+    std::shared_ptr<engine::ui::ITextShaper> m_textShaper;
+    std::shared_ptr<engine::ui::IJsonSchema> m_jsonSchema;
+    // Data-driven UI registry state fed into the contracts (inventory grid,
+    // crafting session) and exposed through the UI surface.
+    std::unique_ptr<engine::ui::IUiInventoryGrid> m_inventoryGridRuntime;
+    std::unique_ptr<engine::ui::IUiCrafting> m_craftingRuntime;
+    // Inventory backing the grid presentation (6x9 slots). Must be
+    // default-constructible as a member, so it is built in build_ui_runtimes()
+    // (Inventory requires an explicit slot count).
+    std::unique_ptr<engine::registry::Inventory> m_inventoryGridInv;
+    std::string m_inventoryGridJson;
+    void build_ui_runtimes();
+    void refresh_ui_runtimes();
+
+    // Visual-script service (Aceleração 4 §C): the public IVisualScriptService
+    // had no consumer. The editor registers the play-mode script VM as a
+    // service and dispatches lifecycle/authoring events into it, so the
+    // contract is consumed by the real scripting surface.
+    std::unique_ptr<engine::scripting::IVisualScriptService> m_visualScriptService;
+    // Owned runtime attached to m_visualScriptService, kept alive for the
+    // editor's lifetime so the service never holds a dangling pointer.
+    std::unique_ptr<engine::scripting::IVisualScriptRuntime> m_visualScriptRuntime;
+    // Luau sandbox (Conta 5 §2): the public ILuauSandbox policy contract had
+    // zero product consumers (sdkTestOnly). The editor runs real boxed script
+    // sources through the sandbox on every frame so the sandbox (budgets,
+    // allowlist, io/require lockdown, result shaping) is a REAL product
+    // consumer — not an orphaned public interface.
+    std::unique_ptr<engine::scripting::ILuauSandbox> m_luauSandbox;
+    std::string m_luauSandboxLastResult;
+    std::uint64_t m_luauSandboxExecutions{ 0 };
+    bool m_luauSandboxIoLocked{ false };
+    // Visual-script lifecycle (Aceleração 4 §C): tracks the REAL play-mode
+    // state between frames and dispatches OnStart/OnStop lifecycle events into
+    // the visual-script service on play-enter / play-exit, so the service
+    // lifecycle is exercised by the product (not just registered/attached).
+    PlayState m_lastVisualScriptPlayState{ PlayState::Edit };
+    void refresh_visual_script_lifecycle();
+    void run_luau_sandbox();
+    void cook_showcase_assets();
+
+    // Plugin gap-factory consumers (Aceleração 4 §C): the isolation runtime
+    // and manifest codec back the editor's plugin metadata/load surface
+    // instead of only existing as SDK adapters.
+    std::unique_ptr<engine::plugins::IPluginIsolationRuntime> m_pluginIsolationRuntime;
+    std::unique_ptr<engine::plugins::IPluginManifestCodec> m_pluginManifestCodec;
+
     // Frame profiler (plano agente 2 §B): deterministic frame-time/memory
     // stats (sliding window + percentiles + spikes). Fed every frame and
     // exposed via GET /profiler.
@@ -1155,10 +1281,76 @@ private:
     std::string m_profilerJson;
     void refresh_profiler();
 
+    // Render diagnostics (agente 4 — Aceleração §C/D): the editor is a REAL
+    // consumer of the canonical public rendering contracts. m_renderMetrics
+    // records REAL per-pass CPU timings from the actual viewport render loop
+    // (shadow + spot/point shadows, scene/content, env capture) and memory
+    // residency, closed every frame; m_renderProviderRegistry records WHICH
+    // editor-side providers back each rendering system (shadow raster,
+    // probe-grid GI, scene lights, pick) with their call sites. Both are
+    // serialized into m_renderDiagnosticsJson and exposed via GET
+    // /render-diagnostics for the Agente 5 batch validation.
+    std::unique_ptr<Engine::Rendering::IRenderPassMetrics> m_renderMetrics;
+    std::unique_ptr<Engine::Rendering::IRenderProviderRegistry> m_renderProviderRegistry;
+    // Real debug-view snapshot (engine/rendering IRenderingDebugView): fed each
+    // frame from the ACTUAL editor state (probe irradiance from m_probeGrid,
+    // captured/pending capture counters) so cards/probes/tracing debug overlays
+    // render REAL data, and serialized into the diagnostics JSON.
+    std::unique_ptr<Engine::Rendering::IRenderingDebugView> m_renderDebugView;
+    std::string m_renderDiagnosticsJson;
+    // Active selectable debug overlay (D.1 "seleção de debug overlay"): which
+    // overlay the SDK/MCP agent selects to emphasize in the presented viewport.
+    // Values: "none", "probes", "cards", "capture", "trace", "disocclusion".
+    std::string m_selectedDebugOverlay{ "none" };
+    void register_render_providers();
+    void refresh_render_diagnostics();
+    void feed_render_debug_view();
+    // Applies a `render-debug <overlay>` selection; returns a human-readable
+    // confirmation of the real overlay now active and its current data.
+    std::string apply_render_debug_overlay(const std::string& overlay);
+
     // Undo history (plano agente 2 §B): the UndoSystem's generic undo/redo
     // stack, exposed via GET /undo.
     std::string m_undoJson;
     void refresh_undo();
+
+    // Network debugger (Aceleração 4 §B): the editor is a REAL consumer of the
+    // public networking contracts. m_netSession holds server-side session
+    // identity/status state (INetworkSession) and m_netRpc holds an RPC
+    // registry (INetworkRpc); the observed JSON is driven from the LIVE
+    // editor/play state each frame instead of static JSON. Exposed via GET
+    // /network-debug.
+    std::unique_ptr<engine::networking::INetworkSession> m_netSession;
+    std::unique_ptr<engine::networking::INetworkRpc> m_netRpc;
+    std::string m_networkDebugJson;
+    void refresh_network_debug();
+
+    // Package manifest + episode compiler (Aceleração 4 §D): the editor is a
+    // REAL consumer of the public packaging/compiler contracts instead of the
+    // SDK-only/test-only adapters they were. m_packageManager holds an
+    // engine::packaging::IPackageManager session (manifest hashes/versions /
+    // dependency resolution) and m_episodeCompiler holds an
+    // engine::compiler::IEpisodeCompiler (validate/simulate/test/compress/sign
+    // pipeline). refresh_package_manifest() drives them from LIVE editor/play
+    // state each frame and serializes the observable result into
+    // GET /package-manifest — so the hashed/versioned signing path has a real
+    // product consumer, not just tests.
+    std::unique_ptr<engine::packaging::IPackageManager> m_packageManager;
+    std::unique_ptr<engine::compiler::IEpisodeCompiler> m_episodeCompiler;
+    // Conta 5 §3/§4 — the public IAssetCooker (previously TEST-ONLY) becomes a
+    // real editor consumer: it cooks the showcase project's text/config assets
+    // through the GCCILMA (cozimento once) path and publishes the content hash
+    // + cache-hit observable each frame (see cook_showcase_assets()).
+    std::unique_ptr<engine::assets::IAssetCooker> m_assetCooker;
+    std::string m_cookedAssetLast;
+    std::uint64_t m_cookedAssetHash{ 0 };
+    bool m_cookedAssetCacheHit{ false };
+    std::size_t m_cookedAssetCount{ 0 };
+    std::string m_cookAssetsJson;
+    std::string m_packageManifestJson;
+    std::string m_packageCompilerSignature;   // last episode-compile signature
+    bool m_packageCompilerVerified{ false };  // last episode-compile verify()
+    void refresh_package_manifest();
 
     // Content browser (plano agente 2 §B): the asset navigation model built
     // from the real AssetRegistry snapshot, exposed via GET /content-browser.
@@ -1326,6 +1518,32 @@ private:
     // ParticleEmitterComponent entity, fed the play physics for collisions.
     Engine::Gameplay::ParticleSimulation m_playParticles;
     std::unordered_map<UUID, std::size_t> m_playEmitters;
+    // Play-world destruction debris (F.3): one burst-only emitter (rate 0 /
+    // emitting false, so it NEVER auto-spawns) re-positioned at each gameplay
+    // destruction event — weapon hit points on an intact destructible and the
+    // fully-destroyed transition — and burst with real debris. The debris flows
+    // into the same GPU particle pass as the per-entity emitters (I.1).
+    std::size_t m_playDebrisEmitter{ static_cast<std::size_t>(-1) };
+    // Previous frame's fully_destroyed() per destructible, so the big burst
+    // fires on the destruction TRANSITION (not every frame while it stands).
+    std::unordered_map<UUID, bool> m_playDestroyedPrev;
+    // Play-world weather particles (F.3): a rain emitter driven by the scene's
+    // WeatherComponent.rainAmount — positionSpread gives a wide spawn curtain
+    // above the camera, rate scales with rainAmount, and the particles fall
+    // through the play physics (collide=false) into the same GPU pass (I.1).
+    std::size_t m_playRainEmitter{ static_cast<std::size_t>(-1) };
+    // Play-world weapon-impact sparks (F.3): every WeaponRuntime hit this frame
+    // (terrain, voxel, props — not just destructibles) bursts a few hot sparks
+    // at the hit point. Burst-only emitter, rendered by the GPU pass (I.1).
+    std::size_t m_playSparkEmitter{ static_cast<std::size_t>(-1) };
+    // Play-world vehicle dust (F.3): grounded wheels of a moving vehicle kick
+    // real dust at their actual contact points (WheelState.contactPoint from
+    // the real raycast). Burst-only emitter, rendered by the GPU pass (I.1).
+    std::size_t m_playDustEmitter{ static_cast<std::size_t>(-1) };
+    // Play-world audio pulses (F.3): the live per-voice level of a playing
+    // voice (Mixer::voice_level — real RMS of the rendered block) drives a soft
+    // particle pulse at the voice's world position. Burst-only emitter.
+    std::size_t m_playPulseEmitter{ static_cast<std::size_t>(-1) };
     // Play-world vehicles: one VehicleRuntime per VehicleComponent entity with
     // a chassis body in the play physics; driven with the arrow keys.
     std::unordered_map<UUID, Engine::Gameplay::VehicleRuntime> m_playVehicles;
@@ -1403,6 +1621,15 @@ private:
         bool dirty{ true };
     };
     std::unordered_map<UUID, SplatCloud> m_splatClouds;
+
+    // Play-world particles (I.1): the ParticleSimulation publishes real
+    // per-particle render data each frame; upload_play_particles() copies it
+    // into this vertex buffer and the scene pass draws it as POINT_LIST
+    // through the splat pipeline, so the sim's render data reaches a real
+    // GPU pass instead of dying in render_data().
+    GPUBuffer m_playParticleVB;
+    uint32_t m_playParticleVertexCount{ 0 };
+    void upload_play_particles();
     // Env probe cubemap capture (one shared capture target, re-captured for
     // the active probe on demand or periodically when realTime).
     struct EnvProbeCapture {
@@ -1467,6 +1694,46 @@ private:
     // (FALTANTES item 12).
     std::unique_ptr<engine::navigation::INavigationProvider> m_playNav;
     std::unordered_map<UUID, PlayNavAgent> m_playNavAgents;
+    // CONTA 3 (item 120): per-frame AI debug snapshot consumed by the editor.
+    // Play mode drives an IAiDebugRecorder from the SAME live nav agents it
+    // steers each frame (async path status + followed route = the agent's
+    // decision state), so the AI Debug panel reads a REAL snapshot with entity
+    // selection and explicit absent-state handling.
+    std::unique_ptr<engine::ai::IAiDebugRecorder> m_playAiRecorder;
+    std::string m_playAiDebugJson{ "{}" };
+    std::vector<engine::ai::AiDebugNode> m_playAiNodes;
+    std::vector<engine::ai::AiDebugBlackboard> m_playAiBlackboard;
+    std::size_t m_playAiAgentCount{ 0 };
+    // CONTA 3 (item 120): the AI Debug panel's focused live nav entity — the
+    // recorder feeds the snapshot for THIS agent each frame (entity selection
+    // for the debug consumer). An invalid UUID means "auto: first live agent";
+    // absent state (no live agent) is shown explicitly by the panel.
+    Engine::UUID m_playAiFocus{ 0, 0 };
+    bool m_showAiDebug{ false };
+    void draw_ai_debug_panel();
+    void feed_play_ai_debug();
+    void update_play_ai_focus();
+    // AGENTE 2 block A: play mode runs the SAME canonical IWorldRuntime
+    // composition as the game executable and the server. The play scene's ECS
+    // is the mob/entity world bound to the runtime; the canonical gameplay
+    // integration drives its fixed tick (physics step + world manager + event
+    // router + navigation queries + audio mapping) every play frame alongside
+    // the editor's dedicated play physics.
+    std::unique_ptr<engine::IWorldRuntime> m_playWorldRuntime;
+    std::unique_ptr<engine::entity::IEntityWorld> m_playRuntimeEcs;
+    std::unique_ptr<engine::gameplay::IGameplayRuntime> m_playRuntimePhysics;
+    std::unique_ptr<engine::world::IWorldManager> m_playRuntimeWorlds;
+    std::unique_ptr<engine::gameplay::IGameplayIntegration> m_playRuntimeIntegration;
+    std::unique_ptr<engine::gameplay::IGameplayBindings> m_playRuntimeBindings;
+    std::unique_ptr<engine::gameplay::IGameplaySystemWiring> m_playRuntimeWiring;
+    std::unique_ptr<engine::gameplay::IGameplayEvents> m_playRuntimeEvents;
+    std::unique_ptr<engine::gameplay::IGameplayMetrics> m_playRuntimeMetrics;
+    std::unique_ptr<engine::gameplay::IGameplayEventRouter> m_playRuntimeRouter;
+    std::unique_ptr<engine::navigation::IAsyncQueryScheduler> m_playRuntimeQueries;
+    std::unique_ptr<engine::audio::IAudioEventMapper> m_playRuntimeAudio;
+    std::unique_ptr<engine::gameplay::IDayNightCycle> m_playDayNight;
+    std::uint64_t m_playRuntimeTick{ 0 };
+    std::string m_playRuntimeError;
     // Sky pass (Clima panel): procedural day/night sky driven by the scene's
     // first WeatherComponent + directional sun. Drawn first in the viewport.
     struct SkyPushConstants {

@@ -29,9 +29,12 @@ int main() {
     assert(transport->poll(error).empty());
     transport->stop();
     assert(transport->state() == TransportState::Stopped);
-    TransportConfig unsupported = config;
-    unsupported.kind = TransportKind::Udp;
-    auto none = create_transport(unsupported, error);
-    assert(!none && error == "transport_backend_unavailable");
+    // The real UDP backend (sdk/UdpTransport.cpp) is now available; creating it
+    // must yield a valid ITransport without binding (state stays Stopped).
+    TransportConfig udp = config;
+    udp.kind = TransportKind::Udp;
+    auto udpTransport = create_transport(udp, error);
+    assert(udpTransport != nullptr);
+    assert(udpTransport->state() == TransportState::Stopped);
     return 0;
 }

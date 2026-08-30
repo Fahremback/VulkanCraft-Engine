@@ -390,6 +390,7 @@ void EditorApplication::draw_menu_bar() {
             ImGui::MenuItem(tr("Layout Settings", "Layout Settings"), nullptr, &m_showLayoutSettings);
             ImGui::MenuItem(tr("Debugger de Scripts", "Script Debugger"), nullptr, &m_showScriptDebugger);
             ImGui::MenuItem(tr("Canvas de Scripts", "Script Canvas"), nullptr, &m_showScriptCanvas);
+            ImGui::MenuItem(tr("IA Debugger", "AI Debugger"), nullptr, &m_showAiDebug);
             ImGui::Separator();
             ImGui::MenuItem(tr("Editores Especializados", "Specialized Editors"), nullptr, &m_specializedEditors.open);
             m_wickedTools.draw_tools_menu();
@@ -611,6 +612,10 @@ void EditorApplication::draw_app_bar() {
         if (paused) {
             ImGui::SameLine();
             if (ImGui::Button(tr(" PASSO ", " STEP "), ImVec2(0, btnHeight))) {
+                if (m_playModeContract) {
+                    std::string stepErr;
+                    (void)m_playModeContract->step(stepErr);
+                }
                 m_stepRequested = true;
             }
             if (ImGui::IsItemHovered()) {
@@ -1298,6 +1303,12 @@ void EditorApplication::draw_inspector_panel() {
         ImGui::DragFloat(tr("Brilho (Intensidade)", "Intensity"), &l.intensity, 100.0f, 0.0f, 100000.0f);
         ImGui::DragFloat(tr("Alcance da Luz", "Range"), &l.range, 0.5f, 0.1f, 1000.0f);
         ImGui::Checkbox(tr("Projetar Sombras", "Cast Shadows"), &l.castShadows);
+        if (l.type == LightType::Spot) {
+            // Real spot cone (agente 4 — B.3): authored here, fed into the
+            // shared LightUboData spotLightParams each frame. 1.45 rad keeps
+            // the outer cone inside the 90° spot shadow-map frustum.
+            ImGui::SliderFloat(tr("Cone (rad)", "Spot Cone (rad)"), &l.coneAngle, 0.05f, 1.45f);
+        }
         ImGui::Spacing();
     }
 
@@ -2140,6 +2151,79 @@ void EditorApplication::draw_content_browser_panel() {
             } else if (selected->type == AssetType::Audio) {
                 ImGui::TextDisabled("%u Hz, %u channel(s), %.2f s", selected->sampleRate,
                                     selected->audioChannels, selected->durationSeconds);
+            } else if (selected->type == AssetType::Material) {
+                // Material asset editor: authors the REAL MaterialAsset (PBR
+                // parameters + albedo/normal/roughness/metallic maps) and saves
+                // it to the .material file. The viewport consumes the same
+                // MaterialAsset through material_graph_from_asset() — the graph
+                // pipeline cache rebuilds by graphHash, so editing a map here
+                // changes the rendered material without any other step.
+                if (load_material_asset(selected->id)) {
+                    const UUID matId = selected->id;
+                    MaterialAsset mat = m_materialAssets.at(matId);
+                    char matNameBuf[256] = {};
+                    strncpy(matNameBuf, mat.name.c_str(), sizeof(matNameBuf) - 1);
+                    if (ImGui::InputText(tr("Nome", "Name"), matNameBuf, sizeof(matNameBuf)))
+                        mat.name = matNameBuf;
+                    ImGui::ColorEdit3(tr("Cor (Albedo)", "Albedo"), &mat.albedo.r);
+                    ImGui::SliderFloat(tr("Rugosidade", "Roughness"), &mat.roughness, 0.0f, 1.0f);
+                    ImGui::SliderFloat(tr("Metalicidade", "Metallic"), &mat.metallic, 0.0f, 1.0f);
+                    ImGui::ColorEdit3(tr("Cor Emissiva", "Emissive Color"), &mat.emissiveColor.r);
+                    ImGui::DragFloat(tr("Intensidade Emissiva", "Emissive Intensity"),
+                                     &mat.emissiveIntensity, 0.05f, 0.0f, 100.0f);
+                    // Map pickers over the real cooked texture assets. Each
+                    // output is driven by its map when present (texture), or
+                    // by the PBR parameter above (constant) otherwise.
+                    std::vector<std::pair<UUID, std::string>> matTextureAssets;
+                    for (const AssetMetadata& tex : m_assetRegistry.snapshot()) {
+                        if (tex.type == AssetType::Texture && tex.isCooked) {
+                            matTextureAssets.emplace_back(tex.id, tex.sourcePath.filename().string());
+                        }
+                    }
+                    const char* matNoneLabel = tr("(Nenhum)", "(None)");
+                    const auto materialMapPicker = [&](const char* label, UUID& target) {
+                        const std::string cur = target.is_valid() ? target.to_string() : std::string();
+                        int currentIndex = -1;
+                        for (size_t i = 0; i < matTextureAssets.size(); ++i) {
+                            if (matTextureAssets[i].first.to_string() == cur) {
+                                currentIndex = static_cast<int>(i);
+                                break;
+                            }
+                        }
+                        const std::string preview =
+                            currentIndex >= 0 ? matTextureAssets[currentIndex].second : matNoneLabel;
+                        if (ImGui::BeginCombo(label, preview.c_str())) {
+                            if (ImGui::Selectable(matNoneLabel, currentIndex < 0)) target = UUID();
+                            for (size_t i = 0; i < matTextureAssets.size(); ++i) {
+                                if (ImGui::Selectable(matTextureAssets[i].second.c_str(),
+                                                      currentIndex == static_cast<int>(i))) {
+                                    target = matTextureAssets[i].first;
+                                }
+                            }
+                            ImGui::EndCombo();
+                        }
+                    };
+                    materialMapPicker(tr("Mapa de Albedo", "Albedo Map"), mat.albedoMapID);
+                    materialMapPicker(tr("Mapa de Normal", "Normal Map"), mat.normalMapID);
+                    materialMapPicker(tr("Mapa de Rugosidade", "Roughness Map"), mat.roughnessMapID);
+                    materialMapPicker(tr("Mapa de Metalicidade", "Metallic Map"), mat.metallicMapID);
+                    ImGui::Spacing();
+                    if (ImGui::Button(tr("Salvar Material", "Save Material"))) {
+                        if (mat.save_to_file(selected->sourcePath)) {
+                            m_materialAssets[matId] = mat;
+                            m_materialLoadFailed.erase(matId);
+                            if (m_assetHotReload) m_assetHotReload->watch_registered_assets();
+                            std::cout << "[ContentBrowser] Material saved: "
+                                      << selected->sourcePath.string() << std::endl;
+                        } else {
+                            std::cerr << "[ContentBrowser] Failed to save material "
+                                      << selected->sourcePath.string() << std::endl;
+                        }
+                    }
+                } else {
+                    ImGui::TextColored(UI::Colors::Danger, "%s",
+                                       tr("Falha ao carregar material", "Failed to load material"));
+                }
             } else {
                 ImGui::TextDisabled("No editable import settings for this asset type");
             }
@@ -2727,6 +2811,69 @@ void EditorApplication::draw_voxel_tool_panel() {
 #endif
 }
 
+namespace {
+
+bool build_game_target_on_demand(const std::filesystem::path& sourceRoot,
+                                 const std::filesystem::path& logPath,
+                                 std::string& error) {
+    const std::filesystem::path script = sourceRoot / "tools" / "maintenance" / "build-shared.ps1";
+    if (!std::filesystem::is_regular_file(script)) {
+        error = "canonical build script not found: " + script.string();
+        return false;
+    }
+
+#ifdef _WIN32
+    // The Editor is the build orchestrator. Game/server/tool executables are
+    // deliberately EXCLUDE_FROM_ALL and must be produced on demand, never
+    // assumed to exist in a stale build/Release directory.
+    std::wstring command =
+        L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" +
+        script.wstring() + L"\" -Target VulkanEngineGame -WaitSeconds 3600 -LogPath \"" +
+        logPath.wstring() + L"\"";
+    std::vector<wchar_t> commandLine(command.begin(), command.end());
+    commandLine.push_back(L'\0');
+
+    STARTUPINFOW startup{ sizeof(startup) };
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, sourceRoot.wstring().c_str(),
+                        &startup, &process)) {
+        error = "could not start the incremental compiler (Windows error " +
+                std::to_string(GetLastError()) + ")";
+        return false;
+    }
+
+    const DWORD waitResult = WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD exitCode = ERROR_GEN_FAILURE;
+    if (waitResult == WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess, &exitCode);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    if (waitResult != WAIT_OBJECT_0 || exitCode != 0) {
+        std::ifstream buildLog(logPath);
+        std::string line;
+        std::string lastLine;
+        while (std::getline(buildLog, line)) {
+            if (!line.empty()) lastLine = line;
+        }
+        error = "VulkanEngineGame compilation failed";
+        if (!lastLine.empty()) error += ": " + lastLine;
+        return false;
+    }
+    return true;
+#else
+    const std::filesystem::path buildDir = sourceRoot / "out" / "dev-shared";
+    const std::string command = "cmake --build \"" + buildDir.string() +
+                                "\" --target VulkanEngineGame";
+    if (std::system(command.c_str()) != 0) {
+        error = "VulkanEngineGame compilation failed";
+        return false;
+    }
+    return true;
+#endif
+}
+
+} // namespace
+
 void EditorApplication::run_game_build() {
     m_buildLog.clear();
     const auto log = [this](const std::string& line) {
@@ -2801,16 +2948,44 @@ void EditorApplication::run_game_build() {
     }
     log(std::to_string(shaders) + " shader(s) copied");
 
-    // 5. Copy the game executable next to the package.
+    // 5. Incrementally compile the game target from the Editor itself. The
+    // shared Ninja tree recompiles only changed dependencies and keeps every
+    // auxiliary executable out of the normal Editor build.
     std::filesystem::create_directories(binDir, ec);
-    const std::filesystem::path gameExe = sourceRoot / "build" / "Release" / "VulkanEngineGame.exe";
-    if (std::filesystem::is_regular_file(gameExe)) {
-        std::filesystem::copy_file(gameExe, binDir / "VulkanEngineGame.exe",
-                                   std::filesystem::copy_options::overwrite_existing, ec);
-        log("Copied VulkanEngineGame.exe");
-    } else {
-        log("WARNING: " + gameExe.string() + " not found — build the VulkanEngineGame target first");
+    const std::filesystem::path compileLog = buildRoot / "compile.log";
+    log("Compiling the game incrementally (only changed modules)...");
+    std::string compileError;
+    if (!build_game_target_on_demand(sourceRoot, compileLog, compileError)) {
+        log("Build failed: " + compileError);
+        if (m_publishPipeline) m_publishPipeline->fail(compileError);
+        return;
     }
+
+    std::filesystem::path gameExe;
+    for (const std::filesystem::path& candidate : {
+             sourceRoot / "out" / "dev-shared" / "VulkanEngineGame.exe",
+             sourceRoot / "out" / "dev-shared" / "RelWithDebInfo" / "VulkanEngineGame.exe" }) {
+        if (std::filesystem::is_regular_file(candidate)) {
+            gameExe = candidate;
+            break;
+        }
+    }
+    if (gameExe.empty()) {
+        const std::string missing = "compiler succeeded but VulkanEngineGame.exe was not produced";
+        log("Build failed: " + missing);
+        if (m_publishPipeline) m_publishPipeline->fail(missing);
+        return;
+    }
+    ec.clear();
+    std::filesystem::copy_file(gameExe, binDir / "VulkanEngineGame.exe",
+                               std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        const std::string copyError = "could not stage VulkanEngineGame.exe: " + ec.message();
+        log("Build failed: " + copyError);
+        if (m_publishPipeline) m_publishPipeline->fail(copyError);
+        return;
+    }
+    log("VulkanEngineGame.exe compiled and staged");
 
     // 6. Package manifest + launcher script.
     std::ofstream manifest(buildRoot / "PackageManifest.txt", std::ios::trunc);

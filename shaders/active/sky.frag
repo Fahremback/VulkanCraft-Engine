@@ -43,6 +43,14 @@ void main() {
     float horizon = clamp(ray.y * 4.0 + 0.18, 0.0, 1.0);
     float sunset = (1.0 - smoothstep(0.02, 0.38, abs(sunDir.y))) * daylight;
 
+    // F.1: physical atmosphere — the REAL spectral transmittance computed by
+    // the IAtmosphereScattering core (sun elevation) is pushed in
+    // environment.z. It attenuates the sun disc/glow (real extinction) and
+    // adds aerial perspective warm haze when the air mass is high.
+    float atmoTransmittance = clamp(push.environment.z, 0.04, 1.0);
+    // F.2: volumetric clouds — the REAL coverage from the IVolumeClouds core
+    // is pushed in sunColor.w (clear sky at 0, overcast at 1).
+
     vec3 nightZenith = vec3(0.002, 0.006, 0.022);
     vec3 nightHorizon = vec3(0.018, 0.032, 0.070);
     vec3 dayZenith = vec3(0.08, 0.29, 0.72);
@@ -51,10 +59,16 @@ void main() {
                    mix(dayHorizon, dayZenith, pow(horizon, 0.38)), daylight);
 
     float sunAmount = max(dot(ray, sunDir), 0.0);
-    float sunDisc = smoothstep(0.99942, 0.99978, sunAmount) * daylight;
-    float sunGlow = pow(sunAmount, 320.0) * daylight + pow(sunAmount, 18.0) * 0.16 * daylight;
+    // Physical extinction: a low sun (high air mass) is attenuated by the real
+    // atmosphere transmittance.
+    float sunDisc = smoothstep(0.99942, 0.99978, sunAmount) * daylight * atmoTransmittance;
+    float sunGlow = (pow(sunAmount, 320.0) * daylight + pow(sunAmount, 18.0) * 0.16 * daylight) * atmoTransmittance;
     sky += mix(vec3(1.0, 0.31, 0.06), vec3(1.0, 0.93, 0.70), smoothstep(0.02, 0.45, sunDir.y))
          * (sunDisc * 12.0 + sunGlow * 2.8);
+    // Aerial perspective: scattered light along the view ray warms the horizon
+    // as the air mass grows (transmittance drops).
+    sky += mix(vec3(1.0, 0.45, 0.15), vec3(0.90, 0.55, 0.28), horizon)
+         * (1.0 - atmoTransmittance) * daylight * 0.55;
 
     vec3 moonDir = -sunDir;
     float moonAmount = max(dot(ray, moonDir), 0.0);
@@ -62,6 +76,8 @@ void main() {
     float moonTexture = 0.74 + noise2(ray.xz * 540.0 + ray.y * 113.0) * 0.26;
     sky += vec3(0.62, 0.75, 1.0) * moonDisc * moonTexture * 3.4;
     sky += vec3(0.20, 0.30, 0.52) * pow(moonAmount, 80.0) * (1.0 - daylight) * 0.18;
+
+    float cloudCoverage = clamp(push.sunColor.w, 0.0, 1.0);
 
     if (ray.y > 0.015) {
         vec2 starGrid = vec2(atan(ray.z, ray.x), asin(ray.y)) * vec2(510.0, 420.0);
@@ -99,7 +115,10 @@ void main() {
             float layerDepth = float(layer) / 5.0;
             vec2 layerPos = cloudPos + ray.xz * layerDepth * 0.17 + vec2(layerDepth * 7.3, -layerDepth * 4.1);
             float density = fbm(layerPos) * 0.66 + fbm(layerPos * 2.7 + 19.0) * 0.34;
-            density = smoothstep(0.53 + layerDepth*0.018, 0.70, density) * 0.30;
+            // F.2: the real volume-cloud coverage modulates the layer density
+            // (coverage 0 = clear sky, 1 = full overcast).
+            density = smoothstep(0.53 + layerDepth*0.018, 0.70, density) * 0.30
+                    * mix(0.12, 1.0, cloudCoverage);
             cloud += density * transmittance;
             transmittance *= 1.0 - density;
         }

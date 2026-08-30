@@ -588,6 +588,60 @@ void World::set_block_at(const glm::vec3& worldPos, RuntimeBlockId type) {
     }
 }
 
+// ---- Atomic block transactions (AGENTE 2 — gameplay showcase) ---------------
+void World::WorldTransaction::set_block(const glm::vec3& worldPos,
+                                        RuntimeBlockId type) {
+    if (done_) return;
+    edits_.push_back(StagedEdit{ worldPos, type });
+}
+
+void World::WorldTransaction::remove_block(const glm::vec3& worldPos) {
+    set_block(worldPos, kRuntimeAirId);
+}
+
+bool World::WorldTransaction::commit(std::string& errorOut) {
+    if (done_) {
+        errorOut = "transaction already committed or rolled back";
+        return false;
+    }
+    done_ = true;
+    // Validation stage: every edit must carry a valid runtime id and target a
+    // writable chunk (mirrors set_block_at's guard). On any failure the whole
+    // transaction rolls back — nothing is applied.
+    for (const StagedEdit& edit : edits_) {
+        if (!world_->is_valid_block_id(edit.blockId)) {
+            errorOut = "transaction rejected: blockId " +
+                       std::to_string(edit.blockId) +
+                       " has no runtime mapping in the world's block table";
+            edits_.clear();
+            return false;
+        }
+        if (!world_->can_touch_chunk_at(edit.position)) {
+            errorOut = "transaction rejected: chunk not loaded at (" +
+                       std::to_string(edit.position.x) + ',' +
+                       std::to_string(edit.position.y) + ',' +
+                       std::to_string(edit.position.z) + ')';
+            edits_.clear();
+            return false;
+        }
+    }
+    // Apply stage: every edit passed validation, so apply all through the
+    // single mutation path (dirties mesh, pins persistence, relights).
+    for (const StagedEdit& edit : edits_) {
+        world_->set_block_at(edit.position, edit.blockId);
+    }
+    return true;
+}
+
+void World::WorldTransaction::rollback() {
+    done_ = true;
+    edits_.clear();
+}
+
+std::unique_ptr<World::WorldTransaction> World::begin_transaction() {
+    return std::make_unique<WorldTransaction>(*this);
+}
+
 void World::set_water_at(const glm::vec3& worldPos, uint8_t level) {
     const int cx = static_cast<int>(std::floor(worldPos.x / CHUNK_SIZE_X));
     const int cz = static_cast<int>(std::floor(worldPos.z / CHUNK_SIZE_Z));

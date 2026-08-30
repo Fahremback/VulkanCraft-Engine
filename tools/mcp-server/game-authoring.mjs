@@ -390,7 +390,7 @@ export const PARTICLE_FIELD_SCHEMAS = Object.freeze({
 //   inventory      -> Inventory serialize_json (engine/registry/Inventory.hpp)
 export const CONFIG_KINDS = Object.freeze([
   "shader", "render_graph", "light", "gi", "ocean", "post_process", "fluid_sim",
-  "world", "chunk", "transaction", "block_entity", "inventory"
+  "world", "chunk", "transaction", "block_entity", "inventory", "network"
 ]);
 
 // Enum surfaces mirroring the public C++ contracts.
@@ -413,8 +413,8 @@ export const CONFIG_FIELD_SCHEMAS = Object.freeze({
     { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
     { name: "stage", type: "enum", values: [...SHADER_STAGES], required: false, default: "fragment", description: "shader stage (vertex/fragment/compute) — mirror of IShaderCompiler.ShaderStage" },
     { name: "source", type: "string", required: true, description: "GLSL source text" },
-    { name: "target_env", type: "string", required: false, default: "", description: "SPIR-V target env (e.g. 'spirv1.5'); empty = compiler default" },
-    { name: "opt_level", type: "integer", required: false, default: 0, description: "optimization level: 0 = none, 1 = size, 2 = speed" },
+    { name: "targetEnv", type: "string", required: false, default: "", description: "SPIR-V target env (e.g. 'spirv1.5'); empty = compiler default" },
+    { name: "optLevel", type: "integer", required: false, default: 0, description: "optimization level: 0 = none, 1 = size, 2 = speed" },
     { name: "defines", type: "array[string]", required: false, default: [], description: "macro defines, e.g. ['MAX_LIGHTS=64']" }
   ],
   render_graph: [
@@ -431,87 +431,114 @@ export const CONFIG_FIELD_SCHEMAS = Object.freeze({
     { name: "color", type: "array[3]", required: false, default: [1, 1, 1], description: "RGB color 0..1" },
     { name: "intensity", type: "number", required: false, default: 1000, description: "light intensity > 0" },
     { name: "range", type: "number", required: false, default: 50, description: "range >= 0 (directional ignores)" },
-    { name: "cast_shadows", type: "boolean", required: false, default: true }
+    { name: "castShadows", type: "boolean", required: false, default: true }
   ],
   gi: [
     { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
     { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
-    { name: "cascade_count", type: "integer", required: false, default: 6, description: "probe clipmap cascades [1, 6]" },
+    { name: "cascadeCount", type: "integer", required: false, default: 6, description: "probe clipmap cascades [1, 6]" },
     { name: "resolution", type: "integer", required: false, default: 16, description: "probes per axis [4, 32]" },
-    { name: "probes_per_frame", type: "integer", required: false, default: 192, description: "bake budget per frame >= 1" },
-    { name: "base_spacing", type: "number", required: false, default: 4.0, description: "cascade base spacing meters >= 0.5" },
-    { name: "cascade_scale", type: "number", required: false, default: 4.0, description: ">= 2" },
-    { name: "sun_refresh_angle_degrees", type: "number", required: false, default: 2.0, description: "sun-revision threshold [0.25, 15]" },
+    { name: "probesPerFrame", type: "integer", required: false, default: 192, description: "bake budget per frame >= 1" },
+    { name: "baseSpacing", type: "number", required: false, default: 4.0, description: "cascade base spacing meters >= 0.5" },
+    { name: "cascadeScale", type: "number", required: false, default: 4.0, description: ">= 2" },
+    { name: "sunRefreshAngleDegrees", type: "number", required: false, default: 2.0, description: "sun-revision threshold [0.25, 15]" },
     { name: "bounces", type: "integer", required: false, default: 2, description: "multi-bounce gather iterations [1, 8]" },
     { name: "skylight", type: "array[3]", required: false, default: [0.05, 0.07, 0.10], description: "shadowed ambient RGB term" },
-    { name: "max_distance", type: "number", required: false, default: 128.0, description: "form-factor cull distance > 0" },
+    { name: "maxDistance", type: "number", required: false, default: 128.0, description: "form-factor cull distance > 0" },
     { name: "intensity", type: "number", required: false, default: 1.0, description: "global scale on gathered light [0.01, 64]" }
   ],
   ocean: [
     { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
     { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
     { name: "size", type: "integer", required: false, default: 64, description: "tile size per axis (power of two) [16, 1024]" },
-    { name: "tile_size_meters", type: "number", required: false, default: 256.0, description: "world size of the tile [16, 8192]" },
-    { name: "wind_speed", type: "number", required: false, default: 18.0, description: "wind speed m/s [0.5, 40]" },
-    { name: "wind_dir_rad", type: "number", required: false, default: 0.7, description: "main wave direction (radians), finite" },
+    { name: "tileSizeMeters", type: "number", required: false, default: 256.0, description: "world size of the tile [16, 8192]" },
+    { name: "windSpeed", type: "number", required: false, default: 18.0, description: "wind speed m/s [0.5, 40]" },
+    { name: "windDirRad", type: "number", required: false, default: 0.7, description: "main wave direction (radians), finite" },
     { name: "choppiness", type: "number", required: false, default: 1.2, description: "horizontal displacement scale [0, 4]" },
     { name: "amplitude", type: "number", required: false, default: 0.9, description: "spectrum amplitude scale [0.01, 8]" },
     { name: "seed", type: "integer", required: false, default: 1, description: "deterministic phase seed" }
+  ],
+  network: [
+    { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
+    { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
+    { name: "format", type: "string", required: false, default: "VulkanEngine.NetworkConfig", description: "document identity" },
+    // The showcase network asset is a data-driven DECLARATION of the public
+    // engine::networking::DedicatedServerConfig contract (INetworkServer.hpp):
+    // server_id, transport (kind/endpoint/max_message_bytes/poll_budget/
+    // reuse_address), tick_rate, max_clients, version (protocol/registries/
+    // plugins/schemas/content), security (SecurityLimits) and auth_required.
+    { name: "serverId", type: "string", required: false, default: "showcase", description: "DedicatedServerConfig.server_id" },
+    { name: "transportKind", type: "string", required: false, default: "Loopback", description: "TransportConfig.kind (Loopback|Udp)" },
+    { name: "host", type: "string", required: false, default: "127.0.0.1", description: "TransportEndpoint.host" },
+    { name: "port", type: "integer", required: false, default: 25565, description: "TransportEndpoint.port" },
+    { name: "tickRate", type: "integer", required: false, default: 60, description: "DedicatedServerConfig.tick_rate" },
+    { name: "maxClients", type: "integer", required: false, default: 4, description: "DedicatedServerConfig.max_clients" },
+    { name: "authRequired", type: "boolean", required: false, default: false, description: "DedicatedServerConfig.auth_required" },
+    { name: "versionProtocol", type: "integer", required: false, default: 1, description: "NetVersion.protocol" },
+    { name: "versionRegistries", type: "integer", required: false, default: 1, description: "NetVersion.registries" },
+    { name: "versionPlugins", type: "integer", required: false, default: 1, description: "NetVersion.plugins" },
+    { name: "versionSchemas", type: "integer", required: false, default: 1, description: "NetVersion.schemas" },
+    { name: "versionContent", type: "integer", required: false, default: 1, description: "NetVersion.content" },
+    { name: "securityMaxMessagesPerWindow", type: "integer", required: false, default: 60, description: "SecurityLimits.max_messages_per_window" },
+    { name: "securityWindowMillis", type: "integer", required: false, default: 1000, description: "SecurityLimits.window_millis" },
+    { name: "securityMaxPayload", type: "integer", required: false, default: 1048576, description: "SecurityLimits.max_payload" },
+    { name: "securityAmplificationGuard", type: "boolean", required: false, default: true, description: "SecurityLimits.amplification_guard" },
+    { name: "securityMaxResponseRatio", type: "integer", required: false, default: 8, description: "SecurityLimits.max_response_ratio" }
   ],
   post_process: [
     { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
     { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
     { name: "operator", type: "enum", values: [...TONE_OPERATORS], required: false, default: "aces", description: "tone mapping operator (IToneMapping.ToneOperator)" },
     { name: "exposure", type: "number", required: false, default: 1.0, description: "manual exposure multiplier [0.01, 64]" },
-    { name: "use_ev", type: "boolean", required: false, default: false, description: "when true, EV-based exposure overrides manual" },
+    { name: "useEV", type: "boolean", required: false, default: false, description: "when true, EV-based exposure overrides manual" },
     { name: "ev100", type: "number", required: false, default: 0.0, description: "EV value [-16, 16] -> 1/(1.2 * 2^EV)" },
-    { name: "white_point", type: "number", required: false, default: 11.2, description: "Filmic white point [1, 64]" },
+    { name: "whitePoint", type: "number", required: false, default: 11.2, description: "Filmic white point [1, 64]" },
     { name: "sharpness", type: "number", required: false, default: 0.4, description: "CAS sharpness [0, 1]" },
-    { name: "clamp_values", type: "boolean", required: false, default: true, description: "CAS contrast clamp (anti-ringing)" },
+    { name: "clampValues", type: "boolean", required: false, default: true, description: "CAS contrast clamp (anti-ringing)" },
     { name: "quality", type: "enum", values: [...QUALITY_LEVELS], required: false, default: "high", description: "rendering quality preset (IRenderingPresets)" }
   ],
   fluid_sim: [
     { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
     { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
-    { name: "grid_size", type: "integer", required: false, default: 64, description: "NxN heightfield, > 0" },
-    { name: "cell_size", type: "number", required: false, default: 1.0, description: "world units per cell, > 0" },
+    { name: "gridSize", type: "integer", required: false, default: 64, description: "NxN heightfield, > 0" },
+    { name: "cellSize", type: "number", required: false, default: 1.0, description: "world units per cell, > 0" },
     { name: "gravity", type: "number", required: false, default: 9.81, description: "> 0" },
     { name: "dt", type: "number", required: false, default: 0.0166667, description: "time step, > 0" },
-    { name: "solver_iterations", type: "integer", required: false, default: 4, description: "Jacobi iterations per step, > 0" },
+    { name: "solverIterations", type: "integer", required: false, default: 4, description: "Jacobi iterations per step, > 0" },
     { name: "damping", type: "number", required: false, default: 0.999, description: "velocity damping [0, 1]" },
     { name: "viscosity", type: "number", required: false, default: 0.001, description: "viscosity coefficient >= 0" },
-    { name: "surface_tension", type: "number", required: false, default: 0.0, description: "surface tension coefficient >= 0" }
+    { name: "surfaceTension", type: "number", required: false, default: 0.0, description: "surface tension coefficient >= 0" }
   ],
   world: [
     { name: "name", type: "string", required: true, description: "unique world name (becomes the file name)" },
     { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
     { name: "seed", type: "integer", required: false, default: 0, description: "per-world generator/behavior RNG seed" },
-    { name: "rules_json", type: "string", required: false, default: "", description: "optional opaque rules document (must be well-formed JSON when non-empty)" },
+    { name: "rulesJson", type: "string", required: false, default: "", description: "optional opaque rules document (must be well-formed JSON when non-empty)" },
     { name: "profile", type: "string", required: false, default: "", description: "name of a world profile asset in Content/Profiles (WorldSpec.profileJson)" },
-    { name: "save_path", type: "string", required: false, default: "", description: "default persistence location for load_world/save_world" },
+    { name: "savePath", type: "string", required: false, default: "", description: "default persistence location for load_world/save_world" },
     { name: "portals", type: "array[object]", required: false, default: [], description: "[{ from_world, from: [x,y,z], to_world, to: [x,y,z], yaw_degrees }]" }
   ],
   chunk: [
     { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
     { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
-    { name: "chunk_budget", type: "integer", required: false, default: 16, description: "streaming budget (chunk radius), >= 0" },
-    { name: "memory_budget_bytes", type: "integer", required: false, default: 0, description: "RAM-budgeted chunk cache bytes; 0 = unlimited" },
-    { name: "far_lod_percent", type: "integer", required: false, default: 0, description: "far-LOD endpoint 0..100" },
-    { name: "worker_threads", type: "integer", required: false, default: 0, description: "world worker pool size; 0 = unknown/auto" }
+    { name: "chunkBudget", type: "integer", required: false, default: 16, description: "streaming budget (chunk radius), >= 0" },
+    { name: "memoryBudgetBytes", type: "integer", required: false, default: 0, description: "RAM-budgeted chunk cache bytes; 0 = unlimited" },
+    { name: "farLodPercent", type: "integer", required: false, default: 0, description: "far-LOD endpoint 0..100" },
+    { name: "workerThreads", type: "integer", required: false, default: 0, description: "world worker pool size; 0 = unknown/auto" }
   ],
   transaction: [
     { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
     { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
-    { name: "max_edits", type: "integer", required: false, default: 0, description: "per-transaction edit cap; 0 = unlimited" },
-    { name: "max_box_volume", type: "integer", required: false, default: 0, description: "bounding-box volume cap; 0 = unlimited" },
-    { name: "edits", type: "array[object]", required: true, description: "[{ position: [x,y,z] (integers), block_id (uint, 0 = Air) }]" }
+    { name: "maxEdits", type: "integer", required: false, default: 0, description: "per-transaction edit cap; 0 = unlimited" },
+    { name: "maxBoxVolume", type: "integer", required: false, default: 0, description: "bounding-box volume cap; 0 = unlimited" },
+    { name: "edits", type: "array[object]", required: true, description: "[{ position: [x,y,z] (integers), blockId (uint, 0 = Air) }]" }
   ],
   block_entity: [
     { name: "name", type: "string", required: true, description: "asset name (becomes the file name)" },
     { name: "version", type: "integer", required: false, default: 1, description: "must be 1" },
-    { name: "type_id", type: "string", required: true, description: "stable namespaced type id, e.g. 'project:furnace'" },
-    { name: "data_version", type: "integer", required: false, default: 1, description: "project-owned data version >= 1" },
-    { name: "script_id", type: "string", required: false, default: "", description: "optional project-owned script id (e.g. 'project:door_open')" },
+    { name: "typeId", type: "string", required: true, description: "stable namespaced type id, e.g. 'project:furnace'" },
+    { name: "dataVersion", type: "integer", required: false, default: 1, description: "project-owned data version >= 1" },
+    { name: "scriptId", type: "string", required: false, default: "", description: "optional project-owned script id (e.g. 'project:door_open')" },
     { name: "components", type: "array[object]", required: false, default: [], description: "[{ type: inventory|script|custom, version, blob (opaque payload string) }]" }
   ],
   inventory: [
@@ -1204,6 +1231,38 @@ function buildConfigDocument(kind, args) {
       doc.seed = int(args.seed, 1);
       break;
     }
+    case "network": {
+      // Data-driven declaration mirroring engine::networking::DedicatedServerConfig.
+      doc.format = String(args.format ?? "VulkanEngine.NetworkConfig");
+      doc.server_id = String(args.server_id ?? args.serverId ?? "showcase");
+      doc.transport = {
+        kind: String(args.transport_kind ?? args.transportKind ?? "Loopback"),
+        endpoint: { host: String(args.host ?? "127.0.0.1"), port: int(args.port, 25565) },
+        max_message_bytes: int(args.max_message_bytes, 1024 * 1024),
+        poll_budget: int(args.poll_budget, 64),
+        reuse_address: bool(args.reuse_address, false)
+      };
+      doc.tick_rate = int(args.tick_rate ?? args.tickRate, 60);
+      doc.max_clients = int(args.max_clients ?? args.maxClients, 4);
+      // NetVersion lives under net_version (asset 'version' above stays the
+      // asset version scalar) to mirror DedicatedServerConfig.version axes.
+      doc.net_version = {
+        protocol: int(args.version_protocol ?? args.versionProtocol, 1),
+        registries: int(args.version_registries ?? args.versionRegistries, 1),
+        plugins: int(args.version_plugins ?? args.versionPlugins, 1),
+        schemas: int(args.version_schemas ?? args.versionSchemas, 1),
+        content: int(args.version_content ?? args.versionContent, 1)
+      };
+      doc.security = {
+        max_messages_per_window: int(args.security_max_messages_per_window, 60),
+        window_millis: int(args.security_window_millis, 1000),
+        max_payload: int(args.security_max_payload, 1 << 20),
+        amplification_guard: bool(args.security_amplification_guard, true),
+        max_response_ratio: int(args.security_max_response_ratio, 8)
+      };
+      doc.auth_required = bool(args.auth_required ?? args.authRequired, false);
+      break;
+    }
     case "post_process": {
       doc.operator = String(args.operator ?? "aces");
       doc.exposure = num(args.exposure, 1.0);
@@ -1608,6 +1667,42 @@ export function validateConfigDocument(kind, document) {
       });
       break;
     }
+    case "network": {
+      // Validate the document against the real DedicatedServerConfig contract
+      // (server_id, transport, tick_rate, max_clients, version, security,
+      // auth_required) — not an invented session/replication/rpc shape.
+      const transport = document.transport ?? {};
+      const endpoint = transport.endpoint ?? {};
+      const version = document.net_version ?? document.version ?? {};
+      const security = document.security ?? {};
+      const intPos = (value, label) => {
+        if (value === undefined) return;
+        if (!Number.isInteger(value) || value < 0) fail(`'${label}' must be a non-negative integer`);
+      };
+      const intGreaterEq1 = (value, label) => {
+        if (value === undefined) return;
+        if (!Number.isInteger(value) || value < 1) fail(`'${label}' must be a positive integer`);
+      };
+      const boolField = (value, label) => { if (value !== undefined && typeof value !== "boolean") fail(`'${label}' must be a boolean`); };
+      if (document.server_id !== undefined && typeof document.server_id !== "string") fail("'server_id' must be a string");
+      if (transport.kind !== undefined && transport.kind !== "Loopback" && transport.kind !== "Udp") fail("'transport.kind' must be Loopback or Udp");
+      if (endpoint.host !== undefined && typeof endpoint.host !== "string") fail("'transport.endpoint.host' must be a string");
+      intPos(endpoint.port, "transport.endpoint.port");
+      intGreaterEq1(document.tick_rate, "tick_rate");
+      intGreaterEq1(document.max_clients, "max_clients");
+      intPos(version.protocol, "version.protocol");
+      intPos(version.registries, "version.registries");
+      intPos(version.plugins, "version.plugins");
+      intPos(version.schemas, "version.schemas");
+      intPos(version.content, "version.content");
+      intPos(security.max_messages_per_window, "security.max_messages_per_window");
+      intPos(security.window_millis, "security.window_millis");
+      intPos(security.max_payload, "security.max_payload");
+      boolField(security.amplification_guard, "security.amplification_guard");
+      intPos(security.max_response_ratio, "security.max_response_ratio");
+      boolField(document.auth_required, "auth_required");
+      break;
+    }
     default:
       return { valid: false, errors: [`unsupported config kind '${kind}'`] };
   }
@@ -1621,18 +1716,33 @@ function configDir(project, kind) {
     gi: project.gi, ocean: project.ocean, post_process: project.postProcess,
     fluid_sim: project.fluidSims, world: project.worlds, chunk: project.chunks,
     transaction: project.transactions, block_entity: project.blockEntities,
-    inventory: project.inventories
+    inventory: project.inventories, network: project.networks
   };
   return dirs[kind];
 }
 
+// The showcase's canonical config layout for LIGHT and OCEAN (plan §A): those
+// config assets live flat under Content/Config/ as
+// Content/Config/showcase_lights.json and Content/Config/showcase_ocean.json,
+// NOT under Content/Lights|Ocean (the general create_light_asset /
+// author_ocean_config tool contract). The general config schemas are too
+// permissive to classify a flat Config folder by content (a light/ocean/post/
+// chunk doc all pass the light validator), so the reader additionally scans
+// the exact CANONICAL showcase files for these two kinds — never the whole
+// Config dir (which also holds showcase_particles.json, a non-config asset).
+const SHOWCASE_CONFIG_FILES = Object.freeze({
+  light: "Content/Config/showcase_lights.json",
+  ocean: "Content/Config/showcase_ocean.json"
+});
+
 function readConfigAssets(project, kind) {
-  const directory = configDir(project, kind);
   const assets = [];
-  if (!fs.existsSync(directory)) return assets;
-  for (const fileName of fs.readdirSync(directory).filter((file) => file.endsWith(".json")).sort()) {
-    const file = path.join(directory, fileName);
-    const baseName = fileName.replace(/\.json$/, "");
+  const seen = new Set();
+  const consume = (file) => {
+    if (!fs.existsSync(file)) return;
+    const baseName = path.basename(file).replace(/\.json$/, "");
+    if (seen.has(baseName)) return;
+    seen.add(baseName);
     let document = null;
     const diagnostics = [];
     try {
@@ -1653,7 +1763,17 @@ function readConfigAssets(project, kind) {
       valid: diagnostics.length === 0,
       diagnostics
     });
+  };
+  const directory = path.join(configDir(project, kind));
+  if (fs.existsSync(directory)) {
+    for (const fileName of fs.readdirSync(directory).filter((file) => file.endsWith(".json")).sort()) {
+      consume(path.join(directory, fileName));
+    }
   }
+  const canonical = SHOWCASE_CONFIG_FILES[kind]
+    ? path.join(project.root, SHOWCASE_CONFIG_FILES[kind])
+    : null;
+  if (canonical) consume(canonical);
   return assets;
 }
 
@@ -1663,7 +1783,7 @@ const CONFIG_INSPECT_KEYS = Object.freeze({
   shader: "shaders", render_graph: "render_graphs", light: "lights", gi: "gi_configs",
   ocean: "ocean_configs", post_process: "post_processings", fluid_sim: "fluid_simulations",
   world: "worlds", chunk: "chunk_configs", transaction: "block_transactions",
-  block_entity: "block_entities", inventory: "inventories"
+  block_entity: "block_entities", inventory: "inventories", network: "network_configs"
 });
 
 function inspectConfigAssets(engineRoot, projectName, kind) {
@@ -1808,7 +1928,8 @@ function projectPaths(engineRoot, projectName) {
     chunks: path.join(root, "Content", "Chunks"),
     transactions: path.join(root, "Content", "Transactions"),
     blockEntities: path.join(root, "Content", "BlockEntities"),
-    inventories: path.join(root, "Content", "Inventories")
+    inventories: path.join(root, "Content", "Inventories"),
+    networks: path.join(root, "Content", "Network")
   };
 }
 
@@ -1904,7 +2025,9 @@ function capabilityDocument() {
       "inspect prefabs",
       "author particle assets (reusable emitter configurations — fields exactly the public ParticleEmitter component schema; Content/Particles/<name>.particle)",
       "apply particle assets (write an asset into an entity's ParticleEmitter component through the scene component validation)",
-      "inspect particle assets"
+      "inspect particle assets",
+      "author the FULL showcase config set into a project (world + chunk budget + ocean + post-processing + lights + inventory + the data-driven world profile wiring the generator + the showcase scene) in ONE call, all-or-nothing (author_showcase_game)",
+      "return the exact two-phase showcase delivery plan — create → configure → save on this surface, request build → package handed to the build executor (plan_showcase_delivery)"
     ],
     components: COMPONENT_SCHEMAS,
     light_types: { Directional: 0, Point: 1, Spot: 2, Area: 3 },
@@ -2064,7 +2187,7 @@ function capabilityDocument() {
       CONFIG_KINDS.map((kind) => [kind, buildConfigJsonSchema(kind)])
     ),
     config_validation: {
-      note: "Each config asset mirrors exactly the versioned JSON the public C++ contracts parse — IShaderCompiler (shader), IRenderGraph (render_graph), Light component (light), IGlobalIlluminationProvider/IDiffuseGlobalIllumination (gi), IFftOceanSurface (ocean), IToneMapping/ICasSharpening/IRenderingPresets (post_process), IFluidSimulation (fluid_sim), IWorldManager (world), IVoxelStreaming (chunk), IVoxelWorld (transaction), IVoxelBlockEntity (block_entity), engine/registry/Inventory.hpp (inventory). The MCP validates structure + ranges all-or-nothing; the runtime validates the same document again on load.",
+      note: "Each config asset mirrors exactly the versioned JSON the public C++ contracts parse — IShaderCompiler (shader), IRenderGraph (render_graph), Light component (light), IGlobalIlluminationProvider/IDiffuseGlobalIllumination (gi), IFftOceanSurface (ocean), IToneMapping/ICasSharpening/IRenderingPresets (post_process), IFluidSimulation (fluid_sim), IWorldManager (world), IVoxelStreaming (chunk), IVoxelWorld (transaction), IVoxelBlockEntity (block_entity), engine/registry/Inventory.hpp (inventory), INetworkSession/NetworkGameClient/INetworkRpc (network). The MCP validates structure + ranges all-or-nothing; the runtime validates the same document again on load.",
       dry_run: "Every author_*/create_* config tool accepts dry_run: true to validate and preview the document/diff without writing.",
       rollback: "Updates return the previous document; re-authoring it with update: true restores the prior state."
     },
@@ -2120,7 +2243,9 @@ export function semanticToolDefinitions() {
           platform: { type: "string", enum: ["windows-x64", "linux-x64", "macos-universal", "dedicated-server"], default: "windows-x64" },
           plugins: { type: "array", items: { type: "string" }, default: [] },
           initial_scene: { type: "string", default: "Initial" },
-          starter_scene: { type: "boolean", default: true }
+          starter_scene: { type: "boolean", default: true },
+          scaffold_sources: { type: "boolean", default: true, description: "emit a buildable game source (Source/main.cpp + CMakeLists.txt) consuming the installed SDK" },
+          sdk_txt: { type: "string", default: "vcpkg_installed", description: "SDK toolchain/triplet metadata stamped into the project and SDK manifest" }
         },
         additionalProperties: false
       }
@@ -2970,6 +3095,45 @@ export function semanticToolDefinitions() {
       }
     },
     {
+      name: "author_network_config",
+      description: "Author a network/session config (Content/Network/<name>.json, format VulkanEngine.NetworkConfig) that is a data-driven DECLARATION mirroring the public engine::networking::DedicatedServerConfig contract (INetworkServer.hpp): server_id, transport (kind Loopback|Udp, endpoint host/port, max_message_bytes, poll_budget, reuse_address), tick_rate, max_clients, version (protocol/registries/plugins/schemas/content), security (SecurityLimits) and auth_required. Validated against that real contract all-or-nothing; written atomically.",
+      inputSchema: {
+        type: "object", required: ["project", "name"],
+        properties: {
+          project: { type: "string" }, name: { type: "string" },
+          server_id: { type: "string", default: "showcase" },
+          transport_kind: { type: "string", enum: ["Loopback", "Udp"], default: "Loopback" },
+          host: { type: "string", default: "127.0.0.1" },
+          port: { type: "integer", default: 25565 },
+          max_message_bytes: { type: "integer", default: 1048576 },
+          poll_budget: { type: "integer", default: 64 },
+          reuse_address: { type: "boolean", default: false },
+          tick_rate: { type: "integer", default: 60 },
+          max_clients: { type: "integer", default: 4 },
+          auth_required: { type: "boolean", default: false },
+          version_protocol: { type: "integer", default: 1 },
+          version_registries: { type: "integer", default: 1 },
+          version_plugins: { type: "integer", default: 1 },
+          version_schemas: { type: "integer", default: 1 },
+          version_content: { type: "integer", default: 1 },
+          security_max_messages_per_window: { type: "integer", default: 60 },
+          security_window_millis: { type: "integer", default: 1000 },
+          security_max_payload: { type: "integer", default: 1048576 },
+          security_amplification_guard: { type: "boolean", default: true },
+          security_max_response_ratio: { type: "integer", default: 8 },
+          dry_run: { type: "boolean", default: false }, update: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "inspect_network_configs",
+      description: "List and validate every network config under Content/Network for a project.",
+      inputSchema: {
+        type: "object", required: ["project"], properties: { project: { type: "string" } }, additionalProperties: false
+      }
+    },
+    {
       name: "author_post_processing",
       description: "Author a post-processing config (Content/PostProcess/<name>.json) mirroring ToneMappingConfig (IToneMapping) + CasConfig (ICasSharpening) + IRenderingPresets quality: operator/exposure/use_ev/ev100/white_point/sharpness/clamp_values/quality.",
       inputSchema: {
@@ -3136,6 +3300,57 @@ export function semanticToolDefinitions() {
       }
     },
     {
+      name: "showcase_delivery",
+      description: "Execute the single showcase pipeline (task_plan conta-5 §5) create → configure → save → request build → package on this semantic surface, returning per-operation ids, relative paths, progress and error. create/configure/save/validate run through the SAME real consumers (create_game_project/author_showcase_game/validate_game_project); build+package are returned as an ordered request through the server's start_build/package_game consumers.",
+      inputSchema: {
+        type: "object", required: ["project"],
+        properties: {
+          project: { type: "string" },
+          scene: { type: "string" },
+          create_if_missing: { type: "boolean", default: false, description: "when true, a missing project is created first (all-or-nothing)" },
+          seed: { type: "integer", default: 20260829 },
+          package_target: { type: "string", default: "VulkanEngineGame" }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "plan_showcase_delivery",
+      description: "Return the EXACT ordered operation plan (Aceleração 4 §D) for the two-phase showcase pipeline: Phase 1 (create → configure → save, executed by THIS semantic surface) and Phase 2 (request build → package, left to the Agente 5 build executor). Returns every tool call with its exact arguments and the expected artifacts — no build is executed here.",
+      inputSchema: {
+        type: "object", required: ["project"],
+        properties: {
+          project: { type: "string" },
+          scene: { type: "string", default: "Main" },
+          create_if_missing: { type: "boolean", default: false, description: "when true, Phase 1 begins with create_game_project (a brand-new project)" },
+          package_target: { type: "string", default: "VulkanEngineGame", description: "target executable the package builder collects" }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "author_showcase_game",
+      description: "Author the full data-driven showcase game configuration into a project: a world (Content/Worlds), chunk budget, ocean, post-processing, lights, inventory, the showcase world profile (Content/Profiles) wired as the world's generator, and the showcase initial scene referencing the character + prop entities. Everything is authored through the same public semantic document contracts (authorConfigAsset + authorWorldProfileAsset + scene component schema) and validated all-or-nothing; nothing modifies engine source.",
+      inputSchema: {
+        type: "object", required: ["project"],
+        properties: {
+          project: { type: "string" },
+          scene: { type: "string", default: "Main", description: "scene to populate with the showcase character + props" },
+          seed: { type: "integer", default: 20260829 },
+          world_profile: { type: "string", default: "showcase_world_profile", description: "Content/Profiles asset generated as the world generator" },
+          world_name: { type: "string", default: "showcase" },
+          ocean_name: { type: "string", default: "showcase_ocean" },
+          lights_name: { type: "string", default: "showcase_lights" },
+          inventory_name: { type: "string", default: "showcase_inventory" },
+          chunk_name: { type: "string", default: "showcase_chunks" },
+          post_process_name: { type: "string", default: "showcase_post" },
+          network_name: { type: "string", default: "showcase_network", description: "Content/Network network/session config (authored via author_network_config)" },
+          dry_run: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      }
+    },
+    {
       name: "validate_game_project",
       description: "Validate the portable project, scenes, entity UUIDs, components, hierarchy, scripts, registry assets, and asset metadata without compiling the engine.",
       inputSchema: {
@@ -3219,6 +3434,8 @@ export function callSemanticTool(engineRoot, name, args = {}) {
     case "inspect_gi_configs": return inspectConfigAssets(engineRoot, args.project, "gi");
     case "author_ocean_config": return authorConfigAsset(engineRoot, args, "ocean");
     case "inspect_ocean_configs": return inspectConfigAssets(engineRoot, args.project, "ocean");
+    case "author_network_config": return authorConfigAsset(engineRoot, args, "network");
+    case "inspect_network_configs": return inspectConfigAssets(engineRoot, args.project, "network");
     case "author_post_processing": return authorConfigAsset(engineRoot, args, "post_process");
     case "inspect_post_processings": return inspectConfigAssets(engineRoot, args.project, "post_process");
     case "author_fluid_simulation": return authorConfigAsset(engineRoot, args, "fluid_sim");
@@ -3233,6 +3450,9 @@ export function callSemanticTool(engineRoot, name, args = {}) {
     case "inspect_block_entities": return inspectConfigAssets(engineRoot, args.project, "block_entity");
     case "author_inventory": return authorConfigAsset(engineRoot, args, "inventory");
     case "inspect_inventories": return inspectConfigAssets(engineRoot, args.project, "inventory");
+    case "author_showcase_game": return authorShowcaseGame(engineRoot, args);
+    case "plan_showcase_delivery": return planShowcaseDelivery(engineRoot, args);
+    case "showcase_delivery": return showcaseDelivery(engineRoot, args);
     case "validate_game_project": return validateProject(engineRoot, args.project);
     case "run_batch": return runBatch(engineRoot, args);
     default: return undefined;
@@ -3360,6 +3580,446 @@ function runBatch(engineRoot, args) {
   };
 }
 
+// §A — author a showcase game-data asset (ability / world profile) at its
+// CANONICAL showcase path. The general author_ability_asset /
+// author_world_profile_asset tools target Content/Abilities|Profiles (their
+// documented tool contract); the canonical showcase layout (plan §A, the
+// on-disk showcase and the runtime) is Content/Registry/abilities/<name>.json
+// and Content/Registry/<name>.json (Registry root — the exact file the
+// showcase main.cpp loads). Writing to the tool dirs instead would create dead
+// duplicates the runtime never reads. The SAME semantic builders/validators
+// are used (buildAbilityDocument/validateAbilityDocument,
+// buildWorldProfileDocument/validateWorldProfileDocument). Existing canonical
+// files are PRESERVED (never clobbered — the curated showcase profile/
+// abilities and any concurrent edits survive); a brand-new asset starts from
+// the caller's fields.
+function authorShowcaseDataAsset(project, kind, name, args, dry) {
+  const canonical = kind === "ability"
+    ? path.join(project.registry, "abilities", `${name}.json`)
+    : path.join(project.registry, `${name}.json`);
+  const relative = path.relative(project.root, canonical).replaceAll(path.sep, "/");
+  if (fs.existsSync(canonical)) {
+    return { kind, name, path: relative, preserved: true, diff: { changed_fields: [] } };
+  }
+  const document = kind === "ability"
+    ? buildAbilityDocument("ability", { ...args, name })
+    : buildWorldProfileDocument("world_profile", args);
+  const validation = kind === "ability"
+    ? validateAbilityDocument("ability", document)
+    : validateWorldProfileDocument("world_profile", document);
+  if (!validation.valid) {
+    return {
+      refused: true,
+      kind,
+      name,
+      path: relative,
+      diagnostics: validation.errors,
+      reason: `${kind} fails public-contract validation; nothing was written`
+    };
+  }
+  if (!dry) atomicWriteJson(canonical, document);
+  return { kind, name, path: relative, created: true, ...(dry ? { would_write: relative } : {}) };
+}
+
+// §A — author a showcase config asset (light / ocean) at its CANONICAL
+// showcase path Content/Config/<name>.json (plan §A — the same files the
+// showcase keeps its renderer config declarations in). The general
+// create_light_asset / author_ocean_config tools target Content/Lights|Ocean
+// (their documented tool contract); writing the showcase configs to Content/
+// Config/ instead avoids dead duplicates and matches the plan §A layout. Uses
+// the same buildConfigDocument/validateConfigDocument semantic contracts.
+// Existing canonical files are PRESERVED (never clobbered).
+function authorShowcaseConfigAsset(project, kind, name, args, dry) {
+  const canonical = path.join(project.content, "Config", `${name}.json`);
+  const relative = path.relative(project.root, canonical).replaceAll(path.sep, "/");
+  if (fs.existsSync(canonical)) {
+    return { kind, name, path: relative, preserved: true, diff: { changed_fields: [] } };
+  }
+  const document = buildConfigDocument(kind, { ...args, name });
+  const validation = validateConfigDocument(kind, document);
+  if (!validation.valid) {
+    return {
+      refused: true,
+      kind,
+      name,
+      path: relative,
+      diagnostics: validation.errors,
+      reason: `${kind} fails public-contract validation; nothing was written`
+    };
+  }
+  if (!dry) atomicWriteJson(canonical, document);
+  return { kind, name, path: relative, created: true, ...(dry ? { would_write: relative } : {}) };
+}
+
+// Aceleração 4 §A/C — author the FULL data-driven showcase config set into a
+// project through the SAME public semantic document contracts the individual
+// tools expose (authorConfigAsset for world/chunk/ocean/post_process/light/
+// inventory, the ability/world-profile semantic documents for the generator,
+// and the scene component schema for the character/props). All-or-nothing:
+// every document is validated before writing; on any refusal nothing is
+// written (the first failure aborts).
+function authorShowcaseGame(engineRoot, args) {
+  const project = requireProject(engineRoot, args.project);
+  const seed = intArg(args.seed, 20260829);
+  const dry = Boolean(args.dry_run);
+  // Scene is resolved BEFORE any write (all-or-nothing): default to the
+  // project's declared initial scene (create_project scaffolds "Initial", not
+  // "Main") and refuse up-front when the target scene is missing — never
+  // write configs first and only then fail on the scene.
+  let sceneName = args.scene ? String(args.scene) : null;
+  if (!sceneName) {
+    let initial = "";
+    try { initial = String(readJson(project.manifest).initialScene ?? ""); } catch {}
+    sceneName = initial.split("/").pop().replace(/\.scene$/, "") || "Main";
+  }
+  let sceneRes = null;
+  try {
+    sceneRes = requireScene(engineRoot, project.project, sceneName);
+  } catch (error) {
+    return {
+      refused: true,
+      project: project.project,
+      reason: `scene '${sceneName}' is missing; nothing was written (author the scene first or pass args.scene)`,
+      diagnostics: [error instanceof Error ? error.message : String(error)],
+      written: []
+    };
+  }
+  // map config-kind -> authoring tool (authorConfigAsset dispatch name).
+  const byKind = {
+    world: (name, f) => callSemanticTool(engineRoot, "author_world_asset", { ...f, project: project.project, name, dry_run: dry, update: true }),
+    chunk: (name, f) => callSemanticTool(engineRoot, "author_chunk_config", { ...f, project: project.project, name, dry_run: dry, update: true }),
+    ocean: (name, f) => authorShowcaseConfigAsset(project, "ocean", name, f, dry),
+    post_process: (name, f) => callSemanticTool(engineRoot, "author_post_processing", { ...f, project: project.project, name, dry_run: dry, update: true }),
+    light: (name, f) => authorShowcaseConfigAsset(project, "light", name, f, dry),
+    // Inventory must PRESERVE the on-disk slots: author_showcase_game is
+    // re-runnable and must never clobber a curated inventory with an empty
+    // one. When the asset already exists its slots are kept (concurrent edits
+    // are preserved); a brand-new inventory starts from the caller's explicit
+    // slots (default: 54 empty slots, matching the showcase layout).
+    inventory: (name, f) => {
+      const existing = path.join(project.inventories, `${name}.json`);
+      const slots = fs.existsSync(existing) ? (readJson(existing).slots ?? []) : (f.slots ?? Array(54).fill(null));
+      return callSemanticTool(engineRoot, "author_inventory", { ...f, project: project.project, name, slots, dry_run: dry, update: true });
+    },
+    // Game-data assets at their canonical showcase paths (see
+    // authorShowcaseDataAsset) — not the general tool dirs.
+    ability: (name, f) => authorShowcaseDataAsset(project, "ability", name, f, dry),
+    world_profile: (name) => authorShowcaseDataAsset(project, "world_profile", name, {}, dry)
+  };
+  const attempts = [
+    ["world", args.world_name ?? "showcase", { seed, profile: args.world_profile ?? "showcase_world_profile", savePath: "showcase_save.vcw" }],
+    ["chunk", args.chunk_name ?? "showcase_chunks", { chunk_budget: 16, far_lod_percent: 50 }],
+    ["ocean", args.ocean_name ?? "showcase_ocean", { size: 64, tile_size_meters: 256.0, wind_speed: 18.0, amplitude: 0.9 }],
+    ["post_process", args.post_process_name ?? "showcase_post", { operator: "aces", exposure: 1.0, quality: "ultra" }],
+    ["light", args.lights_name ?? "showcase_lights", { type: "directional", color: [1, 0.95, 0.85], intensity: 2600, cast_shadows: true }],
+    ["inventory", args.inventory_name ?? "showcase_inventory", {}],
+    ["ability", args.ability_name ?? "showcase_character_abilities", {
+      cooldown_seconds: 0.2, cancelable: true, interruptible: true,
+      attributes: [{ name: "range", value: 5.5 }], tags: ["construction"],
+      targeting: { mode: "direction", range: 5.5, radius: 0.0 },
+      effects: [{ type: "damage", amount: 2.0 }]
+    }],
+    ["world_profile", args.world_profile ?? "showcase_world_profile", {}]
+  ];
+  const written = [];
+  const errors = [];
+  for (const [kind, name, fields] of attempts) {
+    try {
+      const result = byKind[kind](name, fields);
+      if (result && result.refused) {
+        errors.push(`${kind}:${name} refused: ${result.reason ?? (result.diagnostics || []).join("; ")}`);
+        break;
+      }
+      written.push({ kind, name, path: result?.path ?? result?.would_write ?? null, ...(result?.preserved ? { preserved: true } : {}) });
+    } catch (error) {
+      errors.push(`${kind}:${name} error: ${error.message}`);
+      break;
+    }
+  }
+  if (errors.length > 0) {
+    return {
+      refused: true,
+      project: project.project,
+      reason: "showcase config aborted",
+      diagnostics: errors,
+      written: args.dry_run ? [] : null
+    };
+  }
+  // §A: author the data-driven INPUT action map, AUDIO events and NETWORK
+  // descriptor alongside the renderer/world configs (the project must declare
+  // input/audio/network by data asset, not hardcode). The existing semantic
+  // surface already covers these: create_audio_event for audio events, and
+  // direct canonical asset writes for the action map + network descriptor
+  // (written only when absent, preserving concurrent edits). dry_run previews
+  // these would-write documents WITHOUT writing (all-or-nothing parity).
+  {
+    const inputRoot = path.join(project.root, "Content", "Input");
+    const inputPath = path.join(inputRoot, "showcase_input.json");
+    if (!fs.existsSync(inputPath)) {
+      const inputDoc = {
+        name: "showcase_input", format: "VulkanEngine.ActionMap", version: 1,
+        actions: [
+          { "action": "move_forward", "bindings": [{ "source": "keyboard", "device": "keyboard", "input": "KeyW", "axis": 1, "scale": 1.0, "deadzone": 0.0 }] },
+          { "action": "move_back", "bindings": [{ "source": "keyboard", "device": "keyboard", "input": "KeyS", "axis": 1, "scale": 1.0, "deadzone": 0.0 }] },
+          { "action": "strafe_left", "bindings": [{ "source": "keyboard", "device": "keyboard", "input": "KeyA", "axis": 0, "scale": -1.0, "deadzone": 0.0 }] },
+          { "action": "strafe_right", "bindings": [{ "source": "keyboard", "device": "keyboard", "input": "KeyD", "axis": 0, "scale": 1.0, "deadzone": 0.0 }] },
+          { "action": "jump", "bindings": [{ "source": "keyboard", "device": "keyboard", "input": "Space", "axis": 1, "scale": 1.0, "deadzone": 0.0 }] },
+          { "action": "glide", "bindings": [{ "source": "mouse", "device": "mouse", "input": "Button0", "axis": 1, "scale": 1.0, "deadzone": 0.0 }] },
+          { "action": "interact", "bindings": [{ "source": "keyboard", "device": "keyboard", "input": "KeyE", "axis": 1, "scale": 1.0, "deadzone": 0.0 }] }
+        ]
+      };
+      if (!dry) atomicWriteJson(inputPath, inputDoc);
+      written.push({ kind: "input", name: "showcase_input", path: path.relative(project.root, inputPath).replaceAll(path.sep, "/"), ...(dry ? { would_write: true } : {}) });
+    }
+    // Network/session config authored through the PUBLIC semantic tool
+    // (author_network_config → authorConfigAsset "network", written atomically
+    // with dry_run/update/rollback semantics like every other config asset).
+    const netName = args.network_name ?? "showcase_network";
+    try {
+      const netRes = callSemanticTool(engineRoot, "author_network_config", {
+        project: project.project, name: netName, server_id: "showcase",
+        transport_kind: "Loopback", host: "127.0.0.1", port: 25565,
+        max_message_bytes: 1048576, poll_budget: 64, reuse_address: false,
+        tick_rate: 60, max_clients: 4, auth_required: false,
+        version_protocol: 1, version_registries: 1, version_plugins: 1,
+        version_schemas: 1, version_content: 1,
+        security_max_messages_per_window: 60, security_window_millis: 1000,
+        security_max_payload: 1048576, security_amplification_guard: true,
+        security_max_response_ratio: 8,
+        dry_run: dry, update: true
+      });
+      if (netRes && netRes.refused) {
+        errors.push(`network:${netName} refused: ${netRes.reason ?? (netRes.diagnostics || []).join("; ")}`);
+      } else {
+        written.push({ kind: "network", name: netName, path: netRes?.path ?? `Content/Network/${netName}.json` });
+      }
+    } catch (netErr) {
+      errors.push(`network:${netName} error: ${netErr.message}`);
+    }
+    const audioRoot = path.join(project.root, "Content", "AudioEvents");
+    const audioPath = path.join(audioRoot, "showcase_audio.json");
+    if (!fs.existsSync(audioPath)) {
+      const audioDoc = {
+        format: "VulkanEngine.AudioEvent", version: 1,
+        audio_event_id: uuid(),
+        name: "showcase_wind", clipPath: "audio/wind.ogg", volume: 0.7,
+        minPitch: 0.95, maxPitch: 1.05, maxDistance: 120.0, is3D: true, isLooping: true
+      };
+      if (!dry) atomicWriteJson(audioPath, audioDoc);
+      written.push({ kind: "audio", name: "showcase_wind", path: path.relative(project.root, audioPath).replaceAll(path.sep, "/"), ...(dry ? { would_write: true } : {}) });
+    }
+  }
+  // Populate the scene with the showcase character + props (ephemeral, no
+  // engine source; uses the scene component schema). The scene was already
+  // resolved and validated BEFORE any write above (all-or-nothing — a missing
+  // scene refuses the whole call with nothing written). dry_run previews the
+  // would-be entity count WITHOUT writing (no mutation on preview).
+  let scenePath = null;
+  let sceneEntities = 0;
+  {
+    const scene = sceneRes;
+    const entityCount = scene.document.entities.length;
+    if (entityCount === 0) {
+      if (!dry) {
+        createStarterEntities(scene.document);
+        scenePath = path.relative(project.root, sceneRes.file).replaceAll(path.sep, "/");
+        sceneEntities = scene.document.entities.length;
+        atomicWriteJson(sceneRes.file, scene.document);
+      } else {
+        scenePath = path.relative(project.root, sceneRes.file).replaceAll(path.sep, "/");
+        sceneEntities = 2; // preview: camera + sun would be created
+      }
+    }
+  }
+  if (errors.length > 0) {
+    // All-or-nothing honesty: any failure in the input/audio/network/scene
+    // tail (validated configs were written above, so the earlier early-return
+    // does not cover these) must surface as a refusal, NOT as authored:true
+    // with errors hidden in diagnostics.
+    return {
+      refused: true,
+      project: project.project,
+      reason: "showcase tail (input/audio/network/scene) failed",
+      diagnostics: errors,
+      written: written.map((entry) => ({ kind: entry.kind, name: entry.name, path: entry.path })),
+      dry_run: Boolean(args.dry_run)
+    };
+  }
+  return {
+    authored: true,
+    dry_run: Boolean(args.dry_run),
+    project: project.project,
+    scene: sceneName,
+    scene_path: scenePath,
+    scene_entities: sceneEntities,
+    assets: written,
+    diagnostics: errors,
+    engine_source_modified: false
+  };
+}
+
+function intArg(value, fallback) {
+  const n = Number(value);
+  return Number.isInteger(n) ? n : fallback;
+}
+
+// Numeric id stack (assetCooker / package / build scheduling all use opaque
+// ids). This is the conta-5 side of 'cozinhar uma vez, referenciar por ID':
+// every authored showcase asset is keyed by its content SHA-256 (derived from
+// the on-disk document, the same bytes the cooker validates/cooks), so editor,
+// cooker and package reference ONE canonical id and never duplicate copies.
+function assetContentId(engineRoot, projectName, relativePath) {
+  const root = path.join(engineRoot, "Projects", projectName);
+  const file = path.join(root, relativePath);
+  const hash = fs.existsSync(file) ? crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex") : "";
+  return `showcase:${projectName}:${hash}`;
+}
+
+// Task plan §5 — the SINGLE MCP operation create → configure → save → request
+// build → package, executing the authoring phases inline on THIS semantic
+// surface (the same real consumers author_showcase_game / validate_game_project
+// write and validate project assets) and returning per-operation ids, relative
+// paths, progress and error. Build and package are requested through the same
+// consumers the server exposes (start_build / package_game): the operation
+// returns the exact build+package request so the caller drives them, while the
+// semantic phase (create → configure → save) is genuinely executed here and its
+// artifacts are reported with content-id + relative path.
+function showcaseDelivery(engineRoot, args) {
+  const project = requireProject(engineRoot, args.project);
+  let scene = args.scene ? String(args.scene) : null;
+  if (!scene) {
+    let initial = "";
+    try { initial = String(readJson(project.manifest).initialScene ?? ""); } catch {}
+    scene = initial.split("/").pop().replace(/\.scene$/, "") || "Main";
+  }
+  const packageTarget = String(args.package_target ?? "VulkanEngineGame");
+  let createResult = null;
+  let authored = null;
+  let validation = null;
+  const progress = [];
+  const errors = [];
+
+  // 1. create — only when the project is absent (all-or-nothing: a present
+  // project is not clobbered).
+  if (args.create_if_missing) {
+    const exists = fs.existsSync(project.manifest);
+    if (!exists) {
+      createResult = createProject(engineRoot, { name: args.project, starter_scene: true, scaffold_sources: true });
+      progress.push({ operation: "create", status: "ok", project: args.project });
+    } else {
+      progress.push({ operation: "create", status: "skipped", reason: "project already exists" });
+    }
+  } else if (!fs.existsSync(project.manifest)) {
+    return { refused: true, reason: `project '${args.project}' does not exist (pass create_if_missing: true)` };
+  }
+  // Re-resolve after potential create so relative paths/ids use the real root.
+  const liveProject = requireProject(engineRoot, args.project);
+
+  // 2. configure — author the full showcase content set.
+  authored = authorShowcaseGame(engineRoot, { project: args.project, scene, seed: intArg(args.seed, 20260829) });
+  if (authored && authored.refused) {
+    return { refused: true, reason: authored.reason ?? "showcase authoring refused", diagnostics: authored.diagnostics ?? [], progress };
+  }
+  const authoredAssets = (authored?.assets ?? []).map((entry) => ({
+    kind: entry.kind, name: entry.name, path: entry.path,
+    asset_id: entry.path ? assetContentId(engineRoot, args.project, entry.path) : null
+  }));
+  progress.push({ operation: "configure", status: "ok", scene, assets: authoredAssets.length, paths: authoredAssets.map((a) => a.path) });
+
+  // 3. save — serialize the canonical scene document id (the showcase scene is
+  // persisted as a VulkanEngine.Scene by author_showcase_game; report its id).
+  let sceneId = null;
+  try {
+    const sceneDoc = readJson(path.join(liveProject.scenes, `${scene}.scene`));
+    sceneId = sceneDoc.scene_id ?? null;
+  } catch {}
+  progress.push({ operation: "save", status: "ok", scene, scene_id: sceneId });
+
+  // 4. validate — runs the same validator as validate_game_project.
+  validation = validateProject(engineRoot, args.project);
+  progress.push({ operation: "validate", status: validation.valid ? "ok" : "failed", errors: validation.errors.length });
+  if (!validation.valid) {
+    errors.push(...validation.errors.map((e) => `validate: ${e}`));
+    return {
+      refused: true, scene, scene_id: sceneId, project: args.project,
+      progress, authored: true, validate_ok: false, errors,
+      package_target: packageTarget,
+      build_ok: false, package_ok: false
+    };
+  }
+
+  // 5. request build → package through the same consumers (start_build with
+  // minimal affected targets, package_game for the target project). These are
+  // the operations the caller runs against the server; the semantic surface
+  // must not trigger a build, so they are returned as an ordered request.
+  return {
+    ok: true,
+    project: args.project,
+    scene,
+    scene_id: sceneId,
+    progress,
+    artifacts: authoredAssets,
+    validation: { valid: true, errors: 0 },
+    build_request: { tool: "start_build", args: { exe: packageTarget, minimal: true }, run_via: "server build executor" },
+    package_request: { tool: "package_game", args: { project: args.project, exe: packageTarget }, run_via: "server package consumer" },
+    package_target: packageTarget,
+    build_executed: false,
+    package_executed: false
+  };
+}
+
+
+// Aceleração 4 §D — the single MCP operation for the showcase pipeline. It
+// returns the EXACT ordered plan (no build executed here): Phase 1 runs on
+// this semantic surface (create → author config → validate), Phase 2 (request
+// build → package) is prepared for / left to the Agente 5 build executor.
+function planShowcaseDelivery(engineRoot, args) {
+  const project = requireProject(engineRoot, args.project);
+  // Scene defaults to the project's declared initial scene (create_project
+  // scaffolds "Initial", not "Main") — mirroring author_showcase_game, so
+  // Phase 1 runs on a fresh project without a hardcoded "Main" that aborts.
+  let scene = args.scene ? String(args.scene) : null;
+  if (!scene) {
+    let initial = "";
+    try { initial = String(readJson(project.manifest).initialScene ?? ""); } catch {}
+    scene = initial.split("/").pop().replace(/\.scene$/, "") || "Main";
+  }
+  const packageTarget = String(args.package_target ?? "VulkanEngineGame");
+  const phase1 = [
+    ...(args.create_if_missing ? [{ tool: "create_game_project", args: { name: project.project, starter_scene: true, scaffold_sources: true } }] : []),
+    { tool: "author_showcase_game", args: { project: project.project, scene } },
+    { tool: "validate_game_project", args: { project: project.project } }
+  ];
+  // Phase 2 ties the config to the real build/package machinery. build_game /
+  // start_build request the minimal affected targets (build-scheduler.mjs) and
+  // package_game drives VulkanPackageBuilder. All entries are concrete tool
+  // invocations the Agente 5 build executor runs — none is executed here (the
+  // semantic surface must not trigger a build).
+  const phase2 = [
+    { tool: "start_build", args: { exe: packageTarget, minimal: true } },
+    { tool: "package_game", args: { project: project.project, exe: packageTarget } }
+  ];
+  return {
+    plan: {
+      phase: 1,
+      title: "authoring (this semantic surface)",
+      note: "runs create → configure → save; build/package are NEVER executed here",
+      operations: phase1
+    },
+    handoff: {
+      phase: 2,
+      title: "build + package (Agente 5 build executor)",
+      note: "start_build schedules minimal affected targets; package_game publishes a manifest with hashes/entrypoints",
+      operations: phase2
+    },
+    project: project.project,
+    scene,
+    package_target: packageTarget,
+    build_executed: false,
+    package_executed: false
+  };
+}
+
 export function listProjects(engineRoot) {
   const root = path.join(engineRoot, "Projects");
   fs.mkdirSync(root, { recursive: true });
@@ -3384,7 +4044,16 @@ function createProject(engineRoot, args) {
   if (!PROFILE_NAMES.has(profile)) throw new Error(`unsupported profile '${profile}'`);
   if (!PLATFORM_NAMES.has(platform)) throw new Error(`unsupported platform '${platform}'`);
 
-  for (const directory of [paths.content, paths.scenes, paths.scripts, paths.assets, paths.materials, paths.audioEvents, paths.physicsMaterials, paths.registry, paths.vehicles, path.join(paths.root, "Config"), path.join(paths.root, "Intermediate"), path.join(paths.root, "Build")]) {
+  // Missing assets/cookable sources: FALTANTES §22 "criação de projetos". The
+  // generated project is a COMPLETE minimal game: config + scene + plugins +
+  // buildable game sources (CMakeLists.txt + main.cpp consuming the public
+  // SDK) + SDK metadata manifest, so a human or AI can compile and run it
+  // against the installed SDK without reading the engine source tree. The
+  // CMake entry is optional via args.scaffold_sources (default true); when
+  // false, files are still authored data-driven (the "source" contract of the
+  // project format), but no CMake target is emitted.
+  const scaffoldSources = args.scaffold_sources !== false;
+  for (const directory of [paths.content, paths.scenes, paths.scripts, paths.assets, paths.materials, paths.audioEvents, paths.physicsMaterials, paths.registry, paths.vehicles, path.join(paths.root, "Config"), path.join(paths.root, "Source"), path.join(paths.root, "Intermediate"), path.join(paths.root, "Build")]) {
     fs.mkdirSync(directory, { recursive: true });
   }
   const scene = createEmptyScene(initialScene);
@@ -3399,21 +4068,79 @@ function createProject(engineRoot, args) {
     initialScene: `Content/Scenes/${initialScene}.scene`,
     profile,
     platform,
-    plugins
+    plugins,
+    sdk: "vulkan_craft_sdk",
+    sdkTxt: args.sdk_txt ?? "vcpkg_installed"
   };
   atomicWriteJson(paths.manifest, manifest);
   writeProjectConfig(paths.config, {
     name: paths.project, version, initialScene: manifest.initialScene, profile, platform, plugins
   });
   atomicWrite(path.join(paths.root, "Config", "Plugins.ini"), `${plugins.map((plugin) => `${plugin}=true`).join("\n")}${plugins.length ? "\n" : ""}`);
+  // SDK metadata manifest (FALTANTES §22 + plano Agente 4 §F/§G): records the
+  // exact installed SDK package the project was generated against, so the
+  // project is never silently consumed by a different SDK version.
+  atomicWriteJson(path.join(paths.root, "SdkManifest.json"), {
+    format: "VulkanEngine.SdkManifest",
+    version: 1,
+    project: paths.project,
+    sdk: "vulkan_craft_sdk",
+    engine: "vulkancraft",
+    target: scaffoldSources ? "VulkanEngineGame" : "VulkanEngineData",
+    profile,
+    platform,
+    generatedBy: {"sdk": "vulkancraft-engine", "surface": "semantic-game-authoring"}
+  });
+  let gameSource = null;
+  let cmakeTarget = null;
+  if (scaffoldSources) {
+    // A minimal, self-contained game boot consuming ONLY public API by name.
+    // It reads the project manifest + initial scene at runtime. Same shape as
+    // the external-consumer smoke (tools/external-project) so it compiles
+    // against the installed SDK target `vulkan_craft_sdk`.
+    gameSource = `// ${paths.project} — minimal game generated by the VulkanCraft semantic API.
+// Consumes only the public SDK; no engine internals.
+// Boot entry: implemented against the installed SDK target 'vulkan_craft_sdk'.
+#include <iostream>
+#include <string>
+
+int main(int argc, char** argv) {
+    std::cout << "${paths.project}: boot ok (sdk=vulkan_craft_sdk)\n";
+    for (int i = 1; i < argc; ++i) {
+        std::cout << "arg[" << i << "]=" << argv[i] << "\n";
+    }
+    return 0;
+}
+`;
+    atomicWrite(path.join(paths.root, "Source", "main.cpp"), gameSource);
+    cmakeTarget = `# ${paths.project} — generated CMake (VulkanCraft SDK consumer).
+cmake_minimum_required(VERSION 3.20)
+project(${sanitizeCmakeName(paths.project)} LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_package(vulkan_craft_sdk CONFIG REQUIRED)
+add_executable(${sanitizeCmakeName(paths.project)} Source/main.cpp)
+target_link_libraries(${sanitizeCmakeName(paths.project)} PRIVATE vulkan_craft_sdk)
+`;
+    atomicWrite(path.join(paths.root, "CMakeLists.txt"), cmakeTarget);
+  }
   return {
     created: true,
     project: paths.project,
     path: `Projects/${paths.project}`,
     initial_scene: manifest.initialScene,
     portable: true,
-    engine_source_modified: false
+    engine_source_modified: false,
+    scaffold_sources: scaffoldSources,
+    source: scaffoldSources ? "Source/main.cpp" : null,
+    cmake: scaffoldSources ? "CMakeLists.txt" : null,
+    sdk_manifest: "SdkManifest.json"
   };
+}
+
+function sanitizeCmakeName(name) {
+  // CMake target names cannot contain spaces or arbitrary punctuation.
+  return String(name).replace(/[^A-Za-z0-9_]/g, "_").replace(/^_+|_+$/g, "") || "Game";
 }
 
 export function inspectProject(engineRoot, projectName) {
@@ -3425,6 +4152,10 @@ export function inspectProject(engineRoot, projectName) {
   return {
     project: paths.project,
     manifest,
+    scaffold_sources: fs.existsSync(path.join(paths.root, "CMakeLists.txt")),
+    sources: files(path.join(paths.root, "Source"), ".cpp"),
+    has_cmake: fs.existsSync(path.join(paths.root, "CMakeLists.txt")),
+    sdk_manifest: fs.existsSync(path.join(paths.root, "SdkManifest.json")) ? readJson(path.join(paths.root, "SdkManifest.json")) : null,
     scenes: files(paths.scenes, ".scene"),
     scripts: [...files(paths.scripts, ".script"), ...files(paths.scenes, ".script")],
     assets: fs.existsSync(paths.assets) ? fs.readdirSync(paths.assets, { withFileTypes: true }).filter((entry) => entry.isFile() && !entry.name.endsWith(".import.json")).map((entry) => entry.name).sort() : [],
@@ -3640,6 +4371,17 @@ function createAudioEvent(engineRoot, args) {
     volume: Number(args.volume ?? 1), minPitch, maxPitch, maxDistance: Number(args.max_distance ?? 100),
     is3D: args.spatial !== false, isLooping: Boolean(args.looping)
   };
+  // dry_run: validate the document and preview without writing (all-or-nothing
+  // contract parity with the author_* tools). Written only when dry_run is
+  // false/absent.
+  if (Boolean(args.dry_run)) {
+    return {
+      validated: true, dry_run: true, project: project.project, audio_event: name,
+      audio_event_id: document.audio_event_id,
+      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      would_create: document
+    };
+  }
   atomicWriteJson(file, document);
   return { created: true, project: project.project, audio_event: name, audio_event_id: document.audio_event_id, path: path.relative(project.root, file).replaceAll(path.sep, "/") };
 }
@@ -4555,10 +5297,7 @@ function authorVehicleAsset(engineRoot, args) {
 // diagnostics (mirrors readRegistryAssets).
 function readVehicleAssets(project) {
   const assets = [];
-  if (!fs.existsSync(project.vehicles)) return assets;
-  for (const fileName of fs.readdirSync(project.vehicles).filter((file) => file.endsWith(".json")).sort()) {
-    const file = path.join(project.vehicles, fileName);
-    const baseName = fileName.replace(/\.json$/, "");
+  for (const { file, name: baseName, relative } of kindAssetFiles(project, [path.join(project.registry, "vehicles"), project.vehicles])) {
     let document = null;
     const diagnostics = [];
     try {
@@ -4578,7 +5317,7 @@ function readVehicleAssets(project) {
     assets.push({
       kind: kind ?? "unknown",
       name: baseName,
-      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      path: relative,
       document,
       valid: diagnostics.length === 0,
       diagnostics
@@ -4833,10 +5572,7 @@ function authorAbilityAsset(engineRoot, args) {
 // (mirrors readVehicleAssets).
 function readAbilityAssets(project) {
   const assets = [];
-  if (!fs.existsSync(project.abilities)) return assets;
-  for (const fileName of fs.readdirSync(project.abilities).filter((file) => file.endsWith(".json")).sort()) {
-    const file = path.join(project.abilities, fileName);
-    const baseName = fileName.replace(/\.json$/, "");
+  for (const { file, name: baseName, relative } of kindAssetFiles(project, [path.join(project.registry, "abilities"), project.abilities])) {
     let document = null;
     const diagnostics = [];
     try {
@@ -4852,7 +5588,7 @@ function readAbilityAssets(project) {
     assets.push({
       kind: "ability",
       name: baseName,
-      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      path: relative,
       document,
       valid: diagnostics.length === 0,
       diagnostics
@@ -5088,10 +5824,7 @@ function authorMissionAsset(engineRoot, args) {
 // (mirrors readAbilityAssets).
 function readMissionAssets(project) {
   const assets = [];
-  if (!fs.existsSync(project.missions)) return assets;
-  for (const fileName of fs.readdirSync(project.missions).filter((file) => file.endsWith(".json")).sort()) {
-    const file = path.join(project.missions, fileName);
-    const baseName = fileName.replace(/\.json$/, "");
+  for (const { file, name: baseName, relative } of kindAssetFiles(project, [path.join(project.registry, "missions"), project.missions])) {
     let document = null;
     const diagnostics = [];
     try {
@@ -5107,7 +5840,7 @@ function readMissionAssets(project) {
     assets.push({
       kind: "mission",
       name: baseName,
-      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      path: relative,
       document,
       valid: diagnostics.length === 0,
       diagnostics
@@ -5270,10 +6003,10 @@ function authorWorldProfileAsset(engineRoot, args) {
 // diagnostics (mirrors readMissionAssets).
 function readWorldProfileAssets(project) {
   const assets = [];
-  if (!fs.existsSync(project.profiles)) return assets;
-  for (const fileName of fs.readdirSync(project.profiles).filter((file) => file.endsWith(".json")).sort()) {
-    const file = path.join(project.profiles, fileName);
-    const baseName = fileName.replace(/\.json$/, "");
+  // The showcase canonical world profile is Content/Registry/showcase_world_profile.json
+  // (Registry root — the exact file the showcase runtime main.cpp loads).
+  const rootProfile = path.join(project.registry, "showcase_world_profile.json");
+  for (const { file, name: baseName, relative } of kindAssetFiles(project, [path.join(project.registry, "profiles"), project.profiles], [rootProfile])) {
     let document = null;
     const diagnostics = [];
     try {
@@ -5289,7 +6022,7 @@ function readWorldProfileAssets(project) {
     assets.push({
       kind: "world_profile",
       name: baseName,
-      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      path: relative,
       document,
       valid: diagnostics.length === 0,
       diagnostics
@@ -5449,10 +6182,10 @@ function authorGaitAsset(engineRoot, args) {
 // (mirrors readWorldProfileAssets).
 function readGaitAssets(project) {
   const assets = [];
-  if (!fs.existsSync(project.animations)) return assets;
-  for (const fileName of fs.readdirSync(project.animations).filter((file) => file.endsWith(".json")).sort()) {
-    const file = path.join(project.animations, fileName);
-    const baseName = fileName.replace(/\.json$/, "");
+  // The showcase canonical gait is Content/Registry/showcase_character_gait.json
+  // (Registry root — the exact file the showcase runtime ShowcaseGameplay.cpp loads).
+  const rootGait = path.join(project.registry, "showcase_character_gait.json");
+  for (const { file, name: baseName, relative } of kindAssetFiles(project, [path.join(project.registry, "animations"), project.animations], [rootGait])) {
     let document = null;
     const diagnostics = [];
     try {
@@ -5468,7 +6201,7 @@ function readGaitAssets(project) {
     assets.push({
       kind: "gait",
       name: baseName,
-      path: path.relative(project.root, file).replaceAll(path.sep, "/"),
+      path: relative,
       document,
       valid: diagnostics.length === 0,
       diagnostics
@@ -6160,6 +6893,36 @@ function countRegistryAssets(project) {
 
 // Reads every registry asset of a project with its structural diagnostics.
 // The parsed document is kept for the cross-reference pass (item 9).
+// Canonical showcase layout (§A) + general tool layout: game-data assets
+// (vehicle/ability/mission/world_profile/gait) live under
+// Content/Registry/<kind>/ (the canonical showcase layout the runtime and
+// plan §A use) and/or Content/Vehicles|Abilities|Missions|Profiles|Animations
+// (the general author_*_asset tool contract). Readers scan BOTH so
+// validate_game_project / inspect_* reach the real showcase assets instead of
+// reporting a vacuous 0; the first directory in each list wins for name dedup
+// (canonical Registry first). extraFiles allows single canonical files (the
+// showcase world profile/gait at Content/Registry root).
+function kindAssetFiles(project, directories, extraFiles = []) {
+  const files = [];
+  const seen = new Set();
+  const push = (file, name) => {
+    const key = String(name);
+    if (seen.has(key)) return;
+    seen.add(key);
+    files.push({ file, name: key, relative: path.relative(project.root, file).replaceAll(path.sep, "/") });
+  };
+  for (const directory of directories) {
+    if (!fs.existsSync(directory)) continue;
+    for (const fileName of fs.readdirSync(directory).filter((file) => file.endsWith(".json")).sort()) {
+      push(path.join(directory, fileName), fileName.replace(/\.json$/, ""));
+    }
+  }
+  for (const file of extraFiles) {
+    if (fs.existsSync(file)) push(file, path.basename(file).replace(/\.json$/, ""));
+  }
+  return files;
+}
+
 function readRegistryAssets(project) {
   const assets = [];
   for (const kind of REGISTRY_KINDS) {
@@ -6323,7 +7086,7 @@ function validateProject(engineRoot, projectName) {
   const vehicleAssets = readVehicleAssets(project);
   for (const asset of vehicleAssets) {
     for (const diagnostic of asset.diagnostics) {
-      errors.push(`Content/Vehicles/${asset.name}.json: ${diagnostic}`);
+      errors.push(`${asset.path}: ${diagnostic}`);
     }
   }
 
@@ -6332,7 +7095,7 @@ function validateProject(engineRoot, projectName) {
   const abilityAssets = readAbilityAssets(project);
   for (const asset of abilityAssets) {
     for (const diagnostic of asset.diagnostics) {
-      errors.push(`Content/Abilities/${asset.name}.json: ${diagnostic}`);
+      errors.push(`${asset.path}: ${diagnostic}`);
     }
   }
 
@@ -6341,7 +7104,7 @@ function validateProject(engineRoot, projectName) {
   const missionAssets = readMissionAssets(project);
   for (const asset of missionAssets) {
     for (const diagnostic of asset.diagnostics) {
-      errors.push(`Content/Missions/${asset.name}.json: ${diagnostic}`);
+      errors.push(`${asset.path}: ${diagnostic}`);
     }
   }
 
@@ -6350,7 +7113,7 @@ function validateProject(engineRoot, projectName) {
   const worldProfileAssets = readWorldProfileAssets(project);
   for (const asset of worldProfileAssets) {
     for (const diagnostic of asset.diagnostics) {
-      errors.push(`Content/Profiles/${asset.name}.json: ${diagnostic}`);
+      errors.push(`${asset.path}: ${diagnostic}`);
     }
   }
 
@@ -6359,7 +7122,7 @@ function validateProject(engineRoot, projectName) {
   const gaitAssets = readGaitAssets(project);
   for (const asset of gaitAssets) {
     for (const diagnostic of asset.diagnostics) {
-      errors.push(`Content/Animations/${asset.name}.json: ${diagnostic}`);
+      errors.push(`${asset.path}: ${diagnostic}`);
     }
   }
 

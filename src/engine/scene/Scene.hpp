@@ -155,9 +155,8 @@ public:
     std::unordered_map<UUID, VoxelVolumeComponent>   voxelVolumeComponents;
 
     // Wicked-port component set (frontend; PORTS.md). Authored in the tool
-    // panels; runtime integration status is noted on each struct in
-    // Components.hpp (TODO(frontend-port) where the play world does not
-    // simulate the feature yet).
+    // panels and simulated by the play world at runtime; the per-struct
+    // integration note lives in Components.hpp.
     std::unordered_map<UUID, ColliderComponent>     colliderComponents;
     std::unordered_map<UUID, ConstraintComponent>   constraintComponents;
     std::unordered_map<UUID, SoftBodyComponent>     softBodyComponents;

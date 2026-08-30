@@ -26,11 +26,12 @@ function fail(msg) {
 // ---- Surface 1: C++ (semantic_api_tests.exe must pass) ----
 function cppSurface() {
   const candidates = [
+    // Canonical shared tree first (single-config Ninja, binaries at root),
+    // then multi-config subdirs, then legacy in-tree fallbacks.
+    join(ROOT, process.env.VC_BUILD_DIR || 'out/dev-shared', 'semantic_api_tests.exe'),
+    join(ROOT, process.env.VC_BUILD_DIR || 'out/dev-shared', 'Release', 'semantic_api_tests.exe'),
     join(ROOT, 'build', 'Release', 'semantic_api_tests.exe'),
     join(ROOT, 'out', 'release', 'bin', 'semantic_api_tests.exe'),
-    // Shared out-of-tree build (BUG-038 drift): gates should also resolve the
-    // active shared build, not only the legacy in-tree one.
-    join(ROOT, process.env.VC_BUILD_DIR ?? '', 'semantic_api_tests.exe'),
   ];
   const exe = candidates.find((p) => existsSync(p));
   if (!exe) {

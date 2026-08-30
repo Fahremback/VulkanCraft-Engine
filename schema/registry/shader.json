@@ -27,16 +27,6 @@
       "description": "GLSL source text",
       "type": "string"
     },
-    "target_env": {
-      "description": "SPIR-V target env (e.g. 'spirv1.5'); empty = compiler default",
-      "default": "",
-      "type": "string"
-    },
-    "opt_level": {
-      "description": "optimization level: 0 = none, 1 = size, 2 = speed",
-      "default": 0,
-      "type": "integer"
-    },
     "defines": {
       "description": "macro defines, e.g. ['MAX_LIGHTS=64']",
       "default": [],
@@ -44,6 +34,16 @@
       "items": {
         "type": "string"
       }
+    },
+    "targetEnv": {
+      "description": "SPIR-V target env (e.g. 'spirv1.5'); empty = compiler default",
+      "default": "",
+      "type": "string"
+    },
+    "optLevel": {
+      "description": "optimization level: 0 = none, 1 = size, 2 = speed",
+      "default": 0,
+      "type": "integer"
     }
   },
   "required": [

@@ -2213,7 +2213,7 @@ try {
 
     const unknown = spawnSync(process.execPath, [path.join(directory, "semantic-cli.mjs"), "call", "nope", "{}"], { encoding: "utf8" });
     assert.equal(unknown.status, 3, "unknown tool call exits 3");
-    process.stdout.write("Semantic CLI smoke (37 tools, dependency-free) passed\n");
+    process.stdout.write("Semantic CLI smoke (65 tools, dependency-free) passed\n");
   }
 
   process.stdout.write("MCP protocol smoke test passed\n");

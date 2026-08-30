@@ -14,22 +14,22 @@
       "default": 1,
       "type": "integer"
     },
-    "chunk_budget": {
+    "chunkBudget": {
       "description": "streaming budget (chunk radius), >= 0",
       "default": 16,
       "type": "integer"
     },
-    "memory_budget_bytes": {
+    "memoryBudgetBytes": {
       "description": "RAM-budgeted chunk cache bytes; 0 = unlimited",
       "default": 0,
       "type": "integer"
     },
-    "far_lod_percent": {
+    "farLodPercent": {
       "description": "far-LOD endpoint 0..100",
       "default": 0,
       "type": "integer"
     },
-    "worker_threads": {
+    "workerThreads": {
       "description": "world worker pool size; 0 = unknown/auto",
       "default": 0,
       "type": "integer"

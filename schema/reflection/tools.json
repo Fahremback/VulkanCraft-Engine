@@ -1,0 +1,2493 @@
+{
+  "version": 1,
+  "types": [
+    {
+      "name": "apply_particle_asset",
+      "stable_id": "semantic.apply_particle_asset",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "scene",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "entity_id",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "asset",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "author_ability_asset",
+      "stable_id": "semantic.author_ability_asset",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "id",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "version",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "1"
+        },
+        {
+          "name": "cooldown_seconds",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0"
+        },
+        {
+          "name": "cancelable",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "true"
+        },
+        {
+          "name": "interruptible",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "true"
+        },
+        {
+          "name": "attributes",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "tags",
+          "kind": "array",
+          "value_type": "array<string>"
+        },
+        {
+          "name": "cost",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "conditions",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "targeting",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "effects",
+          "kind": "array",
+          "value_type": "array<object>"
+        }
+      ]
+    },
+    {
+      "name": "author_block_entity",
+      "stable_id": "semantic.author_block_entity",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "type_id",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "data_version",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "1"
+        },
+        {
+          "name": "script_id",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "components",
+          "kind": "array",
+          "value_type": "array<object>",
+          "default": "[]"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "author_block_transaction",
+      "stable_id": "semantic.author_block_transaction",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "edits",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "max_edits",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "0"
+        },
+        {
+          "name": "max_box_volume",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "0"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "author_chunk_config",
+      "stable_id": "semantic.author_chunk_config",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "chunk_budget",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "16"
+        },
+        {
+          "name": "memory_budget_bytes",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "0"
+        },
+        {
+          "name": "far_lod_percent",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "0"
+        },
+        {
+          "name": "worker_threads",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "0"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "author_fluid_simulation",
+      "stable_id": "semantic.author_fluid_simulation",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "grid_size",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "64"
+        },
+        {
+          "name": "cell_size",
+          "kind": "float",
+          "value_type": "number",
+          "default": "1"
+        },
+        {
+          "name": "gravity",
+          "kind": "float",
+          "value_type": "number",
+          "default": "9.81"
+        },
+        {
+          "name": "dt",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0.0166667"
+        },
+        {
+          "name": "solver_iterations",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "4"
+        },
+        {
+          "name": "damping",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0.999"
+        },
+        {
+          "name": "viscosity",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0.001"
+        },
+        {
+          "name": "surface_tension",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "author_gait_asset",
+      "stable_id": "semantic.author_gait_asset",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "version",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "1"
+        },
+        {
+          "name": "cycleDuration",
+          "kind": "float",
+          "value_type": "number",
+          "default": "1"
+        },
+        {
+          "name": "stanceFraction",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0.6"
+        },
+        {
+          "name": "stepHeight",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0.25"
+        },
+        {
+          "name": "maxStride",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0.5"
+        },
+        {
+          "name": "legPhases",
+          "kind": "array",
+          "value_type": "array<number>"
+        },
+        {
+          "name": "legs",
+          "kind": "array",
+          "value_type": "array<object>"
+        }
+      ]
+    },
+    {
+      "name": "author_gi_config",
+      "stable_id": "semantic.author_gi_config",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "cascade_count",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "6"
+        },
+        {
+          "name": "resolution",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "16"
+        },
+        {
+          "name": "probes_per_frame",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "192"
+        },
+        {
+          "name": "base_spacing",
+          "kind": "float",
+          "value_type": "number",
+          "default": "4"
+        },
+        {
+          "name": "cascade_scale",
+          "kind": "float",
+          "value_type": "number",
+          "default": "4"
+        },
+        {
+          "name": "sun_refresh_angle_degrees",
+          "kind": "float",
+          "value_type": "number",
+          "default": "2"
+        },
+        {
+          "name": "bounces",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "2"
+        },
+        {
+          "name": "skylight",
+          "kind": "array",
+          "value_type": "array<number>",
+          "default": "[0.05,0.07,0.1]"
+        },
+        {
+          "name": "max_distance",
+          "kind": "float",
+          "value_type": "number",
+          "default": "128"
+        },
+        {
+          "name": "intensity",
+          "kind": "float",
+          "value_type": "number",
+          "default": "1"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "author_inventory",
+      "stable_id": "semantic.author_inventory",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "slots",
+          "kind": "array",
+          "value_type": "array<string>"
+        },
+        {
+          "name": "filters",
+          "kind": "array",
+          "value_type": "array<object>",
+          "default": "[]"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "author_mission_asset",
+      "stable_id": "semantic.author_mission_asset",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "id",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "version",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "1"
+        },
+        {
+          "name": "objectives",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "dialogue",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "unlockConditions",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "reward",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "repeatable",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "author_ocean_config",
+      "stable_id": "semantic.author_ocean_config",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "size",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "64"
+        },
+        {
+          "name": "tile_size_meters",
+          "kind": "float",
+          "value_type": "number",
+          "default": "256"
+        },
+        {
+          "name": "wind_speed",
+          "kind": "float",
+          "value_type": "number",
+          "default": "18"
+        },
+        {
+          "name": "wind_dir_rad",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0.7"
+        },
+        {
+          "name": "choppiness",
+          "kind": "float",
+          "value_type": "number",
+          "default": "1.2"
+        },
+        {
+          "name": "amplitude",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0.9"
+        },
+        {
+          "name": "seed",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "1"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "author_post_processing",
+      "stable_id": "semantic.author_post_processing",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "operator",
+          "kind": "enum",
+          "value_type": "[\"reinhard\",\"aces\",\"filmic\",\"none\"]",
+          "default": "aces"
+        },
+        {
+          "name": "exposure",
+          "kind": "float",
+          "value_type": "number",
+          "default": "1"
+        },
+        {
+          "name": "use_ev",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "ev100",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0"
+        },
+        {
+          "name": "white_point",
+          "kind": "float",
+          "value_type": "number",
+          "default": "11.2"
+        },
+        {
+          "name": "sharpness",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0.4"
+        },
+        {
+          "name": "clamp_values",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "true"
+        },
+        {
+          "name": "quality",
+          "kind": "enum",
+          "value_type": "[\"low\",\"medium\",\"high\",\"ultra\",\"cinematic\"]",
+          "default": "high"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "author_registry_asset",
+      "stable_id": "semantic.author_registry_asset",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "kind",
+          "kind": "enum",
+          "value_type": "[\"block\",\"item\",\"fluid\",\"recipe\",\"biome\",\"structure\"]"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "id",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "namespace",
+          "kind": "string",
+          "value_type": "string",
+          "default": "vulkancraft"
+        },
+        {
+          "name": "version",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "1"
+        },
+        {
+          "name": "class",
+          "kind": "enum",
+          "value_type": "[\"solid\",\"transparent\",\"nonsolid\",\"non_solid\",\"fluid\"]"
+        },
+        {
+          "name": "hardness",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "light_emission",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "light_absorption",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "opaque",
+          "kind": "bool",
+          "value_type": "boolean"
+        },
+        {
+          "name": "collidable",
+          "kind": "bool",
+          "value_type": "boolean"
+        },
+        {
+          "name": "builtin_id",
+          "kind": "int",
+          "value_type": "integer"
+        },
+        {
+          "name": "color",
+          "kind": "array",
+          "value_type": "array<number>"
+        },
+        {
+          "name": "tags",
+          "kind": "array",
+          "value_type": "array<string>"
+        },
+        {
+          "name": "drops",
+          "kind": "array",
+          "value_type": "array<string>"
+        },
+        {
+          "name": "states",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "transitions",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "fluid",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "sound_place",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "sound_break",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "sound_step",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "sound_hit",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "particle_break",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "tool",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "tool_tier",
+          "kind": "int",
+          "value_type": "integer"
+        },
+        {
+          "name": "resistance",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "friction",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "bounciness",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "density",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "behavior",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "max_stack",
+          "kind": "int",
+          "value_type": "integer"
+        },
+        {
+          "name": "durability",
+          "kind": "int",
+          "value_type": "integer"
+        },
+        {
+          "name": "icon",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "model",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "use_cooldown",
+          "kind": "int",
+          "value_type": "integer"
+        },
+        {
+          "name": "use_mode",
+          "kind": "enum",
+          "value_type": "[\"none\",\"instant\",\"continuous\"]"
+        },
+        {
+          "name": "equip_slot",
+          "kind": "enum",
+          "value_type": "[\"none\",\"hand\",\"offhand\",\"head\",\"chest\",\"legs\",\"feet\"]"
+        },
+        {
+          "name": "attack_damage",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "armor",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "block",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "viscosity",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "range",
+          "kind": "int",
+          "value_type": "integer"
+        },
+        {
+          "name": "tick_interval",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "source",
+          "kind": "bool",
+          "value_type": "boolean"
+        },
+        {
+          "name": "falling",
+          "kind": "bool",
+          "value_type": "boolean"
+        },
+        {
+          "name": "evaporation",
+          "kind": "bool",
+          "value_type": "boolean"
+        },
+        {
+          "name": "damage_per_tick",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "compressible",
+          "kind": "bool",
+          "value_type": "boolean"
+        },
+        {
+          "name": "station",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "time",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "energy",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "fuel",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "conditions",
+          "kind": "array",
+          "value_type": "array<string>"
+        },
+        {
+          "name": "inputs",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "outputs",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "byproducts",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "biomes",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "sample_width",
+          "kind": "int",
+          "value_type": "integer"
+        },
+        {
+          "name": "sample_height",
+          "kind": "int",
+          "value_type": "integer"
+        },
+        {
+          "name": "sample",
+          "kind": "array",
+          "value_type": "array<integer>"
+        },
+        {
+          "name": "pattern_size",
+          "kind": "int",
+          "value_type": "integer"
+        },
+        {
+          "name": "symmetry",
+          "kind": "int",
+          "value_type": "integer"
+        },
+        {
+          "name": "periodic_output",
+          "kind": "bool",
+          "value_type": "boolean"
+        },
+        {
+          "name": "ground",
+          "kind": "bool",
+          "value_type": "boolean"
+        },
+        {
+          "name": "seed",
+          "kind": "int",
+          "value_type": "integer"
+        },
+        {
+          "name": "profiles",
+          "kind": "array",
+          "value_type": "array<object>"
+        }
+      ]
+    },
+    {
+      "name": "author_render_graph",
+      "stable_id": "semantic.author_render_graph",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "resources",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "passes",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "dependencies",
+          "kind": "array",
+          "value_type": "array<object>",
+          "default": "[]"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "author_simulation_lod_spec",
+      "stable_id": "semantic.author_simulation_lod_spec",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "version",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "1"
+        },
+        {
+          "name": "cellSize",
+          "kind": "float",
+          "value_type": "number",
+          "default": "16"
+        },
+        {
+          "name": "fullRadius",
+          "kind": "float",
+          "value_type": "number",
+          "default": "48"
+        },
+        {
+          "name": "falloffRadius",
+          "kind": "float",
+          "value_type": "number",
+          "default": "320"
+        },
+        {
+          "name": "dayLengthSeconds",
+          "kind": "float",
+          "value_type": "number",
+          "default": "240"
+        },
+        {
+          "name": "daysPerSeason",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "30"
+        },
+        {
+          "name": "tiers",
+          "kind": "array",
+          "value_type": "array<object>"
+        }
+      ]
+    },
+    {
+      "name": "author_vehicle_asset",
+      "stable_id": "semantic.author_vehicle_asset",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "kind",
+          "kind": "enum",
+          "value_type": "[\"vehicle\",\"beam\"]"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "id",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "version",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "1"
+        },
+        {
+          "name": "provider",
+          "kind": "enum",
+          "value_type": "[\"jolt\",\"chrono\",\"jsbsim\"]",
+          "default": "jolt"
+        },
+        {
+          "name": "vehicle_kind",
+          "kind": "enum",
+          "value_type": "[\"wheeled\",\"motorcycle\",\"tracked\"]"
+        },
+        {
+          "name": "position",
+          "kind": "array",
+          "value_type": "array<number>"
+        },
+        {
+          "name": "rotation",
+          "kind": "array",
+          "value_type": "array<number>"
+        },
+        {
+          "name": "chassis",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "wheels",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "drivetrain",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "propulsion",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "seats",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "power",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "mass",
+          "kind": "float",
+          "value_type": "number"
+        },
+        {
+          "name": "nodes",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "beams",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "solver",
+          "kind": "json",
+          "value_type": "object"
+        }
+      ]
+    },
+    {
+      "name": "author_world_asset",
+      "stable_id": "semantic.author_world_asset",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "seed",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "0"
+        },
+        {
+          "name": "rules_json",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "profile",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "save_path",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "portals",
+          "kind": "array",
+          "value_type": "array<object>",
+          "default": "[]"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "author_world_profile_asset",
+      "stable_id": "semantic.author_world_profile_asset",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "version",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "1"
+        },
+        {
+          "name": "height",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "baseHeight",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "0"
+        },
+        {
+          "name": "amplitude",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "1"
+        },
+        {
+          "name": "climate",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "biomes",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "caves",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "ores",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "carver",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "decorators",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "structures",
+          "kind": "json",
+          "value_type": "object"
+        }
+      ]
+    },
+    {
+      "name": "create_audio_event",
+      "stable_id": "semantic.create_audio_event",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "clip",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "volume",
+          "kind": "float",
+          "value_type": "number",
+          "default": "1"
+        },
+        {
+          "name": "min_pitch",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0.9"
+        },
+        {
+          "name": "max_pitch",
+          "kind": "float",
+          "value_type": "number",
+          "default": "1.1"
+        },
+        {
+          "name": "max_distance",
+          "kind": "float",
+          "value_type": "number",
+          "default": "100"
+        },
+        {
+          "name": "spatial",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "true"
+        },
+        {
+          "name": "looping",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "create_entity",
+      "stable_id": "semantic.create_entity",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "scene",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "transform",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "components",
+          "kind": "json",
+          "value_type": "object"
+        }
+      ]
+    },
+    {
+      "name": "create_game_project",
+      "stable_id": "semantic.create_game_project",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "version",
+          "kind": "string",
+          "value_type": "string",
+          "default": "0.1.0"
+        },
+        {
+          "name": "profile",
+          "kind": "enum",
+          "value_type": "[\"Debug\",\"Development\",\"Shipping\",\"Server\",\"Editor\"]",
+          "default": "Development"
+        },
+        {
+          "name": "platform",
+          "kind": "enum",
+          "value_type": "[\"windows-x64\",\"linux-x64\",\"macos-universal\",\"dedicated-server\"]",
+          "default": "windows-x64"
+        },
+        {
+          "name": "plugins",
+          "kind": "array",
+          "value_type": "array<string>",
+          "default": "[]"
+        },
+        {
+          "name": "initial_scene",
+          "kind": "string",
+          "value_type": "string",
+          "default": "Initial"
+        },
+        {
+          "name": "starter_scene",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "true"
+        }
+      ]
+    },
+    {
+      "name": "create_light_asset",
+      "stable_id": "semantic.create_light_asset",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "type",
+          "kind": "enum",
+          "value_type": "[\"directional\",\"point\",\"spot\",\"area\"]",
+          "default": "directional"
+        },
+        {
+          "name": "color",
+          "kind": "array",
+          "value_type": "array<number>",
+          "default": "[1,1,1]"
+        },
+        {
+          "name": "intensity",
+          "kind": "float",
+          "value_type": "number",
+          "default": "1000"
+        },
+        {
+          "name": "range",
+          "kind": "float",
+          "value_type": "number",
+          "default": "50"
+        },
+        {
+          "name": "cast_shadows",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "true"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "create_material",
+      "stable_id": "semantic.create_material",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "albedo",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "roughness",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0.5"
+        },
+        {
+          "name": "metallic",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0"
+        },
+        {
+          "name": "emissive",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "texture_ids",
+          "kind": "json",
+          "value_type": "object"
+        }
+      ]
+    },
+    {
+      "name": "create_particle_asset",
+      "stable_id": "semantic.create_particle_asset",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "create_physics_material",
+      "stable_id": "semantic.create_physics_material",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "friction",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0.5"
+        },
+        {
+          "name": "restitution",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0.1"
+        },
+        {
+          "name": "density",
+          "kind": "float",
+          "value_type": "number",
+          "default": "1000"
+        },
+        {
+          "name": "hardness",
+          "kind": "float",
+          "value_type": "number",
+          "default": "0.5"
+        }
+      ]
+    },
+    {
+      "name": "create_prefab",
+      "stable_id": "semantic.create_prefab",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "scene",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "entity_ids",
+          "kind": "array",
+          "value_type": "array<string>"
+        },
+        {
+          "name": "root_entity",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "create_scene",
+      "stable_id": "semantic.create_scene",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "starter_entities",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "create_shader_asset",
+      "stable_id": "semantic.create_shader_asset",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "source",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "stage",
+          "kind": "enum",
+          "value_type": "[\"vertex\",\"fragment\",\"compute\"]",
+          "default": "fragment"
+        },
+        {
+          "name": "target_env",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "opt_level",
+          "kind": "int",
+          "value_type": "integer",
+          "default": "0"
+        },
+        {
+          "name": "defines",
+          "kind": "array",
+          "value_type": "array<string>",
+          "default": "[]"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "update",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "create_visual_script",
+      "stable_id": "semantic.create_visual_script",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "name",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "scene_companion",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "nodes",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "links",
+          "kind": "array",
+          "value_type": "array<object>"
+        }
+      ]
+    },
+    {
+      "name": "game_capabilities",
+      "stable_id": "semantic.game_capabilities",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": []
+    },
+    {
+      "name": "inspect_ability_assets",
+      "stable_id": "semantic.inspect_ability_assets",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_block_entities",
+      "stable_id": "semantic.inspect_block_entities",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_block_transactions",
+      "stable_id": "semantic.inspect_block_transactions",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_chunk_configs",
+      "stable_id": "semantic.inspect_chunk_configs",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_fluid_simulations",
+      "stable_id": "semantic.inspect_fluid_simulations",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_gait_assets",
+      "stable_id": "semantic.inspect_gait_assets",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_game_project",
+      "stable_id": "semantic.inspect_game_project",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_gi_configs",
+      "stable_id": "semantic.inspect_gi_configs",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_inventories",
+      "stable_id": "semantic.inspect_inventories",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_light_assets",
+      "stable_id": "semantic.inspect_light_assets",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_mission_assets",
+      "stable_id": "semantic.inspect_mission_assets",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_ocean_configs",
+      "stable_id": "semantic.inspect_ocean_configs",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_particle_assets",
+      "stable_id": "semantic.inspect_particle_assets",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_post_processings",
+      "stable_id": "semantic.inspect_post_processings",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_prefabs",
+      "stable_id": "semantic.inspect_prefabs",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_registry_assets",
+      "stable_id": "semantic.inspect_registry_assets",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_render_graphs",
+      "stable_id": "semantic.inspect_render_graphs",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_scene",
+      "stable_id": "semantic.inspect_scene",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "scene",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_shader_assets",
+      "stable_id": "semantic.inspect_shader_assets",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_simulation_lod_specs",
+      "stable_id": "semantic.inspect_simulation_lod_specs",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_vehicle_assets",
+      "stable_id": "semantic.inspect_vehicle_assets",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_world_assets",
+      "stable_id": "semantic.inspect_world_assets",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "inspect_world_profile_assets",
+      "stable_id": "semantic.inspect_world_profile_assets",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "instantiate_prefab",
+      "stable_id": "semantic.instantiate_prefab",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "scene",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "prefab",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "offset",
+          "kind": "array",
+          "value_type": "array<number>"
+        },
+        {
+          "name": "parent_id",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "list_game_projects",
+      "stable_id": "semantic.list_game_projects",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": []
+    },
+    {
+      "name": "remove_component",
+      "stable_id": "semantic.remove_component",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "scene",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "entity_id",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "component",
+          "kind": "enum",
+          "value_type": "[\"Camera\",\"Light\",\"MeshRenderer\",\"Rigidbody\",\"Weapon\",\"ParticleEmitter\",\"Vehicle\",\"Ragdoll\",\"Mission\",\"Dialogue\",\"Destruction\",\"Navigation\",\"Audio\",\"Material\",\"VoxelVolume\",\"Hierarchy\"]"
+        }
+      ]
+    },
+    {
+      "name": "remove_entity",
+      "stable_id": "semantic.remove_entity",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "scene",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "entity_id",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    },
+    {
+      "name": "run_batch",
+      "stable_id": "semantic.run_batch",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "operations",
+          "kind": "array",
+          "value_type": "array<object>"
+        },
+        {
+          "name": "dry_run",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "set_component",
+      "stable_id": "semantic.set_component",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "scene",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "entity_id",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "component",
+          "kind": "enum",
+          "value_type": "[\"Transform\",\"Camera\",\"Light\",\"MeshRenderer\",\"Rigidbody\",\"Weapon\",\"ParticleEmitter\",\"Vehicle\",\"Ragdoll\",\"Mission\",\"Dialogue\",\"Destruction\",\"Navigation\",\"Audio\",\"Material\",\"VoxelVolume\",\"Hierarchy\"]"
+        },
+        {
+          "name": "values",
+          "kind": "json",
+          "value_type": "object"
+        },
+        {
+          "name": "replace",
+          "kind": "bool",
+          "value_type": "boolean",
+          "default": "false"
+        }
+      ]
+    },
+    {
+      "name": "stage_asset",
+      "stable_id": "semantic.stage_asset",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "source",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "destination",
+          "kind": "string",
+          "value_type": "string"
+        },
+        {
+          "name": "import_settings",
+          "kind": "json",
+          "value_type": "object",
+          "default": "{}"
+        }
+      ]
+    },
+    {
+      "name": "validate_game_project",
+      "stable_id": "semantic.validate_game_project",
+      "alias": "",
+      "version": "1.0.0",
+      "fields": [
+        {
+          "name": "project",
+          "kind": "string",
+          "value_type": "string"
+        }
+      ]
+    }
+  ]
+}

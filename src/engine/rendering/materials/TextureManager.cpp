@@ -1,8 +1,10 @@
 #include "TextureManager.hpp"
+#include "engine/rendering/IKtx2Transcoder.hpp"
 #include <cmath>
 #include <random>
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include "engine/core/logging/Log.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +18,37 @@
 
 using Microsoft::WRL::ComPtr;
 namespace fs = std::filesystem;
+
+// Real KTX2/Basis path (C.4): decode a .ktx2 layer through the public SDK
+// transcoder (ktx-software, CPU-side) into the same RGBA32 raster the WIC
+// loader produces, so a texture pack can ship .ktx2 layers (albedo/_n/_s)
+// and the material pipeline consumes them with no other code change. The
+// transcoder is created once; a missing/unreadable/unsized file falls back
+// to the PNG/WIC path below (never a silent magenta or a boot-only probe).
+static std::vector<uint8_t> load_ktx2_rgba(const fs::path& path, uint32_t width, uint32_t height) {
+    if (!fs::exists(path)) return {};
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return {};
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (bytes.empty()) return {};
+    std::string error;
+    Engine::Rendering::Ktx2Info info;
+    static const auto transcoder = Engine::Rendering::create_ktx2_transcoder();
+    if (!transcoder) return {};
+    if (!transcoder->open(bytes.data(), bytes.size(), info, error)) {
+        std::cerr << "[Textures] ktx2 open refused: " << error << std::endl;
+        return {};
+    }
+    // Only adopt native-size layers; anything else falls back to WIC (the
+    // texture array is fixed-size and the transcoder reports real dims).
+    if (info.width != width || info.height != height || info.faces != 1 || info.levels < 1) return {};
+    std::vector<uint8_t> rgba;
+    if (!transcoder->transcodeLevel(0, 0, Engine::Rendering::Ktx2Format::Rgba32, rgba, error)) {
+        std::cerr << "[Textures] ktx2 transcode refused: " << error << std::endl;
+        return {};
+    }
+    return rgba.size() == static_cast<size_t>(width) * height * 4 ? std::move(rgba) : std::vector<uint8_t>{};
+}
 
 static std::vector<uint8_t> load_wic_rgba(const fs::path& path, uint32_t width, uint32_t height,
                                           WICBitmapInterpolationMode interpolation = WICBitmapInterpolationModeFant) {
@@ -492,11 +525,19 @@ void TextureManager::init(VkDevice device, VkPhysicalDevice physicalDevice, VmaA
 
         if (const char* textureName = minecraft_texture_name(index); textureName && !pack.empty()) {
             const fs::path base = blockDir / fs::u8path(textureName);
-            if (auto loaded = load_wic_rgba(base.wstring() + L".png", texSize, texSize); !loaded.empty())
+            // C.4: KTX2/Basis is a first-class pack layer format — a .ktx2
+            // wins over the .png for the same base name (albedo/_n/_s).
+            if (auto loaded = load_ktx2_rgba(base.wstring() + L".ktx2", texSize, texSize); !loaded.empty())
                 albedo = std::move(loaded);
-            if (auto loaded = load_wic_rgba(base.wstring() + L"_n.png", texSize, texSize); !loaded.empty())
+            else if (auto loaded = load_wic_rgba(base.wstring() + L".png", texSize, texSize); !loaded.empty())
+                albedo = std::move(loaded);
+            if (auto loaded = load_ktx2_rgba(base.wstring() + L"_n.ktx2", texSize, texSize); !loaded.empty())
                 normal = std::move(loaded);
-            if (auto loaded = load_wic_rgba(base.wstring() + L"_s.png", texSize, texSize); !loaded.empty())
+            else if (auto loaded = load_wic_rgba(base.wstring() + L"_n.png", texSize, texSize); !loaded.empty())
+                normal = std::move(loaded);
+            if (auto loaded = load_ktx2_rgba(base.wstring() + L"_s.ktx2", texSize, texSize); !loaded.empty())
+                specular = std::move(loaded);
+            else if (auto loaded = load_wic_rgba(base.wstring() + L"_s.png", texSize, texSize); !loaded.empty())
                 specular = std::move(loaded);
         }
         if (index == TextureIndex::GrassBlade && fs::exists(realisticGrassDir)) {

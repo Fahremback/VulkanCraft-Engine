@@ -7,13 +7,13 @@
 //   node tools/portability/benchmark-gate.mjs [--update]
 import { execSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 const ROOT = process.cwd();
 const ARTIFACTS = join(ROOT, 'out', 'artifacts', 'benchmarks');
 const BASELINE = join(ARTIFACTS, 'benchmark_engine_baseline.json');
-const buildDir = process.env.VC_BUILD_DIR ?? 'build';
-const EXE = join(ROOT, buildDir, 'benchmark_engine_test.exe');
+import { resolveExe } from './exe-resolve.mjs';
+const EXE = resolveExe(ROOT, 'benchmark_engine_test');
 const UPDATE = process.argv.includes('--update');
 // Tolerance is configurable (BENCH_TOLERANCE) because on a shared dev machine
 // with concurrent builds, consecutive runs of the same binary vary by ~±25%
@@ -21,7 +21,7 @@ const UPDATE = process.argv.includes('--update');
 const TOLERANCE = Number(process.env.BENCH_TOLERANCE ?? 0.10);
 
 if (!existsSync(EXE)) {
-  console.error('[benchmark-gate] FAIL: build/Release/benchmark_engine_test.exe not found — build first');
+  console.error(`[benchmark-gate] FAIL: ${EXE} not found — build first (canonical tree ${process.env.VC_BUILD_DIR || 'out/dev-shared'})`);
   process.exit(1);
 }
 if (!existsSync(BASELINE)) {
@@ -35,10 +35,11 @@ const map = new Map(baseline.benchmarks.map((b) => [b.name, b.real_time]));
 // Fresh run: median of 3 repetitions (report aggregates) so a single noisy
 // run on a shared/hot machine cannot flip the gate. On dedicated CI runners
 // the aggregate median is stable well within the default tolerance.
+const exeDir = dirname(EXE);
 const run = spawnSync(EXE, [
   '--benchmark_min_time=0.05s', '--benchmark_repetitions=3', '--benchmark_enable_random_interleaving=false',
   '--benchmark_report_aggregates_only=true', '--benchmark_format=json',
-], { cwd: ROOT, encoding: 'utf8', timeout: 180000, windowsHide: true, env: { ...process.env, PATH: `${join(ROOT, buildDir)};${process.env.PATH ?? ''}` } });
+], { cwd: ROOT, encoding: 'utf8', timeout: 180000, windowsHide: true, env: { ...process.env, PATH: `${exeDir};${process.env.PATH ?? ''}` } });
 if (run.status !== 0) {
   console.error('[benchmark-gate] FAIL: benchmark run exited ' + run.status);
   process.exit(1);

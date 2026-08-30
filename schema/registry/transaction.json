@@ -14,22 +14,22 @@
       "default": 1,
       "type": "integer"
     },
-    "max_edits": {
-      "description": "per-transaction edit cap; 0 = unlimited",
-      "default": 0,
-      "type": "integer"
-    },
-    "max_box_volume": {
-      "description": "bounding-box volume cap; 0 = unlimited",
-      "default": 0,
-      "type": "integer"
-    },
     "edits": {
       "description": "[{ position: [x,y,z] (integers), block_id (uint, 0 = Air) }]",
       "type": "array",
       "items": {
         "type": "object"
       }
+    },
+    "maxEdits": {
+      "description": "per-transaction edit cap; 0 = unlimited",
+      "default": 0,
+      "type": "integer"
+    },
+    "maxBoxVolume": {
+      "description": "bounding-box volume cap; 0 = unlimited",
+      "default": 0,
+      "type": "integer"
     }
   },
   "required": [

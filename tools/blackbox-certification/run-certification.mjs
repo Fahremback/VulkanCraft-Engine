@@ -12,6 +12,14 @@
 //   node tools/blackbox-certification/run-certification.mjs <install-dir>
 //
 // Exit 0 = certified slice green. Exit 1 = any requirement incomplete.
+//
+// Beyond the .exe binaries, this certifier also verifies the non-binary
+// executable surfaces the product ships:  (a) the MCP server (a Node
+// JSON-RPC over stdio process, installed under tools/mcp-server/server.mjs)
+// answers an initialize handshake from the INSTALLED copy, never the
+// checkout; and (b) the install tree exposes the SDK package a showcase
+// consumes via find_package(vulkan_craft_sdk CONFIG). Those are separate
+// entrypoints that a bare .exe walk would silently skip.
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { join, resolve, relative, isAbsolute } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -103,9 +111,62 @@ for (const exe of exes) {
   }
 }
 
+// 4. MCP server — a Node JSON-RPC over stdio process, not an .exe. The
+//    installed copy at tools/mcp-server/server.mjs must answer an
+//    `initialize` from a fresh engine ROOT derived from the INSTALL path (the
+//    server resolves ENGINE_ROOT from the location of its own file, so
+//    running the installed copy forces it to resolve into the prefix, not the
+//    checkout). We send one initialize request and require a serverInfo reply.
+const mcpServer = join(ABS, 'tools', 'mcp-server', 'server.mjs');
+let mcpCertified = false;
+let mcpDetail = '';
+if (existsSync(mcpServer)) {
+  const nodeRes = spawnSync('node', [mcpServer], {
+    encoding: 'utf8', timeout: 20000, windowsHide: true,
+    input: JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'blackbox-certifier', version: '0' } },
+    }) + '\n',
+  });
+  const out = nodeRes.stdout || '';
+  const err = nodeRes.stderr || '';
+  // JSON-RPC replies go to stdout; the readiness "root=..." line is stderr.
+  const gotInfo = out.includes('\"serverInfo\"') && out.includes('\"vulkancraft-engine\"');
+  const readyLine = (out + err).match(/root=([^;\n]+)/);
+  const engineRoot = (readyLine && readyLine[1] || '').trim();
+  const resolvedIntoPrefix = engineRoot && resolve(engineRoot) === ABS;
+  if (nodeRes.status === 0 && gotInfo && resolvedIntoPrefix) {
+    mcpCertified = true;
+    mcpDetail = `root=${engineRoot} serverInfo answered`;
+  } else {
+    problems.push(`MCP server: installed copy asked initialize but engineRoot=${engineRoot} resolvedIntoPrefix=${resolvedIntoPrefix} gotInfo=${gotInfo} (status=${nodeRes.status})`);
+    mcpDetail = `FAILED status=${nodeRes.status} engineRoot=${engineRoot}`;
+  }
+} else {
+  problems.push(`MCP server node entrypoint not found in install (expected tools/mcp-server/server.mjs)`);
+}
+if (mcpCertified) console.log(`[blackbox] MCP server certified outside checkout: ${mcpDetail}`);
+
+// 5. SDK package / showcase — a showcase project is generated as a real
+//    consumer of the installed SDK (find_package(vulkan_craft_sdk CONFIG)).
+//    The install must expose the relocatable package config; without it there
+//    is no way for a showcase to consume the engine outside the checkout.
+const sdkConfigCandidates = [
+  join(ABS, 'lib', 'cmake', 'vulkan_craft_sdk', 'vulkan_craft_sdk-config.cmake'),
+  join(ABS, 'share', 'vulkan_craft_sdk', 'vulkan_craft_sdk-config.cmake'),
+  join(ABS, 'cmake', 'vulkan_craft_sdk-config.cmake'),
+];
+const sdkConfig = sdkConfigCandidates.find((p) => existsSync(p));
+const hasPublicHeaders = existsSync(join(ABS, 'include')) || (readdirSync(ABS, { withFileTypes: true }).some((e) => e.isDirectory() && /^src$|^include$/.test(e.name)));
+if (!sdkConfig && !hasPublicHeaders) {
+  problems.push('showcase/SDK-consume surface missing: neither a vulkan_craft_sdk config nor a public include dir found in the install');
+} else {
+  console.log(`[blackbox] SDK/showcase-consume surface present: ${sdkConfig ? 'vulkan_craft_sdk-config.cmake' : 'public include dir'}`);
+}
+
 if (problems.length) {
   console.error('[blackbox] CERTIFICATION FAILED:');
   problems.forEach((p) => console.error(`  - ${p}`));
   process.exit(1);
 }
-console.log(`[blackbox] certification slice PASSED — install at ${ABS} has no source-tree refs, tools run.`);
+console.log(`[blackbox] certification slice PASSED — install at ${ABS} has no source-tree refs, tools run, MCP+SDK surfaces certified.`);

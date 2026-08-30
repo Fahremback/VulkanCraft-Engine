@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Painel local de progresso dos seis agentes, sem dependências externas."""
+"""Painel local de progresso dos cinco agentes, sem dependências externas."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import threading
 import time
@@ -17,50 +16,17 @@ from pathlib import Path
 ENGINE_ROOT = Path(__file__).resolve().parents[2]
 AGENTS_ROOT = ENGINE_ROOT / "agentes"
 AGENT_LABELS = {
-    "agente1_render_lumen": "Render e Lumen",
-    "agente2_editor_ui": "Editor e UI",
-    "agente3_voxel_world": "Voxel e Mundo",
-    "agente4_gameplay_ai": "Gameplay e IA",
-    "agente5_sdk_mcp": "SDK e MCP",
-    "agente6_integracao": "Integração e Red Team",
+    "agente1_runtime_render": "Runtime e Render",
+    "agente2_world_gameplay": "Mundo e Gameplay",
+    "agente3_network_server": "Rede e Servidor",
+    "agente4_editor_sdk_mcp": "Editor, SDK e MCP",
+    "agente5_integracao_entrega": "Integração e Entrega",
 }
 DONE_RE = re.compile(r"^\s*-\s*\[[xX]\]", re.MULTILINE)
 OPEN_RE = re.compile(r"^\s*-\s*\[(?:\s|~)\]", re.MULTILINE)
-SUCCESSOR_MARKER = "<!-- AUTO-SUCCESSOR:AGENT6-GAMEPLAY-AI -->"
-SUCCESSOR_TEMPLATE = AGENTS_ROOT / "agente6_integracao" / "successor_gameplay_ai.md"
-def activate_agent6_successor() -> bool:
-    """Anexa a missão sucessora uma única vez quando o lote atual chega a 100%."""
-    plan = AGENTS_ROOT / "agente6_integracao" / "task_plan.md"
-    if not plan.exists() or not SUCCESSOR_TEMPLATE.exists():
-        return False
-    current = plan.read_text(encoding="utf-8", errors="replace")
-    if SUCCESSOR_MARKER in current:
-        return False
-    done = len(DONE_RE.findall(current))
-    pending = len(OPEN_RE.findall(current))
-    if done == 0 or pending != 0:
-        return False
-
-    lock = plan.with_suffix(".successor.lock")
-    try:
-        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        return False
-    try:
-        os.close(descriptor)
-        current = plan.read_text(encoding="utf-8", errors="replace")
-        if SUCCESSOR_MARKER in current or len(OPEN_RE.findall(current)) != 0:
-            return False
-        successor = SUCCESSOR_TEMPLATE.read_text(encoding="utf-8", errors="replace").strip()
-        with plan.open("a", encoding="utf-8", newline="\n") as output:
-            output.write(f"\n\n{SUCCESSOR_MARKER}\n{successor}\n")
-        return True
-    finally:
-        lock.unlink(missing_ok=True)
 
 
 def snapshot() -> dict:
-    activated = activate_agent6_successor()
     agents = []
     for directory, label in AGENT_LABELS.items():
         plan = AGENTS_ROOT / directory / "task_plan.md"
@@ -92,7 +58,6 @@ def snapshot() -> dict:
         "percent": round((done / total * 100.0) if total else 0.0, 1),
         "agents": agents,
         "timestamp": int(time.time()),
-        "successor_activated": activated,
     }
 
 
@@ -112,7 +77,7 @@ h1{font-size:28px;margin:0 0 6px}.muted{color:var(--muted)}.live{display:flex;al
 .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}.card{padding:20px}.card-head{display:flex;justify-content:space-between;align-items:center}.name{font-size:17px;font-weight:750}.pct{font-size:22px;font-weight:800}.mini{height:8px;margin:15px 0 12px}.stats{display:flex;justify-content:space-between;color:var(--muted);font-size:13px}.badge{color:var(--yellow);font-weight:800;font-size:12px;margin-left:8px}.complete{color:var(--green)}
 .changed{animation:flash .8s ease}@keyframes flash{50%{border-color:var(--green);box-shadow:0 0 30px #35dc8733}}@media(max-width:700px){.grid{grid-template-columns:1fr}.big{font-size:42px}.top{align-items:start;flex-direction:column}}
 </style></head>
-<body><main><div class="top"><div><h1>VulkanCraft Engine</h1><div class="muted">Progresso dos seis agentes em tempo real</div></div><div class="live"><span class="dot"></span>MONITORANDO</div></div>
+<body><main><div class="top"><div><h1>VulkanCraft Engine</h1><div class="muted">Integração real dos cinco agentes em tempo real</div></div><div class="live"><span class="dot"></span>MONITORANDO</div></div>
 <section class="hero"><div class="hero-row"><div class="big" id="overall">0%</div><div class="count" id="count">Carregando…</div></div><div class="bar"><div class="fill" id="overall-bar"></div></div></section>
 <section class="grid" id="agents"></section><p class="muted" id="updated"></p></main>
 <script>

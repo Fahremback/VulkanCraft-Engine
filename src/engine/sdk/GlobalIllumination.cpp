@@ -448,7 +448,7 @@ public:
     }
     const ReflectionConfig& config() const noexcept override { return config_; }
 
-    ReflectionBackend resolve_mode(const ReflectionSurface& surface) const override {
+    ReflectionBackend resolve_mode(const ReflectionSurfaceInput& surface) const override {
         // Deterministic, never over-claims: rough surfaces prefer probes,
         // clear-coat always reflects, mirror-smooth prefers RT when available,
         // otherwise screen-space, otherwise None.

@@ -32,6 +32,12 @@ struct Particle {
 
 struct ParticleEmitterDesc {
     glm::vec3 position{0.0f};
+    // Horizontal spawn-box radius around `position`: new particles appear at a
+    // uniformly-distributed point inside a disc of this radius (same height as
+    // the emitter), so wide effects (rain curtains, dust fields) can be authored
+    // with ONE emitter instead of a grid of point emitters. 0 = spawn exactly at
+    // `position` (previous behavior — all existing callers unchanged).
+    float positionSpread{0.0f};
     glm::vec3 direction{0.0f, 1.0f, 0.0f};
     float coneAngle{0.4f};
     float rate{20.0f};

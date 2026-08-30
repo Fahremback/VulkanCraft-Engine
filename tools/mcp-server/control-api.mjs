@@ -846,6 +846,31 @@ export function controlApiToolDefinitions() {
       }
     },
     {
+      name: "editor_render_debug",
+      description: "Select which rendering debug overlay is active in the editor viewport and return its REAL current data (probe/card/capture counts, trace paths, disocclusion, denoiser confidence) from the live IRenderingDebugView snapshot. Overlays: none, probes, cards, capture, trace, disocclusion.",
+      inputSchema: {
+        type: "object",
+        required: ["overlay"],
+        properties: {
+          overlay: { type: "string", enum: ["none", "probes", "cards", "capture", "trace", "disocclusion"], description: "Debug overlay to make active" }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: "editor_render_view",
+      description: "Toggle a viewport overlay that gates the PRESENTED viewport render (selective render view): grid, gizmos, or collider wireframes. Each is the same real state the viewport ⋯ menu toggles, so the SDK tool changes what the viewport actually draws, not a stub.",
+      inputSchema: {
+        type: "object",
+        required: ["overlay"],
+        properties: {
+          overlay: { type: "string", enum: ["grid", "gizmos", "colliders"], description: "Which viewport overlay to change" },
+          value: { type: "string", enum: ["0", "1", "toggle", "on", "off", "true", "false"], default: "toggle", description: "0/off = hide, 1/on = show, toggle = flip current" }
+        },
+        additionalProperties: false
+      }
+    },
+    {
       name: "editor_set_graphics",
       description: "Apply graphics settings: vsync and shadow quality (1-4).",
       inputSchema: {
@@ -961,6 +986,26 @@ export function controlApiToolDefinitions() {
       inputSchema: { type: "object", properties: {}, additionalProperties: false }
     },
     {
+      name: "editor_inventory_grid",
+      description: "Live inventory-grid snapshot (GET /inventory-grid) resolved through the public engine/ui IUiInventoryGrid contract from the editor's inventory state.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_network_debug",
+      description: "Live network-debug snapshot (GET /network-debug) resolved through the public engine/networking INetworkSession + INetworkRpc contracts: server-session active players + RPC procedure registry.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_package_manifest",
+      description: "Live package-manifest snapshot (GET /package-manifest) resolved through the public engine/packaging IPackageManager + engine/compiler IEpisodeCompiler contracts: install state, episode compile signature and verify status.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_cook",
+      description: "Live cooked-assets snapshot (GET /cook) resolved through the public engine/assets IAssetCooker contract: the editor cooks the showcase project's data-driven config once by content hash (cache-hit observable) — cow/cozimento-once semantics.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
       name: "editor_window_mode",
       description: "Window mode machine snapshot (GET /window-mode): Windowed/Borderless/Fullscreen + geometry.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false }
@@ -1003,6 +1048,11 @@ export function controlApiToolDefinitions() {
     {
       name: "editor_project_launcher",
       description: "Project launcher state (GET /launcher): launcher_mode, scene path, dirty, recent projects.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      name: "editor_render_diagnostics",
+      description: "Real render diagnostics of the running editor (GET /render-diagnostics): per-viewport pass timings (shadow/scene/env) recorded from the actual render loop via IRenderPassMetrics, the provider registry (which editor implementation backs each rendering system), the IRenderingDebugView overlay snapshot (probes/cards/capture/trace/disocclusion), the compiled viewport frame graph (pass names in order, barriers, lifetimes, executed-pass counters) and viewport/GPU resources. Use to validate the editor viewport actually consumes the canonical rendering contracts.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false }
     },
     {
@@ -1368,6 +1418,22 @@ export async function callControlApiTool(name, args = {}) {
       const quality = Math.trunc(pickNumber(args.quality, 2, { min: 1, max: 4 }));
       return callEditor(name, `/graphics/${vsync}/${quality}`);
     }
+    case "editor_render_view": {
+      const overlay = requireEnum(args.overlay, ["grid", "gizmos", "colliders"], "overlay");
+      const value = String(args.value ?? "toggle");
+      return callEditor(name, `/render-view/${overlay}/${value}`);
+    }
+    case "editor_render_debug": {
+      const overlay = requireEnum(args.overlay, ["none", "probes", "cards", "capture", "trace", "disocclusion"], "overlay");
+      const res = await callEditor(name, `/render-debug/${overlay}`);
+      let result = res.result;
+      try {
+        const parsed = JSON.parse(res.result);
+        if (parsed.ok && parsed.data) result = `Debug overlay ${overlay} active: ${parsed.data}`;
+        else if (parsed.error) result = `render-debug failed: ${parsed.error}`;
+      } catch { /* keep raw */ }
+      return { ...res, result };
+    }
     case "editor_save_settings": return callEditor(name, "/save-settings");
     case "editor_create_project": {
       const name = requireText(args.name, "name", { max: 64 });
@@ -1396,6 +1462,10 @@ export async function callControlApiTool(name, args = {}) {
     case "editor_profiler": return callEditorGet(name, "/profiler");
     case "editor_undo": return callEditorGet(name, "/undo");
     case "editor_content_browser": return callEditorGet(name, "/content-browser");
+    case "editor_inventory_grid": return callEditorGet(name, "/inventory-grid");
+    case "editor_network_debug": return callEditorGet(name, "/network-debug");
+    case "editor_package_manifest": return callEditorGet(name, "/package-manifest");
+    case "editor_cook": return callEditorGet(name, "/cook");
     case "editor_window_mode": return callEditorGet(name, "/window-mode");
     case "editor_camera": return callEditorGet(name, "/camera");
     case "editor_gizmo": return callEditorGet(name, "/gizmo");
@@ -1405,6 +1475,7 @@ export async function callControlApiTool(name, args = {}) {
     case "editor_onboarding": return callEditorGet(name, "/onboarding");
     case "editor_timeline_editor": return callEditorGet(name, "/timeline-editor");
     case "editor_project_launcher": return callEditorGet(name, "/launcher");
+    case "editor_render_diagnostics": return callEditorGet(name, "/render-diagnostics");
     case "editor_retargeting": return callEditorGet(name, "/retargeting");
     case "editor_qt_doc": return callEditorGet(name, "/qt-doc");
     case "editor_qt_theme": return callEditorGet(name, "/qt-theme");

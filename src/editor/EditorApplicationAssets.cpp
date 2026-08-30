@@ -3242,11 +3242,10 @@ static void fill_scene_light_entries(Rendering::LightUboData& data, const Scene*
             const auto tit = scene->transformComponents.find(id);
             if (tit != scene->transformComponents.end()) {
                 position = tit->second.position;
-                const float yaw = glm::radians(tit->second.rotation.y);
-                const float pitch = glm::radians(tit->second.rotation.x);
-                dir = glm::normalize(glm::vec3(
-                    std::cos(pitch) * std::sin(yaw), std::sin(pitch),
-                    std::cos(pitch) * std::cos(yaw)));
+                // Sun direction derives from the light's world POSITION so
+                // moving the directional sun in the editor changes the
+                // illumination (falls back to yaw/pitch at the origin).
+                dir = editor_sun_direction(tit->second);
             }
             // Editor lights use lux-like intensity (default sun = 10000) but the
             // MaterialPipeline Lambert term adds lightColor.rgb straight into
@@ -3261,8 +3260,15 @@ static void fill_scene_light_entries(Rendering::LightUboData& data, const Scene*
             } else if (light.type == LightType::Spot && spotCount < Rendering::kMaxSpotLights) {
                 data.spotLightPos[spotCount] = glm::vec4(position, light.range);
                 data.spotLightDir[spotCount] = glm::vec4(dir, 1.0f);
+                // Real cone (agente 4 — B.3): the editable LightComponent
+                // coneAngle drives cos(inner/outer); inner = 55% of the outer
+                // cone (the same ratio the previous hardcoded 25°/45° pair
+                // used). Clamped to 1.45 rad so the outer cone always fits
+                // the 90° spot shadow-map frustum with margin.
+                const float outerCone = glm::clamp(light.coneAngle, 0.05f, 1.45f);
+                const float innerCone = outerCone * 0.55f;
                 data.spotLightParams[spotCount] = glm::vec4(
-                    std::cos(glm::radians(25.0f)), std::cos(glm::radians(45.0f)), 0.0f, 0.0f);
+                    std::cos(innerCone), std::cos(outerCone), 0.0f, 0.0f);
                 data.spotLightColor[spotCount] = glm::vec4(colorIntensity, 1.0f);
                 ++spotCount;
             } else if (light.type == LightType::Area && areaCount < Rendering::kMaxAreaLights) {
@@ -3440,8 +3446,17 @@ void EditorApplication::update_scene_light_ubo(const Scene* scene) {
     // BUG-EDITOR-SHADOWS-001: the basic mesh path now samples the real sun
     // shadow map (binding 1). w = 1/shadowMapSize for the PCF texel offsets.
     data.sunViewProj = m_shadowMap.viewProj;
-    data.shadowParams = glm::vec4(m_shadowMap.enabled ? 1.0f : 0.0f, 0.0006f, 1.0f,
-                                  1.0f / float(m_shadowMap.size));
+    // L47 cascatas: preenche os VPs reais por cascata (+splits) e ativa o
+    // path de atlas no shader (shadowParams.z = count) quando o sol existe;
+    // senão mantém o fallback single-map (z=1).
+    const float cascadeCount = m_sunCascadeCount > 0u
+        ? static_cast<float>(m_sunCascadeCount) : (m_shadowMap.enabled ? 1.0f : 0.0f);
+    data.shadowParams = glm::vec4(m_shadowMap.enabled ? 1.0f : 0.0f, 0.0006f,
+                                  cascadeCount, 1.0f / float(m_shadowMap.size * 2u));
+    for (std::uint32_t c = 0u; c < Engine::Rendering::kShadowCascadeCount; ++c) {
+        data.sunCascadeVP[c] = m_sunCascadeVP[c];
+    }
+    data.sunCascadeSplits = m_sunCascadeSplits;
     const glm::mat4 view = m_editorCamera.get_view_matrix();
     data.cameraForward = glm::vec4(
         glm::normalize(glm::vec3(-view[2][0], -view[2][1], -view[2][2])), 0.0f);
@@ -3459,8 +3474,16 @@ void EditorApplication::write_light_ubo(GraphMaterialPipeline& p, const Scene* s
     data.cameraPosition = glm::vec4(cameraPos, 1.0f);
     // Real sun shadow map: VP + enabled flag + bias + single-map mode (z=1).
     data.sunViewProj = m_shadowMap.viewProj;
+    // L47 cascatas: mesmo contrato que update_scene_light_ubo — matrizes reais
+    // por cascata no UBO compartilhado + shadowParams.z = contagem ativa.
+    const float cascadeCount = m_sunCascadeCount > 0u
+        ? static_cast<float>(m_sunCascadeCount) : (m_shadowMap.enabled ? 1.0f : 0.0f);
     data.shadowParams = glm::vec4(m_shadowMap.enabled ? 1.0f : 0.0f, 0.0006f,
-                                  m_shadowMap.enabled ? 1.0f : 0.0f, 0.0f);
+                                  cascadeCount, 1.0f / float(m_shadowMap.size * 2u));
+    for (std::uint32_t c = 0u; c < Engine::Rendering::kShadowCascadeCount; ++c) {
+        data.sunCascadeVP[c] = m_sunCascadeVP[c];
+    }
+    data.sunCascadeSplits = m_sunCascadeSplits;
     const glm::mat4 view = m_editorCamera.get_view_matrix();
     data.cameraForward = glm::vec4(glm::normalize(glm::vec3(-view[2][0], -view[2][1], -view[2][2])), 0.0f);
     fill_scene_light_entries(data, scene);

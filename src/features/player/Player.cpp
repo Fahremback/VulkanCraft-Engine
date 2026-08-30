@@ -184,11 +184,19 @@ void Player::update(float deltaTime, const PlayerInput& input, const World& worl
         if (input.descend) velocity.y -= flySpeed;
         isGrounded = false;
     } else if (isInFluid) {
-        // Enquanto qualquer parte do corpo ainda está na água, Space mantém o
-        // impulso. Ao pôr a cabeça para fora ele aumenta para vencer a margem.
-        if (spaceDown) velocity.y = isSubmerged ? 5.4f : 7.2f;
-        else if (input.descend) velocity.y = -4.5f;
-        else velocity.y = (std::max)(velocity.y + gravity * 0.12f * physicsDelta, -2.0f);
+        if (!input.canSwim) {
+            // Enforcement de capability agent.swim: sem a capacidade, o
+            // jogador afunda/deduz para baixo no fluido (não nada). O espaço
+            // ainda permite emergir um instante, mas sem impulso de natação.
+            velocity.y = (std::min)(velocity.y - 1.2f * physicsDelta, -3.0f);
+        } else {
+            // Enquanto qualquer parte do corpo ainda está na água, Space
+            // mantém o impulso. Ao pôr a cabeça para fora ele aumenta para
+            // vencer a margem.
+            if (spaceDown) velocity.y = isSubmerged ? 5.4f : 7.2f;
+            else if (input.descend) velocity.y = -4.5f;
+            else velocity.y = (std::max)(velocity.y + gravity * 0.12f * physicsDelta, -2.0f);
+        }
     } else {
         if (isGrounded && spaceDown && !spaceWasPressed) {
             velocity.y = jumpStrength;
@@ -204,7 +212,11 @@ void Player::update(float deltaTime, const PlayerInput& input, const World& worl
         }
     }
 
-    const bool swimmingTowardLedge = isInFluid && spaceDown && moving > 0.0f;
+    // item 116: capability agent.climb — sem a capacidade, desliga a assistência
+    // de subida de margem (ledge assist), então o jogador não escala degraus/
+    // bordas que exigem o impulso de escalada.
+    const bool swimmingTowardLedge =
+        input.canClimb && isInFluid && spaceDown && moving > 0.0f;
     move_with_collisions(velocity * physicsDelta, world, swimmingTowardLedge);
 
     spaceWasPressed = spaceDown;

@@ -94,7 +94,18 @@ function main() {
 
   // ---- Stage 3: cook — real contract: VulkanEngineCooker <registry.db> <uuid> <out> ----
   log(`3. cook`);
-  const cooker = join(ROOT, 'build', 'Release', 'VulkanEngineCooker.exe');
+  // Resolve the exe from the canonical shared tree (VC_BUILD_DIR, default
+  // out/dev-shared, single-config Ninja) with multi-config fallbacks — never
+  // the legacy in-source build/ tree.
+  const BUILD_REL = process.env.VC_BUILD_DIR || 'out/dev-shared';
+  const exeCandidates = (name) => [
+    join(ROOT, BUILD_REL, name + '.exe'),
+    join(ROOT, BUILD_REL, 'Release', name + '.exe'),
+    join(ROOT, BUILD_REL, 'RelWithDebInfo', name + '.exe'),
+    join(ROOT, BUILD_REL, 'Debug', name + '.exe')
+  ];
+  const resolveExe = (name) => exeCandidates(name).find((p) => existsSync(p)) || exeCandidates(name)[0];
+  const cooker = resolveExe('VulkanEngineCooker');
   // Find the project's registry db (the real cook input), else SKIP honestly.
   const registryDb = (() => {
     const candidates = [
@@ -127,7 +138,7 @@ function main() {
   // not a semantic factory; it requires a built exe + Content dir. Drive it
   // via the MCP stdio transport when a build exists, else report SKIP honestly.
   log(`4. package (${exe})`);
-  const exePath = join(ROOT, 'build', 'Release', exe + '.exe');
+  const exePath = resolveExe(exe);
   const contentDir = join(projectRoot, 'Content');
   let pkgOk = false;
   if (!existsSync(exePath)) {

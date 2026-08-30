@@ -1,0 +1,59 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+// Mesh stage of the real mesh-shader meshlet submission (Conta 2, item 1).
+// Runs once per surviving group (one workgroup), placed after culling in the
+// task stage. It reads REAL world-geometry positions (block-soup triangles)
+// from a storage buffer and emits the group's triangles. The CPU uploader
+// orders the group's vertices so gl_MeshVerticesEXT[0..vtxCount) exactly match
+// the local indices stored in the per-group triangle connectivity buffer.
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout (triangles, max_vertices = 64, max_primitives = 64) out;
+
+layout (binding = 1) readonly buffer MeshletMeta   { vec4 meshletMeta[]; };   /* vec4(firstTri, triCount, firstVtx, vtxCount) */
+layout (binding = 2) readonly buffer WorldPositions { vec4 worldPositions[]; }; /* shared world positions, one vec4 per vertex */
+layout (binding = 3) readonly buffer MeshletTris   { uvec4 meshletTris[]; };   /* per group: uvec4(l0, l1, l2, unused) local indices */
+
+layout (push_constant) uniform MeshletPush {
+    mat4 mvp;
+    vec4 sunDirection;
+    vec4 sunColor;
+    vec4 environment;
+} push;
+
+struct TaskPayload { uint meshletIndex; };
+taskPayloadInEXT TaskPayload IN;
+
+layout (location = 0) out vec4 fragColor;
+layout (location = 1) out vec3 fragNormal;
+layout (location = 2) out vec3 fragWorldPos;
+
+void main() {
+    uint gid = IN.meshletIndex;
+    vec4 meta = meshletMeta[gid];
+    uint firstTri = uint(meta.x);
+    uint triCount = min(uint(meta.y), 64u);
+    uint firstVtx  = uint(meta.z);
+    uint vtxCount  = min(uint(meta.w), 64u);
+
+    uint lane = gl_LocalInvocationIndex;
+    if (lane < vtxCount) {
+        vec4 w = worldPositions[firstVtx + lane];
+        vec3 world = w.xyz;
+        gl_MeshVerticesEXT[lane].gl_Position = push.mvp * vec4(world, 1.0);
+        fragWorldPos = world;
+        fragColor = vec4(0.85, 0.85, 0.82, 1.0);
+        fragNormal = vec3(0.0, 1.0, 0.0);
+    }
+    if (lane < triCount) {
+        uvec4 t = meshletTris[firstTri + lane];
+        uint idx = lane * 3u;
+        gl_PrimitiveTriangleIndicesEXT[idx + 0u] = t.x;
+        gl_PrimitiveTriangleIndicesEXT[idx + 1u] = t.y;
+        gl_PrimitiveTriangleIndicesEXT[idx + 2u] = t.z;
+    }
+    if (gl_LocalInvocationIndex == 0u) {
+        SetMeshOutputsEXT(vtxCount, triCount);
+    }
+}

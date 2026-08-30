@@ -157,3 +157,8 @@ endforeach()
 if(TEST far_terrain_sampling_benchmark)
     set_tests_properties(far_terrain_sampling_benchmark PROPERTIES LABELS "benchmark;far-terrain")
 endif()
+
+# --- measurement: CPU per-system frame breakdown (pre-performance instrumentation) ---
+if(TEST system_timeline_tests)
+    set_tests_properties(system_timeline_tests PROPERTIES LABELS "measurement;cpu-breakdown")
+endif()

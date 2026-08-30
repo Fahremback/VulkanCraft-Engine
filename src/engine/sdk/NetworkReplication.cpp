@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <map>
 #include <sstream>
+#include <unordered_set>
 
 namespace engine::networking {
 
@@ -145,18 +146,19 @@ public:
             return false;
         }
         // Validação all-or-nothing: ids únicos no frame + kind não-vazio.
-        std::vector<std::uint64_t> ids;
-        ids.reserve(frame.states.size());
+        // Duplicate detection via hash set (O(n)) instead of a linear find
+        // per state (O(n^2)) for frames replicating many entities.
+        std::unordered_set<std::uint64_t> seen;
+        seen.reserve(frame.states.size());
         for (const NetworkEntityState& st : frame.states) {
             if (st.kind.empty()) {
                 errorOut = "network: kind vazio na entidade " + std::to_string(st.entity_id);
                 return false;
             }
-            if (std::find(ids.begin(), ids.end(), st.entity_id) != ids.end()) {
+            if (!seen.insert(st.entity_id).second) {
                 errorOut = "network: entity_id duplicado no frame (" + std::to_string(st.entity_id) + ")";
                 return false;
             }
-            ids.push_back(st.entity_id);
         }
         // Aplica (só chega aqui se TUDO validou).
         for (const NetworkEntityState& st : frame.states) entities_[st.entity_id] = st;

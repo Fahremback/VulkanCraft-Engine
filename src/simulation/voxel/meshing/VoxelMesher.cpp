@@ -4,6 +4,35 @@
 #include <cmath>
 #include <iostream>
 
+namespace {
+
+// Resolved per-face material: color, texture array layer and the renderer's
+// material variant dedup key (0 = color-only block, no material variant).
+struct MaterialFace {
+    glm::vec4 color{ 1.0f, 0.0f, 1.0f, 1.0f };
+    float layer{ -1.0f };
+    std::uint32_t variantKey{ 0 };
+};
+
+// Resolver-compatible variant key of a dynamic (registry) block in a named
+// state—read from the snapshot-embedded RuntimeBlockInfo (never the registry).
+// The block-level key applies when the block has no states (states[0] is the
+// default look); an active state (index >= 1) uses the state's key.
+std::uint32_t material_variant_key(const RuntimeBlockInfo& info,
+                                   uint8_t stateIndex) noexcept {
+    const bool hasStates = !info.states.empty();
+    if (hasStates) {
+        const int index = stateIndex >= 0 &&
+                                  stateIndex < static_cast<int>(info.states.size())
+                              ? stateIndex
+                              : 0;
+        return info.states[static_cast<std::size_t>(index)].variantKey;
+    }
+    return info.variantKey;
+}
+
+}  // namespace
+
 ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
     ChunkMeshResult result;
     result.chunk = snapshot.id;
@@ -23,6 +52,8 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
                             uint8_t stateIndex = 0) {
         glm::vec4 color(1.0f, 0.0f, 1.0f, 1.0f);
         float layer = -1.0f;
+        // Renderer material dedup key (0 = not materialized / color-only).
+        std::uint32_t variantKey = 0;
         if (is_builtin_block(id)) {
             const BlockType type = static_cast<BlockType>(id);
             color = get_block_color(type, normal);
@@ -30,9 +61,12 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
         } else if (const RuntimeBlockInfo* info = snapshot.find_runtime_block(id)) {
             // State-aware material (FALTANTES item 2): resolve per-voxel
             // state index (0 = default, >0 = named state from BlockDefinition).
+            // The variant key is resolver-compatible, embedded at dispatch;
+            // it is the renderer's dedup key for identical (block, state).
             color = resolve_state_material(*info, stateIndex, normal);
+            variantKey = material_variant_key(*info, stateIndex);
         }
-        return std::pair<glm::vec4, float>{ color, layer };
+        return MaterialFace{ color, layer, variantKey };
     };
 
     // FALTANTES §8 item 167: a fluid is ANY block that drives the fluid
@@ -63,7 +97,18 @@ ChunkMeshResult VoxelMesher::build(const ChunkSnapshot& snapshot) {
     auto add_face = [&](const glm::vec3& p0, const glm::vec3& p1, const glm::vec3& p2, const glm::vec3& p3,
                         const glm::vec3& normal, RuntimeBlockId type,
                         uint8_t stateIndex, float brightness) {
-        const auto [col, layer] = material_for(type, normal, stateIndex);
+        const MaterialFace resolved = material_for(type, normal, stateIndex);
+        const glm::vec4& col = resolved.color;
+        const float layer = resolved.layer;
+        // Publish the REAL material variant the renderer dedups on: each
+        // distinct resolver-compatible key is uploaded to the chunk's material
+        // buffer (0 = color-only / not materialized, never emitted).
+        if (resolved.variantKey != 0) {
+            auto& variants = mesh.materialVariants;
+            if (std::find(variants.begin(), variants.end(), resolved.variantKey) == variants.end()) {
+                variants.push_back(resolved.variantKey);
+            }
+        }
         // Block-light shading (FALTANTES item 8/9): the vertex color is the
         // material color scaled by light/15. Only RGB is scaled — alpha (water
         // transparency) is brightness-independent.

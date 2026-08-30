@@ -191,7 +191,8 @@ void write_prefab_components(std::ostream& out, const PrefabEntityData& entity) 
         separator(); const auto& v = entity.light;
         out << "\"Light\":{\"r\":" << v.color.r << ",\"g\":" << v.color.g << ",\"b\":" << v.color.b
             << ",\"intensity\":" << v.intensity << ",\"range\":" << v.range
-            << ",\"castShadows\":" << (v.castShadows ? "true" : "false") << '}';
+            << ",\"castShadows\":" << (v.castShadows ? "true" : "false")
+            << ",\"coneAngle\":" << v.coneAngle << '}';
     }
     if (entity.hasCamera) {
         separator(); const auto& v = entity.camera;
@@ -240,6 +241,8 @@ void read_prefab_components(std::string_view object, PrefabEntityData& entity) {
         entity.light.intensity = static_cast<float>(number_field(*value, "intensity").value_or(1000.0));
         entity.light.range = static_cast<float>(number_field(*value, "range").value_or(50.0));
         entity.light.castShadows = bool_field(*value, "castShadows").value_or(true);
+        entity.light.coneAngle = static_cast<float>(
+            number_field(*value, "coneAngle").value_or(0.78539816339));
     }
     if (const auto value = object_field(*components, "Camera")) {
         entity.hasCamera = true;
@@ -332,7 +335,7 @@ SerializationResult Serializer::serialize_scene(
                 << ",\"b\":" << value.color.b << ",\"intensity\":" << value.intensity
                 << ",\"range\":" << value.range << ",\"castShadows\":"
                 << (value.castShadows ? "true" : "false") << ",\"type\":"
-                << static_cast<int>(value.type) << "}";
+                << static_cast<int>(value.type) << ",\"coneAngle\":" << value.coneAngle << "}";
         }
         if (auto mesh = scene.meshRendererComponents.find(id); mesh != scene.meshRendererComponents.end()) {
             const auto& v=mesh->second;out<<",\n      \"MeshRenderer\":{\"mesh\":\""<<v.meshAssetID.to_string()<<"\",\"material\":\""<<v.materialAssetID.to_string()<<"\",\"visible\":"<<(v.isVisible?"true":"false")<<",\"castShadows\":"<<(v.castShadows?"true":"false")<<"}";
@@ -573,6 +576,11 @@ SerializationResult Serializer::deserialize_scene(
             // range>=50 sun heuristic applies unchanged).
             value.type = static_cast<LightType>(
                 static_cast<int>(number_field(*light, "type").value_or(0.0)));
+            // coneAngle optional: legacy scenes default to 45° (π/4), exactly
+            // the cone the editor/game previously hardcoded — old scenes load
+            // with identical spot behavior.
+            value.coneAngle = static_cast<float>(
+                number_field(*light, "coneAngle").value_or(0.78539816339));
             loaded.lightComponents[entityId] = value;
         }
         if (const auto mesh = object_field(object, "MeshRenderer")) {

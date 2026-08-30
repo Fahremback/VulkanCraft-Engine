@@ -3,11 +3,15 @@
 // topological sort, required input checks, and determinism.
 #include <cassert>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "engine/scripting/IVisualScriptGraph.hpp"
+#include "engine/sdk/RegistryJson.hpp"
 
 using namespace engine::scripting;
 
@@ -312,6 +316,116 @@ static void test_node_removal_cascades() {
 }
 
 // ---------------------------------------------------------------------------
+// 11. Wired semantic nodes (§8 item 1, linha 114): o artifact
+//     schema/scripting/visual-nodes.json (gerado por tools/sdk/tool-wiring.mjs
+//     da MESMA fonte única semanticToolDefinitions()) registra TODOS os
+//     NodeDefs na runtime do grafo, e cada reflection_type cross-linka para
+//     um tipo presente no artifact de reflection (semantic.<tool>) — o
+//     wiring reflection⇄scripting é consumível, não documental.
+// ---------------------------------------------------------------------------
+static PinType parsePinType(const std::string& s) {
+    if (s == "Bool") return PinType::Bool;
+    if (s == "Int") return PinType::Int;
+    if (s == "Float") return PinType::Float;
+    if (s == "String") return PinType::String;
+    if (s == "Vec2") return PinType::Vec2;
+    if (s == "Vec3") return PinType::Vec3;
+    if (s == "Vec4") return PinType::Vec4;
+    if (s == "Entity") return PinType::Entity;
+    if (s == "Asset") return PinType::Asset;
+    if (s == "Event") return PinType::Event;
+    return PinType::Any;
+}
+
+static std::string readFileOrEmpty(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) return "";
+    return std::string((std::istreambuf_iterator<char>(in)), {});
+}
+
+static void test_wired_semantic_nodes() {
+#ifdef VULKANCRAFT_SOURCE_DIR
+    const std::string root = std::string(VULKANCRAFT_SOURCE_DIR);
+    const std::string nodesArtifact = root + "/schema/scripting/visual-nodes.json";
+    const std::string reflArtifact = root + "/schema/reflection/tools.json";
+
+    const std::string nodesText = readFileOrEmpty(nodesArtifact);
+    const std::string reflText = readFileOrEmpty(reflArtifact);
+    CHECK(!nodesText.empty(), "artifact schema/scripting/visual-nodes.json existe");
+    CHECK(!reflText.empty(), "artifact schema/reflection/tools.json existe");
+    if (nodesText.empty() || reflText.empty()) return;
+
+    engine::sdk::JsonValue nodesDoc, reflDoc;
+    std::string parseErr;
+    CHECK(engine::sdk::json_parse(nodesText, nodesDoc, parseErr), "visual-nodes.json JSON válido");
+    CHECK(engine::sdk::json_parse(reflText, reflDoc, parseErr), "tools.json JSON válido");
+
+    // Tipos de reflection disponíveis (stable_id) para o cross-link.
+    std::set<std::string> reflectionTypes;
+    if (const auto* typesArr = reflDoc.field("types")) {
+        for (const auto& t : typesArr->array) {
+            reflectionTypes.insert(engine::sdk::json_string(t, "stable_id", ""));
+        }
+    }
+    CHECK(reflectionTypes.size() > 0, "artifact de reflection tem tipos");
+
+    const auto* nodesArr = nodesDoc.field("nodes");
+    CHECK(nodesArr && nodesArr->is_array() && !nodesArr->array.empty(),
+          "artifact de nós tem nodes");
+    if (!nodesArr || !nodesArr->is_array() || nodesArr->array.empty()) return;
+
+    VisualScriptGraph g;
+    std::string regErr;
+    int registered = 0;
+    int crossLinked = 0;
+    for (const auto& n : nodesArr->array) {
+        NodeDef def;
+        def.type_name = engine::sdk::json_string(n, "type_name", "");
+        def.category = engine::sdk::json_string(n, "category", "");
+        def.description = engine::sdk::json_string(n, "description", "");
+        def.reflection_type = engine::sdk::json_string(n, "reflection_type", "");
+        if (const auto* inputs = n.field("inputs")) {
+            for (const auto& pin : inputs->array) {
+                PinDef p;
+                p.name = engine::sdk::json_string(pin, "name", "");
+                p.type = parsePinType(engine::sdk::json_string(pin, "type", "Any"));
+                p.required = engine::sdk::json_bool(pin, "required", true);
+                def.inputs.push_back(p);
+            }
+        }
+        if (const auto* outputs = n.field("outputs")) {
+            for (const auto& pin : outputs->array) {
+                PinDef p;
+                p.name = engine::sdk::json_string(pin, "name", "result");
+                p.type = parsePinType(engine::sdk::json_string(pin, "type", "Any"));
+                p.required = engine::sdk::json_bool(pin, "required", false);
+                def.outputs.push_back(p);
+            }
+        }
+        if (g.register_node_type(def, &regErr)) {
+            ++registered;
+            // Cross-link: reflection_type == stable_id de um tipo real.
+            if (reflectionTypes.count(def.reflection_type)) ++crossLinked;
+        }
+    }
+
+    CHECK(registered == static_cast<int>(nodesArr->array.size()),
+          "todos os NodeDefs do artifact registram na runtime");
+    CHECK(crossLinked == registered,
+          "todo node tem reflection_type cross-linkado a um tipo real");
+    CHECK(g.node_type_names().size() == static_cast<std::size_t>(registered),
+          "node_type_names cobre o artifact inteiro");
+    CHECK(g.get_node_type("create_game_project") != nullptr, "create_game_project node wired");
+    CHECK(g.get_node_type("author_shader_asset") == nullptr, "sem nomes inventados");
+
+    std::cerr << "[VSG] wired " << registered << " semantic nodes, "
+              << crossLinked << " reflection cross-links\n";
+#else
+    CHECK(false, "VULKANCRAFT_SOURCE_DIR definido (wiring test ativo)");
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main() {
@@ -325,6 +439,7 @@ int main() {
     test_topological_sort();
     test_cycle_detection();
     test_node_removal_cascades();
+    test_wired_semantic_nodes();
 
     std::cerr << "\n[visual_script_graph] " << g_checks << " checks, "
               << g_fails << " failures\n";

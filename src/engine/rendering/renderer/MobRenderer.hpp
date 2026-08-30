@@ -28,6 +28,15 @@ public:
 
 private:
     std::array<std::array<LimbMesh, 6>, 6> sharedLimbMeshes_{};
+    // L28 (reabertura): indirect draw no caminho de submissão dos mobs. Os
+    // parâmetros de draw (VkDrawIndirectCommand) vêm de um buffer GPU-visível
+    // construído por frame a partir do culling real (frustum) — a cena voxel
+    // deixa de depender só de partículas para indirect.
+    VkDevice device_{ VK_NULL_HANDLE };
+    VmaAllocator allocator_{ VK_NULL_HANDLE };
+    VkBuffer indirectBuffer_{ VK_NULL_HANDLE };
+    VmaAllocation indirectAllocation_{ VK_NULL_HANDLE };
+    static constexpr std::uint32_t kIndirectCommandCapacity = 6u * 1024u;  // 6 limbs * mobs
     LimbMesh build_box_limb(VkDevice device, VmaAllocator allocator,
                             int texU, int texV, int texW, int texH,
                             float minX, float minY, float minZ,

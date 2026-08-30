@@ -239,6 +239,38 @@ public:
     void update(const glm::vec3& playerPos, WorldRenderBridge& renderBridge, float deltaTime);
     void cleanup();
 
+    // ---- Atomic block transactions (AGENTE 2 — gameplay showcase) ---------
+    // Construction/destruction flows through an atomic transaction: commit()
+    // validates EVERY staged edit (valid runtime id + writable chunk) BEFORE
+    // applying any, so a single invalid edit rolls the whole transaction back
+    // and nothing changes (all-or-nothing). Committed edits go through the
+    // single mutation path (set_block_at), which dirties the chunk mesh,
+    // pins hasUnsavedEdits for persistence and relights the neighborhood.
+    class WorldTransaction {
+    public:
+        explicit WorldTransaction(World& world) : world_(&world) {}
+
+        void set_block(const glm::vec3& worldPos, RuntimeBlockId type);
+        void remove_block(const glm::vec3& worldPos);  // sets Air
+
+        // Validates all edits first; false => nothing applied (full rollback).
+        bool commit(std::string& errorOut);
+        // Discards the staged edits without applying them.
+        void rollback();
+
+        std::size_t edit_count() const { return edits_.size(); }
+
+    private:
+        struct StagedEdit {
+            glm::vec3 position;
+            RuntimeBlockId blockId;
+        };
+        World* world_;
+        std::vector<StagedEdit> edits_;
+        bool done_{ false };
+    };
+    std::unique_ptr<WorldTransaction> begin_transaction();
+
     // Runtime block ids (builtin prefix + dynamic registry blocks).
     RuntimeBlockId get_block_at(const glm::vec3& worldPos) const;
     // Per-voxel block state index (FALTANTES item 2): 0 = default; >0 = named.

@@ -58,7 +58,7 @@ Todas as funcionalidades interativas do editor rodando (o mesmo conjunto da Cont
 - **Estado**: `editor_status` (JSON ao vivo de `/state` + `/health`).
 - **Play/Simulação**: `editor_play`, `editor_pause`, `editor_resume`, `editor_step` (PASSO de 1 frame), `editor_stop`, `editor_simulate`.
 - **Câmera**: `editor_camera_zoom`, `editor_camera_move`, `editor_camera_turn`, `editor_camera_focus`.
-- **Cena**: `editor_new_scene`, `editor_open_scene`, `editor_save_scene`, `editor_add_entity` (16 tipos), `editor_select_entity`, `editor_delete_entity`, `editor_rename_entity`, `editor_set_transform`, `editor_add_component` (15 tipos).
+- **Cena**: `editor_new_scene`, `editor_open_scene`, `editor_save_scene`, `editor_add_entity` (16 tipos), `editor_select_entity`, `editor_delete_entity`, `editor_rename_entity`, `editor_set_transform`, `editor_add_component` (19 tipos).
 - **Gizmos**: `editor_set_gizmo`, `editor_set_gizmo_space`, `editor_set_snap`.
 - **Assets**: `editor_import_asset`, `editor_create_block_model`, `editor_spawn_block`, `editor_duplicate_asset`, `editor_delete_asset`, `editor_reimport_asset`.
 - **Voxel**: `editor_voxel_generate`, `editor_voxel_paint`, `editor_voxel_clear`.
@@ -119,7 +119,7 @@ Este ciclo substitui a validação visual: build → run curto → ler log, tudo
 
 ## CLI sem cliente MCP
 
-O `semantic-cli.mjs` expõe a **fachada semântica completa** (37 tools: projetos, cenas, entidades, componentes, scripts visuais, materiais, áudio, física, prefabs, partículas, registry/vehicle/ability/mission/world_profile/gait/simulation_lod, **run_batch transacional**) **sem servidor MCP** — mesmas factories do servidor (`callSemanticTool`), então nunca diverge da superfície MCP:
+O `semantic-cli.mjs` expõe a **fachada semântica completa** (65 tools hoje, auto-derivadas de `semanticToolDefinitions()`: projetos, cenas, entidades, componentes, scripts visuais, materiais, áudio, física, prefabs, partículas, registry/vehicle/ability/mission/world_profile/gait/simulation_lod, network/session config, inventário, **run_batch transacional**, **plan_showcase_delivery/author_showcase_game**) **sem servidor MCP** — mesmas factories do servidor (`callSemanticTool`), então nunca diverge da superfície MCP:
 
 ```powershell
 node semantic-cli.mjs tools

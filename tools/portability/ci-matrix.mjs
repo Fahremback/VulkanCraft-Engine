@@ -6,7 +6,12 @@ import { existsSync, mkdirSync } from 'fs';
 
 const platform = process.platform === 'win32' ? 'windows' : 'linux';
 const preset = process.argv[2] || 'release';
-const buildDir = process.env.VC_BUILD_DIR || 'out/agent-6';
+// ONE canonical tree: out/dev-shared (single-config Ninja + sccache), the same
+// default as build-shared.ps1 and exe-resolve.mjs. Never introduce a second
+// parallel build tree: a caller that wants a custom path must override with
+// VC_BUILD_DIR explicitly (the 'agent-6' default would silently re-create a
+// parallel tree the rest of the pipeline does not consume).
+const buildDir = process.env.VC_BUILD_DIR || 'out/dev-shared';
 
 function log(msg) { console.log(`[ci-matrix] ${msg}`); }
 function fail(msg) { console.error(`[ci-matrix] FAIL: ${msg}`); process.exit(1); }
@@ -26,19 +31,42 @@ log('Step 0: Integration lint');
 run('node tools/portability/integration-lint.mjs');
 log('Step 0a: Checklist audit (must be clean before final validation)');
 run('node tools/portability/checklist-audit.mjs --strict');
+// Agente 5 §A (auditor de integração) — the "passo 2 da ordem de integração":
+// derive the per-capability state matrix (DECLARED→IMPLEMENTED→CONSUMED→
+// OBSERVABLE) plus stub/parallel-track/flag-only violations from code evidence,
+// as machine-readable JSON + static HTML. No PASSED/percentage is hardcoded;
+// every cell is derived from the scanned code. This is pure static scanning
+// (no build), so it is safe to run pre-build even while the build lock holds.
+log('Step 0b: Integration auditor (capability state matrix + violations)');
+run('node tools/portability/integration-auditor.mjs --check');
 
-// Step 1: Configure — the canonical build/ tree (not the out/<preset> tree):
-// every downstream step (fast-gate ctest, external-consumer/moved-prefix/
-// debug-release installs) resolves against build/, so configuring the preset's
-// out/ tree here would BUILD a tree the rest of the matrix never consumes
-// (preset 'release' -> out/release, Ninja; build/ is the MSVC multi-config
-// tree the gates install from).
-log('Step 1: Configure (build/)');
+// Agente 5 §C (modularização): static review of the vc_object_module split —
+// no stale TU refs (configure breakage), no orphan modules (build-graph nodes
+// never linked by a product executable); mixed-domain aggregates are reported
+// as non-blocking review findings. Pure static scan (no build).
+log('Step 0c: CMake module review (stale refs + orphan modules)');
+run('node tools/portability/cmake-module-review.mjs --check');
+
+// Conta 6 §scope item 1 — rodada-fechamento-audit: derives the closure state
+// of the six rodada_fechamento_6 plans + their bugs.md, refusing [x] whose
+// only evidence is SDK/test/server-only/contradictory text. Exit non-zero
+// (--strict) whenever any account still has open items/bugs/refusals, so the
+// build/certification phase is not entered while a checklist is incomplete.
+// Pure static scan (no build), safe pre-build.
+log('Step 0d: Rodada-fechamento audit (six plans + bugs.md, refuse false [x])');
+run('node tools/portability/rodada-fechamento-audit.mjs --strict');
+
+// Step 1: Configure — ONE canonical tree. The shared dev tree is out/dev-shared
+// (single-config Ninja + sccache, A5 §C/§K; VC_BUILD_DIR overrides for CI).
+// Every downstream step (fast-gate ctest, external-consumer/moved-prefix/
+// debug-release installs) resolves against the same tree, so the matrix never
+// builds a second tree the rest of the pipeline does not consume.
+log('Step 1: Configure (shared dev tree)');
 if (!existsSync(buildDir)) mkdirSync(buildDir, { recursive: true });
 run(`cmake -S . -B ${buildDir}`);
 
 // Step 2: Build
-log('Step 2: Build (build/ Release)');
+log('Step 2: Build (shared dev tree)');
 run(`cmake --build ${buildDir} --config Release`);
 
 // Step 3: Unit tests (fast gate)
@@ -104,6 +132,16 @@ run('node tools/portability/gen-docs.mjs');
 // source: semanticToolDefinitions + registry schemas + public headers).
 log('Step 7f2: Generated bindings (BINDINGS_GENERATED.md)');
 run('node tools/portability/bindings-gen.mjs');
+
+// task_plan Agente 5 §8 item 1 (linha 114): the per-tool WIRING of the
+// semantic facade into reflection (IReflection TypeInfo) and visual
+// scripting (NodeDef with reflection_type cross-link). Generated from the
+// SAME single source (semanticToolDefinitions) — FAILS if any tool lacks a
+// TypeInfo or NodeDef, and --check proves the committed artifacts
+// (schema/reflection/tools.json + schema/scripting/visual-nodes.json) are
+// fresh (anti-drift). Consumed by reflection_tests + visual_script_graph_tests.
+log('Step 7f15: Semantic tool wiring (reflection + visual scripting)');
+run('node tools/sdk/tool-wiring.mjs --check');
 
 // task_plan Agente 5 §1 item 5 ("namespaces"): the hard invariant from
 // bugs.md B-219-2 (no namespace-less public header) is now ENFORCED — the
@@ -209,11 +247,43 @@ run('node tools/portability/freshness-gate.mjs');
 log('Step 7j: Repo hygiene (secrets, abs paths, stale artifacts)');
 run('node tools/portability/repo-hygiene-gate.mjs');
 
+// Agente 5 §E (organização do repositório): the engine root may contain ONLY
+// justified top-level entries. New junk (accidental outputs, stray logs,
+// probe scripts, binaries at root) fails the gate; transient build state
+// (build/, out/, generated/, screenshots/, .sentry-native/) is tolerated.
+log('Step 7j2: Layout gate (root entries allowlisted; new junk fails)');
+run('node tools/portability/layout-gate.mjs');
+
 log('Step 7k: Solution status (clonado/compilado/integrado/testado/usado)');
 run('node tools/portability/solution-status.mjs');
 
+// Agente 5 §D: single repository → agent → capability → state → artifact
+// matrix (external/solutions + docs/SOLUCOES_E_DEPENDENCIAS.md). The gate
+// FAILS while any repo is unclassified, any INTEGRADO lacks a real consumer,
+// or any catalog entry has no repo on disk. Pure static scan (no build).
+log('Step 7k2: Dependency matrix gate (all repos classified; INTEGRADO has consumer)');
+run('node tools/portability/dependency-matrix.mjs --check');
+
 log('Step 7l: SBOM generation (real build-graph deps + versions)');
 run('node tools/portability/sbom-gen.mjs');
+
+// Agente 5 §D-57: reproducible acquisition — every external/solutions repo is
+// pinned with origin+commit (or marked vendored in-tree); verify each is on
+// disk at its recorded pin so a fresh Windows machine can re-acquire.
+log('Step 7l1: Dependency acquisition pin verification');
+run('node tools/portability/deps-acquire.mjs');
+
+// Agente 5 §D-57: redistributable third-party notices — stage each used
+// dependency's LICENSE into manifests/licenses/ (no source trees) + a combined
+// THIRD_PARTY_NOTICES.md, then fail if any used dep lacks a notice.
+log('Step 7l1b: Third-party license bundle (redistributable notices)');
+run('node tools/portability/licenses-bundle.mjs');
+
+// Agente 5 §H item 101: SHA-256 file manifest of the shipped package surface
+// (sources/assets/schemas/tools/docs/shaders/cmake/tests — never build trees
+// or vendor clones), with --check for anti-drift.
+log('Step 7l2: File manifest + hashes (shipped package surface)');
+run('node tools/portability/file-manifest-gen.mjs --check');
 
 log('Step 7m: Build-dir usage (evidence for safe cleanup gating)');
 run('node tools/portability/build-dir-usage.mjs');
@@ -244,5 +314,15 @@ run('node tools/portability/gns-gate.mjs');
 
 log('Step 7v: msquic gate (XDP datapath compiles; msquic.dll + core.lib)');
 run('node tools/portability/msquic-gate.mjs');
+
+// Agente 5 §G-85/86: real-framebuffer capture + versioned-baseline comparison.
+// Needs a live GPU window, so it only runs when VC_VISUAL_VALIDATE=1 (the
+// certification phase launches the editor/game and enables it). visual-compare
+// FAILs when the capture drifts beyond tolerance; no baseline yet = skip.
+if (process.env.VC_VISUAL_VALIDATE === '1') {
+  log('Step 7w: Visual capture + baseline regression (real framebuffer)');
+  run('node tools/blackbox-certification/visual-validate.mjs --process VulkanEngineEditor --frames 2');
+  run('node tools/blackbox-certification/visual-compare.mjs --capture out/artifacts/visual-validation/VulkanEngineEditor_frame_1.png --name editor_showcase');
+}
 
 log(`CI matrix PASSED on ${platform} with preset ${preset}`);

@@ -12,9 +12,10 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 
 const ROOT = process.cwd();
+import { resolveExe } from './exe-resolve.mjs';
 const LUAU = join(ROOT, 'external', 'solutions', 'luau');
 const E2E = join(ROOT, 'tools', 'portability', 'luau-sandbox-e2e.cpp');
-const EXE = join(ROOT, 'build', 'Release', 'luau-sandbox-e2e.exe');
+const EXE = resolveExe(ROOT, 'luau-sandbox-e2e');
 
 const VM_LIB = join(LUAU, 'build-gate', 'Release', 'Luau.VM.lib');
 if (!existsSync(VM_LIB)) {
@@ -36,7 +37,7 @@ const bat = [
   'if errorlevel 1 exit /b 1',
   w(EXE)
 ].join('\r\n');
-const batPath = join(ROOT, 'build', 'luau-sandbox-e2e.bat');
+const batPath = join(ROOT, process.env.VC_BUILD_DIR || 'out/dev-shared', 'luau-sandbox-e2e.bat');
 const { writeFileSync } = await import('fs');
 writeFileSync(batPath, bat, 'utf8');
 

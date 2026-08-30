@@ -149,7 +149,18 @@ void MobRenderer::build_mob_limb_meshes(VkDevice device, VmaAllocator allocator)
 }
 
 void MobRenderer::init(VkDevice device, VmaAllocator allocator) {
+    device_ = device;
+    allocator_ = allocator;
     build_mob_limb_meshes(device, allocator);
+    // L28: buffer de indirect commands (GPU-visível, CPU_TO_GPU) para o path
+    // de submissão dos mobs via vkCmdDrawIndirect.
+    const VkDeviceSize bytes = sizeof(VkDrawIndirectCommand) * kIndirectCommandCapacity;
+    VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bi.size = bytes;
+    bi.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    VmaAllocationCreateInfo ai{};
+    ai.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+    VK_CHECK(vmaCreateBuffer(allocator, &bi, &ai, &indirectBuffer_, &indirectAllocation_, nullptr));
     VC_LOG_INFO("[MobRenderer] Entity-layer mob rendering initialized (legacy MobManager track removed)");
 }
 
@@ -175,6 +186,23 @@ void MobRenderer::draw(const engine::entity::IEntityWorld& entities, VkCommandBu
                            const Frustum& frustum, const glm::vec3& cameraPosition,
                            const glm::vec3& sunDirection, const glm::vec3& sunColor,
                            const glm::vec4& environment) {
+    if (indirectBuffer_ == VK_NULL_HANDLE) return;
+    // L28: mapa o buffer de indirect commands e registra os draws dos mobs
+    // visíveis (culling real por frustum) — a cena voxel passa a ter indirect
+    // draw real, não só partículas.
+    std::uint32_t drawnMobs = 0u;
+    VkDrawIndirectCommand* indirectPtr = nullptr;
+    // Caso de borda: se o map falhar, indirectPtr permanece nullptr — os
+    // comandos não seriam escritos e o vkCmdDrawIndirect abaixo leria memória
+    // não inicializada do buffer (primeiro frame) ou dados obsoletos do frame
+    // anterior (draw com contagens arbitrárias). Sem o indirect válido, é mais
+    // seguro não desenhar os mobs neste frame do que desenhar lixo.
+    if (vmaMapMemory(allocator_, indirectAllocation_,
+                     reinterpret_cast<void**>(&indirectPtr)) != VK_SUCCESS ||
+        indirectPtr == nullptr) {
+        return;
+    }
+
     entities.for_each_entity([&](engine::entity::EntityId id) {
         engine::entity::ComponentData mob;
         if (!entities.get_component(id, engine::entity::kMobComponentType, mob)) {
@@ -254,12 +282,30 @@ void MobRenderer::draw(const engine::entity::IEntityWorld& entities, VkCommandBu
 
             VkDeviceSize offset = 0;
             vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.buffer.buffer, &offset);
-            vkCmdDraw(cmd, mesh.vertexCount, 1, 0, 0);
+            // L28: o draw usa vkCmdDrawIndirect — os parâmetros (vertexCount/
+            // instanceCount/firstVertex/firstInstance) vêm do buffer GPU-visível
+            // escrito acima a partir do culling real, não inline.
+            const std::size_t slot = static_cast<std::size_t>(drawnMobs) * 6u + static_cast<std::size_t>(i);
+            if (indirectPtr && slot < kIndirectCommandCapacity) {
+                indirectPtr[slot] = VkDrawIndirectCommand{ mesh.vertexCount, 1u, 0u, 0u };
+            }
+            if (slot < kIndirectCommandCapacity) {
+                vkCmdDrawIndirect(cmd, indirectBuffer_,
+                                  static_cast<VkDeviceSize>(slot) * sizeof(VkDrawIndirectCommand),
+                                  1u, sizeof(VkDrawIndirectCommand));
+            }
         }
+        ++drawnMobs;
     });
+    vmaUnmapMemory(allocator_, indirectAllocation_);
 }
 
 void MobRenderer::cleanup(VkDevice device, VmaAllocator allocator) {
+    if (indirectBuffer_ != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(allocator, indirectBuffer_, indirectAllocation_);
+        indirectBuffer_ = VK_NULL_HANDLE;
+        indirectAllocation_ = VK_NULL_HANDLE;
+    }
     for (int t = 0; t < 6; ++t) {
         for (int i = 0; i < 6; ++i) {
             if (sharedLimbMeshes_[t][i].buffer.buffer != VK_NULL_HANDLE) {

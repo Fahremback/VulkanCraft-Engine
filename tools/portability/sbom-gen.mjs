@@ -38,6 +38,29 @@ function gitVersion(dir) {
   return head.status === 0 ? head.stdout.trim() : 'unknown';
 }
 
+// Full 40-hex commit + origin remote — the reproducible-acquisition pin for a
+// fresh machine (A5 §D-57): `git clone <remote> && git checkout <pin>`.
+// Only reported when the directory is its OWN git work tree; vendored
+// snapshots (installed artifacts, single-header copies, nested dep extracts)
+// that merely sit inside the engine repo must NOT inherit the engine's commit.
+function gitPin(dir) {
+  const ownRepo = existsSync(join(dir, '.git')) || (() => {
+    try {
+      const top = spawnSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: 5000, windowsHide: true });
+      if (top.status !== 0) return false;
+      const root = top.stdout.trim().replace(/\\/g, '/');
+      const d = dir.replace(/\\/g, '/');
+      return root === d;
+    } catch { return false; }
+  })();
+  if (!ownRepo) return { pin: '', origin: '', vendored: true };
+  const head = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8', timeout: 5000, windowsHide: true });
+  const pin = head.status === 0 ? head.stdout.trim() : '';
+  const remote = spawnSync('git', ['-C', dir, 'remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 5000, windowsHide: true });
+  const origin = remote.status === 0 ? remote.stdout.trim() : '';
+  return { pin, origin };
+}
+
 const solutions = readdirSync(SOLUTIONS, { withFileTypes: true })
   .filter((e) => e.isDirectory())
   .map((e) => e.name)
@@ -50,10 +73,14 @@ for (const name of solutions) {
   const used = new RegExp(`(?:${lower}|solutions/${name})`, 'i').test(cmakeText);
   if (!used) continue;
   const dir = join(SOLUTIONS, name);
+  const { pin, origin, vendored } = gitPin(dir);
   entries.push({
     name,
     kind: 'external/solutions',
     version: gitVersion(dir),
+    pin,
+    origin,
+    vendored,
     role: /target_link_libraries|add_library|add_executable|add_subdirectory/i.test(
       (cmakeText.match(new RegExp(`[^\\n]{0,80}${lower}[^\\n]{0,80}`, 'i')) || [''])[0]) ? 'linked' : 'referenced',
     license: name === 'zstd' ? 'BSD-3-Clause' : name === 'blake3' ? 'CC0-1.0' : 'see vendored LICENSE',
@@ -67,7 +94,10 @@ if (existsSync(join(ROOT, 'third_party'))) {
     if (!e.isDirectory()) continue;
     const dir = join(ROOT, 'third_party', e.name);
     const hasSrc = readdirSync(dir).some((f) => /\.(cpp|hpp|h|cc|c)$/.test(f) || existsSync(join(dir, 'CMakeLists.txt')));
-    if (hasSrc) thirdParty.push({ name: e.name, kind: 'third_party', version: gitVersion(dir), role: 'promoted' });
+    if (hasSrc) {
+      const { pin, origin, vendored } = gitPin(dir);
+      thirdParty.push({ name: e.name, kind: 'third_party', version: gitVersion(dir), pin, origin, vendored, role: 'promoted' });
+    }
   }
 }
 

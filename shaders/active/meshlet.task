@@ -1,0 +1,54 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+// Task stage of the real mesh-shader meshlet submission (Conta 2, item 1).
+// One workgroup is dispatched per meshlet group (vkCmdDrawMeshTasksEXT with
+// groupCountX == number of groups). Thread 0 of each workgroup culls the
+// group against the six view-projection planes by its real world-space
+// bounding sphere; surviving groups emit exactly ONE mesh workgroup (payload
+// GID). This is real GPU-side culling / dispatch of live world geometry.
+
+layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer MeshletBounds { vec4 meshletBounds[]; };  /* vec4(center.xyz, radius) per group */
+layout (binding = 1) readonly buffer MeshletMeta   { vec4 meshletMeta[]; };    /* vec4(firstTri, triCount, firstVtx, vtxCount) */
+
+struct TaskPayload { uint meshletIndex; };
+taskPayloadOutEXT TaskPayload OUT;
+
+layout (push_constant) uniform MeshletPush {
+    mat4 mvp;              /* world -> clip (projection * view) */
+    vec4 sunDirection;     /* xyz = sun direction */
+    vec4 sunColor;         /* rgb = sun color */
+    vec4 environment;      /* x = time, y = daylight */
+} push;
+
+void main() {
+    uint gid = gl_WorkGroupID.x;
+    vec4 b = meshletBounds[gid];
+    vec4 m = meshletMeta[gid];
+
+    uint keep = 1u;
+    if (m.y < 0.5 || m.w < 0.5) {
+        keep = 0u;   /* empty group: never draw */
+    } else {
+        vec4 center = vec4(b.xyz, 1.0);
+        float radius = max(b.w, 0.0);
+        // Gribb–Hartmann planes from a row-major MVP matrix (glm m[col]).
+        vec4 row;
+        row = push.mvp[3] + push.mvp[0];
+        { float d = dot(row, center); float n = length(row.xyz); if (n > 1e-6) d /= n; if (d + radius < 0.0) keep = 0u; }
+        row = push.mvp[3] - push.mvp[0];
+        { float d = dot(row, center); float n = length(row.xyz); if (n > 1e-6) d /= n; if (d + radius < 0.0) keep = 0u; }
+        row = push.mvp[3] + push.mvp[1];
+        { float d = dot(row, center); float n = length(row.xyz); if (n > 1e-6) d /= n; if (d + radius < 0.0) keep = 0u; }
+        row = push.mvp[3] - push.mvp[1];
+        { float d = dot(row, center); float n = length(row.xyz); if (n > 1e-6) d /= n; if (d + radius < 0.0) keep = 0u; }
+        row = push.mvp[3] + push.mvp[2];
+        { float d = dot(row, center); float n = length(row.xyz); if (n > 1e-6) d /= n; if (d + radius < 0.0) keep = 0u; }
+        row = push.mvp[3] - push.mvp[2];
+        { float d = dot(row, center); float n = length(row.xyz); if (n > 1e-6) d /= n; if (d + radius < 0.0) keep = 0u; }
+    }
+    OUT.meshletIndex = gid;
+    gl_TaskCountEXT = keep;
+}

@@ -1346,7 +1346,7 @@ void WickedToolsPanel::draw_dev_window() {
             if (ImGui::Button(tr("⏹ PARAR", "⏹ STOP"), ImVec2(-FLT_MIN, 24))) m_controlCmd("stop");
             ImGui::EndDisabled();
         } else {
-            ImGui::TextDisabled("%s", tr("(callback não ligado)", "(callback not wired)"));
+            ImGui::TextDisabled("%s", tr("(controles indisponíveis)", "(controls unavailable)"));
         }
         ImGui::Separator();
         static float zoomAmt = 0.1f;
@@ -1397,7 +1397,7 @@ void WickedToolsPanel::draw_dev_window() {
                 }
             }
         } else {
-            ImGui::TextDisabled("%s", tr("(callback não ligado)", "(callback not wired)"));
+            ImGui::TextDisabled("%s", tr("(controles indisponíveis)", "(controls unavailable)"));
         }
         if (!m_devStatus.empty()) {
             ImGui::TextWrapped("%s", m_devStatus.c_str());

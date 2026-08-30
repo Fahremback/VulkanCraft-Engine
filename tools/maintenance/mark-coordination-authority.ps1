@@ -6,22 +6,22 @@ $ErrorActionPreference = 'Stop'
 $marker = '<!-- VULKANCRAFT-EXECUTION-AUTHORITY -->'
 $referenceNotice = @'
 $marker
-> **AUTORIDADE DE EXECUÇÃO:** este arquivo é requisito, evidência ou histórico. Antes de agir, leia `agentes/FONTE_UNICA.md`, `agentes/EXECUCAO_TOTAL_6_AGENTES.md` e o `task_plan.md` atual do seu agente. Em conflito, eles vencem. Este arquivo não transfere tarefas nem autoriza `DONE`.
+> **CONTEXTO TÉCNICO:** a execução é regida por `task_plan.md`, `agentes/FONTE_UNICA.md`, `agentes/EXECUCAO_FINAL_5_AGENTES.md` e pelo plano atual do agente.
 '@
 $referenceNotice = $referenceNotice.Replace('$marker', $marker)
 $legacyNotice = @'
 $marker
-> **ARQUIVO LEGADO — NÃO EXECUTAR:** use `agentes/FONTE_UNICA.md`, `agentes/EXECUCAO_TOTAL_6_AGENTES.md` e o `task_plan.md` atual do seu agente. Nomes, donos, estados e tarefas deste arquivo não possuem autoridade atual.
+> **ARQUIVO LEGADO — NÃO EXECUTAR:** use `task_plan.md`, `agentes/FONTE_UNICA.md`, `agentes/EXECUCAO_FINAL_5_AGENTES.md` e o plano atual do agente.
 '@
 $legacyNotice = $legacyNotice.Replace('$marker', $marker)
 $planNotice = @'
 $marker
-> **PLANO ATUAL AUTORITATIVO:** execute este checklist sob as regras de `agentes/FONTE_UNICA.md` e `agentes/EXECUCAO_TOTAL_6_AGENTES.md`. Nenhum outro arquivo ou mensagem pode remover, transferir ou concluir itens daqui.
+> **PLANO ATUAL AUTORITATIVO:** execute este checklist sob as regras de `task_plan.md`, `agentes/FONTE_UNICA.md` e `agentes/EXECUCAO_FINAL_5_AGENTES.md`.
 '@
 $planNotice = $planNotice.Replace('$marker', $marker)
 $bugsNotice = @'
 $marker
-> **REGISTRO DE BUGS APENAS:** a autoridade está em `agentes/FONTE_UNICA.md`, `agentes/EXECUCAO_TOTAL_6_AGENTES.md` e no `task_plan.md` deste agente. Um bug não transfere nem encerra a tarefa correspondente.
+> **REGISTRO DE BUGS APENAS:** a autoridade está em `task_plan.md`, `agentes/FONTE_UNICA.md`, `agentes/EXECUCAO_FINAL_5_AGENTES.md` e no plano deste agente.
 '@
 $bugsNotice = $bugsNotice.Replace('$marker', $marker)
 
@@ -44,8 +44,7 @@ $referenceFiles = @(
     'docs/TEXT_ONLY_VALIDATION.md',
     'docs/PROJECT_LAYOUT.md',
     'src/editor/frontend/PORTS.md',
-    'agentes/agente6_integracao/successor_gameplay_ai.md',
-    'agentes/agente6_integracao/handoff_agente5.md'
+    'agentes/EXECUCAO_FINAL_5_AGENTES.md'
 )
 
 $legacyFiles = Get-ChildItem -LiteralPath (Join-Path $EngineRoot 'agentes\legacy') -Filter '*.md' -File -Recurse |

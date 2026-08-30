@@ -10,10 +10,11 @@ import { existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
 const ROOT = process.cwd();
+import { resolveExe } from './exe-resolve.mjs';
 const SODIUM = join(ROOT, 'external', 'solutions', 'libsodium');
 const INCLUDE_SODIUM = join(SODIUM, 'src', 'libsodium', 'include');
 const LIB = join(SODIUM, 'bin', 'x64', 'Release', 'v143', 'static', 'libsodium.lib');
-const EXE = join(ROOT, 'build', 'Release', 'package-manager-sodium-gate.exe');
+const EXE = resolveExe(ROOT, 'package-manager-sodium-gate');
 
 if (!existsSync(LIB)) {
   console.error('[package-manager-sodium-gate] FAIL: libsodium lib missing — run libsodium-gate first');

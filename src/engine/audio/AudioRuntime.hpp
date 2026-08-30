@@ -205,6 +205,10 @@ public:
     // True while the voice is still playing (rendered, not finished/stopped).
     [[nodiscard]] bool is_active(VoiceId id) const noexcept;
     [[nodiscard]] std::size_t active_voice_count() const noexcept;
+    // Live RMS level of the voice's last rendered block (0 when the voice is
+    // inactive/absent). Computed under the same mutex as render(), so it can be
+    // read from the game/editor thread to drive audio-linked effects.
+    [[nodiscard]] float voice_level(VoiceId id) const noexcept;
 
 private:
     struct Bus {
@@ -221,6 +225,10 @@ private:
         std::size_t observedFrames{};
         bool paused{};
         bool active{true};
+        // Live RMS level of the last rendered block (computed in render_voice
+        // under the mixer mutex). Drives data-driven effects (e.g. particles
+        // pulsing with audio) — see voice_level().
+        float level{0.0f};
         std::vector<float> occlusionState;
     };
 

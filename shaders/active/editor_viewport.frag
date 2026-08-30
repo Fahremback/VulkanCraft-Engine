@@ -187,8 +187,11 @@ void main() {
     // ------------------------------------------------------------------
     vec3 lightAccum = vec3(0.0);
 
-    // Directional sun — falls back to the classic editor key light when the
-    // scene has no directional sun so an empty scene is still readable.
+    // Directional sun — falls back to a faint fill when the scene has no
+    // directional sun. Kept LOW on purpose: otherwise the fixed bounce
+    // direction dominates and hides any point/spot/area light the user places
+    // (the "light always coming from the same spot" symptom). A scene without
+    // a sun is still readable from the dim ambient + the user's lights.
     if (lights.sunDirection.w > 0.5) {
         vec3 L = -normalize(lights.sunDirection.xyz);
         float ndl = max(dot(n, L), 0.0);
@@ -196,7 +199,7 @@ void main() {
         lightAccum += ndl * sh * lights.sunColor.rgb;
     } else {
         vec3 L = normalize(vec3(0.45, 0.85, 0.55));
-        lightAccum += max(dot(n, L), 0.0) * vec3(0.9, 0.9, 0.85);
+        lightAccum += max(dot(n, L), 0.0) * vec3(0.18, 0.18, 0.17);
     }
 
     // Point lights (position + range, color * intensity). The point shadow

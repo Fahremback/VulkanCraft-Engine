@@ -22,7 +22,9 @@ import { existsSync } from 'node:fs';
 
 const ROOT = process.cwd();
 const SKIP_BUILD = process.argv.includes('--skip-build');
-const HAS_BUILD = existsSync(join(ROOT, 'build'));
+// Canonical shared tree (out/dev-shared); the in-source build/ is legacy.
+const BUILD_ROOT = process.env.VC_BUILD_DIR || 'out/dev-shared';
+const HAS_BUILD = existsSync(join(ROOT, BUILD_ROOT)) || existsSync(join(ROOT, 'build'));
 
 const STEPS = [
   ['ci-lint', 'node', ['tools/portability/ci-lint.mjs'], false],

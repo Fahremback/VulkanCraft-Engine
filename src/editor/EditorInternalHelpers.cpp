@@ -290,6 +290,10 @@ Rendering::MaterialGraph material_graph_from_asset(const MaterialAsset& mat) {
     const auto roughOut = graph.add_output("Roughness", Rendering::MaterialValueType::Float);
     const auto metalOut = graph.add_output("Metallic", Rendering::MaterialValueType::Float);
     const auto emisOut = graph.add_output("Emissive", Rendering::MaterialValueType::Vec3);
+    // Outputs are driven by the real asset maps when present, else by the
+    // exposed parameters. Each output is driven EXACTLY once (connect()
+    // overwrites — last wins — and an undriven Output node would compile to
+    // an empty-operand StoreOutput, so outputs are only added when driven).
     if (mat.albedoMapID.is_valid()) {
         const auto tex = graph.add_texture_sample("Albedo Map");
         if (auto* node = graph.find_node(tex)) node->value = mat.albedoMapID.to_string();
@@ -298,8 +302,31 @@ Rendering::MaterialGraph material_graph_from_asset(const MaterialAsset& mat) {
         const auto albedo = graph.add_parameter("Albedo");
         (void)graph.connect(albedo, baseOut, 0);
     }
-    (void)graph.connect(roughness, roughOut, 0);
-    (void)graph.connect(metallic, metalOut, 0);
+    // Normal output (agente 4 — B.2): the asset's real normal map feeds the
+    // graph's Normal semantic. The generated fragment shader consumes it as a
+    // WORLD-SPACE normal override (the viewport mesh pipeline carries no
+    // tangents, so tangent-space TBN is not available); graphs without a
+    // Normal output keep the interpolated world normal — zero visual change.
+    if (mat.normalMapID.is_valid()) {
+        const auto normalOut = graph.add_output("Normal", Rendering::MaterialValueType::Vec3);
+        const auto tex = graph.add_texture_sample("Normal Map");
+        if (auto* node = graph.find_node(tex)) node->value = mat.normalMapID.to_string();
+        (void)graph.connect(tex, normalOut, 0);
+    }
+    if (mat.roughnessMapID.is_valid()) {
+        const auto tex = graph.add_texture_sample("Roughness Map");
+        if (auto* node = graph.find_node(tex)) node->value = mat.roughnessMapID.to_string();
+        (void)graph.connect(tex, roughOut, 0);
+    } else {
+        (void)graph.connect(roughness, roughOut, 0);
+    }
+    if (mat.metallicMapID.is_valid()) {
+        const auto tex = graph.add_texture_sample("Metallic Map");
+        if (auto* node = graph.find_node(tex)) node->value = mat.metallicMapID.to_string();
+        (void)graph.connect(tex, metalOut, 0);
+    } else {
+        (void)graph.connect(metallic, metalOut, 0);
+    }
     (void)graph.connect(emissive, emisOut, 0);
     return graph;
 }

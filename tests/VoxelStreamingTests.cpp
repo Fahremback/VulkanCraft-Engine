@@ -22,6 +22,7 @@
 
 #include <glm/glm.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -263,6 +264,10 @@ bool scenario_dynamic_block_meshes() {
     info.uuid = "00000000-0000-0000-0000-0000000000ab";
     info.color = glm::vec4(0.9f, 0.1f, 0.1f, 1.0f);
     info.solid = true;
+    // The resolver-compatible variant key is embedded at dispatch; the mesher
+    // must publish that REAL key into the chunk's material list for the
+    // renderer's material buffer (C.1/C.2).
+    info.variantKey = runtime_block_variant_key("vulkancraft:probe_block");
     snapshot.runtimeBlocks.emplace_back(dynamicId, info);
 
     const ChunkMeshResult result = VoxelMesher::build(snapshot);
@@ -275,6 +280,10 @@ bool scenario_dynamic_block_meshes() {
         if (vertex.uv.z != -1.0f) allDynamicColor = false;  // color-only
     }
     CHECK(allDynamicColor);
+    // The mesher consumed the resolver-originated variant and surfaced it.
+    CHECK(std::find(result.mesh.materialVariants.begin(),
+                    result.mesh.materialVariants.end(), info.variantKey) !=
+          result.mesh.materialVariants.end());
 
     // Contrast: a builtin block still resolves through the engine material
     // table (textured layer), not the runtime table.

@@ -30,6 +30,12 @@ public:
     void play_hammer_sound();
     void play_fire_sound();
 
+    // Public data-driven wiring: registers an externally-provided audio
+    // asset by name+path so project-authored audio (e.g. the showcase
+    // Content/AudioEvents/showcase_audio.json clip) joins the same sound map
+    // the builtin sounds live in. Returns true when registered.
+    bool register_audio_asset(const std::string& soundName, const std::string& filePath);
+
 private:
     ma_engine* engine{ nullptr };
     std::unordered_map<std::string, std::string> soundFiles;

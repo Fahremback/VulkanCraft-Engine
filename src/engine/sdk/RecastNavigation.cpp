@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -192,10 +193,18 @@ bool bake_navmesh_data(const NavmeshConfig& config,
     const float bmax[3] = { maxX + borderCells * config.cellSize,
                             config.boundsMaxY,
                             maxZ + borderCells * config.cellSize };
-    const int spanX = world_to_cell(bmax[0], bmin[0], config.cellSize);
-    const int spanZ = world_to_cell(bmax[2], bmin[2], config.cellSize);
-    const int sizeX = spanX + (exactCells ? 0 : 1);
-    const int sizeZ = spanZ + (exactCells ? 0 : 1);
+    // Grid size must COVER the expanded bounds (bmin..bmax). In tiled mode
+    // (exactCells) the caller hands integer-cell tile bounds, so the span is
+    // an exact whole number of cells (tileCells + 2*borderCells); round to
+    // the nearest cell so float representation noise (e.g. 63.0000001)
+    // cannot push ceil() to 64 and shift the border ring off the shared tile
+    // edge — a shifted ring makes adjacent tiles rasterize different border
+    // vertices and Detour never links them (cross-tile find_path partial).
+    // Single mode (exactCells=false) adds one guard cell as before.
+    const int sizeX = static_cast<int>(std::lround(
+        (bmax[0] - bmin[0]) / config.cellSize)) + (exactCells ? 0 : 1);
+    const int sizeZ = static_cast<int>(std::lround(
+        (bmax[2] - bmin[2]) / config.cellSize)) + (exactCells ? 0 : 1);
     const int walkableHeight = static_cast<int>(
         std::ceil(config.agentHeight / config.cellHeight));
     const int walkableClimb = static_cast<int>(
@@ -216,16 +225,17 @@ bool bake_navmesh_data(const NavmeshConfig& config,
     // TOP face is the walkable surface. Columns outside the (border-expanded)
     // grid are skipped by the cell check.
     int rasterized = 0;
+    int skippedNotSolid = 0, skippedOutOfGrid = 0, skippedYSpan = 0;
     for (const VoxelColumn& column : columns) {
-        if (!column.solid || column.solidMaxY <= column.solidMinY) continue;
+        if (!column.solid || column.solidMaxY <= column.solidMinY) { ++skippedNotSolid; continue; }
         const int x = world_to_cell(column.x, bmin[0], config.cellSize);
         const int z = world_to_cell(column.z, bmin[2], config.cellSize);
-        if (x < 0 || x >= sizeX || z < 0 || z >= sizeZ) continue;
+        if (x < 0 || x >= sizeX || z < 0 || z >= sizeZ) { ++skippedOutOfGrid; continue; }
         const int spanMin = world_to_cell(column.solidMinY, bmin[1],
                                           config.cellHeight);
         const int spanMax = world_to_cell(column.solidMaxY, bmin[1],
                                           config.cellHeight);
-        if (spanMax <= spanMin) continue;
+        if (spanMax <= spanMin) { ++skippedYSpan; continue; }
         // Surface cost area: 0 (default) bakes as the standard walkable area
         // (RC_WALKABLE_AREA); 1..62 are custom cost areas preserved onto the
         // produced polygons so find_path can weight them (set_area_cost).
@@ -317,14 +327,27 @@ bool bake_navmesh_data(const NavmeshConfig& config,
         errorOut.clear();
         return true;
     }
-
     // Slope rejection: this Recast build (new API) keeps no triangle list on
     // the poly mesh, so decompose each polygon into a fan and test the face
     // slope. Polygons steeper than agentMaxSlope are marked RC_NULL_AREA
     // (not walkable). (The slope COST tagging happens earlier, at the
     // heightfield level, where the per-cell slope is exact — see
     // tag_slope_cost_spans above.)
+    //
+    // Block-step exemption: the engine's voxel terrain rises in whole 1 m
+    // blocks. A fixed slope cutoff would reject every single-block step (a
+    // 1 m rise over a 0.3 m cell is ~73°) and fragment the navmesh on the
+    // engine's own blocky worlds — paths would break across perfectly
+    // walkable hills. Block-aligned polys (the voxel world's native surface)
+    // are exempt: their climbability is already enforced by the heightfield
+    // filters (rcFilterLedgeSpans / walkableClimb), so the poly-level slope
+    // test would be redundant and harmful. agentMaxSlope still governs
+    // smooth, non-blocky faces (e.g. synthetic ramp meshes), keeping the
+    // documented 42°-ramp-at-30° behavior intact.
     const float maxSlopeLimitY = std::cos(config.agentMaxSlope * (RC_PI / 180.0f));
+    // Voxel block size (1 m) and alignment tolerance for the exemption.
+    constexpr float kBlockMeters = 1.0f;
+    constexpr float kStepTolerance = 0.1f;
     for (int i = 0; i < mesh.npolys; ++i) {
         const unsigned short* p = &mesh.polys[i * mesh.nvp * 2];
         int nv = 0;
@@ -333,6 +356,23 @@ bool bake_navmesh_data(const NavmeshConfig& config,
             mesh.areas[i] = RC_NULL_AREA;
             continue;
         }
+        // A voxel-world poly sits entirely on whole 1 m blocks (every vertex
+        // block-aligned). Its surface is a staircase of climbable block steps
+        // — the heightfield pipeline (rcFilterLedgeSpans with walkableClimb)
+        // has ALREADY removed any step the agent cannot climb, so a steep
+        // riser on a blocky poly is a walkable 1-block step, not a wall.
+        // Exempt such polys from the slope rejection (agentMaxSlope keeps
+        // governing smooth, non-blocky faces like synthetic ramp meshes).
+        bool blockAligned = true;
+        for (int e = 0; e < nv; ++e) {
+            const float hy = static_cast<float>(mesh.verts[p[e] * 3 + 1]) * mesh.ch;
+            const float nearest = std::round(hy / kBlockMeters) * kBlockMeters;
+            if (std::fabs(hy - nearest) > kStepTolerance) {
+                blockAligned = false;
+                break;
+            }
+        }
+        if (blockAligned) continue;  // block-staircase surface: keep walkable
         const unsigned short* v0 = &mesh.verts[p[0] * 3];
         const float v0x = static_cast<float>(v0[0]);
         const float v0y = static_cast<float>(v0[1]);
@@ -817,7 +857,9 @@ public:
     bool run_path_query(const float start[3], const float goal[3],
                         PathResult& out) const {
         out = PathResult{};
-        if (!navmesh_ || !query_ || revision_ == 0) return false;
+        if (!navmesh_ || !query_ || revision_ == 0) {
+            return false;
+        }
         const float ext[3] = { config_.agentRadius * 4.0f, config_.agentHeight,
                                config_.agentRadius * 4.0f };
 
@@ -829,7 +871,9 @@ public:
                                                    &goalRef, goalPt))) {
             return false;
         }
-        if (startRef == 0 || goalRef == 0) return false;
+        if (startRef == 0 || goalRef == 0) {
+            return false;
+        }
 
         dtPolyRef path[2048];
         int pathCount = 0;
@@ -842,7 +886,9 @@ public:
             // unreachable instead of a best-guess path.
             return false;
         }
-        if (pathCount == 0) return false;
+        if (pathCount == 0) {
+            return false;
+        }
 
         float straight[4096];
         unsigned char straightFlags[2048];
@@ -1245,11 +1291,31 @@ private:
     bool build_tiled(const NavmeshConfig& config,
                      const std::vector<VoxelColumn>& columns,
                      std::string& errorOut) {
-        const float ts = config.tileSize;
+        // Tile boundaries MUST land on the cell grid: Detour links adjacent
+        // tiles by matching vertex coordinates at the shared edge, so each
+        // tile must span a whole number of cells, and adjacent tiles must
+        // compute their shared boundary from the SAME integer cell index
+        // (float accumulation like boundsMinX + tx*ts is not associative —
+        // the right edge of tile A and the left edge of tile B would differ
+        // by float noise, the border rings would not coincide, and Detour
+        // would never link them). Compute every tile's bounds in integer
+        // cell units from a common cell-grid origin; world values are only
+        // derived at the end (cell * cellSize), so boundaries are exact.
+        const int tileCells = std::max(
+            1, static_cast<int>(std::lround(config.tileSize / config.cellSize)));
+        const float ts = static_cast<float>(tileCells) * config.cellSize;
+        const int originCellX = static_cast<int>(
+            std::llround(config.boundsMinX / config.cellSize));
+        const int originCellZ = static_cast<int>(
+            std::llround(config.boundsMinZ / config.cellSize));
         const int tileCountX = std::max(
-            1, static_cast<int>(std::ceil((config.boundsMaxX - config.boundsMinX) / ts)));
+            1, static_cast<int>(std::ceil(
+                (config.boundsMaxX / config.cellSize - originCellX) /
+                tileCells)));
         const int tileCountZ = std::max(
-            1, static_cast<int>(std::ceil((config.boundsMaxZ - config.boundsMinZ) / ts)));
+            1, static_cast<int>(std::ceil(
+                (config.boundsMaxZ / config.cellSize - originCellZ) /
+                tileCells)));
         const int borderCells = static_cast<int>(
             std::ceil(config.agentRadius / config.cellSize)) + 3;
 
@@ -1263,10 +1329,17 @@ private:
         baked.reserve(static_cast<std::size_t>(tileCountX) * tileCountZ);
         for (int tz = 0; tz < tileCountZ; ++tz) {
             for (int tx = 0; tx < tileCountX; ++tx) {
-                const float minX = config.boundsMinX + tx * ts;
-                const float minZ = config.boundsMinZ + tz * ts;
-                const float maxX = std::min(config.boundsMaxX, minX + ts);
-                const float maxZ = std::min(config.boundsMaxZ, minZ + ts);
+                // Exact integer-cell boundaries: shared edges between
+                // adjacent tiles are computed from the same cell index, so
+                // both tiles rasterize identical border vertices.
+                const int minCellX = originCellX + tx * tileCells;
+                const int minCellZ = originCellZ + tz * tileCells;
+                const int maxCellX = minCellX + tileCells;
+                const int maxCellZ = minCellZ + tileCells;
+                const float minX = static_cast<float>(minCellX) * config.cellSize;
+                const float minZ = static_cast<float>(minCellZ) * config.cellSize;
+                const float maxX = static_cast<float>(maxCellX) * config.cellSize;
+                const float maxZ = static_cast<float>(maxCellZ) * config.cellSize;
                 std::vector<std::byte> data;
                 std::string bakeError;
                 if (!bake_navmesh_data(config, minX, minZ, maxX, maxZ, borderCells,

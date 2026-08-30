@@ -98,8 +98,26 @@ inline BlockType as_builtin_block(RuntimeBlockId id) {
 
 // Material/behavior snapshot for a DYNAMIC (registry-defined) block, copied
 // into the world and into mesh snapshots so workers never touch the registry.
+// FNV-1a hash used for the renderer's material variant dedup key (the same
+// algorithm Engine::Rendering::IBlockMaterialResolver::variantKey applies to
+// (namespaced name + state) at the headless/SDK layer). build time embeds this
+// into the immutable RuntimeBlockInfo/RuntimeBlockState so the mesher and
+// renderer never need the registry or the resolver instance on the worker.
+inline std::uint32_t runtime_block_variant_key(const std::string& name) noexcept {
+    std::uint32_t h = 2166136261u;
+    for (const char c : name) {
+        h ^= static_cast<std::uint32_t>(static_cast<unsigned char>(c));
+        h *= 16777619u;
+    }
+    if (h == 0) h = 1;  // 0 is reserved for "no material" in the variant contract
+    return h;
+}
+
 struct RuntimeBlockInfo {
     std::string uuid;              // persistent identity (empty = builtin)
+    // Renderer material dedup key at the BLOCK level (embedded at dispatch;
+    // resolver-compatible). 0 = not materialized.
+    std::uint32_t variantKey{ 0 };
     glm::vec4 color{ 1.0f };       // data-driven base color (no texture layer)
     // Per-face material overrides (FALTANTES §14): mirror of
     // BlockDefinition.faceTop/Bottom/Side; the mesher picks by face normal.
@@ -161,6 +179,9 @@ struct RuntimeBlockInfo {
         bool faceBottomSet{ false };
         bool faceSideSet{ false };
         uint8_t lightEmission{ 0 };
+        // Renderer material dedup key for THIS state (embedder-computed; 0 when
+        // the block declares no states — the block-level key then applies).
+        std::uint32_t variantKey{ 0 };
     };
     std::vector<RuntimeBlockState> states;
 };

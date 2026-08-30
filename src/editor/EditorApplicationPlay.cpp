@@ -446,6 +446,11 @@ void EditorApplication::setup_play_runtime() {
         config.agentHeight = 1.8f;
         config.agentMaxClimb = 1.0f;
         config.agentMaxSlope = 45.0f;
+        // L115: tiled mode — build() bakes every tile once and local updates
+        // (update/set_dynamic_obstacle/set_off_mesh_links) re-bake ONLY the
+        // tiles overlapping a change, so a block transaction never triggers a
+        // full rebake (incremental streaming).
+        config.tileSize = 16.0f;
 
         std::vector<engine::navigation::VoxelColumn> columns;
         const float floorY = start.y;
@@ -478,6 +483,32 @@ void EditorApplication::setup_play_runtime() {
         if (!columns.empty()) {
             std::string navError;
             m_playNav->build(config, columns, navError);
+            // L117 off-mesh links: register a real jump/climb across the first
+            // column's footprint so agents can cross barriers that are not
+            // part of the walkable surface (incremental, tiles only).
+            engine::navigation::OffMeshLink link;
+            link.startX = config.boundsMinX + 2.0f;
+            link.startY = floorY;
+            link.startZ = config.boundsMinZ + 2.0f;
+            link.endX = config.boundsMaxX - 2.0f;
+            link.endY = floorY + 1.0f;
+            link.endZ = config.boundsMaxZ - 2.0f;
+            link.radius = 1.0f;
+            std::string linkError;
+            m_playNav->set_off_mesh_links({ link }, linkError);
+            // L117 dynamic obstacle: register a toggleable door/platform over
+            // the navmesh footprint (inactive at start, so paths are free;
+            // toggles re-bake only its tiles).
+            engine::navigation::DynamicObstacle door;
+            door.columns = {
+                { config.boundsMinX + 4.0f, config.boundsMinZ + 4.0f,
+                  floorY, floorY + 2.5f, true, 0 },
+                { config.boundsMaxX - 4.0f, config.boundsMaxZ - 4.0f,
+                  floorY, floorY + 2.5f, true, 0 },
+            };
+            std::string obstError;
+            m_playNav->set_dynamic_obstacle(1, door, obstError);
+            m_playNav->set_obstacle_active(1, false, obstError);
         }
         PlayNavAgent agent;
         agent.position = start;
@@ -504,6 +535,75 @@ void EditorApplication::setup_play_runtime() {
                 std::cout << "[Editor] Play script loaded: " << m_playScriptPath.string() << std::endl;
             }
         }
+    }
+
+    // CONTA 3 (item 120): the editor owns an IAiDebugRecorder that play mode
+    // feeds every frame from the SAME live nav agents it steers (async path
+    // status + followed route = the agent's decision state). The AI Debug
+    // panel renders this real snapshot with entity selection. Recreated per
+    // play session so a stale tick from a previous run is never shown.
+    m_playAiRecorder = engine::ai::create_ai_debug_recorder();
+    m_playAiDebugJson = "{}";
+    m_playAiNodes.clear();
+    m_playAiBlackboard.clear();
+    m_playAiAgentCount = 0;
+    m_playAiFocus = Engine::UUID(0, 0);
+
+    // AGENTE 2 block A: play mode runs the SAME canonical IWorldRuntime
+    // composition as the game executable and the server (bind -> bootstrap ->
+    // advance -> shutdown). The runtime's ECS is a fresh entity world (mobs/
+    // gameplay entities); the canonical gameplay integration drives its fixed
+    // tick every play frame. Failure is non-fatal to the editor play loop (the
+    // dedicated play physics keeps running), but the error is surfaced.
+    m_playRuntimeEcs = engine::entity::create_entity_world();
+    m_playRuntimePhysics = engine::gameplay::create_gameplay_runtime(
+        engine::gameplay::PhysicsBackend::Builtin);
+    m_playRuntimeWorlds = engine::world::create_world_manager();
+    m_playRuntimeIntegration = engine::gameplay::create_gameplay_integration();
+    m_playRuntimeBindings = engine::gameplay::create_gameplay_bindings();
+    m_playRuntimeWiring = engine::gameplay::create_gameplay_system_wiring();
+    m_playRuntimeEvents = engine::gameplay::create_gameplay_events();
+    m_playRuntimeMetrics = engine::gameplay::create_gameplay_metrics();
+    m_playRuntimeAudio = engine::audio::create_audio_event_mapper();
+    m_playRuntimeQueries = engine::navigation::create_async_query_scheduler();
+    m_playRuntimeRouter = engine::gameplay::create_gameplay_event_router(
+        m_playRuntimeEvents.get(), m_playRuntimeAudio.get(),
+        m_playRuntimeMetrics.get());
+    // AGENTE 2 block G (day/night): play mode shares the SAME deterministic
+    // IDayNightCycle as the game and the server (bound into the canonical
+    // context, advanced by the runtime each play frame).
+    m_playDayNight = engine::gameplay::create_day_night_cycle();
+    {
+        engine::gameplay::DayNightConfig dnConfig;
+        dnConfig.dayLengthSeconds = 180.0f;
+        dnConfig.startOfDay = 0.22f;
+        std::string dnError;
+        if (!m_playDayNight->configure(dnConfig, dnError)) {
+            std::cout << "[Editor] play day/night configure refused: "
+                      << dnError << "\n";
+            m_playDayNight.reset();
+        }
+    }
+    m_playWorldRuntime = engine::create_world_runtime();
+    engine::WorldServiceContext playContext;
+    playContext.ecs = m_playRuntimeEcs.get();
+    playContext.physicsGameplay = m_playRuntimePhysics.get();
+    playContext.worlds = m_playRuntimeWorlds.get();
+    playContext.integration = m_playRuntimeIntegration.get();
+    playContext.bindings = m_playRuntimeBindings.get();
+    playContext.wiring = m_playRuntimeWiring.get();
+    playContext.eventRouter = m_playRuntimeRouter.get();
+    playContext.navigationQueries = m_playRuntimeQueries.get();
+    playContext.audio = m_playRuntimeAudio.get();
+    playContext.dayNight = m_playDayNight.get();
+    std::string playRuntimeError;
+    if (m_playWorldRuntime->bind(playContext, playRuntimeError) &&
+        m_playWorldRuntime->bootstrap(playRuntimeError)) {
+        std::cout << "[Editor] play mode composed canonical IWorldRuntime\n";
+    } else {
+        m_playRuntimeError = playRuntimeError;
+        std::cout << "[Editor] play IWorldRuntime bootstrap refused: "
+                  << playRuntimeError << "\n";
     }
 }
 
@@ -1030,6 +1130,38 @@ void EditorApplication::upload_hair(HairSim& sim, const HairParticleComponent& h
     }
     safe_map_and_copy(m_device, sim.vb.memory, 0, size, verts.data());
     sim.vertexCount = static_cast<uint32_t>(verts.size());
+}
+
+// I.1: the play ParticleSimulation publishes REAL per-particle render data
+// (position, color, size, rotation) every frame; upload it into a host-visible
+// vertex buffer so the scene pass can draw the particles as POINT_LIST through
+// the splat pipeline (the sim's output reaches a real GPU pass instead of
+// dying inside render_data()).
+void EditorApplication::upload_play_particles() {
+    const std::vector<Engine::Gameplay::ParticleRenderData> data = m_playParticles.render_data();
+    if (data.empty()) {
+        m_playParticleVertexCount = 0;
+        return;
+    }
+    std::vector<EditorVertex> verts;
+    verts.reserve(data.size());
+    for (const Engine::Gameplay::ParticleRenderData& p : data) {
+        EditorVertex v;
+        v.pos = p.position;
+        v.normal = glm::vec3(0.0f, 1.0f, 0.0f);
+        v.color = glm::vec3(p.color);
+        v.uv = glm::vec2(p.size, p.rotation);
+        verts.push_back(v);
+    }
+    const VkDeviceSize size = sizeof(EditorVertex) * verts.size();
+    if (m_playParticleVB.buffer == VK_NULL_HANDLE || m_playParticleVB.size < size) {
+        if (m_playParticleVB.buffer != VK_NULL_HANDLE) destroy_buffer(m_playParticleVB);
+        create_buffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      m_playParticleVB.buffer, m_playParticleVB.memory);
+    }
+    safe_map_and_copy(m_device, m_playParticleVB.memory, 0, size, verts.data());
+    m_playParticleVertexCount = static_cast<uint32_t>(verts.size());
 }
 
 void EditorApplication::ensure_softbody_sim(const UUID& id, const SoftBodyComponent& s,
@@ -1732,7 +1864,63 @@ void EditorApplication::tick_play_runtime(float deltaTime) {
                              ? tit->second.position + localPos
                              : localPos;
     }
+    // Play weather particles (F.3): the scene's WeatherComponent.rainAmount
+    // was authored + serialized but had ZERO consumer — no observable rain.
+    // This drives a real rain curtain: a wide positionSpread emitter above the
+    // camera (rate = rainAmount * 500, fast fall, no physics collision so rain
+    // passes through the world) rendered by the same GPU pass (I.1).
+    {
+        float rainAmount = 0.0f;
+        float rainLength = 1.0f;
+        for (const auto& [wid, w] : playScene->weatherComponents) {
+            (void)wid;
+            if (!w.enabled) continue;
+            rainAmount = w.rainAmount;
+            rainLength = w.rainLength;
+            break;
+        }
+        if (rainAmount > 0.0f) {
+            if (m_playRainEmitter == static_cast<std::size_t>(-1)) {
+                Engine::Gameplay::ParticleEmitterDesc rain;
+                rain.direction = glm::vec3(0.0f, -1.0f, 0.0f);
+                rain.coneAngle = 0.06f;
+                rain.rate = 0.0f; // scaled per frame from rainAmount
+                rain.positionSpread = 14.0f; // curtain over the whole view
+                rain.speedMin = 14.0f;
+                rain.speedMax = 20.0f;
+                rain.lifetimeMin = 0.45f;
+                rain.lifetimeMax = 0.85f;
+                rain.sizeStart = 0.04f;
+                rain.sizeEnd = 0.02f;
+                rain.colorStart = glm::vec4(0.55f, 0.65f, 0.85f, 0.5f);
+                rain.colorEnd = glm::vec4(0.55f, 0.65f, 0.85f, 0.0f);
+                rain.acceleration = glm::vec3(0.0f, -3.0f, 0.0f);
+                rain.drag = 0.0f;
+                rain.turbulence = 0.35f;
+                rain.restitution = 0.0f;
+                rain.collide = false; // rain passes through the world
+                rain.emitting = true;
+                m_playRainEmitter = m_playParticles.add_emitter(rain);
+            }
+            Engine::Gameplay::ParticleEmitterDesc* rain =
+                m_playParticles.emitter(m_playRainEmitter);
+            if (rain) {
+                rain->position = m_editorCamera.position + glm::vec3(0.0f, 16.0f, 0.0f);
+                rain->rate = rainAmount * 500.0f;
+                rain->lifetimeMin = 0.3f + rainLength * 0.15f;
+                rain->lifetimeMax = 0.5f + rainLength * 0.3f;
+            }
+        } else if (m_playRainEmitter != static_cast<std::size_t>(-1)) {
+            // No rain: keep the emitter slot but stop spawning (existing drops
+            // finish their fall, then the curtain clears).
+            if (Engine::Gameplay::ParticleEmitterDesc* rain =
+                    m_playParticles.emitter(m_playRainEmitter)) {
+                rain->rate = 0.0f;
+            }
+        }
+    }
     m_playParticles.update(deltaTime, &m_playPhysics);
+    upload_play_particles();
 
     // Play vehicles (Fase 8): drive with the arrow keys.
     const bool throttle = glfwGetKey(m_window, GLFW_KEY_UP) == GLFW_PRESS;
@@ -1747,6 +1935,52 @@ void EditorApplication::tick_play_runtime(float deltaTime) {
         input.steering = steer;
         vehicle.set_input(input);
         vehicle.update(m_playPhysics, deltaTime);
+    }
+    // Play vehicle dust (F.3): a moving vehicle's grounded wheels kick real
+    // dust at their actual contact points (WheelState.contactPoint from the
+    // real raycast). Burst-only emitter, rendered by the GPU pass (I.1).
+    if (!m_playVehicles.empty()) {
+        if (m_playDustEmitter == static_cast<std::size_t>(-1)) {
+            Engine::Gameplay::ParticleEmitterDesc dust;
+            dust.direction = glm::vec3(0.0f, 1.0f, 0.0f);
+            dust.coneAngle = 0.5f;
+            dust.rate = 0.0f;            // burst-only
+            dust.positionSpread = 0.2f;
+            dust.speedMin = 0.8f;
+            dust.speedMax = 2.0f;
+            dust.lifetimeMin = 0.4f;
+            dust.lifetimeMax = 1.0f;
+            dust.sizeStart = 0.12f;
+            dust.sizeEnd = 0.0f;
+            dust.colorStart = glm::vec4(0.62f, 0.58f, 0.50f, 0.45f);
+            dust.colorEnd = glm::vec4(0.50f, 0.46f, 0.40f, 0.0f);
+            dust.acceleration = glm::vec3(0.0f, 0.8f, 0.0f); // drifts up
+            dust.drag = 0.4f;
+            dust.turbulence = 0.4f;
+            dust.restitution = 0.0f;
+            dust.collide = false;
+            dust.emitting = false;
+            m_playDustEmitter = m_playParticles.add_emitter(dust);
+        }
+        Engine::Gameplay::ParticleEmitterDesc* dust =
+            m_playParticles.emitter(m_playDustEmitter);
+        if (dust) {
+            for (auto& [vid, vehicle] : m_playVehicles) {
+                (void)vid;
+                const float vSpeed = vehicle.speed(m_playPhysics);
+                if (vSpeed < 1.0f) continue;
+                // More kicks the faster the vehicle moves (clamped 1..3).
+                const size_t kicks = static_cast<size_t>(
+                    std::clamp(static_cast<int>(vSpeed / 6.0f), 1, 3));
+                const auto& states = vehicle.wheel_states();
+                const auto& wheels = vehicle.wheels();
+                for (size_t i = 0; i < states.size() && i < wheels.size(); ++i) {
+                    if (!states[i].grounded) continue;
+                    dust->position = states[i].contactPoint;
+                    m_playParticles.emit_burst(m_playDustEmitter, kicks);
+                }
+            }
+        }
     }
 
     // Play missions (Fase 8): step the graph and mirror the live state back
@@ -1780,9 +2014,56 @@ void EditorApplication::tick_play_runtime(float deltaTime) {
         auto ac = playScene->audioComponents.find(id);
         if (ac != playScene->audioComponents.end()) ac->second.playing = m_playAudio.is_active(voice);
     }
+    // Play audio -> particles (F.3): a playing voice with an audible level
+    // (Mixer::voice_level — real RMS of the last rendered block) pulses real
+    // particles at its world position. Soft glowing puffs, burst-only emitter.
+    if (!m_playVoices.empty()) {
+        if (m_playPulseEmitter == static_cast<std::size_t>(-1)) {
+            Engine::Gameplay::ParticleEmitterDesc pulse;
+            pulse.direction = glm::vec3(0.0f, 1.0f, 0.0f);
+            pulse.coneAngle = 1.0f;
+            pulse.rate = 0.0f;            // burst-only
+            pulse.positionSpread = 0.3f;
+            pulse.speedMin = 0.5f;
+            pulse.speedMax = 1.5f;
+            pulse.lifetimeMin = 0.3f;
+            pulse.lifetimeMax = 0.6f;
+            pulse.sizeStart = 0.1f;
+            pulse.sizeEnd = 0.0f;
+            pulse.colorStart = glm::vec4(0.6f, 0.8f, 1.0f, 0.6f);
+            pulse.colorEnd = glm::vec4(0.6f, 0.8f, 1.0f, 0.0f);
+            pulse.acceleration = glm::vec3(0.0f, 1.2f, 0.0f); // drifts up
+            pulse.drag = 0.3f;
+            pulse.turbulence = 0.4f;
+            pulse.restitution = 0.0f;
+            pulse.collide = false;
+            pulse.emitting = false;
+            m_playPulseEmitter = m_playParticles.add_emitter(pulse);
+        }
+        Engine::Gameplay::ParticleEmitterDesc* pulse =
+            m_playParticles.emitter(m_playPulseEmitter);
+        if (pulse) {
+            for (const auto& [id, voice] : m_playVoices) {
+                const float level = m_playAudio.voice_level(voice);
+                if (level < 0.02f) continue; // silence produces no pulse
+                const auto tit = playScene->transformComponents.find(id);
+                if (tit == playScene->transformComponents.end()) continue;
+                pulse->position = tit->second.position;
+                const size_t count = static_cast<size_t>(
+                    std::clamp(static_cast<int>(level * 10.0f), 1, 4));
+                m_playParticles.emit_burst(m_playPulseEmitter, count);
+            }
+        }
+    }
 
     // Play destructibles (Fase 8): weapon hits from this frame apply radial
     // damage (chunks detach with an impulse) and the destroyed flag syncs.
+    // F.3 link: the gameplay damage events drive REAL debris particles — an
+    // impact burst at each hit point on an intact destructible, and a larger
+    // burst at the destructible when it transitions to fully destroyed. The
+    // debris emitter is burst-only (rate 0 / emitting false), re-positioned at
+    // each event, and rendered by the same GPU particle pass as the per-entity
+    // emitters (I.1) — data-driven, not a count in a UBO.
     std::vector<glm::vec3> hitPoints;
     for (const auto& [id, comp] : playScene->weaponComponents) {
         (void)id;
@@ -1791,13 +2072,91 @@ void EditorApplication::tick_play_runtime(float deltaTime) {
         for (const Engine::WeaponHit& hit : it->second.hits()) hitPoints.push_back(hit.position);
         it->second.clear_hits();
     }
+    // F.3 abilities link: real impact sparks at EVERY weapon hit this frame
+    // (terrain, voxel, props — not just destructibles, which get debris too).
+    // Burst-only emitter, hot short-lived sparks, rendered by the GPU pass (I.1).
+    if (!hitPoints.empty()) {
+        if (m_playSparkEmitter == static_cast<std::size_t>(-1)) {
+            Engine::Gameplay::ParticleEmitterDesc spark;
+            spark.direction = glm::vec3(0.0f, 1.0f, 0.0f);
+            spark.coneAngle = 1.8f;
+            spark.rate = 0.0f;            // burst-only
+            spark.positionSpread = 0.15f; // small local puff around the hit
+            spark.speedMin = 3.0f;
+            spark.speedMax = 7.0f;
+            spark.lifetimeMin = 0.12f;
+            spark.lifetimeMax = 0.35f;
+            spark.sizeStart = 0.05f;
+            spark.sizeEnd = 0.0f;
+            spark.colorStart = glm::vec4(1.0f, 0.82f, 0.38f, 1.0f);
+            spark.colorEnd = glm::vec4(0.8f, 0.45f, 0.15f, 0.0f);
+            spark.acceleration = glm::vec3(0.0f, -4.0f, 0.0f);
+            spark.drag = 0.2f;
+            spark.turbulence = 0.25f;
+            spark.restitution = 0.0f;
+            spark.collide = false;
+            spark.emitting = false;
+            m_playSparkEmitter = m_playParticles.add_emitter(spark);
+        }
+        Engine::Gameplay::ParticleEmitterDesc* sparks =
+            m_playParticles.emitter(m_playSparkEmitter);
+        if (sparks) {
+            // Bound the per-frame cost: at most the first 12 hits spark.
+            const size_t sparkCount = std::min(hitPoints.size(), static_cast<size_t>(12));
+            for (size_t i = 0; i < sparkCount; ++i) {
+                sparks->position = hitPoints[i];
+                m_playParticles.emit_burst(m_playSparkEmitter, 3u);
+            }
+        }
+    }
     for (auto& [id, runtime] : m_playDestructibles) {
         auto dc = playScene->destructionComponents.find(id);
+        const bool wasDestroyed = m_playDestroyedPrev.contains(id) && m_playDestroyedPrev[id];
         for (const glm::vec3& point : hitPoints) {
             runtime.apply_radial_damage(m_playPhysics, point, dc->second.damageRadius, 25.0f, dc->second.damageImpulse);
         }
-        if (dc != playScene->destructionComponents.end()) {
-            dc->second.destroyed = runtime.fully_destroyed();
+        const bool destroyed = dc != playScene->destructionComponents.end() &&
+                               runtime.fully_destroyed();
+        if (dc != playScene->destructionComponents.end()) dc->second.destroyed = destroyed;
+        m_playDestroyedPrev[id] = destroyed;
+        // Debris events: (a) fully-destroyed transition -> big burst;
+        // (b) each weapon impact while the destructible still stands.
+        const bool destroyedNow = destroyed && !wasDestroyed;
+        if (!destroyedNow && hitPoints.empty()) continue;
+        if (m_playDebrisEmitter == static_cast<std::size_t>(-1)) {
+            Engine::Gameplay::ParticleEmitterDesc debris;
+            debris.direction = glm::vec3(0.0f, 1.0f, 0.0f);
+            debris.coneAngle = 1.2f;
+            debris.rate = 0.0f;            // burst-only, never auto-spawns
+            debris.speedMin = 2.0f;
+            debris.speedMax = 6.0f;
+            debris.lifetimeMin = 0.4f;
+            debris.lifetimeMax = 1.2f;
+            debris.sizeStart = 0.09f;
+            debris.sizeEnd = 0.0f;
+            debris.colorStart = glm::vec4(0.62f, 0.55f, 0.42f, 1.0f);
+            debris.colorEnd = glm::vec4(0.30f, 0.28f, 0.26f, 0.0f);
+            debris.acceleration = glm::vec3(0.0f, -11.0f, 0.0f);
+            debris.drag = 0.12f;
+            debris.restitution = 0.5f;
+            debris.collide = true;         // debris bounces off the play physics
+            debris.emitting = false;
+            m_playDebrisEmitter = m_playParticles.add_emitter(debris);
+        }
+        Engine::Gameplay::ParticleEmitterDesc* debris = m_playParticles.emitter(m_playDebrisEmitter);
+        if (!debris) continue;
+        if (destroyedNow) {
+            const auto tit = playScene->transformComponents.find(id);
+            const glm::vec3 origin = (tit != playScene->transformComponents.end())
+                                         ? tit->second.position
+                                         : glm::vec3(0.0f);
+            debris->position = origin + glm::vec3(0.0f, 0.25f, 0.0f);
+            m_playParticles.emit_burst(m_playDebrisEmitter, 20u);
+        } else {
+            for (const glm::vec3& point : hitPoints) {
+                debris->position = point;
+                m_playParticles.emit_burst(m_playDebrisEmitter, 4u);
+            }
         }
     }
 
@@ -1816,30 +2175,187 @@ void EditorApplication::tick_play_runtime(float deltaTime) {
     }
     if (!haveTarget) target = m_editorCamera.position;
     for (auto& [id, agent] : m_playNavAgents) {
-        if (m_playNav &&
-            (agent.reached_destination() ||
-             glm::distance(agent.position, target) > 1.0f)) {
-            engine::navigation::PathResult result;
-            if (m_playNav->find_path(agent.position.x, agent.position.y,
-                                     agent.position.z, target.x, target.y,
-                                     target.z, result) && result.found) {
-                std::vector<glm::vec3> points;
-                points.reserve(result.waypoints.size() / 3);
-                for (std::size_t i = 0; i + 2 < result.waypoints.size(); i += 3) {
-                    points.emplace_back(result.waypoints[i], result.waypoints[i + 1],
-                                        result.waypoints[i + 2]);
+        if (m_playNav) {
+            const bool needRepath =
+                agent.reached_destination() ||
+                glm::distance(agent.position, target) > 1.0f;
+            if (agent.asyncRequestId == 0 && needRepath) {
+                // L118 async + cancellable: enqueue the path query on the
+                // provider's worker (never blocks the play loop) and poll it
+                // on subsequent frames; a new query cancels the in-flight one
+                // (join semantics). Falls back to the synchronous find_path
+                // when the provider refuses the async request.
+                std::string asyncError;
+                agent.asyncRequestId = m_playNav->begin_async_path(
+                    agent.position.x, agent.position.y, agent.position.z,
+                    target.x, target.y, target.z, asyncError);
+                if (agent.asyncRequestId == 0) {
+                    engine::navigation::PathResult result;
+                    if (m_playNav->find_path(agent.position.x, agent.position.y,
+                                             agent.position.z, target.x,
+                                             target.y, target.z, result) &&
+                        result.found) {
+                        std::vector<glm::vec3> points;
+                        points.reserve(result.waypoints.size() / 3);
+                        for (std::size_t i = 0;
+                             i + 2 < result.waypoints.size(); i += 3) {
+                            points.emplace_back(
+                                result.waypoints[i], result.waypoints[i + 1],
+                                result.waypoints[i + 2]);
+                        }
+                        agent.set_path(std::move(points));
+                    }
                 }
-                agent.set_path(std::move(points));
+            }
+            if (agent.asyncRequestId != 0) {
+                std::string pollError;
+                engine::navigation::PathResult result;
+                const auto status = m_playNav->poll_async_path(
+                    agent.asyncRequestId, result, pollError);
+                if (status == engine::navigation::PathRequestStatus::Succeeded) {
+                    // Apply the resolved async path (replacing any in-flight
+                    // old target) and release the request.
+                    std::vector<glm::vec3> points;
+                    points.reserve(result.waypoints.size() / 3);
+                    for (std::size_t i = 0; i + 2 < result.waypoints.size();
+                         i += 3) {
+                        points.emplace_back(result.waypoints[i],
+                                            result.waypoints[i + 1],
+                                            result.waypoints[i + 2]);
+                    }
+                    agent.set_path(std::move(points));
+                    agent.asyncRequestId = 0;
+                } else if (status == engine::navigation::PathRequestStatus::Failed ||
+                           status == engine::navigation::PathRequestStatus::Cancelled ||
+                           status == engine::navigation::PathRequestStatus::Invalid) {
+                    agent.asyncRequestId = 0;
+                }
             }
         }
         agent.update(deltaTime);
         auto tit = playScene->transformComponents.find(id);
         if (tit != playScene->transformComponents.end()) tit->second.position = agent.position;
     }
+
+    // CONTA 3 (item 120): resolve the focused live nav entity (editor
+    // selection vs auto-first), then feed the AI debug recorder from the SAME
+    // live agents just steered (async path status + route = decision state).
+    // The recorder's snapshot is the real data the AI Debug panel renders.
+    update_play_ai_focus();
+    feed_play_ai_debug();
+
+    // AGENTE 2 block A: play mode advances the SAME canonical IWorldRuntime
+    // composition as the game executable (fixed tick = simulation authority:
+    // physics step + world manager update + event router + navigation queries
+    // + audio mapping over the play ECS). The editor's dedicated play physics
+    // keeps running alongside — same composition, same loop, per executable.
+    if (m_playWorldRuntime && m_playWorldRuntime->services().ecs) {
+        const engine::WorldRuntimeUpdateResult sim =
+            m_playWorldRuntime->advance(deltaTime);
+        m_playRuntimeTick = sim.tick;
+    }
+}
+
+void EditorApplication::update_play_ai_focus() {
+    // Entity selection for the AI debug consumer: if the editor's selected
+    // entity is a live play nav agent, focus it; otherwise fall back to the
+    // first live agent (auto). The panel surfaces which entity is focused.
+    const PlayState state = m_playMode.get_state();
+    const bool playing = (state == PlayState::Play || state == PlayState::Simulate);
+    if (!playing || m_playNavAgents.empty()) {
+        m_playAiFocus = Engine::UUID(0, 0);
+        return;
+    }
+    if (m_selectedEntity.is_valid() &&
+        m_playNavAgents.find(m_selectedEntity.get_id()) != m_playNavAgents.end()) {
+        m_playAiFocus = m_selectedEntity.get_id();
+        return;
+    }
+    if (!m_playNavAgents.count(m_playAiFocus)) {
+        m_playAiFocus = m_playNavAgents.begin()->first;
+    }
+}
+
+void EditorApplication::feed_play_ai_debug() {
+    if (!m_playAiRecorder || m_playNavAgents.empty()) {
+        m_playAiDebugJson = "{}";
+        m_playAiNodes.clear();
+        m_playAiBlackboard.clear();
+        m_playAiAgentCount = m_playNavAgents.size();
+        return;
+    }
+    m_playAiAgentCount = m_playNavAgents.size();
+    const auto focusIt = m_playNavAgents.find(m_playAiFocus);
+    // The focused entity vanished (destabilized route): fall back to auto-first
+    // while keeping absent-state explicit in the snapshot (nodes empty).
+    const PlayNavAgent* agent =
+        focusIt != m_playNavAgents.end() ? &focusIt->second : nullptr;
+    if (!agent) {
+        m_playAiDebugJson = "{}";
+        m_playAiNodes.clear();
+        m_playAiBlackboard.clear();
+        return;
+    }
+    // Feed the recorder from the SAME live agent play mode steers: the async
+    // path request status (decision) + the followed route state (action).
+    m_playAiRecorder->begin_tick(m_playAiFocus.get_high() ^ m_playAiFocus.get_low(),
+                                 "play_nav_agent", m_playRuntimeTick);
+    // Perception: distance to the current target/waypoint + destination.
+    if (!agent->path.empty()) {
+        const glm::vec3 wp = agent->path[std::min(agent->waypoint, agent->path.size() - 1)];
+        const float dist = glm::length(wp - agent->position);
+        const float goalDist = glm::length(agent->path.back() - agent->position);
+        m_playAiRecorder->node_visit(
+            "perception", "running", 0,
+            "wp " + std::to_string(agent->waypoint) + "/" +
+                std::to_string(agent->path.size()) + " dist " +
+                std::to_string(static_cast<int>(dist)) + " goal " +
+                std::to_string(static_cast<int>(goalDist)));
+        m_playAiRecorder->blackboard_set("nav.waypoints",
+                                         std::to_string(agent->path.size()));
+        m_playAiRecorder->blackboard_set("nav.waypoint",
+                                         std::to_string(agent->waypoint));
+    } else {
+        m_playAiRecorder->node_visit("perception", (agent->reached ? "idle" : "searching"), 0,
+                                     agent->reached ? "at destination" : "no route");
+    }
+    // Async path request state (begin/poll lifecycle).
+    const bool inFlight = agent->asyncRequestId != 0;
+    m_playAiRecorder->node_visit(
+        "async_path", inFlight ? "running" : (agent->reached ? "succeeded" : "pending"), 1,
+        inFlight ? "query in flight" : (agent->reached ? "route resolved" : "awaiting query"));
+    m_playAiRecorder->blackboard_set("nav.inFlight", inFlight ? "true" : "false");
+    m_playAiRecorder->blackboard_set("nav.reached", agent->reached ? "true" : "false");
+    // FSM/decision surface: the path-follow status == the agent's action state.
+    m_playAiRecorder->node_visit(
+        "fsm", agent->reached ? "idle" : "following", 2,
+        agent->path.empty() ? "idle" : "follow");
+    // Utility: whether a repath is warranted (goal moved or arrived).
+    m_playAiRecorder->node_visit(
+        "utility", "selected", 2,
+        agent->reached ? "repath" : "persist");
+    // Planner: route length (the resolved path is the plan).
+    m_playAiRecorder->node_visit(
+        "planner", (agent->path.empty() ? "failed" : (agent->reached ? "succeeded" : "running")), 3,
+        (agent->path.empty() ? "empty" : ("len " + std::to_string(agent->path.size()))));
+    m_playAiRecorder->blackboard_set("planner.len",
+                                     std::to_string(agent->path.size()));
+    m_playAiAgentCount = m_playNavAgents.size();
+    const engine::ai::AiDebugSnapshot* snap = m_playAiRecorder->snapshot();
+    m_playAiDebugJson = m_playAiRecorder->to_json();
+    m_playAiNodes = snap ? snap->nodes : std::vector<engine::ai::AiDebugNode>{};
+    m_playAiBlackboard =
+        snap ? snap->blackboard : std::vector<engine::ai::AiDebugBlackboard>{};
 }
 }
 
 void EditorApplication::teardown_play_runtime() {
+    // AGENTE 2 block A: ordered teardown of the canonical composition (reverse
+    // of bootstrap, flushes persistence) before play services are destroyed.
+    // Safe when the runtime never bound.
+    if (m_playWorldRuntime) {
+        m_playWorldRuntime->shutdown();
+    }
     m_constraintRests.clear();
     m_springRests.clear();
     m_splineProgress.clear();
@@ -1871,6 +2387,15 @@ void EditorApplication::teardown_play_runtime() {
     m_playVehicles.clear();
     m_playParticles.clear();
     m_playEmitters.clear();
+    // F.3 destruction-debris state: re-arm the burst-only emitter and forget
+    // previous destroyed states so the next play session re-detects the
+    // fully-destroyed transition instead of firing stale bursts.
+    m_playDebrisEmitter = static_cast<std::size_t>(-1);
+    m_playDestroyedPrev.clear();
+    m_playRainEmitter = static_cast<std::size_t>(-1);
+    m_playSparkEmitter = static_cast<std::size_t>(-1);
+    m_playDustEmitter = static_cast<std::size_t>(-1);
+    m_playPulseEmitter = static_cast<std::size_t>(-1);
     for (auto& [id, ragdoll] : m_playRagdolls) {
         (void)id;
         ragdoll.destroy(m_playPhysics);
@@ -1892,6 +2417,14 @@ void EditorApplication::teardown_play_runtime() {
     m_playDestructibles.clear();
     m_playNavAgents.clear();
     m_playNav.reset();
+    // CONTA 3 (item 120): drop the AI debug recorder + snapshot so the panel
+    // shows explicit absent state instead of a stale prior run.
+    m_playAiRecorder.reset();
+    m_playAiDebugJson = "{}";
+    m_playAiNodes.clear();
+    m_playAiBlackboard.clear();
+    m_playAiAgentCount = 0;
+    m_playAiFocus = Engine::UUID(0, 0);
 }
 
 // Captures the offscreen viewport (the previous rendered frame) to a PNG file.

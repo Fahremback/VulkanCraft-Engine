@@ -46,6 +46,15 @@ struct EditorApiState {
     std::string selectedEntity;
     std::string gizmoMode{ "translate" };
     float snap{ 1.0f };
+    // Selective render-view overlays that gate the PRESENTED viewport (grid /
+    // gizmos / collider wireframes) — the SDK/MCP render-view toggles drive
+    // exactly these booleans. Published in GET /state as "renderView".
+    bool grid{ true };
+    bool gizmos{ true };
+    bool colliders{ true };
+    // Active selectable debug overlay (D.1): "none" | "probes" | "cards" |
+    // "capture" | "trace" | "disocclusion" — published in GET /state.
+    std::string selectedDebugOverlay{ "none" };
     float camTargetX{ 0.0f }, camTargetY{ 0.0f }, camTargetZ{ 0.0f };
     // Panel features (Opções Gráficas / Terreno / Configurações) telemetry.
     bool vsync{ true };
@@ -96,6 +105,22 @@ struct EditorApiState {
     // The undo-history JSON (engine/editor IUndoHistory) — the editor's
     // UndoSystem stack depths/cap (deterministic), observable via GET /undo.
     std::string undo;
+    // The inventory-grid JSON (engine/ui IUiInventoryGrid) — the live grid
+    // slot presentation resolved from the editor's inventory state via the
+    // public inventory-grid contract. Observed via GET /inventory-grid.
+    std::string inventory_grid;
+    // The network-debug JSON (engine/networking INetworkSession + INetworkRpc)
+    // — live server-session identity/status + RPC registry, observed via GET
+    // /network-debug.
+    std::string network_debug;
+    // The cooked-assets JSON (engine/assets IAssetCooker) — Conta 5 §3: the
+    // editor's live cook of the showcase project's data assets (source, content
+    // hash, cache hit), observed via GET /cook.
+    std::string cooked_assets_json;
+    // The package-manifest JSON (engine/packaging IPackageManager +
+    // engine/compiler IEpisodeCompiler) — live install state + episode compile
+    // signature, observed via GET /package-manifest.
+    std::string package_manifest;
     // The content-browser JSON (engine/editor IContentBrowser) — the asset
     // navigation model (index/folders/selection) from the AssetRegistry.
     std::string content_browser;
@@ -131,6 +156,10 @@ struct EditorApiState {
     // deterministic retarget document (skeletons/mapping/root motion), via
     // GET /retargeting.
     std::string retargeting;
+    // The render-diagnostics JSON (engine/rendering IRenderPassMetrics +
+    // IRenderProviderRegistry) — REAL per-pass timings + provider selection
+    // recorded by the viewport render loop, via GET /render-diagnostics.
+    std::string render_diagnostics;
 };
 
 class EditorControlApi {
