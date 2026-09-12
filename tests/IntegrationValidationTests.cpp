@@ -13,6 +13,12 @@
 #include <engine/registry/Inventory.hpp>
 #include <engine/hashing/IHashProvider.hpp>
 #include <engine/compression/ICompressionProvider.hpp>
+#include <engine/gameplay/IGameplayCrossDomain.hpp>
+#include <engine/gameplay/IGameplayPhase.hpp>
+#include <engine/networking/IClientPrediction.hpp>
+#include <engine/networking/IReplicationSecurity.hpp>
+#include <engine/plugins/IPluginPermissions.hpp>
+#include <engine/rendering/IRenderProviderRegistry.hpp>
 #include <glm/glm.hpp>
 
 #include <algorithm>
@@ -448,6 +454,246 @@ void test_transaction_policy_comprehensive() {
     std::cout << "[ival] PASS: transaction policy comprehensive\n";
 }
 
+// =====================================================================
+// Account 6: deterministic public-contract certification
+// =====================================================================
+void test_client_prediction_contract() {
+    std::cout << "[ival] test_client_prediction_contract...\n";
+    using namespace engine::networking;
+
+    std::string err;
+    auto prediction = create_client_prediction(err);
+    CHECK(prediction != nullptr);
+    CHECK(err.empty());
+
+    prediction->set_step([](const PredictedPose& from, const PredictionInput& input) {
+        PredictedPose next = from;
+        next.x += static_cast<double>(input.move_x);
+        next.z += static_cast<double>(input.move_z);
+        return next;
+    });
+
+    const auto first = prediction->predict(1.0f, 1.0f, 0.0f, false);
+    const auto second = prediction->predict(1.0f, 1.0f, 2.0f, false);
+    CHECK(first.sequence == 1);
+    CHECK(second.sequence == 2);
+    CHECK(prediction->pending_input_count() == 2);
+    CHECK(prediction->pose().x == 2.0);
+    CHECK(prediction->pose().z == 2.0);
+
+    PredictedPose authoritative;
+    authoritative.x = 10.0;
+    authoritative.z = 20.0;
+    const auto reconciled = prediction->reconcile(authoritative, first.sequence);
+    CHECK(reconciled.corrected);
+    CHECK(reconciled.replayed_inputs == 1);
+    CHECK(prediction->pending_input_count() == 1);
+    CHECK(prediction->pose().x == 11.0);
+    CHECK(prediction->pose().z == 22.0);
+
+    const auto edit = prediction->predict_block(BlockEditKind::Break, 4, 5, 6, 7, 0);
+    CHECK(prediction->pending_block_edits() == 1);
+    CHECK(prediction->confirm_block(edit, false));
+    const auto rollbacks = prediction->drain_rollbacks();
+    CHECK(rollbacks.size() == 1);
+    CHECK(rollbacks[0].sequence == edit);
+    CHECK(rollbacks[0].restore_block == 7);
+    CHECK(prediction->pending_block_edits() == 0);
+
+    RemoteSnapshot a;
+    a.entity_net_id = 99;
+    a.tick = 10;
+    a.server_time = 1.0;
+    a.pose.x = 2.0;
+    RemoteSnapshot b = a;
+    b.tick = 11;
+    b.server_time = 2.0;
+    b.pose.x = 6.0;
+    CHECK(prediction->push_remote_snapshot(a));
+    CHECK(prediction->push_remote_snapshot(b));
+    PredictedPose sampled;
+    CHECK(prediction->sample_remote(99, 1.5, sampled));
+    CHECK(sampled.x == 4.0);
+
+    CHECK(prediction->reset(err));
+    CHECK(prediction->pending_input_count() == 0);
+    CHECK(prediction->pending_block_edits() == 0);
+    CHECK(prediction->next_sequence() == 1);
+    std::cout << "[ival] PASS: client prediction contract\n";
+}
+
+void test_gameplay_phase_contract() {
+    std::cout << "[ival] test_gameplay_phase_contract...\n";
+    using namespace engine::gameplay;
+
+    auto phase = create_gameplay_phase();
+    CHECK(phase != nullptr);
+    std::string err;
+    CHECK(phase->configure({GameplayDomain::Ecs, GameplayDomain::Renderer}, err));
+    CHECK(!phase->complete(err));
+    CHECK(phase->mark_producer_bound(GameplayDomain::Ecs));
+    CHECK(phase->mark_consumer_bound(GameplayDomain::Ecs));
+    CHECK(!phase->complete(err));
+    CHECK(phase->mark_persistence_bound(GameplayDomain::Ecs));
+    CHECK(!phase->complete(err));
+    CHECK(phase->mark_replication_bound(GameplayDomain::Ecs));
+    CHECK(phase->mark_producer_bound(GameplayDomain::Renderer));
+    CHECK(phase->mark_consumer_bound(GameplayDomain::Renderer));
+    CHECK(phase->complete(err));
+    CHECK(err.empty());
+    CHECK(phase->status().size() == 2);
+    CHECK(!phase->mark_producer_bound(GameplayDomain::Audio));
+
+    phase->reset();
+    CHECK(phase->status().empty());
+    CHECK(!phase->complete(err));
+    std::cout << "[ival] PASS: gameplay phase contract\n";
+}
+
+void test_gameplay_cross_domain_contract() {
+    std::cout << "[ival] test_gameplay_cross_domain_contract...\n";
+    using namespace engine::gameplay;
+
+    auto cross = create_gameplay_cross_domain();
+    auto integration = create_gameplay_integration();
+    CHECK(cross != nullptr);
+    CHECK(integration != nullptr);
+    std::string err;
+    CHECK(integration->configure(1.0f / 60.0f, 8, err));
+    CHECK(cross->bind_integration(integration.get()));
+    CHECK(!cross->bind_navigation(nullptr, nullptr, nullptr, nullptr, err));
+    CHECK(!err.empty());
+    CHECK(!cross->bind_debug(nullptr, nullptr));
+    CHECK(!cross->bind_authoring(nullptr, nullptr));
+    cross->refresh();
+    const auto snapshot = cross->snapshot();
+    CHECK(!snapshot.navigationBound);
+    CHECK(!snapshot.debugBound);
+    CHECK(!snapshot.authoringBound);
+    CHECK(!snapshot.fullyBound);
+    const auto json = cross->to_json();
+    CHECK(json.find("\"navigationBound\":false") != std::string::npos);
+    CHECK(json.find("\"fullyBound\":false") != std::string::npos);
+    std::cout << "[ival] PASS: gameplay cross-domain contract\n";
+}
+
+void test_render_provider_registry_contract() {
+    std::cout << "[ival] test_render_provider_registry_contract...\n";
+    using namespace Engine::Rendering;
+
+    std::string err;
+    auto registry = create_render_provider_registry(err);
+    CHECK(registry != nullptr);
+    registry->set(RenderProviderEntry{
+        "integration-test", "provider-a", "IntegrationValidationTests",
+        "vc_sdk_rendering", "deterministic-test"});
+    const auto* first = registry->find("integration-test");
+    CHECK(first != nullptr);
+    CHECK(first && first->provider == "provider-a");
+
+    registry->set(RenderProviderEntry{
+        "integration-test", "provider-b", "IntegrationValidationTests",
+        "vc_sdk_rendering", "replacement"});
+    const auto* replaced = registry->find("integration-test");
+    CHECK(replaced != nullptr);
+    CHECK(replaced && replaced->provider == "provider-b");
+    const auto all = registry->all();
+    CHECK(std::count_if(all.begin(), all.end(), [](const RenderProviderEntry& entry) {
+        return entry.system == "integration-test";
+    }) == 1);
+    const auto json = registry->to_json();
+    CHECK(json.find("\"integration-test\"") != std::string::npos);
+    CHECK(json.find("\"provider-b\"") != std::string::npos);
+    registry->clear();
+    CHECK(registry->find("integration-test") == nullptr);
+    std::cout << "[ival] PASS: render provider registry contract\n";
+}
+
+void test_replication_security_contract() {
+    std::cout << "[ival] test_replication_security_contract...\n";
+    using namespace engine::networking;
+
+    SecurityLimits limits;
+    limits.max_messages_per_window = 2;
+    limits.window_millis = 1000;
+    limits.max_payload = 8;
+    limits.max_response_ratio = 2;
+    limits.journal_max_entries = 2;
+
+    std::string err;
+    auto security = create_replication_security(limits, err);
+    CHECK(security != nullptr);
+    PayloadSchema schema;
+    schema.name = "bounded-u8";
+    schema.max_size = 1;
+    schema.fields.push_back(SchemaFieldRule{"value", FieldKind::U8, 1, 1, 3, 1});
+    CHECK(security->register_schema(schema, err));
+    const std::uint8_t valid[] = {2};
+    const std::uint8_t invalid[] = {9};
+    CHECK(security->validate("bounded-u8", valid, sizeof(valid), err));
+    CHECK(!security->validate("bounded-u8", invalid, sizeof(invalid), err));
+
+    CHECK(security->advance_window(1000));
+    CHECK(security->observe_incoming(7, 2));
+    CHECK(security->observe_incoming(7, 2));
+    CHECK(!security->observe_incoming(7, 2));
+    CHECK(security->dropped_spam() == 1);
+    CHECK(security->amplification_ok(7, 2, 4));
+    CHECK(!security->amplification_ok(7, 2, 5));
+    CHECK(security->dropped_amplification() == 1);
+
+    const std::uint8_t payload[] = {1, 2, 3};
+    std::uint64_t seq1 = 0;
+    std::uint64_t seq2 = 0;
+    std::uint64_t seq3 = 0;
+    CHECK(security->journal_record("one", payload, sizeof(payload), 10, seq1, err));
+    CHECK(security->journal_record("two", payload, sizeof(payload), 11, seq2, err));
+    CHECK(security->journal_record("three", payload, sizeof(payload), 12, seq3, err));
+    CHECK(seq1 == 1 && seq2 == 2 && seq3 == 3);
+    CHECK(security->journal_size() == 2);
+    const auto retained = security->journal_since(0);
+    CHECK(retained.size() == 2);
+    CHECK(retained[0].sequence == 2);
+    CHECK(retained[1].sequence == 3);
+    std::vector<std::uint64_t> replayed;
+    CHECK(security->replay(1, [&](const JournalEntry& entry) {
+        replayed.push_back(entry.sequence);
+    }) == 2);
+    CHECK(replayed.size() == 2);
+    CHECK(replayed[0] == 2 && replayed[1] == 3);
+
+    CHECK(security->reset(err));
+    CHECK(security->journal_size() == 0);
+    CHECK(security->last_journal_sequence() == 0);
+    CHECK(security->dropped_spam() == 0);
+    CHECK(security->dropped_amplification() == 0);
+    std::cout << "[ival] PASS: replication security contract\n";
+}
+
+void test_plugin_permissions_contract() {
+    std::cout << "[ival] test_plugin_permissions_contract...\n";
+    using namespace engine::plugins;
+
+    auto permissions = create_plugin_permission_policy();
+    CHECK(permissions != nullptr);
+    CHECK(!permissions->is_granted("world.read", "integration-plugin"));
+    CHECK(permissions->grant("world.read", "integration-plugin"));
+    CHECK(!permissions->grant("world.read", "integration-plugin"));
+    CHECK(permissions->is_granted("world.read", "integration-plugin"));
+    const auto granted = permissions->evaluate("world.read", "integration-plugin");
+    CHECK(granted.allowed);
+    CHECK(granted.reason == "granted");
+    const auto decisions = permissions->evaluate_all(
+        "integration-plugin", {"world.read", "world.write"});
+    CHECK(decisions.size() == 2);
+    CHECK(decisions[0].allowed);
+    CHECK(!decisions[1].allowed);
+    CHECK(permissions->revoke("world.read", "integration-plugin"));
+    CHECK(!permissions->is_granted("world.read", "integration-plugin"));
+    CHECK(!permissions->revoke("world.read", "integration-plugin"));
+    std::cout << "[ival] PASS: plugin permissions contract\n";
+}
+
 int main() {
     std::cout << "=== Integration & Validation Tests (items 239, 249, 266, 268) ===\n\n";
 
@@ -456,6 +702,12 @@ int main() {
     test_hot_reload();
     test_plugin_fault_isolation();
     test_transaction_policy_comprehensive();
+    test_client_prediction_contract();
+    test_gameplay_phase_contract();
+    test_gameplay_cross_domain_contract();
+    test_render_provider_registry_contract();
+    test_replication_security_contract();
+    test_plugin_permissions_contract();
 
     std::cout << "\n=== Results: " << g_failures << " failures ===\n";
     if (g_failures > 0) {

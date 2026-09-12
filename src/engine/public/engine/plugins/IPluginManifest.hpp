@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -145,5 +146,22 @@ public:
     virtual const PluginRuntimeInfo* get_runtime_info(const std::string&) const = 0;
     virtual bool set_state(const std::string&, PluginState, std::string&) = 0;
 };
+
+/// Canonical serialization surface for `PluginManifest`.  It lives with the
+/// manifest model/manager so encode/decode and lifecycle metadata cannot drift
+/// into a second public contract.  IPluginManifestCodec.hpp remains a source
+/// compatibility include only.
+class IPluginManifestCodec {
+public:
+    virtual ~IPluginManifestCodec() = default;
+    virtual bool encode(const PluginManifest& manifest,
+                        std::string& encoded,
+                        std::string& error) const = 0;
+    virtual bool decode(const std::string& encoded,
+                        PluginManifest& manifest,
+                        std::string& error) const = 0;
+};
+
+std::unique_ptr<IPluginManifestCodec> create_plugin_manifest_codec();
 
 } // namespace engine::plugins

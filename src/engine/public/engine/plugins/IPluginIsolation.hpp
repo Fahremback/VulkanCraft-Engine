@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -193,5 +194,34 @@ public:
     /// Reseta o contador de memória (após GC ou unload).
     virtual void reset_usage(const std::string& plugin_name) = 0;
 };
+
+/// Host-level isolation authority. This manager owns the runtime slots used by
+/// the per-plugin `IPluginIsolation` views above: registration establishes the
+/// limits, begin/end_call account live execution, and unload tears the slot
+/// down. The old `IPluginIsolationRuntime` spelling is an alias below, not a
+/// second public interface.
+class IPluginIsolationManager {
+public:
+    virtual ~IPluginIsolationManager() = default;
+    virtual bool register_plugin(const std::string& plugin_name,
+                                 std::uint64_t timeout_ms,
+                                 std::uint64_t memory_limit_bytes,
+                                 std::string& error) = 0;
+    virtual bool begin_call(const std::string& plugin_name, std::string& error) = 0;
+    virtual bool end_call(const std::string& plugin_name,
+                          std::uint64_t elapsed_ms,
+                          std::uint64_t memory_bytes,
+                          std::string& error) = 0;
+    virtual bool cancel(const std::string& plugin_name, std::string& error) = 0;
+    [[nodiscard]] virtual bool healthy(const std::string& plugin_name) const = 0;
+    virtual bool unload(const std::string& plugin_name, std::string& error) = 0;
+};
+
+// Source-compatibility only. There is one host-manager contract and one
+// per-plugin isolation contract; this alias carries no independent vtable or
+// implementation and therefore cannot form a parallel runtime track.
+using IPluginIsolationRuntime = IPluginIsolationManager;
+
+std::unique_ptr<IPluginIsolationManager> create_plugin_isolation_runtime();
 
 }  // namespace engine::plugins

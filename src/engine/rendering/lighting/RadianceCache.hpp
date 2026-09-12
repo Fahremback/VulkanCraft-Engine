@@ -2,11 +2,13 @@
 
 #include "VulkanTypes.hpp"
 #include "RadianceCacheMath.hpp"
+#include "engine/rendering/IGlobalIlluminationProvider.hpp"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -37,6 +39,11 @@ public:
             std::numeric_limits<int32_t>::min(),
             std::numeric_limits<int32_t>::min(), -1
         };
+        // DDGI hit-distance moments: mean, mean-square, min and max distance.
+        // The material shader consumes these for leak rejection/parallax weight.
+        glm::vec4 depthMoments{ 0.0f };
+        // RGB = temporally filtered probe/RT reflection; A = hit distance.
+        glm::vec4 reflectionRadianceDistance{ 0.0f };
     };
 
     struct alignas(16) CascadeGpu {
@@ -128,6 +135,11 @@ private:
     glm::vec3 cachedSunColor_{ 1.0f };
     uint32_t sunRevision_{ 1 };
     bool metadataDirty_{ true };
+    std::unique_ptr<Engine::Rendering::IGlobalIlluminationProvider> canonicalGiProvider_;
+    std::uint64_t frameRevision_{ 0u };
+    std::uint64_t sceneRevision_{ 1u };
+    std::uint64_t lastSceneHash_{ 0u };
+    glm::ivec2 lastSceneAnchor_{ std::numeric_limits<int32_t>::max() };
 
     void create_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
                        VmaMemoryUsage memoryUsage, VmaAllocationCreateFlags flags,
@@ -139,12 +151,22 @@ private:
     ProbeGpu evaluate_probe(uint32_t cascadeIndex, const glm::ivec3& cell,
                             const glm::vec3& sunDirection, const glm::vec3& sunColor) const;
     void mark_dirty(uint32_t cascadeIndex, uint32_t globalSlot);
+    void update_canonical_gi(const glm::vec3& cameraPosition,
+                             const glm::vec3& sunDirection,
+                             const glm::vec3& sunColor,
+                             uint32_t probeBudgetOverride);
+    void update_reflection_field(const glm::vec3& cameraPosition,
+                                 const glm::vec3& sunDirection,
+                                 const glm::vec3& sunColor);
+    void update_scene_revision(const glm::vec3& cameraPosition);
 };
 
-static_assert(sizeof(RadianceCache::ProbeGpu) == 48);
+static_assert(sizeof(RadianceCache::ProbeGpu) == 80);
 static_assert(offsetof(RadianceCache::ProbeGpu, radianceVisibility) == 0);
 static_assert(offsetof(RadianceCache::ProbeGpu, directionConfidence) == 16);
 static_assert(offsetof(RadianceCache::ProbeGpu, worldCellCascade) == 32);
+static_assert(offsetof(RadianceCache::ProbeGpu, depthMoments) == 48);
+static_assert(offsetof(RadianceCache::ProbeGpu, reflectionRadianceDistance) == 64);
 static_assert(sizeof(RadianceCache::CascadeGpu) == 32);
 static_assert(sizeof(RadianceCache::MetadataGpu) == 32 + RadianceCache::MaxCascades * 32);
 static_assert(offsetof(RadianceCache::MetadataGpu, counts) == 0);

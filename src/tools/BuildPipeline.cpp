@@ -91,6 +91,40 @@ bool ensure_directory(const std::filesystem::path& path, std::string& message) {
     }
     return true;
 }
+
+bool copy_directory_tree(const std::filesystem::path& source,
+                         const std::filesystem::path& destination,
+                         std::string& message) {
+    if (!std::filesystem::is_directory(source)) {
+        message = "Source directory missing: " + source.string();
+        return false;
+    }
+    if (!ensure_directory(destination, message)) return false;
+
+    std::error_code ec;
+    for (std::filesystem::recursive_directory_iterator it(source, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        const auto relative = std::filesystem::relative(it->path(), source, ec);
+        if (ec) break;
+        const auto target = destination / relative;
+        if (it->is_directory()) {
+            std::filesystem::create_directories(target, ec);
+        } else if (it->is_regular_file()) {
+            std::filesystem::create_directories(target.parent_path(), ec);
+            if (!ec) {
+                std::filesystem::copy_file(it->path(), target,
+                                           std::filesystem::copy_options::overwrite_existing, ec);
+            }
+        }
+        if (ec) break;
+    }
+    if (ec) {
+        message = "Cannot copy directory tree from " + source.string() +
+                  " to " + destination.string() + " (" + ec.message() + ")";
+        return false;
+    }
+    return true;
+}
 } // namespace
 
 bool BuildPipeline::stage_validate(std::string& message) {
@@ -143,11 +177,56 @@ bool BuildPipeline::stage_import_assets(std::string& message) {
 bool BuildPipeline::stage_compile_shaders(std::string& message) {
     const std::filesystem::path shaderDir = config_.intermediate_path() / "shaders";
     if (!ensure_directory(shaderDir, message)) return false;
-    // Emit a manifest of compiled shader stages (the tool chain invokes glslc).
-    std::ofstream out(shaderDir / "shader_manifest.txt", std::ios::trunc);
-    out << "# shaders compiled for " << profile_name(config_.activeProfile) << "\n";
-    out << "standard_pbr.vert.spv\nstandard_pbr.frag.spv\nfullscreen.vert.spv\n";
-    message = "Compiled 3 shader permutations";
+
+    // The canonical shared build owns shader compilation. Packaging stages the
+    // exact SPIR-V bytes produced there; it must never fabricate a manifest that
+    // claims shaders were compiled when no .spv exists.
+    const std::filesystem::path canonicalShaderDir =
+        (config_.enginePath / "out" / "dev-shared" / "shaders").lexically_normal();
+    if (!std::filesystem::is_directory(canonicalShaderDir)) {
+        message = "Canonical compiled shader directory is missing: " +
+                  canonicalShaderDir.string();
+        return false;
+    }
+
+    std::ofstream manifest(shaderDir / "shader_manifest.txt", std::ios::trunc);
+    if (!manifest) {
+        message = "Cannot create shader manifest in " + shaderDir.string();
+        return false;
+    }
+    manifest << "# staged SPIR-V for " << profile_name(config_.activeProfile) << "\n";
+
+    std::error_code ec;
+    std::size_t copied = 0;
+    for (std::filesystem::recursive_directory_iterator it(canonicalShaderDir, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file() || it->path().extension() != ".spv") continue;
+        const auto relative = std::filesystem::relative(it->path(), canonicalShaderDir, ec);
+        if (ec) break;
+        const auto target = shaderDir / relative;
+        std::filesystem::create_directories(target.parent_path(), ec);
+        if (ec) break;
+        std::filesystem::copy_file(it->path(), target,
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) break;
+        manifest << relative.generic_string() << "\n";
+        ++copied;
+    }
+    if (ec) {
+        message = "Failed staging canonical shaders (" + ec.message() + ")";
+        return false;
+    }
+    if (copied == 0) {
+        message = "Canonical shader directory contains no SPIR-V files: " +
+                  canonicalShaderDir.string();
+        return false;
+    }
+    if (!manifest.good()) {
+        message = "Failed writing shader manifest in " + shaderDir.string();
+        return false;
+    }
+    message = "Staged " + std::to_string(copied) +
+              " canonical SPIR-V shaders from " + canonicalShaderDir.string();
     return true;
 }
 
@@ -190,43 +269,105 @@ bool BuildPipeline::stage_package_content(std::string& message) {
 bool BuildPipeline::stage_build_executable(std::string& message) {
     const std::filesystem::path binDir = config_.build_path() / "Binaries";
     if (!ensure_directory(binDir, message)) return false;
-    // In real flows this invokes CMake/MSBuild; here we produce the stub marker
-    // so the pipeline is complete and testable end to end.
-    std::ofstream out(binDir / (config_.name + ".exe"), std::ios::trunc);
-    out << "VC executable stub for " << config_.name << "\n";
-    message = "Built executable " + config_.name + ".exe";
+
+    // A project build may wrap the canonical engine build, but it must never
+    // manufacture an executable marker. The shared development tree is the
+    // single native build authority used by the editor/MCP/certification flow.
+    const bool dedicated = config_.activeProfile == BuildProfile::Server ||
+                           config_.targetPlatform == TargetPlatform::DedicatedServer;
+#ifdef _WIN32
+    const char* canonicalName = dedicated ? "VulkanEngineServer.exe" : "VulkanEngineGame.exe";
+    const std::filesystem::path target = binDir / (config_.name + ".exe");
+#else
+    const char* canonicalName = dedicated ? "VulkanEngineServer" : "VulkanEngineGame";
+    const std::filesystem::path target = binDir / config_.name;
+#endif
+    const std::filesystem::path canonical =
+        (config_.enginePath / "out" / "dev-shared" / canonicalName).lexically_normal();
+    if (!std::filesystem::is_regular_file(canonical)) {
+        message = "Canonical native executable is missing: " + canonical.string() +
+                  ". Build the shared engine tree before packaging the project.";
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::copy_file(canonical, target,
+                               std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        message = "Cannot stage native executable from " + canonical.string() +
+                  " to " + target.string() + " (" + ec.message() + ")";
+        return false;
+    }
+    message = "Staged native executable " + target.filename().string() +
+              " from " + canonical.string();
     return true;
 }
 
 bool BuildPipeline::stage_copy_dependencies(std::string& message) {
     const std::filesystem::path binDir = config_.build_path() / "Binaries";
     if (!ensure_directory(binDir, message)) return false;
-    // Runtime DLLs/libraries get copied next to the executable.
-    std::ofstream out(binDir / "deps.txt", std::ios::trunc);
-    out << "vulkan-1.dll\nglfw3.dll\nminiaudio (static)\n";
-    message = "Copied runtime dependencies to " + binDir.string();
+
+    const std::filesystem::path canonicalBin =
+        (config_.enginePath / "out" / "dev-shared").lexically_normal();
+    if (!std::filesystem::is_directory(canonicalBin)) {
+        message = "Canonical binary directory is missing: " + canonicalBin.string();
+        return false;
+    }
+
+    std::error_code ec;
+    std::size_t copied = 0;
+    for (std::filesystem::directory_iterator it(canonicalBin, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file()) continue;
+        const std::string ext = it->path().extension().string();
+        if (ext != ".dll" && ext != ".so" && ext != ".dylib") continue;
+        std::filesystem::copy_file(it->path(), binDir / it->path().filename(),
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) break;
+        ++copied;
+    }
+    if (ec) {
+        message = "Failed staging runtime dependencies from " + canonicalBin.string() +
+                  " (" + ec.message() + ")";
+        return false;
+    }
+    message = "Staged " + std::to_string(copied) +
+              " runtime dependencies beside the native executable";
     return true;
 }
 
 bool BuildPipeline::stage_generate_distributable(std::string& message) {
     const std::filesystem::path distDir = config_.build_path() / "Distributable";
-    if (!ensure_directory(distDir, message)) return false;
-    // Final distributable: content + binaries + a launch script.
-    const std::filesystem::path contentSrc = config_.build_path() / "Package";
-    const std::filesystem::path binariesSrc = config_.build_path() / "Binaries";
     std::error_code ec;
-    if (std::filesystem::is_directory(contentSrc)) {
-        std::filesystem::copy(contentSrc, distDir / "Content",
-                              std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
+    std::filesystem::remove_all(distDir, ec);
+    if (ec) {
+        message = "Cannot clear distributable directory: " + distDir.string() +
+                  " (" + ec.message() + ")";
+        return false;
     }
-    if (std::filesystem::is_directory(binariesSrc)) {
-        std::filesystem::copy(binariesSrc, distDir / "Binaries",
-                              std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
-    }
+    if (!ensure_directory(distDir, message)) return false;
+
+    // Final distributable: cooked content + package metadata + native binaries.
+    const std::filesystem::path contentSrc = config_.build_path() / "Content";
+    const std::filesystem::path packageSrc = config_.build_path() / "Package";
+    const std::filesystem::path binariesSrc = config_.build_path() / "Binaries";
+    if (!copy_directory_tree(contentSrc, distDir / "Content", message)) return false;
+    if (!copy_directory_tree(packageSrc, distDir / "Package", message)) return false;
+    if (!copy_directory_tree(binariesSrc, distDir / "Binaries", message)) return false;
+
     std::ofstream launch(distDir / "run_game.bat", std::ios::trunc);
+    if (!launch) {
+        message = "Cannot create distributable launcher: " +
+                  (distDir / "run_game.bat").string();
+        return false;
+    }
     launch << "@echo off\n";
     launch << "cd /d %~dp0\n";
     launch << "Binaries\\" << config_.name << ".exe\n";
+    if (!launch.good()) {
+        message = "Failed writing distributable launcher";
+        return false;
+    }
     message = "Generated distributable at " + distDir.string();
     return true;
 }

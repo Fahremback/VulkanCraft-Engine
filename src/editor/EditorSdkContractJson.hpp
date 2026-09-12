@@ -75,6 +75,17 @@ struct SdkContractStats {
     double audioMusic = 0.0;
     double audioSfx = 0.0;
     double audioGainDbMaster = 0.0;
+    // canonical plugin runtime (same services used by EnginePlugin lifecycle)
+    bool hasPlugins = false;
+    std::size_t pluginRuntimeCount = 0;
+    std::size_t pluginTypeCount = 0;
+    bool pluginRuntimeCoreLoaded = false;
+    bool pluginWorldReadGranted = false;
+    // canonical scripting bridge owned by IVisualScriptRuntime
+    bool hasScriptingBridge = false;
+    std::string scriptingBridgeContext;
+    bool scriptingBridgeCanQuery = false;
+    bool scriptingBridgeQueryOk = false;
 };
 
 // Builds the `/sdk-contracts` document exactly as the editor publishes it.

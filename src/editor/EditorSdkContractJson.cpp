@@ -90,6 +90,21 @@ std::string serialize_sdk_contract_json(const SdkContractStats& s) {
             { "gain_db_master", s.audioGainDbMaster },
         };
     }
+    if (s.hasPlugins) {
+        root["plugins"] = {
+            { "runtimeCount",     s.pluginRuntimeCount },
+            { "typeCount",        s.pluginTypeCount },
+            { "runtimeCoreLoaded", s.pluginRuntimeCoreLoaded },
+            { "worldReadGranted", s.pluginWorldReadGranted },
+        };
+    }
+    if (s.hasScriptingBridge) {
+        root["scriptingBridge"] = {
+            { "context",  s.scriptingBridgeContext },
+            { "canQuery", s.scriptingBridgeCanQuery },
+            { "queryOk",  s.scriptingBridgeQueryOk },
+        };
+    }
 
     return root.dump();
 }

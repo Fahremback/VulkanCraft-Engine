@@ -21,24 +21,6 @@ constexpr float kLumenHalfExtent = 0.5f;
 // is a cache, not a copy of the mesh).
 constexpr std::size_t kMaxLumenSurfacesPerChunk = 64;
 
-// B.4: a ChunkId is {coord.x:int, coord.z:int, generation:uint32}. The draw-
-// queue payload is a 64-bit integer, so the id is encoded faithfully in the
-// supported chunk range (±32767 within the current origin — far beyond any
-// streamed frontier): x|z each in 16 bits, generation in the low 32 bits.
-std::uint64_t encode_chunk_id(const ChunkId& id) noexcept {
-    const std::uint64_t cx = static_cast<std::uint32_t>(id.coord.x + 32768) & 0xFFFFu;
-    const std::uint64_t cz = static_cast<std::uint32_t>(id.coord.z + 32768) & 0xFFFFu;
-    return (cx << 48u) | (cz << 32u) | id.generation;
-}
-
-ChunkId decode_chunk_id(std::uint64_t payload) noexcept {
-    ChunkId id;
-    id.coord.x = static_cast<int>((payload >> 48u) & 0xFFFFu) - 32768;
-    id.coord.z = static_cast<int>((payload >> 32u) & 0xFFFFu) - 32768;
-    id.generation = static_cast<std::uint32_t>(payload & 0xFFFFFFFFu);
-    return id;
-}
-
 }  // namespace
 
 void WorldRenderer::configure(VkDevice device, VmaAllocator allocator) {
@@ -55,7 +37,7 @@ void WorldRenderer::begin_frame() {
     safe.clear();
     ++gpuEpoch_;
     if (drawQueues_) drawQueues_->clear();
-    farTerrain_.upload_ready(device_, allocator_, &retiredBuffers_[(gpuEpoch_ - 1) % FRAME_OVERLAP]);
+    farTerrain_.upload_ready(allocator_, retiredBuffers_[(gpuEpoch_ - 1) % FRAME_OVERLAP]);
 }
 
 void WorldRenderer::request_far_terrain(int centerChunkX, int centerChunkZ, int reachChunks,
@@ -68,11 +50,12 @@ void WorldRenderer::retire_chunk(ChunkId chunk) {
 }
 
 void WorldRenderer::upload_chunk(ChunkMeshResult result) {
-    chunkRenderer_.upload(std::move(result), device_, allocator_, &retiredBuffers_[(gpuEpoch_ - 1) % FRAME_OVERLAP]);
     // A.3: mesh->surface pass — feed the Lumen-style surface cache from the
     // REAL chunk mesh that was just uploaded, keyed by (chunk id, revision).
     // The scene replaces the chunk's cards incrementally (no global rebuild).
     if (lumenScene_ != nullptr && result.valid) feed_lumen_scene(result);
+    chunkRenderer_.upload(std::move(result), allocator_,
+                          retiredBuffers_[(gpuEpoch_ - 1) % FRAME_OVERLAP]);
 }
 
 void WorldRenderer::feed_lumen_scene(const ChunkMeshResult& result) {
@@ -137,7 +120,14 @@ void WorldRenderer::feed_lumen_scene(const ChunkMeshResult& result) {
 
 void WorldRenderer::cleanup(bool deviceAlreadyIdle) {
     farTerrainThreadPool_.wait_idle();
-    farTerrain_.cleanup(device_, allocator_, deviceAlreadyIdle);
+    // Shutdown owns one unconditional device-idle checkpoint when the caller
+    // has not already provided it. Previously the wait happened only inside
+    // FarTerrain::cleanup when FAR buffers existed, so a world containing only
+    // chunk/retired buffers could destroy resources that were still in flight.
+    if (!deviceAlreadyIdle && device_ != VK_NULL_HANDLE) {
+        VK_CHECK(vkDeviceWaitIdle(device_));
+    }
+    farTerrain_.cleanup(device_, allocator_, true);
     chunkRenderer_.cleanup(device_, allocator_, true);
     for (auto& list : retiredBuffers_) {
         for (const AllocatedBuffer& buffer : list) {
@@ -166,6 +156,8 @@ void WorldRenderer::collect_chunks_into_queue(const Frustum& frustum,
     visibleChunkCount_ = 0;
     culledChunkCount_ = 0;
     lodSplit_ = 0;
+    queuedChunkIds_.clear();
+    queuedChunkIds_.reserve(world_.chunks.size());
     for (const auto& [key, chunk] : world_.chunks) {
         if (chunk->state.load() != ChunkState::Uploaded || !world_.inside_stable_frontier(key)) continue;
         const glm::vec3 minimum(float(key.first * CHUNK_SIZE_X), 0.0f, float(key.second * CHUNK_SIZE_Z));
@@ -186,12 +178,18 @@ void WorldRenderer::collect_chunks_into_queue(const Frustum& frustum,
             lodSplit_ = sceneCulling_->selectLod(
                 std::sqrt(std::max(depth, 0.0f)));
         }
-        drawQueues_->push(queue, Engine::Rendering::SceneDrawItem{
-            encode_chunk_id(chunk->id()), depth, 0u });
+        const std::uint64_t payload = static_cast<std::uint64_t>(queuedChunkIds_.size());
+        queuedChunkIds_.push_back(chunk->id());
+        drawQueues_->push(queue, Engine::Rendering::SceneDrawItem{payload, depth, 0u});
     }
 }
 
-bool WorldRenderer::detail_chunk_visible(const Frustum& frustum, const glm::vec3& minimum,
+const ChunkId* WorldRenderer::queued_chunk(std::uint64_t payload) const noexcept {
+    if (payload >= queuedChunkIds_.size()) return nullptr;
+    return &queuedChunkIds_[static_cast<std::size_t>(payload)];
+}
+
+bool WorldRenderer::detail_chunk_visible(const glm::vec3& minimum,
                                          const glm::vec3& maximum, float depth) const {
     // B.4: conservative occlusion culling for the detail queues — a chunk fully
     // inside the frustum that is entirely behind a nearer opaque chunk is
@@ -220,7 +218,8 @@ void WorldRenderer::draw_details_unlocked(VkCommandBuffer commandBuffer, const F
     drawQueues_->clear();
     collect_chunks_into_queue(frustum, Engine::Rendering::DrawQueue::Opaque);
     for (const auto& item : drawQueues_->sorted(Engine::Rendering::DrawQueue::Opaque)) {
-        chunkRenderer_.draw(decode_chunk_id(item.payload), commandBuffer);
+        const ChunkId* id = queued_chunk(item.payload);
+        if (id != nullptr) chunkRenderer_.draw(*id, commandBuffer);
     }
 }
 
@@ -276,13 +275,15 @@ void WorldRenderer::draw_grass(VkCommandBuffer commandBuffer, const Frustum& fru
     occludedDetailCount_ = 0;
     collect_chunks_into_queue(frustum, Engine::Rendering::DrawQueue::Foliage);
     for (const auto& item : drawQueues_->sorted(Engine::Rendering::DrawQueue::Foliage)) {
-        const ChunkId id = decode_chunk_id(item.payload);
+        const ChunkId* queuedId = queued_chunk(item.payload);
+        if (queuedId == nullptr) continue;
+        const ChunkId id = *queuedId;
         const auto it = world_.chunks.find({ id.coord.x, id.coord.z });
         if (it == world_.chunks.end()) continue;
         const glm::vec3 minimum(float(id.coord.x * CHUNK_SIZE_X), 0.0f, float(id.coord.z * CHUNK_SIZE_Z));
         const glm::vec3 maximum(float((id.coord.x + 1) * CHUNK_SIZE_X), float(it->second->vertical_render_extent()),
                                 float((id.coord.z + 1) * CHUNK_SIZE_Z));
-        if (!detail_chunk_visible(frustum, minimum, maximum, item.depth)) continue;
+        if (!detail_chunk_visible(minimum, maximum, item.depth)) continue;
         chunkRenderer_.draw_grass(id, commandBuffer);
     }
 }
@@ -295,13 +296,15 @@ void WorldRenderer::draw_foliage(VkCommandBuffer commandBuffer, const Frustum& f
     occludedDetailCount_ = 0;
     collect_chunks_into_queue(frustum, Engine::Rendering::DrawQueue::Foliage);
     for (const auto& item : drawQueues_->sorted(Engine::Rendering::DrawQueue::Foliage)) {
-        const ChunkId id = decode_chunk_id(item.payload);
+        const ChunkId* queuedId = queued_chunk(item.payload);
+        if (queuedId == nullptr) continue;
+        const ChunkId id = *queuedId;
         const auto it = world_.chunks.find({ id.coord.x, id.coord.z });
         if (it == world_.chunks.end()) continue;
         const glm::vec3 minimum(float(id.coord.x * CHUNK_SIZE_X), 0.0f, float(id.coord.z * CHUNK_SIZE_Z));
         const glm::vec3 maximum(float((id.coord.x + 1) * CHUNK_SIZE_X), float(it->second->vertical_render_extent()),
                                 float((id.coord.z + 1) * CHUNK_SIZE_Z));
-        if (!detail_chunk_visible(frustum, minimum, maximum, item.depth)) continue;
+        if (!detail_chunk_visible(minimum, maximum, item.depth)) continue;
         chunkRenderer_.draw_foliage(id, commandBuffer);
     }
 }
@@ -316,6 +319,7 @@ void WorldRenderer::draw_water(VkCommandBuffer commandBuffer, const Frustum& fru
     collect_chunks_into_queue(frustum, Engine::Rendering::DrawQueue::Water);
     farTerrain_.draw_water(commandBuffer);
     for (const auto& item : drawQueues_->sorted(Engine::Rendering::DrawQueue::Water)) {
-        chunkRenderer_.draw_water(decode_chunk_id(item.payload), commandBuffer);
+        const ChunkId* id = queued_chunk(item.payload);
+        if (id != nullptr) chunkRenderer_.draw_water(*id, commandBuffer);
     }
 }

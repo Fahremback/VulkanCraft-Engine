@@ -2,6 +2,7 @@
 
 #include "../core/uuid/UUID.hpp"
 
+#include <atomic>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -56,6 +57,7 @@ public:
     [[nodiscard]] std::optional<UUID> find_id(const std::filesystem::path& sourcePath) const;
     [[nodiscard]] std::vector<AssetMetadata> snapshot() const;
     [[nodiscard]] size_t size() const;
+    [[nodiscard]] uint64_t revision() const noexcept { return revision_.load(std::memory_order_relaxed); }
     [[nodiscard]] bool save(const std::filesystem::path& databasePath) const;
     [[nodiscard]] bool load(const std::filesystem::path& databasePath);
     [[nodiscard]] bool set_dependencies(UUID asset, std::vector<UUID> dependencies);
@@ -69,6 +71,7 @@ private:
     std::unordered_map<UUID, AssetMetadata> assets_;
     std::unordered_map<std::string, UUID> pathToId_;
     std::unordered_map<UUID, std::vector<UUID>> dependencies_;
+    std::atomic<uint64_t> revision_{0};
 };
 
 struct ImportRequest {

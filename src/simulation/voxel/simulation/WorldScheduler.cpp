@@ -3,10 +3,14 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <tuple>
 #include <utility>
 
 namespace {
+constexpr std::uint64_t kSimulationFarmSampleStride = 4;
+constexpr std::uint64_t kSimulationFarmCheckStride = 32;
+
 // Deterministic coordinate ordering shared by every phase: (x, y, z) ascending.
 bool coord_less(const TickCell& a, const TickCell& b) {
     return std::tie(a.x, a.y, a.z) < std::tie(b.x, b.y, b.z);
@@ -342,6 +346,91 @@ void WorldScheduler::run_tick() {
     run_phase(Phase::FluidTick);
     run_scheduled_phase();
     run_neighbor_phase();
+    observe_simulation_farm_watchdog();
+}
+
+bool WorldScheduler::has_actionable_pending() const {
+    for (const auto& [cell, priority] : blockPending_) {
+        (void)priority;
+        if (is_active(cell)) return true;
+    }
+    for (const TickChunk& chunk : randomChunks_) {
+        if (is_active(TickCell{ chunk.x * chunkSize_, 0,
+                                chunk.z * chunkSize_ })) {
+            return true;
+        }
+    }
+    for (const TickCell& cell : fluidPending_) {
+        if (is_active(cell)) return true;
+    }
+    for (const auto& [cell, deadline] : scheduledPending_) {
+        if (deadline <= tick_ && is_active(cell)) return true;
+    }
+    for (const TickCell& cell : neighborCenters_) {
+        if (is_active(cell)) return true;
+    }
+    return false;
+}
+
+void WorldScheduler::observe_simulation_farm_watchdog() {
+    // Keep the live path cheap: sample once every four fixed ticks and only
+    // while there is work that is eligible to run now. Sleeping cells and
+    // future scheduled deadlines are legitimate waits, not softlocks.
+    if ((tick_ % kSimulationFarmSampleStride) != 0) return;
+    if (!has_actionable_pending()) {
+        simulationFarmSampleHead_ = 0;
+        simulationFarmSampleCount_ = 0;
+        return;
+    }
+
+    SimulationFarmWatchdogSample sample;
+    sample.pending = pending_count();
+    for (std::size_t i = 0; i < sample.executed.size(); ++i) {
+        sample.executed[i] = executed_[i];
+    }
+
+    if (simulationFarmSampleCount_ < kSimulationFarmWindow) {
+        const std::size_t index =
+            (simulationFarmSampleHead_ + simulationFarmSampleCount_) %
+            kSimulationFarmWindow;
+        simulationFarmSamples_[index] = sample;
+        ++simulationFarmSampleCount_;
+    } else {
+        simulationFarmSamples_[simulationFarmSampleHead_] = sample;
+        simulationFarmSampleHead_ =
+            (simulationFarmSampleHead_ + 1) % kSimulationFarmWindow;
+    }
+
+    if (simulationFarmSampleCount_ < kSimulationFarmWindow ||
+        (tick_ % kSimulationFarmCheckStride) != 0) {
+        return;
+    }
+
+    const SimulationFarmWatchdogHook hook = simulation_farm_watchdog_hook();
+    if (hook == nullptr) return;  // SDK intentionally absent (isolated runtime).
+
+    std::array<SimulationFarmWatchdogSample, kSimulationFarmWindow> ordered{};
+    for (std::size_t i = 0; i < kSimulationFarmWindow; ++i) {
+        ordered[i] = simulationFarmSamples_[
+            (simulationFarmSampleHead_ + i) % kSimulationFarmWindow];
+    }
+
+    SimulationFarmWatchdogResult result = hook(ordered.data(), ordered.size());
+    ++simulationFarmChecks_;
+    simulationFarmReportJson_ = std::move(result.reportJson);
+    simulationFarmError_ = std::move(result.error);
+    simulationFarmHealthy_ = result.ok && !result.finding;
+
+    if (!simulationFarmHealthy_ && !simulationFarmFindingReported_) {
+        std::cerr << "[SimulationFarm] live scheduler watchdog: "
+                  << (simulationFarmError_.empty()
+                          ? "actionable queue stopped making progress"
+                          : simulationFarmError_)
+                  << '\n';
+        simulationFarmFindingReported_ = true;
+    } else if (simulationFarmHealthy_) {
+        simulationFarmFindingReported_ = false;
+    }
 }
 
 void WorldScheduler::run_phase(Phase phase) {

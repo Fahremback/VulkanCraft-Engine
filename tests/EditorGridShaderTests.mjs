@@ -65,6 +65,25 @@ assert.match(
 // These regex assertions are the local-executable stand-in for the render
 // capture; they FAIL if someone re-introduces per-vertex normalize / drops the
 // underside rejection.
+// A2-GRID-FLIP-NDC-Y (the "grade invertida" root cause): the unproject MUST
+// use +ndc.y — the SAME unflipped convention as the pick ray (viewport_mouse_dir:
+// ndcY = 1 - y*2, then invViewProj * vec4(ndcX, ndcY, ...)) and the mesh vertex
+// shader (gl_Position = push.mvp * pos). The earlier `-ndc.y` mirror sent every
+// grid ray to the vertically-mirrored screen position, drawing the whole plane
+// upside down against the entities ("nasce debaixo" / camera bugged on it). The
+// viewport is presented V-flipped (ImGui::Image uv (0,1)->(1,0), so displayed
+// top = NDC +1), which is exactly why the pick uses 1 - y*2 and the grid uses
+// +ndc.y: a re-introduced negate is a double flip and this assertion FAILS.
+assert.match(
+  vert,
+  /vec4\s*p\s*=\s*pc\.invViewProj\s*\*\s*vec4\(\s*ndc\.x\s*,\s*ndc\.y\s*,\s*clipZ\s*,\s*1\.0\s*\)\s*;/,
+  "A2-GRID-FLIP-NDC-Y: unproject must use +ndc.y (no vertical mirror), the SAME convention as the pick ray"
+);
+assert.doesNotMatch(
+  vert,
+  /vec4\(\s*ndc\.x\s*,\s*-\s*ndc\.y/,
+  "A2-GRID-FLIP-NDC-Y: the unproject must NEVER negate ndc.y — that mirror was the inversion bug"
+);
 assert.match(
   vert,
   /vec3\s+dir\s*=\s*farWorld\s*-\s*nearPoint\s*;/,

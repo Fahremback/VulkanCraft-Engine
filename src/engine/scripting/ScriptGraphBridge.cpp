@@ -1,7 +1,12 @@
 #include "ScriptGraphBridge.hpp"
+#include "engine/core/serialization/JsonMini.hpp"
+#include "engine/entity/IEntityWorld.hpp"
 
 #include <algorithm>
 #include <cstdint>
+#include <set>
+#include <sstream>
+#include <unordered_set>
 
 namespace Engine {
 
@@ -232,3 +237,391 @@ ScriptGraphAsset from_visual_graph(const VisualScriptGraph& graph, const ScriptG
 }
 
 } // namespace Engine
+
+namespace engine::scripting {
+namespace {
+
+using engine::entity::ComponentData;
+using engine::entity::EntityId;
+using engine::entity::Health;
+using engine::entity::IEntityWorld;
+using engine::entity::Position;
+
+BridgeResult ok(std::string data = {}) { return {true, {}, std::move(data)}; }
+BridgeResult fail(std::string error) { return {false, std::move(error), {}}; }
+
+std::string handle_string(EntityId id) {
+    return std::to_string(id.id) + ":" + std::to_string(id.generation);
+}
+
+bool parse_handle(const std::string& value, EntityId& out) {
+    const auto colon = value.find(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= value.size()) return false;
+    try {
+        const auto id = std::stoul(value.substr(0, colon));
+        const auto generation = std::stoul(value.substr(colon + 1));
+        if (id == 0 || id > 0xFFFFFFFFull || generation > 0xFFFFFFFFull) return false;
+        out = {static_cast<std::uint32_t>(id), static_cast<std::uint32_t>(generation)};
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool parse_object(const std::string& data, Engine::Json::Value& out, std::string& error) {
+    out = Engine::Json::parse(data, &error);
+    return error.empty() && out.is_object();
+}
+
+std::string position_json(const Position& p) {
+    Engine::Json::Value value = Engine::Json::Value::make_object();
+    value["x"] = static_cast<double>(p.x);
+    value["y"] = static_cast<double>(p.y);
+    value["z"] = static_cast<double>(p.z);
+    return Engine::Json::stringify(value);
+}
+
+std::string health_json(const Health& h) {
+    Engine::Json::Value value = Engine::Json::Value::make_object();
+    value["value"] = static_cast<double>(h.value);
+    value["max"] = static_cast<double>(h.max);
+    return Engine::Json::stringify(value);
+}
+
+void shallow_merge(Engine::Json::Value& target, const Engine::Json::Value& patch) {
+    for (const auto& [key, value] : patch.object()) target[key] = value;
+}
+
+class EcsScriptingBridge final : public IScriptingBridge, public IScriptingBridgeBatch {
+public:
+    EcsScriptingBridge(IEntityWorld& world, EcsScriptingBridgeConfig config)
+        : world_(world), config_(std::move(config)), permissions_(config_.permissions.begin(), config_.permissions.end()) {
+        if (config_.context_id.empty()) config_.context_id = "runtime.scripting";
+        if (config_.spawn_type.empty()) config_.spawn_type = "script.entity";
+    }
+
+    const std::string& context_id() const override { return config_.context_id; }
+    bool has_permission(BridgePermission permission) const override {
+        return permissions_.count(permission) != 0;
+    }
+
+    BridgeResult read_component(const EntityHandle& entity, const std::string& type) const override {
+        if (!has_permission(BridgePermission::ReadComponents)) return fail("permission:read_components");
+        EntityId id{};
+        if (!parse_live(entity, id)) return fail("not_found:entity");
+        if (type == "Position" || type == "Transform") {
+            Position p{};
+            return world_.get_position(id, p) ? ok(position_json(p)) : fail("not_found:Position");
+        }
+        if (type == "Health") {
+            Health h{};
+            return world_.get_health(id, h) ? ok(health_json(h)) : fail("not_found:Health");
+        }
+        ComponentData component;
+        if (!world_.get_component(id, type, component)) return fail("not_found:" + type);
+        return ok(component.blob);
+    }
+
+    BridgeResult list_components(const EntityHandle& entity) const override {
+        if (!has_permission(BridgePermission::ReadComponents)) return fail("permission:read_components");
+        EntityId id{};
+        if (!parse_live(entity, id)) return fail("not_found:entity");
+        Engine::Json::Value array = Engine::Json::Value::make_array();
+        array.push("Position");
+        array.push("Health");
+        world_.for_each_component(id, [&](const ComponentData& c) { array.push(c.type); });
+        return ok(Engine::Json::stringify(array));
+    }
+
+    BridgeResult write_component(const EntityHandle& entity, const std::string& type,
+                                 const std::string& data) override {
+        if (!has_permission(BridgePermission::WriteComponents)) return fail("permission:write_components");
+        if (type.empty()) return fail("invalid:component_type");
+        EntityId id{};
+        if (!parse_live(entity, id)) return fail("not_found:entity");
+        std::string parseError;
+        Engine::Json::Value patch;
+        if (!parse_object(data, patch, parseError)) return fail("invalid:json:" + parseError);
+
+        if (type == "Position" || type == "Transform") {
+            Position p{};
+            if (!world_.get_position(id, p)) return fail("not_found:Position");
+            for (const auto& [key, value] : patch.object()) {
+                if (!value.is_number()) return fail("invalid:Position." + key);
+                if (key == "x") p.x = static_cast<float>(value.as_number());
+                else if (key == "y") p.y = static_cast<float>(value.as_number());
+                else if (key == "z") p.z = static_cast<float>(value.as_number());
+                else return fail("invalid:Position." + key);
+            }
+            return world_.set_position(id, p) ? ok(position_json(p)) : fail("runtime:set_position");
+        }
+        if (type == "Health") {
+            Health h{};
+            if (!world_.get_health(id, h)) return fail("not_found:Health");
+            for (const auto& [key, value] : patch.object()) {
+                if (!value.is_number()) return fail("invalid:Health." + key);
+                if (key == "value") h.value = static_cast<float>(value.as_number());
+                else if (key == "max") h.max = static_cast<float>(value.as_number());
+                else return fail("invalid:Health." + key);
+            }
+            if (h.max < 0.0f || h.value < 0.0f || h.value > h.max) return fail("invalid:Health.range");
+            return world_.set_health(id, h) ? ok(health_json(h)) : fail("runtime:set_health");
+        }
+
+        Engine::Json::Value merged = Engine::Json::Value::make_object();
+        ComponentData current;
+        if (world_.get_component(id, type, current) && !current.blob.empty()) {
+            std::string existingError;
+            auto existing = Engine::Json::parse(current.blob, &existingError);
+            if (existingError.empty() && existing.is_object()) merged = std::move(existing);
+        }
+        shallow_merge(merged, patch);
+        ComponentData component{type, current.version == 0 ? 1u : current.version,
+                                Engine::Json::stringify(merged)};
+        return world_.set_component(id, component) ? ok(component.blob) : fail("runtime:set_component");
+    }
+
+    BridgeResult remove_component(const EntityHandle& entity, const std::string& type) override {
+        if (!has_permission(BridgePermission::WriteComponents)) return fail("permission:write_components");
+        EntityId id{};
+        if (!parse_live(entity, id)) return fail("not_found:entity");
+        if (type == "Position" || type == "Transform" || type == "Health") return fail("invalid:builtin_component");
+        return world_.remove_component(id, type) ? ok() : fail("runtime:remove_component");
+    }
+
+    BridgeResult spawn_entity() override {
+        if (!has_permission(BridgePermission::SpawnEntities)) return fail("permission:spawn_entities");
+        std::string error;
+        const EntityId id = world_.spawn(config_.spawn_type, Position{}, error);
+        if (!id.valid()) return fail("runtime:spawn:" + error);
+        return ok("\"" + handle_string(id) + "\"");
+    }
+
+    BridgeResult destroy_entity(const EntityHandle& entity) override {
+        if (!has_permission(BridgePermission::DestroyEntities)) return fail("permission:destroy_entities");
+        EntityId id{};
+        if (!parse_live(entity, id)) return fail("not_found:entity");
+        return world_.despawn(id) ? ok() : fail("runtime:despawn");
+    }
+
+    BridgeResult query_entities(const EntityQuery& query) const override {
+        if (!has_permission(BridgePermission::QueryEntities)) return fail("permission:query_entities");
+        Engine::Json::Value array = Engine::Json::Value::make_array();
+        std::uint32_t count = 0;
+        world_.for_each_entity([&](EntityId id) {
+            if (query.limit != 0 && count >= query.limit) return;
+            for (const auto& type : query.required_components) if (!has_component(id, type)) return;
+            for (const auto& type : query.excluded_components) if (has_component(id, type)) return;
+            array.push(handle_string(id));
+            ++count;
+        });
+        return ok(Engine::Json::stringify(array));
+    }
+
+    BridgeResult send_event(const std::string& eventType, const std::string& data) override {
+        if (!has_permission(BridgePermission::SendEvents)) return fail("permission:send_events");
+        if (eventType.empty()) return fail("invalid:event_type");
+        std::string parseError;
+        (void)Engine::Json::parse(data, &parseError);
+        if (!parseError.empty()) return fail("invalid:event_json:" + parseError);
+        if (config_.event_sink) {
+            std::string error;
+            if (!config_.event_sink(eventType, data, error)) return fail("runtime:event:" + error);
+        }
+        ++eventsSent_;
+        return ok("{\"sequence\":" + std::to_string(eventsSent_) + "}");
+    }
+
+    BridgeResult list_component_types() const override {
+        if (!has_permission(BridgePermission::ReadComponents)) return fail("permission:read_components");
+        std::set<std::string> types{"Health", "Position"};
+        for (const auto& [name, schema] : config_.component_schemas) { (void)schema; types.insert(name); }
+        world_.for_each_entity([&](EntityId id) {
+            world_.for_each_component(id, [&](const ComponentData& c) { types.insert(c.type); });
+        });
+        Engine::Json::Value array = Engine::Json::Value::make_array();
+        for (const auto& type : types) array.push(type);
+        return ok(Engine::Json::stringify(array));
+    }
+
+    BridgeResult get_component_schema(const std::string& type) const override {
+        if (!has_permission(BridgePermission::ReadComponents)) return fail("permission:read_components");
+        if (type == "Position" || type == "Transform") {
+            return ok("{\"type\":\"object\",\"fields\":[\"x\",\"y\",\"z\"]}");
+        }
+        if (type == "Health") {
+            return ok("{\"type\":\"object\",\"fields\":[\"value\",\"max\"]}");
+        }
+        const auto found = config_.component_schemas.find(type);
+        return found == config_.component_schemas.end() ? fail("not_found:schema") : ok(found->second);
+    }
+
+    BatchResult execute_batch(const std::vector<BatchOperation>& operations) override {
+        BatchResult result;
+        result.results.reserve(operations.size());
+
+        // Phase 1 is read-only and simulates entity/component existence in
+        // operation order. Once it succeeds, every ECS operation below is on
+        // a live handle with valid JSON/permissions, so the commit phase has
+        // no expected refusal and never needs a rollback that would recycle
+        // generational handles.
+        std::unordered_map<std::string, std::unordered_set<std::string>> state;
+        world_.for_each_entity([&](EntityId id) {
+            const std::string handle = handle_string(id);
+            auto& components = state[handle];
+            components.insert("Position");
+            components.insert("Transform");
+            components.insert("Health");
+            world_.for_each_component(id, [&](const ComponentData& component) {
+                components.insert(component.type);
+            });
+        });
+
+        auto preflight_fail = [&](std::string error) {
+            result.all_ok = false;
+            result.error = std::move(error);
+            return result;
+        };
+
+        for (const auto& operation : operations) {
+            switch (operation.kind) {
+                case BatchOperation::Kind::ReadComponent: {
+                    if (!has_permission(BridgePermission::ReadComponents))
+                        return preflight_fail("permission:read_components");
+                    const auto entity = state.find(operation.entity);
+                    if (entity == state.end()) return preflight_fail("not_found:entity");
+                    if (!entity->second.count(operation.component_type))
+                        return preflight_fail("not_found:" + operation.component_type);
+                    break;
+                }
+                case BatchOperation::Kind::WriteComponent: {
+                    if (!has_permission(BridgePermission::WriteComponents))
+                        return preflight_fail("permission:write_components");
+                    auto entity = state.find(operation.entity);
+                    if (entity == state.end()) return preflight_fail("not_found:entity");
+                    const auto validation = validate_write(operation.entity, operation.component_type,
+                                                           operation.data);
+                    if (!validation.ok) return preflight_fail(validation.error);
+                    entity->second.insert(operation.component_type == "Transform"
+                                              ? "Position" : operation.component_type);
+                    break;
+                }
+                case BatchOperation::Kind::RemoveComponent: {
+                    if (!has_permission(BridgePermission::WriteComponents))
+                        return preflight_fail("permission:write_components");
+                    auto entity = state.find(operation.entity);
+                    if (entity == state.end()) return preflight_fail("not_found:entity");
+                    if (operation.component_type == "Position" || operation.component_type == "Transform" ||
+                        operation.component_type == "Health")
+                        return preflight_fail("invalid:builtin_component");
+                    entity->second.erase(operation.component_type);
+                    break;
+                }
+                case BatchOperation::Kind::SpawnEntity:
+                    if (!has_permission(BridgePermission::SpawnEntities))
+                        return preflight_fail("permission:spawn_entities");
+                    break;
+                case BatchOperation::Kind::DestroyEntity: {
+                    if (!has_permission(BridgePermission::DestroyEntities))
+                        return preflight_fail("permission:destroy_entities");
+                    const auto entity = state.find(operation.entity);
+                    if (entity == state.end()) return preflight_fail("not_found:entity");
+                    state.erase(entity);
+                    break;
+                }
+                case BatchOperation::Kind::SendEvent: {
+                    if (!has_permission(BridgePermission::SendEvents))
+                        return preflight_fail("permission:send_events");
+                    if (operation.event_type.empty()) return preflight_fail("invalid:event_type");
+                    std::string parseError;
+                    (void)Engine::Json::parse(operation.data, &parseError);
+                    if (!parseError.empty()) return preflight_fail("invalid:event_json:" + parseError);
+                    // An arbitrary external callback cannot participate in an
+                    // ECS transaction. Refuse before mutation rather than
+                    // claiming atomicity across an irreversible side effect.
+                    if (config_.event_sink) return preflight_fail("atomic:external_event_sink");
+                    break;
+                }
+            }
+        }
+
+        // Phase 2 commits only operations proven valid above.
+        for (const auto& operation : operations) {
+            BridgeResult item;
+            switch (operation.kind) {
+                case BatchOperation::Kind::ReadComponent:
+                    item = read_component(operation.entity, operation.component_type); break;
+                case BatchOperation::Kind::WriteComponent:
+                    item = write_component(operation.entity, operation.component_type, operation.data); break;
+                case BatchOperation::Kind::RemoveComponent:
+                    item = remove_component(operation.entity, operation.component_type); break;
+                case BatchOperation::Kind::SpawnEntity:
+                    item = spawn_entity(); break;
+                case BatchOperation::Kind::DestroyEntity:
+                    item = destroy_entity(operation.entity); break;
+                case BatchOperation::Kind::SendEvent:
+                    item = send_event(operation.event_type, operation.data); break;
+            }
+            result.results.push_back(item);
+            if (!item.ok) {
+                result.all_ok = false;
+                result.error = "commit_invariant:" + item.error;
+                return result;
+            }
+        }
+        result.all_ok = true;
+        return result;
+    }
+
+private:
+    BridgeResult validate_write(const EntityHandle& entity, const std::string& type,
+                                const std::string& data) const {
+        if (type.empty()) return fail("invalid:component_type");
+        EntityId id{};
+        if (!parse_live(entity, id)) return fail("not_found:entity");
+        std::string parseError;
+        Engine::Json::Value patch;
+        if (!parse_object(data, patch, parseError)) return fail("invalid:json:" + parseError);
+        if (type == "Position" || type == "Transform") {
+            for (const auto& [key, value] : patch.object()) {
+                if (!value.is_number() || (key != "x" && key != "y" && key != "z"))
+                    return fail("invalid:Position." + key);
+            }
+        } else if (type == "Health") {
+            Health health{};
+            if (!world_.get_health(id, health)) return fail("not_found:Health");
+            for (const auto& [key, value] : patch.object()) {
+                if (!value.is_number()) return fail("invalid:Health." + key);
+                if (key == "value") health.value = static_cast<float>(value.as_number());
+                else if (key == "max") health.max = static_cast<float>(value.as_number());
+                else return fail("invalid:Health." + key);
+            }
+            if (health.max < 0.0f || health.value < 0.0f || health.value > health.max)
+                return fail("invalid:Health.range");
+        }
+        return ok();
+    }
+
+    bool parse_live(const EntityHandle& handle, EntityId& id) const {
+        return parse_handle(handle, id) && world_.alive(id);
+    }
+    bool has_component(EntityId id, const std::string& type) const {
+        if (type == "Position" || type == "Transform" || type == "Health") return world_.alive(id);
+        ComponentData data;
+        return world_.get_component(id, type, data);
+    }
+
+    IEntityWorld& world_;
+    EcsScriptingBridgeConfig config_;
+    std::unordered_set<BridgePermission> permissions_;
+    std::uint64_t eventsSent_{0};
+};
+
+} // namespace
+
+std::unique_ptr<IScriptingBridge> create_ecs_scripting_bridge(
+    engine::entity::IEntityWorld& world, EcsScriptingBridgeConfig config) {
+    return std::make_unique<EcsScriptingBridge>(world, std::move(config));
+}
+
+} // namespace engine::scripting

@@ -24,8 +24,14 @@
 #include "EditorInternalHelpers.hpp"
 #include "EditorSdkContractJson.hpp"
 
+#include "../plugins/PluginContract.hpp"
+#include "engine/plugins/IPluginLoader.hpp"
+#include "engine/plugins/IPluginPermissions.hpp"
+#include "engine/plugins/IPluginTypeRegistry.hpp"
+#include "engine/scripting/IScriptingBridge.hpp"
 #include "engine/voxel/IVoxelBlockEntity.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -107,6 +113,50 @@ void EditorApplication::refresh_sdk_contract_runtimes() {
     // changed, so a failing factory or a hostile string can no longer emit
     // invalid JSON (no leading comma, no unescaped quote/backslash/newline).
     SdkContractStats stats;
+
+    // ---- canonical plugin runtime -----------------------------------------
+    // These are references to the SAME instances used by EnginePlugin::on_load
+    // in PluginContract.cpp. Reading them here makes loader, permission policy
+    // and type registry product consumers with a per-frame observable, without
+    // constructing a parallel plugin stack inside the editor.
+    engine::plugins::IPluginLoader* pluginLoader =
+        Engine::Plugins::product_plugin_loader();
+    engine::plugins::IPluginPermissionPolicy* pluginPermissions =
+        Engine::Plugins::product_plugin_permissions();
+    engine::plugins::IPluginTypeRegistry* pluginTypes =
+        Engine::Plugins::product_plugin_type_registry();
+    if (pluginLoader && pluginPermissions && pluginTypes) {
+        const auto runtimes = pluginLoader->runtime();
+        stats.hasPlugins = true;
+        stats.pluginRuntimeCount = runtimes.size();
+        stats.pluginTypeCount = pluginTypes->count();
+        stats.pluginRuntimeCoreLoaded = std::any_of(
+            runtimes.begin(), runtimes.end(), [](const auto& runtime) {
+                return runtime.manifest.name == "RuntimeCore" &&
+                       runtime.state == engine::plugins::PluginState::Loaded;
+            });
+        stats.pluginWorldReadGranted = pluginPermissions->is_granted(
+            engine::plugins::Permissions::kWorldRead, "RuntimeCore");
+    }
+
+    // ---- canonical IScriptingBridge ---------------------------------------
+    // The editor inspects the bridge owned by its live visual-script runtime;
+    // no second ECS/bridge is created. A real query proves the bridge reaches
+    // the runtime world and publishes the result through /sdk-contracts.
+    if (m_visualScriptRuntime) {
+        const engine::scripting::IScriptingBridge* bridge =
+            m_visualScriptRuntime->scripting_bridge();
+        if (bridge) {
+            engine::scripting::EntityQuery query;
+            query.limit = 1;
+            const auto result = bridge->query_entities(query);
+            stats.hasScriptingBridge = true;
+            stats.scriptingBridgeContext = bridge->context_id();
+            stats.scriptingBridgeCanQuery = bridge->has_permission(
+                engine::scripting::BridgePermission::QueryEntities);
+            stats.scriptingBridgeQueryOk = result.ok;
+        }
+    }
 
     // ---- 1. create_job_system (engine::jobs::IJobSystem) ------------------
     // Real job dispatch: each frame the editor submits a genuine unit of work

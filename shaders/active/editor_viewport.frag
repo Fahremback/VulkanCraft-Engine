@@ -13,10 +13,10 @@
 // the spot atlas (binding 2, one 90° tile per spot slot) and the point slot-0
 // face atlas (binding 3, six tiles with LINEAR depth = distance/range).
 //
-// BUG-EDITOR-GI-001: indirect ambient comes from the Agente 1 IProbeGrid core
-// (deterministic CPU capture) uploaded as a dense 8^3 irradiance array inside
-// EditorShadowUbo (binding 4). Trilinear + window-edge fade replaces the flat
-// 0.22 ambient; with GI disabled the constant reproduces the old look exactly.
+// BUG-EDITOR-GI-001 / CONTA2-GI-EDITOR-005: indirect ambient comes from the
+// canonical IGlobalIlluminationProvider DDGI core, uploaded as a dense 8^3
+// irradiance array inside EditorShadowUbo (binding 4). Trilinear + window-edge
+// fade replaces the flat 0.22 ambient; disabled GI reproduces the old look.
 //
 // SYNC: the EditorShadow block must mirror Editor::EditorShadowUbo
 // (EditorApplication.hpp) byte for byte, and the spot/face basis formulas

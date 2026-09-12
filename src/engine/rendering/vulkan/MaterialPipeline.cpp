@@ -1,16 +1,127 @@
 #include "engine/rendering/vulkan/MaterialPipeline.hpp"
 
 #include "engine/rendering/IShaderCompiler.hpp"
+#include "engine/rendering/ISpirvReflection.hpp"
 
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <sstream>
+#include <string_view>
 
 namespace Engine::Rendering {
 
 // ─── GLSL generation ───
 namespace {
+
+SpirvShaderStage reflected_stage(VkShaderStageFlagBits stage) noexcept {
+    switch (stage) {
+        case VK_SHADER_STAGE_VERTEX_BIT: return SpirvShaderStage::Vertex;
+        case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: return SpirvShaderStage::TessellationControl;
+        case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: return SpirvShaderStage::TessellationEvaluation;
+        case VK_SHADER_STAGE_GEOMETRY_BIT: return SpirvShaderStage::Geometry;
+        case VK_SHADER_STAGE_FRAGMENT_BIT: return SpirvShaderStage::Fragment;
+        case VK_SHADER_STAGE_COMPUTE_BIT: return SpirvShaderStage::Compute;
+        default: return SpirvShaderStage::Unknown;
+    }
+}
+
+std::optional<SpirvDescriptorType> reflected_descriptor_type(VkDescriptorType type) noexcept {
+    switch (type) {
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+            return SpirvDescriptorType::UniformBuffer;
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+            return SpirvDescriptorType::StorageBuffer;
+        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            return SpirvDescriptorType::SampledImage;
+        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+            return SpirvDescriptorType::StorageImage;
+        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+            return SpirvDescriptorType::CombinedImageSampler;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+            return SpirvDescriptorType::UniformTexelBuffer;
+        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+            return SpirvDescriptorType::StorageTexelBuffer;
+        case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+            return SpirvDescriptorType::InputAttachment;
+        default:
+            return std::nullopt;
+    }
+}
+
+const SpirvDescriptorBinding* find_binding(const SpirvReflection& reflection,
+                                           uint32_t set, uint32_t binding) noexcept {
+    for (const SpirvDescriptorSet& reflectedSet : reflection.sets) {
+        if (reflectedSet.set != set) continue;
+        for (const SpirvDescriptorBinding& reflectedBinding : reflectedSet.bindings) {
+            if (reflectedBinding.binding == binding) return &reflectedBinding;
+        }
+        break;
+    }
+    return nullptr;
+}
+
+const SpirvPipelineDescriptorBinding* find_layout_binding(
+    const SpirvPipelineInterfaceExpectation& expected,
+    uint32_t set, uint32_t binding) noexcept {
+    for (const SpirvPipelineDescriptorBinding& layoutBinding : expected.descriptorBindings) {
+        if (layoutBinding.set == set && layoutBinding.binding.binding == binding) {
+            return &layoutBinding;
+        }
+    }
+    return nullptr;
+}
+
+bool parse_material_descriptor_contract(const std::string& source,
+                                        SpirvPipelineInterfaceExpectation& expected,
+                                        std::string& error) {
+    constexpr std::string_view prefix = "// @vc_descriptor ";
+    std::istringstream lines(source);
+    std::string line;
+    bool found = false;
+    while (std::getline(lines, line)) {
+        if (!line.starts_with(prefix)) continue;
+        found = true;
+        std::istringstream declaration(line.substr(prefix.size()));
+        uint32_t set = 0;
+        uint32_t binding = 0;
+        uint32_t count = 0;
+        std::string type;
+        if (!(declaration >> set >> binding >> type >> count) || count == 0) {
+            error = "invalid embedded material descriptor contract";
+            return false;
+        }
+
+        VkDescriptorType vkType = VK_DESCRIPTOR_TYPE_MAX_ENUM;
+        if (type == "uniform_buffer") vkType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        else if (type == "combined_image_sampler") vkType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        else {
+            error = "unsupported embedded material descriptor type: " + type;
+            return false;
+        }
+
+        for (const SpirvPipelineDescriptorBinding& existing : expected.descriptorBindings) {
+            if (existing.set == set && existing.binding.binding == binding) {
+                error = "duplicate embedded material descriptor binding";
+                return false;
+            }
+        }
+
+        SpirvPipelineDescriptorBinding layoutBinding;
+        layoutBinding.set = set;
+        layoutBinding.binding.binding = binding;
+        layoutBinding.binding.descriptorType = vkType;
+        layoutBinding.binding.descriptorCount = count;
+        layoutBinding.binding.stageFlags = expected.stage;
+        expected.descriptorBindings.push_back(layoutBinding);
+    }
+    expected.validateDescriptorLayout = found;
+    expected.requireAllDescriptorBindings = found;
+    return true;
+}
 
 std::string_view glsl_type(MaterialValueType type) {
     switch (type) {
@@ -79,6 +190,7 @@ GlslGenerationResult material_graph_to_glsl(const MaterialGraph& graph) {
     out << "layout(location = 1) in vec3 vWorldPos;\n";
     out << "layout(location = 2) in vec3 vNormal;\n";
     out << "layout(location = 0) out vec4 outColor;\n\n";
+    out << "// @vc_descriptor 0 0 uniform_buffer 1\n";
     out << "layout(binding = 0) uniform MaterialParams {\n";
 
     // Collect exposed parameters as UBO members.
@@ -104,6 +216,7 @@ GlslGenerationResult material_graph_to_glsl(const MaterialGraph& graph) {
     for (size_t i = 0; i < textureNodes.size(); ++i) {
         const std::string name = "tex" + std::to_string(i);
         samplerNames[textureNodes[i]->id] = name;
+        out << "// @vc_descriptor 0 " << (i + 1) << " combined_image_sampler 1\n";
         out << "layout(binding = " << (i + 1) << ") uniform sampler2D " << name << ";\n";
     }
 
@@ -112,6 +225,7 @@ GlslGenerationResult material_graph_to_glsl(const MaterialGraph& graph) {
     // Matches LightUboData in MaterialPipeline.hpp — keep both layouts in sync.
     result.lightUboBinding = static_cast<uint32_t>(textureNodes.size()) + 1;
     result.shadowSamplerBinding = result.lightUboBinding + 1;
+    out << "// @vc_descriptor 0 " << result.lightUboBinding << " uniform_buffer 1\n";
     out << "layout(binding = " << result.lightUboBinding << ") uniform LightParams {\n";
     out << "    vec4 cameraPosition;\n";
     out << "    vec4 sunDirection;\n";
@@ -132,6 +246,8 @@ GlslGenerationResult material_graph_to_glsl(const MaterialGraph& graph) {
     out << "    vec4 sunCascadeSplits;\n";
     out << "    vec4 cameraForward;\n";
     out << "} lights;\n\n";
+    out << "// @vc_descriptor 0 " << result.shadowSamplerBinding
+        << " combined_image_sampler 1\n";
     out << "layout(binding = " << result.shadowSamplerBinding
         << ") uniform sampler2D shadowMap;\n\n";
 
@@ -359,7 +475,106 @@ MaterialGraph material_graph_from_pbr(const MaterialAsset& material) {
     return graph;
 }
 
+bool validate_spirv_pipeline_interface(
+    const std::vector<uint32_t>& spirv,
+    const SpirvPipelineInterfaceExpectation& expected,
+    std::string* error) {
+    auto fail = [&](std::string message) {
+        if (error) *error = std::move(message);
+        return false;
+    };
+    if (error) error->clear();
+    if (spirv.empty()) return fail("empty SPIR-V module");
+
+    std::string reflectionError;
+    std::unique_ptr<SpirvReflection> reflection = reflect_spirv_module(
+        spirv.data(), spirv.size(), reflectionError);
+    if (!reflection) return fail("SPIR-V reflection failed: " + reflectionError);
+
+    const SpirvShaderStage expectedStage = reflected_stage(expected.stage);
+    if (expectedStage == SpirvShaderStage::Unknown) {
+        return fail("unsupported Vulkan shader stage for SPIR-V validation");
+    }
+    if (reflection->stage != expectedStage) {
+        return fail("SPIR-V stage does not match requested pipeline stage");
+    }
+    if (reflection->entryPoint != expected.entryPoint) {
+        return fail("SPIR-V entry point '" + reflection->entryPoint +
+                    "' does not match pipeline entry point '" + expected.entryPoint + "'");
+    }
+
+    if (expected.validateDescriptorLayout) {
+        for (const SpirvDescriptorSet& reflectedSet : reflection->sets) {
+            for (const SpirvDescriptorBinding& reflectedBinding : reflectedSet.bindings) {
+                const SpirvPipelineDescriptorBinding* layoutBinding = find_layout_binding(
+                    expected, reflectedSet.set, reflectedBinding.binding);
+                if (!layoutBinding) {
+                    return fail("SPIR-V descriptor set " + std::to_string(reflectedSet.set) +
+                                " binding " + std::to_string(reflectedBinding.binding) +
+                                " is missing from the pipeline descriptor layout");
+                }
+                if ((layoutBinding->binding.stageFlags & expected.stage) == 0) {
+                    return fail("pipeline descriptor set " + std::to_string(reflectedSet.set) +
+                                " binding " + std::to_string(reflectedBinding.binding) +
+                                " is not visible to the reflected shader stage");
+                }
+                const std::optional<SpirvDescriptorType> layoutType =
+                    reflected_descriptor_type(layoutBinding->binding.descriptorType);
+                if (layoutType && reflectedBinding.type != SpirvDescriptorType::Other &&
+                    reflectedBinding.type != *layoutType) {
+                    return fail("pipeline descriptor type mismatch at set " +
+                                std::to_string(reflectedSet.set) + " binding " +
+                                std::to_string(reflectedBinding.binding));
+                }
+                if (reflectedBinding.count > 0 &&
+                    layoutBinding->binding.descriptorCount < reflectedBinding.count) {
+                    return fail("pipeline descriptor count is too small at set " +
+                                std::to_string(reflectedSet.set) + " binding " +
+                                std::to_string(reflectedBinding.binding));
+                }
+            }
+        }
+
+        if (expected.requireAllDescriptorBindings) {
+            // Generated material contracts are exact. Catch declarations that
+            // disappeared or changed before Vulkan descriptor creation.
+            for (const SpirvPipelineDescriptorBinding& layoutBinding : expected.descriptorBindings) {
+                if (!find_binding(*reflection, layoutBinding.set, layoutBinding.binding.binding)) {
+                    return fail("pipeline descriptor contract expects set " +
+                                std::to_string(layoutBinding.set) + " binding " +
+                                std::to_string(layoutBinding.binding.binding) +
+                                " but SPIR-V reflection did not report it");
+                }
+            }
+        }
+    }
+
+    if (expected.validatePushConstantLayout) {
+        for (const SpirvPushConstantBlock& block : reflection->pushConstants) {
+            bool covered = false;
+            const uint64_t blockEnd = static_cast<uint64_t>(block.offset) + block.size;
+            for (const VkPushConstantRange& range : expected.pushConstantRanges) {
+                const uint64_t rangeEnd = static_cast<uint64_t>(range.offset) + range.size;
+                if ((range.stageFlags & expected.stage) != 0 && range.offset <= block.offset &&
+                    rangeEnd >= blockEnd) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) {
+                return fail("reflected push-constant block is not covered by the pipeline layout");
+            }
+        }
+    }
+
+    return true;
+}
+
 std::vector<uint32_t> compile_glsl_to_spirv(const std::string& source, VkShaderStageFlagBits stage) {
+    if (stage != VK_SHADER_STAGE_VERTEX_BIT && stage != VK_SHADER_STAGE_FRAGMENT_BIT) {
+        std::cerr << "[MaterialPipeline] runtime GLSL compiler only accepts vertex/fragment stages\n";
+        return {};
+    }
     // The slang contract (C.15 IShaderCompiler) is the PRODUCT's shader
     // compilation path: every material-graph shader the engine compiles at
     // runtime goes through this public core (glslc + spirv-val), instead of a
@@ -378,7 +593,18 @@ std::vector<uint32_t> compile_glsl_to_spirv(const std::string& source, VkShaderS
                     : vc::rendering::ShaderStage::Fragment;
             std::vector<uint32_t> spirv = compiler->compile(
                 source.c_str(), shaderStage, config, compileError);
-            if (!spirv.empty()) return spirv;
+            SpirvPipelineInterfaceExpectation expected;
+            expected.stage = stage;
+            expected.entryPoint = "main";
+            std::string contractError;
+            if (!parse_material_descriptor_contract(source, expected, contractError)) {
+                std::cerr << "[MaterialPipeline] " << contractError << '\n';
+            } else {
+                std::string validationError;
+                if (validate_spirv_pipeline_interface(spirv, expected, &validationError)) return spirv;
+                std::cerr << "[MaterialPipeline] SPIR-V interface rejected module: "
+                          << validationError << '\n';
+            }
         }
     }
     // Legacy fallback: write the source to a temp file and invoke glslc.
@@ -409,6 +635,21 @@ std::vector<uint32_t> compile_glsl_to_spirv(const std::string& source, VkShaderS
     std::error_code ec;
     std::filesystem::remove(srcFile, ec);
     std::filesystem::remove(spvFile, ec);
+    SpirvPipelineInterfaceExpectation expected;
+    expected.stage = stage;
+    expected.entryPoint = "main";
+    std::string contractError;
+    if (!parse_material_descriptor_contract(source, expected, contractError)) {
+        std::cerr << "[MaterialPipeline] " << contractError << '\n';
+        spirv.clear();
+    } else {
+        std::string validationError;
+        if (!validate_spirv_pipeline_interface(spirv, expected, &validationError)) {
+            std::cerr << "[MaterialPipeline] SPIR-V interface rejected module: "
+                      << validationError << '\n';
+            spirv.clear();
+        }
+    }
     return spirv;
 }
 

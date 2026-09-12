@@ -1,14 +1,35 @@
 #include "ReliableTransport.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
 namespace Engine::Networking {
 
-ReliableTransport::ReliableTransport() : config_(Config{}) {}
+namespace {
 
-ReliableTransport::ReliableTransport(Config config) : config_(config) {}
+void apply_product_socket_override(ReliableTransport::Config& config) {
+    const char* configured = std::getenv("VC_RELIABLE_TRANSPORT");
+    if (!configured || !*configured) return;
+    std::string value(configured);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (value == "tcp") config.socketKind = SocketKind::Tcp;
+    else if (value == "udp") config.socketKind = SocketKind::Udp;
+}
+
+} // namespace
+
+ReliableTransport::ReliableTransport() : config_(Config{}) {
+    apply_product_socket_override(config_);
+}
+
+ReliableTransport::ReliableTransport(Config config) : config_(config) {
+    apply_product_socket_override(config_);
+}
 
 ReliableTransport::~ReliableTransport() {
     close();
@@ -41,7 +62,7 @@ bool ReliableTransport::listen(std::uint16_t port) {
     // then re-bind and restart under the lock.
     socket_.stop_receive();
     socket_.close();
-    if (!socket_.listen(port, SocketKind::Udp)) return false;
+    if (!socket_.listen(port, config_.socketKind)) return false;
     socket_.start_receive([this](Datagram datagram) {
         const auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(mutex_);
@@ -70,8 +91,10 @@ bool ReliableTransport::connect(const std::string& host, std::uint16_t port) {
     // state under the lock.
     socket_.stop_receive();
     socket_.close();
-    if (!socket_.listen(0, SocketKind::Udp)) return false;
-    if (!socket_.connect(host, port, SocketKind::Udp)) return false;
+    // SocketTransport::connect owns the client socket and binds an ephemeral
+    // UDP port itself; for TCP it performs the stream connect before switching
+    // to non-blocking steady-state.  One call therefore covers both backends.
+    if (!socket_.connect(host, port, config_.socketKind)) return false;
     socket_.start_receive([this](Datagram datagram) {
         const auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(mutex_);

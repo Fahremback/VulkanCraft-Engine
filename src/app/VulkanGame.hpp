@@ -8,6 +8,7 @@
 #include "engine/assets/GltfAssets.hpp"
 #include "engine/assets/RuntimePackage.hpp"
 #include "engine/rendering/vulkan/MaterialPipeline.hpp"
+#include "engine/rendering/ISpirvReflection.hpp"
 #include "engine/physics/PhysicsRuntime.hpp"
 #include "engine/physics/Ragdoll.hpp"
 #include "engine/animation/AnimationRuntime.hpp"

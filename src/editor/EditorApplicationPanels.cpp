@@ -1021,12 +1021,7 @@ void EditorApplication::draw_inspector_panel() {
         UI::sectionHeader(ICON_FA_CUBE, tr("Malha", "Mesh Renderer"));
         auto& mr = scene->meshRendererComponents[id];
         // Mesh asset picker (from the project asset registry).
-        std::vector<std::pair<UUID, std::string>> meshAssets;
-        for (const AssetMetadata& asset : m_assetRegistry.snapshot()) {
-            if (asset.type == AssetType::Mesh) {
-                meshAssets.emplace_back(asset.id, asset.sourcePath.filename().string());
-            }
-        }
+        const auto& meshAssets = m_meshAssetPickerCache;
         const std::string noneLabel = tr("(Nenhuma malha)", "(None)");
         const char* currentName = noneLabel.c_str();
         int currentIndex = -1;
@@ -1050,12 +1045,7 @@ void EditorApplication::draw_inspector_panel() {
             ImGui::EndCombo();
         }
         // Material asset picker: rendered on the mesh via a material-graph pipeline.
-        std::vector<std::pair<UUID, std::string>> materialAssets;
-        for (const AssetMetadata& asset : m_assetRegistry.snapshot()) {
-            if (asset.type == AssetType::Material) {
-                materialAssets.emplace_back(asset.id, asset.sourcePath.filename().string());
-            }
-        }
+        const auto& materialAssets = m_materialAssetPickerCache;
         const std::string matNoneLabel = tr("(Padrão)", "(Default)");
         const char* matCurrentName = matNoneLabel.c_str();
         int matCurrentIndex = -1;
@@ -1900,8 +1890,33 @@ void EditorApplication::draw_content_browser_panel() {
         default: break;
     }
 
-    AssetBrowserModel browser(m_assetRegistry);
-    std::vector<AssetMetadata> assets = browser.query(search, selectedType);
+    const uint64_t browserRevision = m_assetRegistry.revision();
+    const std::string browserSearch(search);
+    if (m_contentBrowserDirty || m_contentBrowserQueryRevision != browserRevision ||
+        m_contentBrowserQueryText != browserSearch || m_contentBrowserQueryFilter != typeFilter) {
+        std::string needle = browserSearch;
+        std::transform(needle.begin(), needle.end(), needle.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        m_contentBrowserQueryCache.clear();
+        m_contentBrowserQueryCache.reserve(m_assetRegistrySnapshotCache.size());
+        for (const AssetMetadata& asset : m_assetRegistrySnapshotCache) {
+            if (selectedType && asset.type != *selectedType) continue;
+            std::string searchable = asset.sourcePath.generic_string();
+            std::transform(searchable.begin(), searchable.end(), searchable.begin(),
+                           [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            if (!needle.empty() && searchable.find(needle) == std::string::npos) continue;
+            m_contentBrowserQueryCache.push_back(asset);
+        }
+        std::sort(m_contentBrowserQueryCache.begin(), m_contentBrowserQueryCache.end(),
+                  [](const AssetMetadata& a, const AssetMetadata& b) {
+                      return a.sourcePath.generic_string() < b.sourcePath.generic_string();
+                  });
+        m_contentBrowserQueryRevision = browserRevision;
+        m_contentBrowserQueryText = browserSearch;
+        m_contentBrowserQueryFilter = typeFilter;
+        m_contentBrowserDirty = false;
+    }
+    std::vector<AssetMetadata> assets = m_contentBrowserQueryCache;
     // .vblock sidecars are hidden plumbing: the PNG IS the block, so Block
     // assets never appear as cards (that would duplicate the texture).
     assets.erase(std::remove_if(assets.begin(), assets.end(), [](const AssetMetadata& candidate) {
@@ -1918,7 +1933,7 @@ void EditorApplication::draw_content_browser_panel() {
     }
     if (typeFilter == 8) {
         std::vector<UUID> roots;
-        for (const AssetMetadata& candidate : m_assetRegistry.snapshot())
+        for (const AssetMetadata& candidate : m_assetRegistrySnapshotCache)
             if (candidate.type == AssetType::Scene) roots.push_back(candidate.id);
         const std::vector<UUID> unused = m_assetRegistry.unused_assets(roots);
         const std::unordered_set<UUID> unusedSet(unused.begin(), unused.end());
@@ -2040,6 +2055,7 @@ void EditorApplication::draw_content_browser_panel() {
             }
         }
         if (ImGui::BeginPopupContextItem("AssetContext")) {
+            AssetBrowserModel browser{ m_assetRegistry };
             if (ImGui::MenuItem(tr("Duplicar", "Duplicate"))) {
                 std::filesystem::path duplicatePath = asset.sourcePath.parent_path() /
                     (asset.sourcePath.stem().string() + "_copy" + asset.sourcePath.extension().string());
@@ -2174,12 +2190,7 @@ void EditorApplication::draw_content_browser_panel() {
                     // Map pickers over the real cooked texture assets. Each
                     // output is driven by its map when present (texture), or
                     // by the PBR parameter above (constant) otherwise.
-                    std::vector<std::pair<UUID, std::string>> matTextureAssets;
-                    for (const AssetMetadata& tex : m_assetRegistry.snapshot()) {
-                        if (tex.type == AssetType::Texture && tex.isCooked) {
-                            matTextureAssets.emplace_back(tex.id, tex.sourcePath.filename().string());
-                        }
-                    }
+                    const auto& matTextureAssets = m_textureAssetPickerUuidCache;
                     const char* matNoneLabel = tr("(Nenhum)", "(None)");
                     const auto materialMapPicker = [&](const char* label, UUID& target) {
                         const std::string cur = target.is_valid() ? target.to_string() : std::string();
@@ -3036,12 +3047,8 @@ void EditorApplication::draw_console_panel() {
 
     // Real asset status from the registry.
     {
-        size_t cooked = 0;
-        for (const AssetMetadata& asset : m_assetRegistry.snapshot()) {
-            if (asset.isCooked) ++cooked;
-        }
         char assetMsg[256];
-        snprintf(assetMsg, sizeof(assetMsg), tr("[INFO] Registro de assets: %zu total, %zu cozidos", "[INFO] Asset registry: %zu total, %zu cooked"), m_assetRegistry.size(), cooked);
+        snprintf(assetMsg, sizeof(assetMsg), tr("[INFO] Registro de assets: %zu total, %zu cozidos", "[INFO] Asset registry: %zu total, %zu cooked"), m_assetRegistry.size(), m_assetRegistryCookedCount);
         ImGui::TextColored(ImVec4(0.20f, 0.82f, 0.60f, 1.0f), "%s", assetMsg);
     }
 
@@ -3053,10 +3060,55 @@ void EditorApplication::draw_console_panel() {
 // ===========================================================================
 
 std::vector<uint32_t> read_spv(const char* name) {
-    const std::string path = std::string(VULKANCRAFT_SHADER_DIR) + "/" + name;
-    std::ifstream in(path, std::ios::binary);
+    if (name == nullptr || *name == '\0') {
+        std::cerr << "[Editor] Refusing empty shader name" << std::endl;
+        return {};
+    }
+
+    const std::filesystem::path requested(name);
+    if (requested.has_parent_path() || requested.filename() != requested ||
+        requested.extension() != ".spv") {
+        std::cerr << "[Editor] Refusing non-canonical shader name: " << name << std::endl;
+        return {};
+    }
+
+    // The editor has exactly one runtime shader root. Resolve it before opening
+    // so the boot fingerprint names the file actually consumed with an absolute
+    // path rather than merely echoing the compile definition.
+    std::error_code pathError;
+    const std::filesystem::path absoluteRoot =
+        std::filesystem::absolute(std::filesystem::path(VULKANCRAFT_SHADER_DIR), pathError);
+    if (pathError) {
+        std::cerr << "[Editor] Cannot resolve shader root " << VULKANCRAFT_SHADER_DIR
+                  << ": " << pathError.message() << std::endl;
+        return {};
+    }
+    std::filesystem::path shaderRoot =
+        std::filesystem::weakly_canonical(absoluteRoot, pathError);
+    if (pathError) {
+        pathError.clear();
+        shaderRoot = absoluteRoot.lexically_normal();
+    }
+    const std::filesystem::path requestedPath = shaderRoot / requested;
+    std::filesystem::path loadedPath = std::filesystem::weakly_canonical(requestedPath, pathError);
+    if (pathError) {
+        pathError.clear();
+        loadedPath = std::filesystem::absolute(requestedPath, pathError).lexically_normal();
+    }
+    if (pathError) {
+        std::cerr << "[Editor] Cannot resolve shader path: " << requestedPath.string()
+                  << ": " << pathError.message() << std::endl;
+        return {};
+    }
+    if (loadedPath.parent_path() != shaderRoot) {
+        std::cerr << "[Editor] Refusing shader outside canonical root: "
+                  << loadedPath.string() << std::endl;
+        return {};
+    }
+
+    std::ifstream in(loadedPath, std::ios::binary);
     if (!in) {
-        std::cerr << "[Editor] Cannot read shader: " << path << std::endl;
+        std::cerr << "[Editor] Cannot read shader: " << loadedPath.string() << std::endl;
         return {};
     }
     in.seekg(0, std::ios::end);
@@ -3067,11 +3119,15 @@ std::vector<uint32_t> read_spv(const char* name) {
         return {};
     }
     std::vector<uint32_t> spirv(static_cast<size_t>(size) / 4);
-    in.read(reinterpret_cast<char*>(spirv.data()), size);
+    if (!in.read(reinterpret_cast<char*>(spirv.data()), size)) {
+        std::cerr << "[Editor] Short/incomplete SPIR-V read: "
+                  << loadedPath.string() << std::endl;
+        return {};
+    }
     // C6-GRID-ARTIFACT-001: log path + fingerprint of the SPIR-V tree the editor
     // ACTUALLY loaded, so certification can prove it executed the canonical
     // shader (out/dev-shared/shaders) and not a stale build/out/ag3 copy.
-    log_shader_fingerprint(name, path, spirv);
+    log_shader_fingerprint(name, loadedPath.string(), spirv);
     return spirv;
 }
 
@@ -3138,8 +3194,14 @@ VkPipeline create_scene_pipeline(VkDevice device, VkRenderPass renderPass, VkPip
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizer.depthBiasEnable = depthBias ? VK_TRUE : VK_FALSE;
     if (depthBias) {
-        // Push the grid slightly away so geometry sitting on the plane
-        // (y = 0) wins the depth test instead of z-fighting.
+        // NOTE (grid, 2026-08-30): this bias is INERT for the analytic grid —
+        // the grid fragment shader writes gl_FragDepth, which overrides the
+        // interpolated depth the bias is applied to (see BUG-EDITOR-GRID-003 in
+        // editor_grid.frag). The coplanar tie with geometry on the plane (Y=0)
+        // is actually resolved by the shader's ~10-ULP nudge TOWARD the camera
+        // (gridDepth -= gridDepth * 1.2e-6) so the GRID wins the LEQUAL tie
+        // deterministically. Do not "fix" this by removing that nudge expecting
+        // the bias to cover it — the bias never reaches a shader-written depth.
         rasterizer.depthBiasConstantFactor = 4.0f;
         rasterizer.depthBiasSlopeFactor = 1.0f;
         rasterizer.depthBiasClamp = 0.0f;

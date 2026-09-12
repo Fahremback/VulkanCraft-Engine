@@ -15,14 +15,15 @@ constexpr int kBaseHalfExtentBlocks = 128;
 // below one screen pixel on a 720p/70-degree reference view.  Coarser levels
 // still double progressively, but the smooth height-field is reserved for the
 // kilometre-scale horizon where individual blocks can no longer be resolved.
-// Vegetation is budgeted independently for every clipmap annulus.  A single
-// global counter made the inner grass exhaust the whole buffer, leaving a hard
-// vegetation cut exactly where the next LOD started.
-constexpr std::size_t kBaseGrassProxyVertices = 1'700'000u;
-constexpr std::size_t kFirstRingGrassProxyVertices = 2'200'000u;
-constexpr std::size_t kOuterRingGrassProxyVertices = 700'000u;
-constexpr std::size_t kBaseTreeProxyVertices = 360'000u;
-constexpr std::size_t kOuterRingTreeProxyVertices = 220'000u;
+// Vegetation density is selected independently for every clipmap annulus, but
+// the hard caps below apply to the complete rebuild. The old 1.7M/2.2M/0.7M
+// grass reserves could allocate and upload tens of MiB per terrain update.
+// Density is now reduced adaptively before emission instead of allowing a
+// multi-ring rebuild to accumulate another multi-million-vertex burst.
+constexpr std::size_t kGrassProxyMinVertices = 12'288u;
+constexpr std::size_t kGrassProxyHardCapVertices = 196'608u;
+constexpr std::size_t kTreeProxyMinVertices = 6'144u;
+constexpr std::size_t kTreeProxyHardCapVertices = 65'536u;
 constexpr float kFarVertexMarker = 2.0f;
 // Adjacent rings already have a watertight transition skirt. Offsetting every
 // level vertically produced a visible contour (and luminous water steps) at
@@ -346,9 +347,48 @@ void append_grass_proxy(std::vector<VoxelVertex>& output,
     const float v = 0.12f + hash_tree(cellX, cellZ, 73.0f) * 0.76f;
     const float x = cellX + u * static_cast<float>(spacing);
     const float z = cellZ + v * static_cast<float>(spacing);
+
+    // VIS-GRASS-002: on coarse rings the chosen card can be many blocks away
+    // from the south-west sample that admitted the cell. Re-sample the exact
+    // placement so grass cannot be inherited across a coarse cell onto water,
+    // rock, a non-grass biome or a steep/non-exposed source column.
+    const TerrainSample placementSample = TerrainGenerator::sample(x, z);
+    if (!has_grass_surface(placementSample)) return;
+
     const float southHeight = glm::mix(swHeight, seHeight, u);
     const float northHeight = glm::mix(nwHeight, neHeight, u);
-    const float y = glm::mix(southHeight, northHeight, v) + 0.012f;
+    const float renderedSurfaceY = glm::mix(southHeight, northHeight, v);
+    // swHeight already contains the per-ring terrain bias. Apply the same bias
+    // to the exact source column, then keep the card above BOTH representations:
+    // the rendered coarse surface and the actual solid terrain at its position.
+    const float terrainBias = static_cast<float>(sample.height + 1) - swHeight;
+    const float exactSurfaceY = static_cast<float>(placementSample.height + 1) - terrainBias;
+    const float centerSurfaceY = std::max(renderedSurfaceY, exactSurfaceY);
+
+    // VIS-GRASS-001: a biome tag alone does not prove that a plant card sits
+    // on an exposed top face. Reconstruct the local terrain tangent from the
+    // four rendered corners and reject cliff-like/downward support. The same
+    // tangent is then used for BOTH card endpoints, so a tuft follows a slope
+    // instead of cutting through the higher side of the ground plane.
+    const float inverseSpacing = 1.0f / static_cast<float>(std::max(1, spacing));
+    const float dHeightDx = ((seHeight - swHeight) + (neHeight - nwHeight)) *
+                            (0.5f * inverseSpacing);
+    const float dHeightDz = ((nwHeight - swHeight) + (neHeight - seHeight)) *
+                            (0.5f * inverseSpacing);
+    const glm::vec3 supportNormal = glm::normalize(
+        glm::vec3(-dHeightDx, 1.0f, -dHeightDz));
+    if (supportNormal.y < 0.35f) return;
+
+    constexpr float kPlantSurfaceClearance = 0.035f;
+    const auto support_height = [&](const glm::vec2& offset) {
+        const float renderedHeight = centerSurfaceY +
+            dHeightDx * offset.x + dHeightDz * offset.y;
+        const TerrainSample exactEndpoint = TerrainGenerator::sample(
+            x + offset.x, z + offset.y);
+        const float exactHeight =
+            static_cast<float>(exactEndpoint.height + 1) - terrainBias;
+        return std::max(renderedHeight, exactHeight) + kPlantSurfaceClearance;
+    };
 
     const float lod = std::clamp(std::log2(static_cast<float>(spacing)) / 5.0f,
                                  0.0f, 1.0f);
@@ -357,8 +397,8 @@ void append_grass_proxy(std::vector<VoxelVertex>& output,
     const float angle = hash_tree(cellX, cellZ, 74.0f) * 6.28318530718f;
     const glm::vec2 axis(std::cos(angle), std::sin(angle));
     const glm::vec2 halfAxis = axis * (width * 0.5f);
-    const glm::vec3 p0(x - halfAxis.x, y, z - halfAxis.y);
-    const glm::vec3 p1(x + halfAxis.x, y, z + halfAxis.y);
+    const glm::vec3 p0(x - halfAxis.x, support_height(-halfAxis), z - halfAxis.y);
+    const glm::vec3 p1(x + halfAxis.x, support_height( halfAxis), z + halfAxis.y);
     const glm::vec3 p2 = p1 + glm::vec3(0.0f, height, 0.0f);
     const glm::vec3 p3 = p0 + glm::vec3(0.0f, height, 0.0f);
     const glm::vec3 normal = glm::normalize(glm::vec3(-axis.y, 0.28f, axis.x));
@@ -386,8 +426,8 @@ void append_grass_proxy(std::vector<VoxelVertex>& output,
         output.size() + 12u <= vertexBudget) {
         const glm::vec2 secondAxis(-axis.y, axis.x);
         const glm::vec2 secondHalf = secondAxis * (width * 0.46f);
-        const glm::vec3 q0(x - secondHalf.x, y, z - secondHalf.y);
-        const glm::vec3 q1(x + secondHalf.x, y, z + secondHalf.y);
+        const glm::vec3 q0(x - secondHalf.x, support_height(-secondHalf), z - secondHalf.y);
+        const glm::vec3 q1(x + secondHalf.x, support_height( secondHalf), z + secondHalf.y);
         const glm::vec3 q2 = q1 + glm::vec3(0.0f, height * 0.94f, 0.0f);
         const glm::vec3 q3 = q0 + glm::vec3(0.0f, height * 0.94f, 0.0f);
         const glm::vec3 secondNormal = glm::normalize(
@@ -656,11 +696,21 @@ void append_tree_proxy(std::vector<VoxelVertex>& output,
 void append_triangle(std::vector<VoxelVertex>& output,
                      const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
                      BlockType material) {
-    glm::vec3 normal = glm::cross(b - a, c - a);
+    // Opaque terrain must have geometry winding and normals that agree. The
+    // previous helper flipped a downward normal without flipping the vertices,
+    // making the lighting look correct while back-face culling still rejected
+    // the triangle. Canonicalize upward terrain winding at the source.
+    glm::vec3 p0 = a;
+    glm::vec3 p1 = b;
+    glm::vec3 p2 = c;
+    glm::vec3 normal = glm::cross(p1 - p0, p2 - p0);
     const float lengthSquared = glm::dot(normal, normal);
     if (lengthSquared < 1.0e-8f) normal = glm::vec3(0.0f, 1.0f, 0.0f);
     else normal *= glm::inversesqrt(lengthSquared);
-    if (normal.y < 0.0f) normal = -normal;
+    if (normal.y < 0.0f) {
+        std::swap(p1, p2);
+        normal = -normal;
+    }
 
     const glm::vec4 color = far_color(material, normal);
     const float layer = get_block_texture_layer(material, normal);
@@ -672,19 +722,20 @@ void append_triangle(std::vector<VoxelVertex>& output,
         return VoxelVertex{ position, normal, color,
                             glm::vec3(uv, layer) };
     };
-    output.push_back(vertex(a));
-    output.push_back(vertex(b));
-    output.push_back(vertex(c));
+    output.push_back(vertex(p0));
+    output.push_back(vertex(p1));
+    output.push_back(vertex(p2));
 }
 
-void append_double_sided_skirt(std::vector<VoxelVertex>& output,
-                               const glm::vec3& a, const glm::vec3& b,
-                               float depth, BlockType material) {
+void append_outward_skirt(std::vector<VoxelVertex>& output,
+                          const glm::vec3& a, const glm::vec3& b,
+                          float depth, BlockType material) {
     const glm::vec3 down(0.0f, depth, 0.0f);
     const glm::vec3 ad = a - down;
     const glm::vec3 bd = b - down;
-    append_triangle(output, a, b, bd, material);
-    append_triangle(output, a, bd, ad, material);
+    // Callers pass an edge in the direction whose reverse winding faces out of
+    // the visible annulus. Emit that exterior side only; terrain is opaque and
+    // must never rely on duplicated reverse triangles to survive culling.
     append_triangle(output, b, a, ad, material);
     append_triangle(output, b, ad, bd, material);
 }
@@ -707,7 +758,8 @@ void append_water_quad(std::vector<VoxelVertex>& output,
 }
 
 void append_ring(FarTerrain::BuildResult& result, float centerX, float centerZ,
-                  const RingSpec& ring) {
+                 const RingSpec& ring, std::size_t& remainingGrassVertices,
+                 std::size_t& remainingTreeVertices, std::size_t ringsRemaining) {
     const std::size_t firstSurfaceInstance = result.surfaceInstances.size();
     const int cells = (ring.outerHalfExtent * 2) / ring.spacing;
     const float originX = centerX - static_cast<float>(ring.outerHalfExtent);
@@ -716,26 +768,40 @@ void append_ring(FarTerrain::BuildResult& result, float centerX, float centerZ,
     std::vector<TerrainSample> samples(side * side);
     const float qualityWeight = std::sqrt(std::clamp(
         ring.retainedQuality, 0.00001f, 1.0f));
-    const std::size_t grassVertexBudget = ring.level == 0
-        ? kBaseGrassProxyVertices
-        : (ring.level == 1 ? kFirstRingGrassProxyVertices
-                           : static_cast<std::size_t>(kOuterRingGrassProxyVertices *
-                                                     glm::mix(0.25f, 1.0f, qualityWeight)));
-    const std::size_t treeVertexBudget = ring.level == 0
-        ? kBaseTreeProxyVertices
-        : static_cast<std::size_t>(kOuterRingTreeProxyVertices *
-                                   glm::mix(0.30f, 1.0f, qualityWeight));
-    std::vector<VoxelVertex> grassVertices;
-    std::vector<VoxelVertex> treeVertices;
-    grassVertices.reserve(grassVertexBudget);
-    treeVertices.reserve(treeVertexBudget);
-
     const int innerCellSpan = ring.innerHalfExtent <= 0 ? 0 :
         std::min(cells, (ring.innerHalfExtent * 2) / ring.spacing);
     const std::size_t estimatedVisibleCells = std::max<std::size_t>(1u,
         static_cast<std::size_t>(cells) * static_cast<std::size_t>(cells) -
         static_cast<std::size_t>(innerCellSpan) * static_cast<std::size_t>(innerCellSpan));
     const float expectedGrassVertices = ring.spacing <= 2 ? 14.0f : 12.0f;
+    const float levelDensity = ring.level == 0 ? 0.55f :
+        (ring.level == 1 ? 0.38f : 0.20f);
+    const std::size_t desiredGrassVertices = static_cast<std::size_t>(
+        static_cast<double>(estimatedVisibleCells) * expectedGrassVertices *
+        static_cast<double>(levelDensity * glm::mix(0.25f, 1.0f, qualityWeight)));
+    const std::size_t grassFairShare = ringsRemaining > 0
+        ? remainingGrassVertices / ringsRemaining : 0u;
+    const std::size_t grassVertexBudget = std::min(
+        grassFairShare,
+        std::clamp(desiredGrassVertices,
+                   kGrassProxyMinVertices, kGrassProxyHardCapVertices));
+
+    const std::size_t desiredTreeVertices = static_cast<std::size_t>(
+        static_cast<double>(estimatedVisibleCells) *
+        static_cast<double>((ring.level == 0 ? 5.0f : 2.0f) *
+                            glm::mix(0.20f, 1.0f, qualityWeight)));
+    const std::size_t treeFairShare = ringsRemaining > 0
+        ? remainingTreeVertices / ringsRemaining : 0u;
+    const std::size_t treeVertexBudget = std::min(
+        treeFairShare,
+        std::clamp(desiredTreeVertices,
+                   kTreeProxyMinVertices, kTreeProxyHardCapVertices));
+
+    std::vector<VoxelVertex> grassVertices;
+    std::vector<VoxelVertex> treeVertices;
+    grassVertices.reserve(grassVertexBudget);
+    treeVertices.reserve(treeVertexBudget);
+
     const float grassBudgetScale = std::min(1.0f,
         static_cast<float>(grassVertexBudget) /
         (static_cast<float>(estimatedVisibleCells) * expectedGrassVertices));
@@ -837,16 +903,14 @@ void append_ring(FarTerrain::BuildResult& result, float centerX, float centerZ,
             // Skirts make both the outer rim and every LOD transition watertight.
             // They point down, so a coarse level cannot rise through a finer one.
             if (!cell_is_visible(x - 1, z))
-                append_double_sided_skirt(result.terrainVertices, sw, nw, skirtDepth, material);
+                append_outward_skirt(result.terrainVertices, sw, nw, skirtDepth, material);
             if (!cell_is_visible(x + 1, z))
-                append_double_sided_skirt(result.terrainVertices, ne, se, skirtDepth, material);
+                append_outward_skirt(result.terrainVertices, ne, se, skirtDepth, material);
             if (!cell_is_visible(x, z - 1))
-                append_double_sided_skirt(result.terrainVertices, se, sw, skirtDepth, material);
+                append_outward_skirt(result.terrainVertices, se, sw, skirtDepth, material);
             if (!cell_is_visible(x, z + 1))
-                append_double_sided_skirt(result.terrainVertices, nw, ne, skirtDepth, material);
+                append_outward_skirt(result.terrainVertices, nw, ne, skirtDepth, material);
 
-            const float proxyDistance = std::max(std::abs(x0 - centerX),
-                                                 std::abs(z0 - centerZ));
             append_grass_proxy(grassVertices, swSample, x0, z0,
                                ring.spacing, ring.retainedQuality,
                                sw.y, se.y, ne.y, nw.y,
@@ -902,6 +966,22 @@ void append_ring(FarTerrain::BuildResult& result, float centerX, float centerZ,
             }
 
             if (!selected) continue;
+
+            // VIS-GRASS-001: coarse cells may choose a representative several
+            // blocks away from the south-west sample. Re-sample that exact
+            // placement before emitting a trunk/crown; otherwise a tree chosen
+            // from a grassy corner can land inside water, rock or a steeper
+            // solid surface elsewhere in the coarse cell.
+            if (ring.spacing > 1) {
+                TerrainSample placementSample = TerrainGenerator::sample(treeX, treeZ);
+                TreeProfile placementProfile = tree_profile(placementSample);
+                if (!tree_has_grass_surface(placementSample) ||
+                    placementProfile.density <= 0.0f) {
+                    continue;
+                }
+                treeSample = placementSample;
+                profile = placementProfile;
+            }
             int trunkHeight = 6 + static_cast<int>(hash_tree(treeX, treeZ, 1.0f) * 3.0f);
             if (treeSample.biome == BiomeType::Jungle) trunkHeight += 4;
             if (profile.wood == BlockType::WoodSpruce) trunkHeight += 2;
@@ -916,7 +996,11 @@ void append_ring(FarTerrain::BuildResult& result, float centerX, float centerZ,
                 const float southHeight = glm::mix(sw.y, se.y, u);
                 const float northHeight = glm::mix(nw.y, ne.y, u);
                 const float smoothGround = glm::mix(southHeight, northHeight, v);
-                groundTop = glm::mix(sw.y, smoothGround, ring.smoothness);
+                const float renderedGround = glm::mix(sw.y, smoothGround, ring.smoothness);
+                // Start above both the exact solid column and the displayed
+                // coarse surface. This prevents a proxy from being buried by
+                // either representation during an LOD transition.
+                groundTop = std::max(groundTop, renderedGround);
             }
             append_tree_proxy(treeVertices, treeX, groundTop, treeZ,
                                trunkHeight, profile, ring.spacing,
@@ -924,6 +1008,8 @@ void append_ring(FarTerrain::BuildResult& result, float centerX, float centerZ,
         }
     }
 
+    remainingGrassVertices -= std::min(remainingGrassVertices, grassVertices.size());
+    result.grassProxyVertexCount += static_cast<uint32_t>(grassVertices.size());
     result.terrainVertices.insert(result.terrainVertices.end(),
                                   grassVertices.begin(), grassVertices.end());
 
@@ -936,6 +1022,8 @@ void append_ring(FarTerrain::BuildResult& result, float centerX, float centerZ,
     }
 
     const uint32_t treeFirstVertex = static_cast<uint32_t>(result.terrainVertices.size());
+    remainingTreeVertices -= std::min(remainingTreeVertices, treeVertices.size());
+    result.treeProxyVertexCount += static_cast<uint32_t>(treeVertices.size());
     result.terrainVertices.insert(result.terrainVertices.end(),
                                   treeVertices.begin(), treeVertices.end());
     // The current warped shadow map has useful texel density for roughly the
@@ -1027,14 +1115,20 @@ FarTerrain::BuildResult FarTerrain::build(uint64_t version, int centerChunkX,
         surfaceReserve += cells * cells - std::min(cells * cells, inner * inner);
     }
     result.surfaceInstances.reserve(surfaceReserve);
-    result.terrainVertices.reserve(4'600'000u);
+    // Do not pre-allocate the legacy multi-million-vertex FAR buffer. The
+    // adaptive per-ring vegetation caps now bound growth, and reserving 4.6M
+    // vertices up front defeated the memory win even when little was emitted.
     result.waterVertices.reserve(rings.size() * 2048u * 6u);
-    for (const RingSpec& ring : rings) {
+    std::size_t remainingGrassVertices = kGrassProxyHardCapVertices;
+    std::size_t remainingTreeVertices = kTreeProxyHardCapVertices;
+    for (std::size_t ringIndex = 0; ringIndex < rings.size(); ++ringIndex) {
         if (latestRequestedVersion &&
             latestRequestedVersion->load(std::memory_order_acquire) != version) {
             return result;
         }
-        append_ring(result, centerX, centerZ, ring);
+        append_ring(result, centerX, centerZ, rings[ringIndex],
+                    remainingGrassVertices, remainingTreeVertices,
+                    rings.size() - ringIndex);
     }
 
     result.buildMicroseconds = static_cast<uint64_t>(
@@ -1094,8 +1188,8 @@ void FarTerrain::request(ThreadPool& pool, int centerChunkX, int centerChunkZ,
     });
 }
 
-void FarTerrain::upload_ready(VkDevice device, VmaAllocator allocator,
-                              std::vector<AllocatedBuffer>* retiredBuffers) {
+void FarTerrain::upload_ready(VmaAllocator allocator,
+                              std::vector<AllocatedBuffer>& retiredBuffers) {
     std::optional<BuildResult> result;
     {
         std::lock_guard lock(readyMutex);
@@ -1110,11 +1204,7 @@ void FarTerrain::upload_ready(VkDevice device, VmaAllocator allocator,
 
     auto retire = [&](AllocatedBuffer& buffer) {
         if (buffer.buffer == VK_NULL_HANDLE) return;
-        if (retiredBuffers) retiredBuffers->push_back(buffer);
-        else {
-            vkDeviceWaitIdle(device);
-            vmaDestroyBuffer(allocator, buffer.buffer, buffer.allocation);
-        }
+        retiredBuffers.push_back(buffer);
         buffer = {};
     };
     auto upload = [&](const void* data, std::size_t byteCount, AllocatedBuffer& buffer) {
@@ -1136,12 +1226,15 @@ void FarTerrain::upload_ready(VkDevice device, VmaAllocator allocator,
     AllocatedBuffer newTerrain;
     AllocatedBuffer newSurface;
     AllocatedBuffer newWater;
-    upload(result->terrainVertices.data(),
-           result->terrainVertices.size() * sizeof(VoxelVertex), newTerrain);
-    upload(result->surfaceInstances.data(),
-           result->surfaceInstances.size() * sizeof(FarSurfaceInstance), newSurface);
-    upload(result->waterVertices.data(),
-           result->waterVertices.size() * sizeof(VoxelVertex), newWater);
+    const std::uint64_t terrainBytes =
+        static_cast<std::uint64_t>(result->terrainVertices.size()) * sizeof(VoxelVertex);
+    const std::uint64_t surfaceBytes =
+        static_cast<std::uint64_t>(result->surfaceInstances.size()) * sizeof(FarSurfaceInstance);
+    const std::uint64_t waterBytes =
+        static_cast<std::uint64_t>(result->waterVertices.size()) * sizeof(VoxelVertex);
+    upload(result->terrainVertices.data(), terrainBytes, newTerrain);
+    upload(result->surfaceInstances.data(), surfaceBytes, newSurface);
+    upload(result->waterVertices.data(), waterBytes, newWater);
     retire(terrainBuffer);
     retire(surfaceBuffer);
     retire(waterBuffer);
@@ -1160,13 +1253,19 @@ void FarTerrain::upload_ready(VkDevice device, VmaAllocator allocator,
     publishedClipmapLevels.store(result->clipmapLevels, std::memory_order_release);
     lastBuildMicroseconds.store(result->buildMicroseconds, std::memory_order_release);
     publishedEndpointQuality.store(result->endpointQualityFraction, std::memory_order_release);
+    publishedGrassProxyVertices.store(result->grassProxyVertexCount, std::memory_order_release);
+    publishedTreeProxyVertices.store(result->treeProxyVertexCount, std::memory_order_release);
+    publishedUploadBytes.store(terrainBytes + surfaceBytes + waterBytes, std::memory_order_release);
+    publishedUploadVersion.store(result->version, std::memory_order_release);
     {
         std::lock_guard lock(requestMutex);
         uploadedVersion = result->version;
     }
-    VC_LOG_INFO("[FAR LOD] aplicado {}% | {} niveis | {} celulas | {} vertices | {:.1f} ms",
+    VC_LOG_INFO("[FAR LOD] aplicado {}% | {} niveis | {} celulas | {} vertices (grass {} / tree {}) | {} bytes upload | {:.1f} ms",
                 (result->endpointQualityFraction * 100.0f), result->clipmapLevels,
                 result->surfaceInstances.size(), result->terrainVertices.size(),
+                result->grassProxyVertexCount, result->treeProxyVertexCount,
+                terrainBytes + surfaceBytes + waterBytes,
                 (static_cast<double>(result->buildMicroseconds) / 1000.0));
 }
 
@@ -1242,4 +1341,8 @@ void FarTerrain::cleanup(VkDevice device, VmaAllocator allocator, bool deviceAlr
     publishedClipmapLevels.store(0, std::memory_order_release);
     lastBuildMicroseconds.store(0, std::memory_order_release);
     publishedEndpointQuality.store(0.0f, std::memory_order_release);
+    publishedGrassProxyVertices.store(0, std::memory_order_release);
+    publishedTreeProxyVertices.store(0, std::memory_order_release);
+    publishedUploadBytes.store(0, std::memory_order_release);
+    publishedUploadVersion.store(0, std::memory_order_release);
 }

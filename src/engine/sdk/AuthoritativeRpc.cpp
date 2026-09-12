@@ -7,6 +7,7 @@
 // codes — no memory/address/internal-path leakage.
 
 #include "engine/networking/IAuthoritativeRpc.hpp"
+#include "engine/networking/IReplicationSecurity.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -30,13 +31,39 @@ struct Registered {
 
 class AuthoritativeRpcImpl final : public IAuthoritativeRpc {
 public:
-    AuthoritativeRpcImpl() { nextSequence_ = 1; nextEvent_ = 1; }
+    AuthoritativeRpcImpl() {
+        nextSequence_ = 1;
+        nextEvent_ = 1;
+        SecurityLimits limits;
+        limits.max_messages_per_window = 240;
+        limits.window_millis = 1000;
+        limits.max_payload = 1u << 20;
+        limits.amplification_guard = true;
+        limits.max_response_ratio = 16;
+        std::string ignored;
+        security_ = create_replication_security(limits, ignored);
+    }
 
     bool register_command(const std::string& name, CommandHandler handler,
                           const CommandRules& rules, std::string& errorOut) override {
         if (name.empty() || !handler) { errorOut = "invalid_command_registration"; return false; }
         if (commands_.count(name) != 0) { errorOut = "command_already_registered"; return false; }
+        if (rules.max_payload == 0 || rules.max_payload > (1u << 20)) {
+            errorOut = "invalid_command_payload_limit";
+            return false;
+        }
+        if (security_) {
+            PayloadSchema schema;
+            schema.name = schema_name(name);
+            schema.max_size = rules.max_payload;
+            std::string securityError;
+            if (!security_->register_schema(schema, securityError)) {
+                errorOut = "security_schema_registration_failed";
+                return false;
+            }
+        }
         commands_[name] = Registered{ rules, std::move(handler) };
+        errorOut.clear();
         return true;
     }
 
@@ -48,6 +75,7 @@ public:
         (void)errorOut;
         std::vector<CommandResult> results;
         results.reserve(envelopes.size());
+        if (security_) security_->advance_window(ctx.now_ms);
         for (auto& env : envelopes) {
             CommandResult r;
             r.sequence = env.sequence;
@@ -57,6 +85,22 @@ public:
                 r.error = "unknown_command";
                 results.push_back(std::move(r));
                 continue;
+            }
+            if (security_) {
+                const std::uint64_t connection =
+                    env.connection_id != 0 ? env.connection_id : ctx.connection_id;
+                if (!security_->observe_incoming(connection, env.payload.size())) {
+                    r.error = "rate_limited";
+                    results.push_back(std::move(r));
+                    continue;
+                }
+                std::string securityError;
+                if (!security_->validate(schema_name(env.command), env.payload.data(),
+                                         env.payload.size(), securityError)) {
+                    r.error = "invalid_schema";
+                    results.push_back(std::move(r));
+                    continue;
+                }
             }
             // Payload schema/limit gate BEFORE allocating any effect.
             if (env.payload.size() > it->second.rules.max_payload) {
@@ -115,6 +159,15 @@ public:
                 localCtx, env.payload.data(), env.payload.size());
             r.ok = outcome.ok;
             r.data = std::move(outcome.data);
+            if (r.ok && security_) {
+                const std::uint64_t connection =
+                    env.connection_id != 0 ? env.connection_id : ctx.connection_id;
+                if (!security_->amplification_ok(connection, env.payload.size(), r.data.size())) {
+                    r.ok = false;
+                    r.error = "amplification_rejected";
+                    r.data.clear();
+                }
+            }
             executed_.insert(dedupKey);
             if (it->second.rules.cooldown_millis > 0) {
                 cooldowns_[cooldown_key(ctx.player_id, env.command)] = ctx.now_ms;
@@ -210,6 +263,10 @@ public:
         cooldowns_.clear();
         owners_.clear();
         permissions_.clear();
+        if (security_) {
+            std::string ignored;
+            security_->reset(ignored);
+        }
         nextSequence_ = 1;
         nextEvent_ = 1;
         return true;
@@ -221,6 +278,9 @@ private:
     }
     static std::string cooldown_key(std::uint64_t player, const std::string& cmd) {
         return std::to_string(player) + "#" + cmd;
+    }
+    static std::string schema_name(const std::string& command) {
+        return "authoritative_rpc:" + command;
     }
     bool has_permission(std::uint64_t player, const std::string& perm) const {
         const auto it = permissions_.find(player);
@@ -240,6 +300,7 @@ private:
     std::uint64_t nextSequence_{ 1 };
     std::uint64_t nextEvent_{ 1 };
     std::uint64_t lastAcked_{ 0 };
+    std::unique_ptr<IReplicationSecurity> security_;
 };
 
 }  // namespace

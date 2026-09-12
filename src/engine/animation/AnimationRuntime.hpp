@@ -35,13 +35,21 @@ class AnimationSampler final {
 public:
     static Pose bind_pose(const SkeletonAsset& skeleton);
     static Pose sample(const SkeletonAsset& skeleton, const AnimationClip& clip, float time);
+    static void sample_into(const SkeletonAsset& skeleton, const AnimationClip& clip, float time,
+                            Pose& out);
     static RootMotionDelta root_motion(const AnimationClip& clip, float previousTime, float currentTime);
+    // Allocation-free variant for frame loops. `out` keeps its capacity and is
+    // overwritten in-place; callers that own a persistent scratch buffer avoid
+    // constructing a fresh matrix vector every animation update.
+    static void global_matrices_into(const SkeletonAsset& skeleton, const Pose& pose,
+                                     std::vector<glm::mat4>& out);
     static std::vector<glm::mat4> global_matrices(const SkeletonAsset& skeleton, const Pose& pose);
 };
 
 class AnimationBlender final {
 public:
     static Pose blend(const Pose& a, const Pose& b, float weight);
+    static void blend_into(const Pose& a, const Pose& b, float weight, Pose& out);
     static Pose additive(const Pose& base, const Pose& additivePose, float weight,
                          const std::vector<float>& boneMask = {});
 };
@@ -86,6 +94,7 @@ private:
     float blendTime_{};
     float blendDuration_{};
     Pose pose_;
+    Pose previousPoseScratch_;
 };
 
 struct BlendTreePoint {

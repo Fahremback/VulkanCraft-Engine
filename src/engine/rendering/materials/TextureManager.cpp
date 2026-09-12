@@ -262,8 +262,12 @@ static void upload_rgba_array(VkDevice device, VmaAllocator allocator, VkQueue q
     VkSubmitInfo submit{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
-    VK_CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
-    VK_CHECK(vkQueueWaitIdle(queue));
+    VkFence uploadFence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fenceInfo{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VK_CHECK(vkCreateFence(device, &fenceInfo, nullptr, &uploadFence));
+    VK_CHECK(vkQueueSubmit(queue, 1, &submit, uploadFence));
+    VK_CHECK(vkWaitForFences(device, 1, &uploadFence, VK_TRUE, UINT64_MAX));
+    vkDestroyFence(device, uploadFence, nullptr);
     vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
     vmaDestroyBuffer(allocator, staging.buffer, staging.allocation);
 

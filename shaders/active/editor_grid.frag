@@ -21,7 +21,8 @@
 //   so the 2x2 quads used by fwidth stay intact.
 
 layout (location = 0) in vec3 nearPoint;
-layout (location = 1) in vec3 farPoint;
+layout (location = 1) in vec3 rayVector;
+layout (location = 2) flat in vec2 gridOrigin;
 
 layout (location = 0) out vec4 outColor;
 
@@ -115,17 +116,10 @@ void main() {
     // distance cutoff — it runs to the horizon.
     // ----------------------------------------------------------------------
     vec3 rayOrigin = nearPoint;
-    // BUG-EDITOR-GRID-005 (orbit jitter): the ray target is unprojected from
-    // clipZ = 1.0, i.e. the FULL far plane (farPlane = 50000 by default). That
-    // target can sit tens of thousands of units away, and fp32 keeps only ~1e-7
-    // RELATIVE precision there. Rotating the camera perturbs the far corners by
-    // a few ULPs of a huge number, and subtracting farPoint - nearPoint spreads
-    // that absolute error into every component of the intersection point -- so
-    // the analytic grid shivers while meshes (which project precise local
-    // vertices) stay rock solid. Fix: normalize the direction FIRST and do all
-    // of the remaining math on a unit vector, so the magnitude-50000 error is
-    // confined to the initial normalize instead of leaking into t and p.
-    vec3 rawDir = farPoint - nearPoint;
+    // VIS-GRID-001: rayVector was built from near -> clipZ 0.5 in the vertex
+    // stage. It is a short camera-local delta, never a subtraction against the
+    // 50 km far plane. Normalize exactly once after interpolation.
+    vec3 rawDir = rayVector;
     float rawLen = length(rawDir);
     vec3 rayDirection = rawLen > 1e-9 ? (rawDir / rawLen) : vec3(0.0, -1.0, 0.0);
 
@@ -146,16 +140,23 @@ void main() {
 
     vec3 p = rayOrigin + safeT * rayDirection;
 
+    // Do grid frequency/derivative math in a rebased coordinate system. The
+    // flat origin comes from the centre near-plane ray and is quantized to an
+    // exact multiple of 1 m and 10 m, so this is phase-identical to world XZ
+    // while avoiding large-coordinate precision loss. Depth still uses `p`,
+    // because the scene projection consumes absolute world space.
+    vec2 localGridXZ = (rayOrigin.xz - gridOrigin) + safeT * rayDirection.xz;
+
     // Full projected footprint of the ground cell. This is shared by X lines,
     // Z lines and axes so their fade cannot disagree by viewing orientation.
-    float worldPerPixel = max(max(length(dFdx(p.xz)), length(dFdy(p.xz))), 1e-6);
+    float worldPerPixel = max(max(length(dFdx(localGridXZ)), length(dFdy(localGridXZ))), 1e-6);
 
     // Fixed world hierarchy. Both families exist everywhere and are exact
     // multiples, so their intersections remain aligned while fwidth performs
     // the only distance-dependent operation: a gradual anti-aliasing fade.
-    float minorGrid = gridAtScale(p.xz, MINOR_GRID_STEP)
+    float minorGrid = gridAtScale(localGridXZ, MINOR_GRID_STEP)
                     * cellVisibility(MINOR_GRID_STEP, worldPerPixel);
-    float majorGrid = gridAtScale(p.xz, MAJOR_GRID_STEP)
+    float majorGrid = gridAtScale(localGridXZ, MAJOR_GRID_STEP)
                     * cellVisibility(MAJOR_GRID_STEP, worldPerPixel);
 
     // ----------------------------------------------------------------------

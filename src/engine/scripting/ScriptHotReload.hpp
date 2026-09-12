@@ -41,7 +41,8 @@ public:
                                               const std::string& message)>;
 
     /// Default pipeline: ScriptGraphAsset::load + ScriptCompiler::compile.
-    /// (The graph load step is stubbed in the engine today — see header.)
+    /// The graph is loaded from the watched file and compiled before the VM
+    /// program is swapped; a failed load/compile leaves the current VM intact.
     static CompileFn default_compiler();
 
     ScriptHotReload() = default;

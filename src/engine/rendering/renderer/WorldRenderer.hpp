@@ -10,12 +10,23 @@
 #include "engine/rendering/ISceneRenderQueues.hpp"
 #include "engine/rendering/ISceneCulling.hpp"
 
+#include <memory>
+#include <utility>
+#include <vector>
+
 class World;
 
 class WorldRenderer final : public WorldRenderBridge {
 public:
-    explicit WorldRenderer(World& world)
-        : world_(world), drawQueues_(Engine::Rendering::create_scene_render_queues()) {}
+    explicit WorldRenderer(
+        World& world,
+        std::unique_ptr<Engine::Rendering::ISceneRenderQueues> drawQueues =
+            Engine::Rendering::create_scene_render_queues())
+        : world_(world), drawQueues_(std::move(drawQueues)) {
+        // Keep the renderer usable for external callers while allowing the
+        // product composition root to inject the canonical public service.
+        if (!drawQueues_) drawQueues_ = Engine::Rendering::create_scene_render_queues();
+    }
 
     void configure(VkDevice device, VmaAllocator allocator);
     void begin_frame() override;
@@ -35,6 +46,21 @@ public:
     [[nodiscard]] float last_build_milliseconds() const { return farTerrain_.last_build_milliseconds(); }
     [[nodiscard]] float applied_endpoint_percent() const { return farTerrain_.applied_endpoint_percent(); }
     [[nodiscard]] bool is_building() const { return farTerrain_.is_building(); }
+    [[nodiscard]] std::uint32_t far_grass_proxy_vertices() const {
+        return farTerrain_.grass_proxy_vertex_count();
+    }
+    [[nodiscard]] std::uint32_t far_tree_proxy_vertices() const {
+        return farTerrain_.tree_proxy_vertex_count();
+    }
+    [[nodiscard]] std::uint32_t far_surface_instances() const {
+        return farTerrain_.near_surface_instance_count() + farTerrain_.far_surface_instance_count();
+    }
+    [[nodiscard]] std::uint64_t far_last_upload_bytes() const {
+        return farTerrain_.last_upload_bytes();
+    }
+    [[nodiscard]] std::uint64_t far_upload_version() const {
+        return farTerrain_.upload_version();
+    }
     void draw_far_surface_shadow(VkCommandBuffer commandBuffer) { farTerrain_.draw_surface_shadow(commandBuffer); }
     void draw_far_shadow(VkCommandBuffer commandBuffer) { farTerrain_.draw_shadow(commandBuffer); }
 
@@ -82,11 +108,12 @@ private:
     // feed the observable title contract.
     void collect_chunks_into_queue(const Frustum& frustum,
                                    Engine::Rendering::DrawQueue queue);
+    [[nodiscard]] const ChunkId* queued_chunk(std::uint64_t payload) const noexcept;
     // B.4: detail queues (grass/foliage) skip chunks the conservative occlusion
     // test proves hidden behind a nearer opaque chunk; returns true when the
     // chunk should be drawn.
-    bool detail_chunk_visible(const Frustum& frustum, const glm::vec3& minimum,
-                              const glm::vec3& maximum, float depth) const;
+    bool detail_chunk_visible(const glm::vec3& minimum, const glm::vec3& maximum,
+                              float depth) const;
     // A.3: samples the just-uploaded chunk mesh into LumenSurface cards for the
     // bound ILumenScene (bounded per-chunk budget, real world albedo/emission).
     void feed_lumen_scene(const ChunkMeshResult& result);
@@ -101,6 +128,7 @@ private:
     Engine::Rendering::ILumenScene* lumenScene_{ nullptr };
     Engine::Rendering::ISceneRenderQueues* queues() const noexcept { return drawQueues_.get(); }
     std::unique_ptr<Engine::Rendering::ISceneRenderQueues> drawQueues_;
+    std::vector<ChunkId> queuedChunkIds_;
     Engine::Rendering::ISceneCulling* sceneCulling_{ nullptr };
     glm::vec3 detailCamera_{ 0.0f, 0.0f, 0.0f };
     glm::mat4 detailViewProj_{ 1.0f };

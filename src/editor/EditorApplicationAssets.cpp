@@ -2,6 +2,7 @@
 #include "EditorInternalHelpers.hpp"
 #include "BlockTextureAtlas.hpp"
 #include "../engine/audio/OggDecoder.hpp"
+#include "../engine/rendering/lighting/RenderProviderSelection.hpp"
 #include <imgui_impl_vulkan.h>
 #include <Unknwn.h>
 #include <objbase.h>
@@ -306,6 +307,117 @@ EditorApplication::GraphMaterialPipeline* EditorApplication::ensure_texture_pipe
         it = cache.insert_or_assign(texId, std::move(built)).first;
     }
     return it->second.valid ? &it->second : nullptr;
+}
+
+EditorApplication::GraphMaterialPipeline* EditorApplication::cached_texture_pipeline(
+    const UUID& texId, std::unordered_map<UUID, GraphMaterialPipeline>& cache) {
+    const auto it = cache.find(texId);
+    return it != cache.end() && it->second.valid ? &it->second : nullptr;
+}
+
+void EditorApplication::refresh_asset_lookup_cache() {
+    const uint64_t registryRevision = m_assetRegistry.revision();
+    if (registryRevision == m_textureAssetPickerRegistryRevision) return;
+
+    m_assetRegistrySnapshotCache = m_assetRegistry.snapshot();
+    m_textureAssetPickerCache.clear();
+    m_textureAssetPickerUuidCache.clear();
+    m_meshAssetPickerCache.clear();
+    m_materialAssetPickerCache.clear();
+    m_textureAssetNameCache.clear();
+    m_assetRegistryCookedCount = 0;
+    m_textureAssetPickerCache.reserve(m_assetRegistrySnapshotCache.size());
+    m_textureAssetPickerUuidCache.reserve(m_assetRegistrySnapshotCache.size());
+    m_meshAssetPickerCache.reserve(m_assetRegistrySnapshotCache.size());
+    m_materialAssetPickerCache.reserve(m_assetRegistrySnapshotCache.size());
+    m_textureAssetNameCache.reserve(m_assetRegistrySnapshotCache.size());
+    for (const AssetMetadata& meta : m_assetRegistrySnapshotCache) {
+        if (meta.isCooked) ++m_assetRegistryCookedCount;
+        const std::string filename = meta.sourcePath.filename().string();
+        if (meta.type == AssetType::Mesh) {
+            m_meshAssetPickerCache.emplace_back(meta.id, filename);
+        } else if (meta.type == AssetType::Material) {
+            m_materialAssetPickerCache.emplace_back(meta.id, filename);
+        }
+        if (meta.type != AssetType::Texture) continue;
+        if (!filename.empty()) m_textureAssetNameCache.insert_or_assign(filename, meta.id);
+        if (meta.isCooked) {
+            m_textureAssetPickerCache.emplace_back(filename, meta.id);
+            m_textureAssetPickerUuidCache.emplace_back(meta.id, filename);
+        }
+    }
+    m_textureAssetPickerRegistryRevision = registryRevision;
+    m_contentBrowserQueryRevision = static_cast<uint64_t>(-1);
+    m_contentBrowserDirty = true;
+    m_specializedEditors.set_texture_assets(m_textureAssetPickerCache);
+}
+
+void EditorApplication::prepare_frame_material_pipelines(Scene* scene) {
+    if (!scene) return;
+
+    // Material compilation/pipeline creation is prepared before command-buffer
+    // recording. The viewport draw path below only consumes valid cache entries.
+    if (m_specializedEditors.previewOnSelected && m_selectedEntity.is_valid()) {
+        const auto& live = m_specializedEditors.live_material_graph();
+        const uint64_t liveHash = hash_material_graph(live);
+        if (liveHash != m_liveGraphHash || !m_liveGraphPipeline.valid) {
+            destroy_graph_pipeline(m_liveGraphPipeline);
+            if (!build_graph_pipeline(live, m_liveGraphPipeline)) {
+                if (!m_liveGraphLastErrorLogged) {
+                    std::cerr << "[Editor] Material preview: "
+                              << m_liveGraphPipeline.lastError << std::endl;
+                    m_liveGraphLastErrorLogged = true;
+                }
+            } else {
+                m_liveGraphLastErrorLogged = false;
+            }
+            m_liveGraphHash = liveHash;
+        }
+    }
+
+    for (const auto& [id, meshComp] : scene->meshRendererComponents) {
+        if (!meshComp.meshAssetID.is_valid()) continue;
+
+        if (const auto vidIt = scene->videoComponents.find(id);
+            vidIt != scene->videoComponents.end() && !vidIt->second.framePaths.empty()) {
+            const VideoComponent& video = vidIt->second;
+            const int frame = std::clamp(video.currentFrame, 0,
+                static_cast<int>(video.framePaths.size()) - 1);
+            const UUID frameTex = resolve_texture_asset_by_name(video.framePaths[frame]);
+            if (frameTex.is_valid()) ensure_texture_pipeline(frameTex, m_videoGraphPipelines);
+            continue;
+        }
+
+        const auto meshMeta = m_assetRegistry.find(meshComp.meshAssetID);
+        if (meshMeta && meshMeta->type == AssetType::Block) {
+            const UUID texId = resolve_block_texture(meshComp.meshAssetID);
+            if (texId.is_valid()) ensure_texture_pipeline(texId, m_blockGraphPipelines, true);
+        } else if (meshMeta && meshMeta->type == AssetType::Texture && is_character_texture(*meshMeta)) {
+            ensure_texture_pipeline(meshComp.meshAssetID, m_skinGraphPipelines, true);
+        } else if (meshComp.materialAssetID.is_valid() && load_material_asset(meshComp.materialAssetID)) {
+            const UUID matId = meshComp.materialAssetID;
+            const Rendering::MaterialGraph graph = material_graph_from_asset(m_materialAssets.at(matId));
+            const uint64_t graphHash = hash_material_graph(graph);
+            auto it = m_graphMaterialPipelines.find(matId);
+            if (it == m_graphMaterialPipelines.end() || !it->second.valid ||
+                it->second.graphHash != graphHash) {
+                if (it != m_graphMaterialPipelines.end()) destroy_graph_pipeline(it->second);
+                GraphMaterialPipeline built;
+                built.graphHash = graphHash;
+                if (!build_graph_pipeline(graph, built)) {
+                    std::cerr << "[Editor] Material pipeline: " << built.lastError << std::endl;
+                }
+                m_graphMaterialPipelines.insert_or_assign(matId, std::move(built));
+            }
+        }
+    }
+
+    for (const auto& [id, decal] : scene->decalComponents) {
+        (void)id;
+        if (!decal.enabled) continue;
+        const UUID texId = resolve_texture_asset_by_name(decal.texturePath);
+        if (texId.is_valid()) ensure_texture_pipeline(texId, m_blockGraphPipelines, true);
+    }
 }
 
 void EditorApplication::spawn_block_entity(const UUID& blockId, const glm::vec3& position) {
@@ -2388,10 +2500,12 @@ void EditorApplication::rebuild_voxel_mesh(const UUID& entityId) {
 
     auto& mesh = m_voxelMeshes[entityId];
     if (mesh.valid) {
-        // Same in-flight hazard as terrain regeneration: wait for the GPU
-        // before freeing buffers the previous frame may still read.
-        if (mesh.vb.buffer != VK_NULL_HANDLE || mesh.ib.buffer != VK_NULL_HANDLE)
-            vkDeviceWaitIdle(m_device);
+        // Wait only for the editor frame fences which can reference these
+        // buffers; draining the entire device made live voxel editing hitch.
+        if ((mesh.vb.buffer != VK_NULL_HANDLE || mesh.ib.buffer != VK_NULL_HANDLE) &&
+            !wait_for_inflight_gpu("voxel-mesh rebuild")) {
+            return;
+        }
         if (mesh.vb.buffer != VK_NULL_HANDLE) destroy_buffer(mesh.vb);
         if (mesh.ib.buffer != VK_NULL_HANDLE) destroy_buffer(mesh.ib);
         mesh = EditorVoxelMesh{};
@@ -2551,7 +2665,7 @@ void EditorApplication::draw_voxel_volumes(VkCommandBuffer cmd, const glm::mat4&
             // without a matching block fall back to the vertex-color pipeline.
             GraphMaterialPipeline* gmp = nullptr;
             if (range.blockId.is_valid()) {
-                gmp = ensure_texture_pipeline(range.blockId, m_blockGraphPipelines, true);
+                gmp = cached_texture_pipeline(range.blockId, m_blockGraphPipelines);
                 if (gmp) {
                     write_material_ubo(*gmp, nullptr, nullptr);
                     write_light_ubo(*gmp, scene, m_editorCamera.position);
@@ -3381,8 +3495,8 @@ void EditorApplication::init_scene_light_resources() {
     writes[4].pBufferInfo = &shadowBufferInfo;
     vkUpdateDescriptorSets(m_device, 5, writes, 0, nullptr);
 
-    // BUG-EDITOR-GI-001: the headless probe grid core (Agente 1) behind the
-    // viewport's indirect ambient.
+    // BUG-EDITOR-GI-001 / CONTA2-GI-EDITOR-005: the canonical DDGI provider
+    // behind the viewport's indirect ambient.
     init_gi_probes();
 }
 
@@ -3412,6 +3526,8 @@ void EditorApplication::refresh_shadow_descriptors() {
 }
 
 void EditorApplication::destroy_scene_light_resources() {
+    m_editorGiProvider.reset();
+    vc::rendering::provider_selection::retire("giProvider");
     if (m_sceneLightBuffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(m_device, m_sceneLightBuffer, nullptr);
         m_sceneLightBuffer = VK_NULL_HANDLE;

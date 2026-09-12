@@ -28,7 +28,7 @@
 #include "../engine/rendering/materials/Material.hpp"
 #include "../engine/rendering/MaterialGraph.hpp"
 #include "../engine/rendering/vulkan/MaterialPipeline.hpp"
-#include "../engine/public/engine/rendering/IProbeGrid.hpp"
+#include "../engine/public/engine/rendering/IGlobalIlluminationProvider.hpp"
 #include "../engine/scene/Entity.hpp"
 #include "../engine/editor/play_mode/PlayMode.hpp"
 #include "../engine/editor/undo/UndoSystem.hpp"
@@ -48,10 +48,12 @@
 #include "engine/navigation/INavInvalidation.hpp"
 #include "engine/ai/IAiDebugInfo.hpp"
 #include "engine/entity/IEntityWorld.hpp"
+#include "engine/entity/IReflection.hpp"
 #include "engine/world/IWorldRuntime.hpp"
 #include "engine/world/IWorldManager.hpp"
 #include "engine/gameplay/IGameplayRuntime.hpp"
 #include "engine/gameplay/IGameplayIntegration.hpp"
+#include "engine/gameplay/IGameplayDebugSurface.hpp"
 #include "engine/gameplay/IGameplayBindings.hpp"
 #include "engine/gameplay/IGameplaySystemWiring.hpp"
 #include "engine/gameplay/IGameplayEvents.hpp"
@@ -81,7 +83,7 @@
 #include "engine/scripting/ILuauSandbox.hpp"
 #include "engine/assets/IAssetCooker.hpp"
 #include "engine/scripting/IVisualScriptRuntime.hpp"
-#include "engine/plugins/IPluginIsolationRuntime.hpp"
+#include "engine/plugins/IPluginIsolation.hpp"
 #include "engine/plugins/IPluginManifestCodec.hpp"
 #include "engine/editor/IMessageCatalog.hpp"
 #include "engine/editor/IShortcutDoc.hpp"
@@ -301,8 +303,8 @@ struct EditorPointShadowMap {
 // ---------------------------------------------------------------------------
 // BUG-EDITOR-GI-001: editor-only shadow + GI metadata for the basic viewport
 // path (binding 4 of the scene light set). Spot tiles, point slot 0 and the
-// dense probe-irradiance grid (Agente 1 IProbeGrid state, toroidal window
-// wrapped to the resolution) travel together in one small UBO.
+// dense probe-irradiance grid produced by the canonical DDGI provider
+// (toroidal window wrapped to the resolution) travel together in one small UBO.
 // ---------------------------------------------------------------------------
 inline constexpr uint32_t kEditorSpotShadowSlots = 4;                                  // = Rendering::kMaxSpotLights
 inline constexpr uint32_t kEditorProbeResolution = 8;                                  // 8^3 = 512 probes
@@ -580,6 +582,19 @@ private:
     std::vector<VkSemaphore> m_renderFinishedSemaphores;
     std::vector<VkFence> m_inFlightFences;
     uint32_t m_currentFrame{ 0 };
+    static constexpr std::uint32_t kEditorGpuTimestampSlots = 6;
+    std::array<VkQueryPool, 2> m_gpuTimestampPools{ VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<std::array<double, 3>, 2> m_pendingCpuPassMs{};
+    std::array<bool, 2> m_gpuTimestampSubmitted{ false, false };
+    std::array<bool, 2> m_gpuTimestampComplete{ false, false };
+    double m_gpuTimestampPeriodNs{ 1.0 };
+    // Interactive resource changes must never drain the whole Vulkan device.
+    // They wait only for the editor's own submitted frame fences. The
+    // counters are real profiler observables: one stall is counted whenever a
+    // fence was still pending and we had to block for it.
+    std::uint64_t m_gpuFenceStallCount{ 0 };
+    double m_gpuFenceWaitMs{ 0.0 };
+    bool wait_for_inflight_gpu(const char* reason);
 
     // ---- Offscreen Viewport Rendering ----
     OffscreenTarget m_offscreen;
@@ -596,7 +611,7 @@ private:
     EditorPointShadowMap m_pointShadow;
     GPUBuffer m_editorShadowUbo;
     VkDeviceMemory m_editorShadowUboMemory{ VK_NULL_HANDLE };
-    std::unique_ptr<Engine::Rendering::IProbeGrid> m_probeGrid;
+    std::unique_ptr<Engine::Rendering::IGlobalIlluminationProvider> m_editorGiProvider;
     bool m_giEnabled{ true };
     EditorShadowUbo m_shadowUboData{};
     VkPipeline m_scenePipeline{ VK_NULL_HANDLE };
@@ -1017,6 +1032,10 @@ private:
     GraphMaterialPipeline* ensure_texture_pipeline(
         const UUID& texId, std::unordered_map<UUID, GraphMaterialPipeline>& cache,
         bool withAlpha = false);
+    GraphMaterialPipeline* cached_texture_pipeline(
+        const UUID& texId, std::unordered_map<UUID, GraphMaterialPipeline>& cache);
+    void refresh_asset_lookup_cache();
+    void prepare_frame_material_pipelines(Scene* scene);
 
     // Voxel sculpting (Escultura de Blocos): each VoxelVolumeComponent entity
     // gets an editable grid (Engine::Voxel::VoxelStructure) rendered as colored
@@ -1095,6 +1114,21 @@ private:
     std::unordered_map<UUID, GraphMaterialPipeline> m_skinGraphPipelines;
     std::unordered_set<UUID> m_materialLoadFailed;
     std::unordered_map<UUID, MaterialAsset> m_materialAssets;
+    // Texture picker inventory is rebuilt only when the registry mutates.
+    // AssetRegistry revision catches reimports/metadata changes without
+    // snapshotting/scanning the full registry every rendered frame.
+    std::vector<std::pair<std::string, UUID>> m_textureAssetPickerCache;
+    std::vector<std::pair<UUID, std::string>> m_textureAssetPickerUuidCache;
+    std::vector<std::pair<UUID, std::string>> m_meshAssetPickerCache;
+    std::vector<std::pair<UUID, std::string>> m_materialAssetPickerCache;
+    std::vector<AssetMetadata> m_assetRegistrySnapshotCache;
+    std::vector<AssetMetadata> m_contentBrowserQueryCache;
+    std::string m_contentBrowserQueryText;
+    int m_contentBrowserQueryFilter{ -1 };
+    uint64_t m_contentBrowserQueryRevision{ static_cast<uint64_t>(-1) };
+    std::unordered_map<std::string, UUID> m_textureAssetNameCache;
+    std::size_t m_assetRegistryCookedCount{ 0 };
+    uint64_t m_textureAssetPickerRegistryRevision{ static_cast<uint64_t>(-1) };
     bool load_material_asset(const UUID& assetId);
     bool build_graph_pipeline(const Rendering::MaterialGraph& graph, GraphMaterialPipeline& out);
     void destroy_graph_pipeline(GraphMaterialPipeline& p);
@@ -1280,7 +1314,7 @@ private:
     // Plugin gap-factory consumers (Aceleração 4 §C): the isolation runtime
     // and manifest codec back the editor's plugin metadata/load surface
     // instead of only existing as SDK adapters.
-    std::unique_ptr<engine::plugins::IPluginIsolationRuntime> m_pluginIsolationRuntime;
+    std::unique_ptr<engine::plugins::IPluginIsolationManager> m_pluginIsolationRuntime;
     std::unique_ptr<engine::plugins::IPluginManifestCodec> m_pluginManifestCodec;
 
     // Frame profiler (plano agente 2 §B): deterministic frame-time/memory
@@ -1296,13 +1330,13 @@ private:
     // (shadow + spot/point shadows, scene/content, env capture) and memory
     // residency, closed every frame; m_renderProviderRegistry records WHICH
     // editor-side providers back each rendering system (shadow raster,
-    // probe-grid GI, scene lights, pick) with their call sites. Both are
+    // canonical DDGI, scene lights, pick) with their call sites. Both are
     // serialized into m_renderDiagnosticsJson and exposed via GET
     // /render-diagnostics for the Agente 5 batch validation.
     std::unique_ptr<Engine::Rendering::IRenderPassMetrics> m_renderMetrics;
     std::unique_ptr<Engine::Rendering::IRenderProviderRegistry> m_renderProviderRegistry;
     // Real debug-view snapshot (engine/rendering IRenderingDebugView): fed each
-    // frame from the ACTUAL editor state (probe irradiance from m_probeGrid,
+    // frame from the ACTUAL editor state (probe irradiance from m_editorGiProvider,
     // captured/pending capture counters) so cards/probes/tracing debug overlays
     // render REAL data, and serialized into the diagnostics JSON.
     std::unique_ptr<Engine::Rendering::IRenderingDebugView> m_renderDebugView;
@@ -1509,6 +1543,9 @@ private:
 
     // Load a .scene file into the editor (Abrir Jogo / Open Scene).
     void load_scene_file(const std::string& path);
+    void ensure_scene_reflection();
+    bool restore_scene_reflection_sidecar(const std::string& path);
+    bool persist_scene_reflection_sidecar(const std::string& path);
     // Save the current scene; if it has no path yet, opens Salvar Como.
     void save_current_scene();
     void save_scene_as();
@@ -1694,6 +1731,8 @@ private:
     // GPU pass instead of dying in render_data().
     GPUBuffer m_playParticleVB;
     uint32_t m_playParticleVertexCount{ 0 };
+    std::vector<EditorVertex> m_playParticleVertices;
+    float m_playParticleMaxSizePx{ 8.0f };
     void upload_play_particles();
     // Env probe cubemap capture (one shared capture target, re-captured for
     // the active probe on demand or periodically when realTime).
@@ -1778,6 +1817,11 @@ private:
     void draw_ai_debug_panel();
     void feed_play_ai_debug();
     void update_play_ai_focus();
+    // Canonical gameplay debug surface: combines the same live integration,
+    // AI recorder and rendering debug view used by play mode into one
+    // machine-readable snapshot every frame.
+    std::unique_ptr<engine::gameplay::IGameplayDebugSurface> m_playGameplayDebugSurface;
+    std::string m_playGameplayDebugJson{ "{}" };
     // AGENTE 2 block A: play mode runs the SAME canonical IWorldRuntime
     // composition as the game executable and the server. The play scene's ECS
     // is the mob/entity world bound to the runtime; the canonical gameplay
@@ -1799,6 +1843,11 @@ private:
     std::unique_ptr<engine::gameplay::IDayNightCycle> m_playDayNight;
     std::uint64_t m_playRuntimeTick{ 0 };
     std::string m_playRuntimeError;
+
+    // Reflection schema is persisted beside each .scene and validated before
+    // loading. This makes IReflection part of the real scene persistence path
+    // instead of a test/tool-only registry.
+    std::unique_ptr<engine::entity::IReflection> m_sceneReflection;
     // Sky pass (Clima panel): procedural day/night sky driven by the scene's
     // first WeatherComponent + directional sun. Drawn first in the viewport.
     struct SkyPushConstants {

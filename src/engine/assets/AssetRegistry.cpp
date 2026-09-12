@@ -139,6 +139,7 @@ bool AssetRegistry::register_asset(AssetMetadata metadata) {
         collision != pathToId_.end() && collision->second != metadata.id) return false;
     pathToId_[key] = metadata.id;
     assets_.insert_or_assign(metadata.id, std::move(metadata));
+    revision_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -152,6 +153,7 @@ bool AssetRegistry::remove_asset(UUID id) {
     for (auto& [owner, dependencies] : dependencies_) {
         dependencies.erase(std::remove(dependencies.begin(), dependencies.end(), id), dependencies.end());
     }
+    revision_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -191,6 +193,7 @@ bool AssetRegistry::set_dependencies(UUID asset, std::vector<UUID> dependencies)
     for (UUID dependency : dependencies)
         if (!assets_.contains(dependency)) return false;
     dependencies_[asset] = std::move(dependencies);
+    revision_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -387,6 +390,7 @@ bool AssetRegistry::load(const std::filesystem::path& databasePath) {
     assets_ = std::move(loadedAssets);
     pathToId_ = std::move(loadedPaths);
     dependencies_ = std::move(loadedDependencies);
+    revision_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 

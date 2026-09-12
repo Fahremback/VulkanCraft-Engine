@@ -569,6 +569,13 @@ void EditorApplication::setup_play_runtime() {
     m_playRuntimeRouter = engine::gameplay::create_gameplay_event_router(
         m_playRuntimeEvents.get(), m_playRuntimeAudio.get(),
         m_playRuntimeMetrics.get());
+    m_playGameplayDebugSurface = engine::gameplay::create_gameplay_debug_surface();
+    if (m_playGameplayDebugSurface) {
+        m_playGameplayDebugSurface->bind_integration(m_playRuntimeIntegration.get());
+        m_playGameplayDebugSurface->bind_ai(m_playAiRecorder.get());
+        m_playGameplayDebugSurface->bind_rendering(m_renderDebugView.get());
+        m_playGameplayDebugJson = m_playGameplayDebugSurface->to_json();
+    }
     // AGENTE 2 block G (day/night): play mode shares the SAME deterministic
     // IDayNightCycle as the game and the server (bound into the canonical
     // context, advanced by the runtime each play frame).
@@ -1138,30 +1145,35 @@ void EditorApplication::upload_hair(HairSim& sim, const HairParticleComponent& h
 // the splat pipeline (the sim's output reaches a real GPU pass instead of
 // dying inside render_data()).
 void EditorApplication::upload_play_particles() {
-    const std::vector<Engine::Gameplay::ParticleRenderData> data = m_playParticles.render_data();
+    const std::span<const Engine::Gameplay::ParticleRenderData> data = m_playParticles.render_data();
     if (data.empty()) {
         m_playParticleVertexCount = 0;
+        m_playParticleMaxSizePx = 8.0f;
         return;
     }
-    std::vector<EditorVertex> verts;
-    verts.reserve(data.size());
+    if (m_playParticleVertices.capacity() < m_playParticles.capacity()) {
+        m_playParticleVertices.reserve(m_playParticles.capacity());
+    }
+    m_playParticleVertices.clear();
+    m_playParticleMaxSizePx = 8.0f;
     for (const Engine::Gameplay::ParticleRenderData& p : data) {
         EditorVertex v;
         v.pos = p.position;
         v.normal = glm::vec3(0.0f, 1.0f, 0.0f);
         v.color = glm::vec3(p.color);
         v.uv = glm::vec2(p.size, p.rotation);
-        verts.push_back(v);
+        m_playParticleVertices.push_back(v);
+        m_playParticleMaxSizePx = std::max(m_playParticleMaxSizePx, p.size * 32.0f);
     }
-    const VkDeviceSize size = sizeof(EditorVertex) * verts.size();
+    const VkDeviceSize size = sizeof(EditorVertex) * m_playParticleVertices.size();
     if (m_playParticleVB.buffer == VK_NULL_HANDLE || m_playParticleVB.size < size) {
         if (m_playParticleVB.buffer != VK_NULL_HANDLE) destroy_buffer(m_playParticleVB);
         create_buffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       m_playParticleVB.buffer, m_playParticleVB.memory);
     }
-    safe_map_and_copy(m_device, m_playParticleVB.memory, 0, size, verts.data());
-    m_playParticleVertexCount = static_cast<uint32_t>(verts.size());
+    safe_map_and_copy(m_device, m_playParticleVB.memory, 0, size, m_playParticleVertices.data());
+    m_playParticleVertexCount = static_cast<uint32_t>(m_playParticleVertices.size());
 }
 
 void EditorApplication::ensure_softbody_sim(const UUID& id, const SoftBodyComponent& s,
@@ -1431,11 +1443,8 @@ void EditorApplication::capture_env_probe(const UUID& id, const EnvProbeComponen
 }
 
 UUID EditorApplication::resolve_texture_asset_by_name(const std::string& name) const {
-    for (const AssetMetadata& meta : m_assetRegistry.snapshot()) {
-        if (meta.type == AssetType::Texture && meta.sourcePath.filename().string() == name) {
-            return meta.id;
-        }
-    }
+    const auto it = m_textureAssetNameCache.find(std::filesystem::path(name).filename().string());
+    if (it != m_textureAssetNameCache.end()) return it->second;
     return UUID{ 0, 0 };
 }
 
@@ -2254,6 +2263,13 @@ void EditorApplication::tick_play_runtime(float deltaTime) {
             m_playWorldRuntime->advance(deltaTime);
         m_playRuntimeTick = sim.tick;
     }
+    if (m_playGameplayDebugSurface) {
+        // Rendering debug may be created lazily after play starts; rebind the
+        // live pointer each frame and publish one coherent product snapshot.
+        m_playGameplayDebugSurface->bind_ai(m_playAiRecorder.get());
+        m_playGameplayDebugSurface->bind_rendering(m_renderDebugView.get());
+        m_playGameplayDebugJson = m_playGameplayDebugSurface->to_json();
+    }
 }
 }
 
@@ -2420,6 +2436,8 @@ void EditorApplication::teardown_play_runtime() {
     // CONTA 3 (item 120): drop the AI debug recorder + snapshot so the panel
     // shows explicit absent state instead of a stale prior run.
     m_playAiRecorder.reset();
+    m_playGameplayDebugSurface.reset();
+    m_playGameplayDebugJson = "{}";
     m_playAiDebugJson = "{}";
     m_playAiNodes.clear();
     m_playAiBlackboard.clear();
@@ -2437,8 +2455,9 @@ std::string EditorApplication::capture_viewport_screenshot(const std::string& pa
         return "screenshot: viewport not initialized";
     const uint32_t w = m_offscreen.width, h = m_offscreen.height;
     const VkDeviceSize size = static_cast<VkDeviceSize>(w) * h * 4;
-    // Make sure no frame is in flight before we read the image back.
-    vkDeviceWaitIdle(m_device);
+    // Synchronize only the editor's graphics queue up to the current frame.
+    if (!wait_for_inflight_gpu("viewport screenshot"))
+        return "screenshot: GPU synchronization failed";
     VkBuffer staging = VK_NULL_HANDLE;
     VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
     create_buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -2565,7 +2584,8 @@ std::string EditorApplication::capture_ui_screenshot(const std::string& path) {
         return "screenshot-ui: no frame snapshot (editor sem UI renderizada)";
     const uint32_t w = m_uiSnapshotW, h = m_uiSnapshotH;
     const VkDeviceSize size = static_cast<VkDeviceSize>(w) * h * 4;
-    vkDeviceWaitIdle(m_device);
+    if (!wait_for_inflight_gpu("ui screenshot"))
+        return "screenshot-ui: GPU synchronization failed";
     VkBuffer staging = VK_NULL_HANDLE;
     VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
     create_buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,

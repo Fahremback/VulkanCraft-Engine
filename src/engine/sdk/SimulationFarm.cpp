@@ -11,12 +11,15 @@
 // The sweep is deterministic: seeds ascending x profiles in config order, and
 // the same config + driver reproduce a bit-identical report.
 #include "engine/simfarm/ISimulationFarm.hpp"
+#include "simulation/voxel/simulation/WorldScheduler.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace engine {
@@ -79,6 +82,86 @@ std::string outcome_name(FarmOutcome outcome) {
     }
     return "ok";
 }
+
+std::string watchdog_state(const SimulationFarmWatchdogSample& sample) {
+    // Tick is deliberately absent: a changing clock must not hide a queue that
+    // is stuck.  The cumulative execution counters change whenever real work
+    // progresses, while `pending` catches a queue whose size changes without a
+    // dispatch.  This is compact and deterministic across machines.
+    char buffer[192];
+    std::snprintf(buffer, sizeof(buffer), "%llu:%llu:%llu:%llu:%llu:%llu",
+                  static_cast<unsigned long long>(sample.pending),
+                  static_cast<unsigned long long>(sample.executed[0]),
+                  static_cast<unsigned long long>(sample.executed[1]),
+                  static_cast<unsigned long long>(sample.executed[2]),
+                  static_cast<unsigned long long>(sample.executed[3]),
+                  static_cast<unsigned long long>(sample.executed[4]));
+    return std::string(buffer);
+}
+
+SimulationFarmWatchdogResult analyze_live_scheduler(
+    const SimulationFarmWatchdogSample* samples, std::size_t count) {
+    SimulationFarmWatchdogResult result;
+    if (samples == nullptr || count < 2) {
+        result.ok = false;
+        result.error = "watchdog requires at least two scheduler samples";
+        return result;
+    }
+
+    std::unique_ptr<ISimulationFarm> farm = create_simulation_farm();
+    if (!farm) {
+        result.ok = false;
+        result.error = "create_simulation_farm returned null";
+        return result;
+    }
+
+    std::string error;
+    if (!farm->set_driver(
+            [samples, count](const std::string&, std::uint64_t,
+                             const std::string&, std::uint64_t step,
+                             std::string& hookError) -> std::string {
+                if (step >= count) {
+                    hookError = "scheduler sample window exhausted";
+                    return {};
+                }
+                return watchdog_state(samples[static_cast<std::size_t>(step)]);
+            },
+            error)) {
+        result.ok = false;
+        result.error = error.empty() ? "failed to install scheduler watchdog driver"
+                                    : std::move(error);
+        return result;
+    }
+
+    FarmConfig config;
+    config.maxStepsPerTrial = static_cast<std::uint64_t>(count);
+    config.maxStallSteps = std::min<std::uint64_t>(8, config.maxStepsPerTrial);
+    config.maxTrials = 1;
+    config.detectCycles = false;
+    config.seedStart = 0;
+    config.seedEnd = 1;
+    config.profiles = { "live-world-scheduler" };
+
+    FarmReport report;
+    if (!farm->run(config, report, error)) {
+        result.ok = false;
+        result.error = error.empty() ? "simulation farm refused live scheduler sweep"
+                                    : std::move(error);
+        return result;
+    }
+
+    result.reportJson = farm->report_to_json(report);
+    result.finding = report.softlocks != 0 || report.repeats != 0;
+    return result;
+}
+
+struct LiveSchedulerFarmRegistration final {
+    LiveSchedulerFarmRegistration() {
+        install_simulation_farm_watchdog_hook(&analyze_live_scheduler);
+    }
+};
+
+LiveSchedulerFarmRegistration gLiveSchedulerFarmRegistration;
 
 class SimulationFarm final : public ISimulationFarm {
 public:

@@ -1225,6 +1225,14 @@ target_include_directories(vc_sdk_ui_editor PRIVATE
 
 # ── vc_sdk_core: remaining infrastructure, plugins, audio, scripting ──
 vc_object_module(vc_sdk_core
+    # Public entity reflection is shared by editor scene persistence and the
+    # voxel facade. It must live in the canonical SDK object set, not only in
+    # the standalone reflection_tests target.
+    src/engine/sdk/Reflection.cpp
+    # VisualScriptRuntime constructs the public ECS scripting bridge. Keep the
+    # implementation in the same canonical SDK object set so Game/Server do
+    # not depend on the editor target to provide this symbol.
+    src/engine/scripting/ScriptGraphBridge.cpp
     src/engine/sdk/TimeTravel.cpp
     src/engine/sdk/TimelineGraph.cpp
     src/engine/sdk/CausalResolver.cpp
@@ -6776,6 +6784,15 @@ if(VC_NODE_EXECUTABLE)
         COMMAND "${VC_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/GridSimulationTests.mjs")
     set_tests_properties(grid_simulation_tests PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # BUG-EDITOR-GRID-006 (corrected): INDEPENDENT grid-vs-pick check — GridSimulationTests
+    # re-implements the shader math, so it would pass even with an inverted Y. This test
+    # instead verifies the grid ray recovers the SAME on-screen ground point the mesh
+    # paints there (the working pick convention), and fails if the old `-ndc.y` mirror is
+    # re-introduced (only the Y-symmetric origin would recover).
+    add_test(NAME grid_pick_consistency_tests
+        COMMAND "${VC_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/GridPickConsistencyTests.mjs")
+    set_tests_properties(grid_pick_consistency_tests PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     # C6-GRID-ARTIFACT-001: proves the active sources (shaders/active/) compile
     # DETERMINISTICALLY to the canonical SPIR-V hashes (out/dev-shared/shaders),
     # closing the source -> SPIR-V -> runtime chain without a full build. Fails
@@ -6967,7 +6984,6 @@ add_executable(VulkanEngineEditor
     src/engine/gameplay/DialogueSystem.cpp
     src/engine/scripting/ScriptRuntime.cpp
     src/engine/scripting/ScriptDebugger.cpp
-    src/engine/scripting/ScriptGraphBridge.cpp
     src/engine/scripting/VisualScriptCanvas.cpp
     src/engine/sdk/BlockEntityScripting.cpp
     src/engine/scripting/VisualScriptGraph.cpp

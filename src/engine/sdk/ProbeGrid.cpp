@@ -10,12 +10,14 @@
 // cores.
 
 #include "engine/rendering/IProbeGrid.hpp"
+#include "../rendering/lighting/GiProviderBridge.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Engine::Rendering {
@@ -58,12 +60,17 @@ struct Slot {
 class ProbeGrid final : public IProbeGrid {
 public:
     ProbeGrid() : config_(ProbeGridConfig{}) {}
+    ~ProbeGrid() override { vc::rendering::gi_bridge::retire(this); }
 
     bool configure(const ProbeGridConfig& config, std::string& errorOut) override {
         if (!config.valid(errorOut)) {
             return false;
         }
-        const bool realloc = config_.resolution != config.resolution ||
+        // A reconfigure invalidates any renderer publication immediately.  A
+        // fresh publication is emitted only after the next completed update.
+        vc::rendering::gi_bridge::retire(this);
+        const bool realloc = slots_.empty() ||
+                             config_.resolution != config.resolution ||
                              config_.cellSize != config.cellSize;
         config_ = config;
         if (realloc) {
@@ -159,6 +166,7 @@ public:
             ++updated;
             cursor_ = (cursor_ + 1) % total;
         }
+        publish_renderer_view();
         return updated;
     }
 
@@ -188,6 +196,27 @@ public:
     }
 
 private:
+    void publish_renderer_view() const {
+        std::vector<vc::rendering::gi_bridge::Probe> published;
+        published.reserve(slots_.size());
+        for (const Slot& s : slots_) {
+            vc::rendering::gi_bridge::Probe p;
+            p.irradiance = s.irradiance;
+            p.cell = s.cell;
+            p.position = cellCenter(s.cell) + s.offset;
+            p.direction = glm::length(s.offset) > 1.0e-5f
+                              ? glm::normalize(s.offset)
+                              : glm::vec3(0.0f, 1.0f, 0.0f);
+            p.visibility = (s.flags & 4u) != 0u
+                               ? 0.05f
+                               : std::min(1.0f, static_cast<float>(s.age) / 8.0f);
+            p.confidence = std::min(1.0f, static_cast<float>(s.age) / 32.0f);
+            published.push_back(p);
+        }
+        vc::rendering::gi_bridge::publish(this, config_.cellSize,
+                                          config_.resolution, std::move(published));
+    }
+
     glm::vec3 cellCenter(const glm::ivec3& c) const {
         return (glm::vec3(c) + 0.5f) * config_.cellSize;
     }
@@ -199,6 +228,7 @@ private:
         float maxL = -1.0f;
         int backfaces[3] = {0, 0, 0};  // per axis pair (X, Y, Z)
         bool freeAxis[3] = {false, false, false};
+        bool freeDirection[6] = {false, false, false, false, false, false};
 
         for (int a = 0; a < 6; ++a) {
             const ProbeCaptureSample smp = sampler(pos, kAxes[a]);
@@ -207,6 +237,7 @@ private:
                 backfaces[a / 2] += 1;
             } else {
                 freeAxis[a / 2] = true;
+                freeDirection[a] = true;
             }
             const float l = 0.2126f * smp.radiance.r + 0.7152f * smp.radiance.g +
                             0.0722f * smp.radiance.b;
@@ -240,9 +271,11 @@ private:
             glm::vec3 step = axisDir;
             if (freeAxis[axis] && backfaces[axis] == 1) {
                 // Exactly one direction of the axis is free: move toward it.
-                const int freeIdx = (axis == 0) ? 0 : (axis == 1) ? 2 : 4;
-                const glm::vec3 freeDir = kAxes[freeIdx];
-                if (glm::dot(axisDir, freeDir) < 0.0f) step = -axisDir;
+                const int positive = axis * 2;
+                const int negative = positive + 1;
+                if (!freeDirection[positive] && freeDirection[negative]) {
+                    step = -axisDir;
+                }
             }
             s.irradiance = glm::vec3(0.0f);
             s.age = 0;

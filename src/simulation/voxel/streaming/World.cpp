@@ -1800,3 +1800,73 @@ void World::cleanup() {
     std::lock_guard<std::recursive_mutex> lock(chunksMutex);
     chunks.clear();
 }
+
+World::RestoreRuntimeState World::capture_restore_runtime_state() const {
+    RestoreRuntimeState state;
+    state.scheduler = scheduler_.capture_state();
+    std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+    state.activeFluidCells = activeFluidCells;
+    state.activeFluidSet = activeFluidSet;
+    state.structurePopulatedChunks = structurePopulatedChunks;
+    state.lightDirtyChunks = lightDirtyChunks_;
+    state.lightContentRevision = lightContentRevision_;
+    state.pendingLightEdits = pendingLightEdits_;
+    state.visibleCenterChunkX = visibleCenterChunkX;
+    state.visibleCenterChunkZ = visibleCenterChunkZ;
+    state.stableVisibleRadius = stableVisibleRadius;
+    return state;
+}
+
+void World::reset_content_for_restore(WorldRenderBridge& renderBridge) {
+    // A load replaces world content. Drain workers first so no generation,
+    // meshing or lighting job can publish an old chunk after the reset.
+    threadPool.wait_idle();
+    {
+        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+        for (const auto& [key, chunk] : chunks) {
+            (void)key;
+            if (chunk) {
+                renderBridge.retire_chunk(
+                    ChunkId{ { chunk->chunkX, chunk->chunkZ }, 0 });
+            }
+        }
+        chunks.clear();
+        activeFluidCells.clear();
+        activeFluidSet.clear();
+        structurePopulatedChunks.clear();
+        lightDirtyChunks_.clear();
+        lightContentRevision_.clear();
+        pendingLightEdits_.clear();
+        // Replacement loads restore block entities from the save. Factories
+        // and listeners remain registered because they are runtime config.
+        blockEntities_.clear();
+        visibleCenterChunkX = 0;
+        visibleCenterChunkZ = 0;
+        stableVisibleRadius = -1;
+        nextChunkGeneration.fetch_add(1, std::memory_order_acq_rel);
+    }
+    {
+        std::lock_guard<std::mutex> lock(meshResultsMutex);
+        completedMeshResults.clear();
+    }
+    scheduler_.restore_state(WorldScheduler::State{});
+    pendingTasks.store(0, std::memory_order_release);
+    pendingLightJobs.store(0, std::memory_order_release);
+}
+
+void World::restore_runtime_state(RestoreRuntimeState state) {
+    // Called after VoxelWorldFacade has re-materialized the pre-load chunks and
+    // block entities. Overwrite the transient queues last so work scheduled by
+    // restore_chunk_data/restore_block_entity cannot perturb rollback state.
+    scheduler_.restore_state(state.scheduler);
+    std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+    activeFluidCells = std::move(state.activeFluidCells);
+    activeFluidSet = std::move(state.activeFluidSet);
+    structurePopulatedChunks = std::move(state.structurePopulatedChunks);
+    lightDirtyChunks_ = std::move(state.lightDirtyChunks);
+    lightContentRevision_ = std::move(state.lightContentRevision);
+    pendingLightEdits_ = std::move(state.pendingLightEdits);
+    visibleCenterChunkX = state.visibleCenterChunkX;
+    visibleCenterChunkZ = state.visibleCenterChunkZ;
+    stableVisibleRadius = state.stableVisibleRadius;
+}

@@ -19,18 +19,14 @@ bool ChunkRenderer::has_resource(ChunkId id) const {
     return resource && resource->vertexBuffer.buffer != VK_NULL_HANDLE;
 }
 
-void ChunkRenderer::upload(ChunkMeshResult result, VkDevice device, VmaAllocator allocator,
-                           std::vector<AllocatedBuffer>* retiredBuffers) {
+void ChunkRenderer::upload(ChunkMeshResult result, VmaAllocator allocator,
+                           std::vector<AllocatedBuffer>& retiredBuffers) {
     if (!result.valid) return;
     auto& mesh = result.mesh;
     ChunkRenderResource& resource = resources_[result.chunk];
     auto retireBuffer = [&](AllocatedBuffer& buffer) {
         if (buffer.buffer == VK_NULL_HANDLE) return;
-        if (retiredBuffers) retiredBuffers->push_back(buffer);
-        else {
-            vkDeviceWaitIdle(device);
-            vmaDestroyBuffer(allocator, buffer.buffer, buffer.allocation);
-        }
+        retiredBuffers.push_back(buffer);
         buffer = {};
     };
     retireBuffer(resource.vertexBuffer);
@@ -38,11 +34,7 @@ void ChunkRenderer::upload(ChunkMeshResult result, VkDevice device, VmaAllocator
     retireBuffer(resource.grassInstanceBuffer);
     retireBuffer(resource.foliageInstanceBuffer);
     if (resource.materialBuffer != VK_NULL_HANDLE) {
-        if (retiredBuffers) retiredBuffers->push_back({resource.materialBuffer, resource.materialAllocation});
-        else {
-            vkDeviceWaitIdle(device);
-            vmaDestroyBuffer(allocator, resource.materialBuffer, resource.materialAllocation);
-        }
+        retiredBuffers.push_back({resource.materialBuffer, resource.materialAllocation});
         resource.materialBuffer = VK_NULL_HANDLE;
         resource.materialAllocation = VK_NULL_HANDLE;
     }
@@ -101,16 +93,18 @@ void ChunkRenderer::upload(ChunkMeshResult result, VkDevice device, VmaAllocator
                                  &resource.materialBuffer, &resource.materialAllocation, nullptr));
         void* materialMapped = nullptr;
         VK_CHECK(vmaMapMemory(allocator, resource.materialAllocation, &materialMapped));
-        // Host-visible staging copy of the distinct variant keys (u32 each
-        // viewed as a single vec4 channel per record).
-        std::vector<glm::vec4> records;
-        records.reserve(mesh.materialVariants.size());
+        // Write directly into mapped memory. Creating a temporary vector here
+        // allocated and copied once per streamed chunk for data that is already
+        // in its final upload format.
+        auto* materialBytes = static_cast<std::byte*>(materialMapped);
+        std::size_t materialOffset = 0;
         for (const std::uint32_t key : mesh.materialVariants) {
-            records.push_back(glm::vec4(static_cast<float>(key), 0.0f, 0.0f, 1.0f));
+            const glm::vec4 record(static_cast<float>(key), 0.0f, 0.0f, 1.0f);
+            std::memcpy(materialBytes + materialOffset, &record, sizeof(record));
+            materialOffset += sizeof(record);
         }
-        std::memcpy(materialMapped, records.data(), records.size() * sizeof(glm::vec4));
         VK_CHECK(vmaFlushAllocation(allocator, resource.materialAllocation, 0,
-                                    records.size() * sizeof(glm::vec4)));
+                                    materialInfo.size));
         vmaUnmapMemory(allocator, resource.materialAllocation);
     }
     resource.dynamicMaterialVertexCount = 0u;

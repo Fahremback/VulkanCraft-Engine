@@ -134,7 +134,28 @@ void AttenuationCurve::set_rolloff(float rolloff) noexcept {
 }
 
 void AttenuationCurve::set_points(std::vector<AttenuationPoint> points) {
-    points_ = std::move(points);
+    for (auto& point : points) {
+        point.normalizedDistance = std::clamp(point.normalizedDistance, 0.0f, 1.0f);
+        point.gain = std::clamp(point.gain, 0.0f, 1.0f);
+    }
+    std::stable_sort(points.begin(), points.end(), [](const AttenuationPoint& a,
+                                                       const AttenuationPoint& b) {
+        return a.normalizedDistance < b.normalizedDistance;
+    });
+
+    // Coalesce duplicate keys so interpolation never divides by zero. The
+    // last authored value wins for an exact normalized-distance key.
+    std::vector<AttenuationPoint> normalized;
+    normalized.reserve(points.size());
+    for (const auto& point : points) {
+        if (!normalized.empty() &&
+            std::abs(normalized.back().normalizedDistance - point.normalizedDistance) <= 1.0e-6f) {
+            normalized.back() = point;
+        } else {
+            normalized.push_back(point);
+        }
+    }
+    points_ = std::move(normalized);
 }
 
 float AttenuationCurve::evaluate(float distance, float minimumDistance, float maximumDistance) const noexcept {
@@ -148,9 +169,35 @@ float AttenuationCurve::evaluate(float distance, float minimumDistance, float ma
             return (minimumDistance / (minimumDistance + rolloff_ * (distance - minimumDistance)));
         case AttenuationModel::Exponential:
             return std::pow(minimumDistance / distance, rolloff_);
-        case AttenuationModel::Custom:
-            // Placeholder for custom curve evaluation
-            return 1.0f;
+        case AttenuationModel::Custom: {
+            const float span = maximumDistance - minimumDistance;
+            if (span <= 1.0e-6f || points_.empty()) {
+                return 1.0f - std::clamp((distance - minimumDistance) /
+                                         std::max(span, 1.0e-6f), 0.0f, 1.0f);
+            }
+            const float normalizedDistance = std::clamp(
+                (distance - minimumDistance) / span, 0.0f, 1.0f);
+            if (normalizedDistance <= points_.front().normalizedDistance) {
+                return points_.front().gain;
+            }
+            if (normalizedDistance >= points_.back().normalizedDistance) {
+                return points_.back().gain;
+            }
+
+            const auto upper = std::lower_bound(
+                points_.begin(), points_.end(), normalizedDistance,
+                [](const AttenuationPoint& point, float value) {
+                    return point.normalizedDistance < value;
+                });
+            const auto lower = upper - 1;
+            const float width = upper->normalizedDistance - lower->normalizedDistance;
+            const float alpha = std::clamp(
+                (normalizedDistance - lower->normalizedDistance) /
+                    std::max(width, 1.0e-6f),
+                0.0f, 1.0f);
+            return std::clamp(lower->gain + (upper->gain - lower->gain) * alpha,
+                              0.0f, 1.0f);
+        }
     }
     return 1.0f;
 }

@@ -23,7 +23,76 @@
 
 namespace Engine {
 
+void EditorApplication::ensure_scene_reflection() {
+    if (m_sceneReflection) return;
+    m_sceneReflection = engine::entity::create_reflection();
+    if (!m_sceneReflection) return;
+
+    engine::entity::TypeInfo entityType;
+    entityType.name = "SceneEntity";
+    entityType.stable_id = "vulkancraft.scene.entity";
+    entityType.version = "1.0.0";
+    entityType.fields.push_back({ "uuid", engine::entity::FieldKind::Uuid });
+    entityType.fields.push_back({ "name", engine::entity::FieldKind::String });
+    entityType.fields.push_back({ "parent", engine::entity::FieldKind::Optional });
+    entityType.fields.push_back({ "components", engine::entity::FieldKind::Json });
+
+    engine::entity::TypeInfo transformType;
+    transformType.name = "TransformComponent";
+    transformType.stable_id = "vulkancraft.scene.transform";
+    transformType.version = "1.0.0";
+    transformType.fields.push_back({ "position", engine::entity::FieldKind::Vec3 });
+    transformType.fields.push_back({ "rotation", engine::entity::FieldKind::Quat });
+    transformType.fields.push_back({ "scale", engine::entity::FieldKind::Vec3 });
+
+    std::string error;
+    if (!m_sceneReflection->register_type(entityType, error) ||
+        !m_sceneReflection->register_type(transformType, error)) {
+        std::cerr << "[Editor] reflection schema init failed: " << error << std::endl;
+        m_sceneReflection.reset();
+    }
+}
+
+bool EditorApplication::restore_scene_reflection_sidecar(const std::string& path) {
+    ensure_scene_reflection();
+    if (!m_sceneReflection) return false;
+
+    const std::filesystem::path sidecar = std::filesystem::path(path).string() + ".reflection.json";
+    std::ifstream in(sidecar, std::ios::binary);
+    if (!in) return true;  // legacy scene: use the canonical builtin schema.
+
+    const std::string json((std::istreambuf_iterator<char>(in)), {});
+    auto candidate = engine::entity::create_reflection();
+    std::string error;
+    if (!candidate || !candidate->load_from_json(json, error) ||
+        !candidate->has_field("SceneEntity", "uuid") ||
+        !candidate->has_field("SceneEntity", "components") ||
+        !candidate->has_field("TransformComponent", "position")) {
+        std::cerr << "[Editor] scene reflection sidecar rejected: "
+                  << (error.empty() ? "required stable fields missing" : error)
+                  << std::endl;
+        return false;
+    }
+    m_sceneReflection = std::move(candidate);
+    return true;
+}
+
+bool EditorApplication::persist_scene_reflection_sidecar(const std::string& path) {
+    ensure_scene_reflection();
+    if (!m_sceneReflection) return false;
+    const std::filesystem::path sidecar = std::filesystem::path(path).string() + ".reflection.json";
+    std::ofstream out(sidecar, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out << m_sceneReflection->to_json();
+    return out.good();
+}
+
 void EditorApplication::load_scene_file(const std::string& path) {
+    if (!restore_scene_reflection_sidecar(path)) {
+        std::cerr << "[Editor] Falha ao abrir cena: schema reflection incompatível: "
+                  << path << std::endl;
+        return;
+    }
     auto scene = std::make_unique<Scene>("Untitled Scene");
     if (!scene->load_from_file(path)) {
         std::cerr << "[Editor] Falha ao abrir cena: " << path << std::endl;
@@ -104,6 +173,10 @@ void EditorApplication::save_current_scene() {
         } else {
             m_sceneDirty = false;
             persist_terrain_sidecar(m_activeScenePath);
+            if (!persist_scene_reflection_sidecar(m_activeScenePath)) {
+                std::cerr << "[Editor] Falha ao salvar schema reflection da cena: "
+                          << m_activeScenePath << std::endl;
+            }
             std::cout << "[Editor] Cena salva: " << m_activeScenePath << std::endl;
         }
         return;
@@ -128,6 +201,10 @@ void EditorApplication::save_scene_as() {
     m_autosavePath.clear();
     m_sceneDirty = false;
     persist_terrain_sidecar(path);
+    if (!persist_scene_reflection_sidecar(path)) {
+        std::cerr << "[Editor] Falha ao salvar schema reflection da cena: "
+                  << path << std::endl;
+    }
     std::cout << "[Editor] Cena salva: " << path << std::endl;
 }
 
@@ -457,8 +534,8 @@ void EditorApplication::generate_terrain_mesh(const TerrainParams& params) {
     // without waiting crashes the device (fence wait failed: -4, then the
     // viewport renders black forever). The editor can afford an idle here:
     // terrain regeneration is a user/API action, never per-frame.
-    if (m_terrainVB.buffer != VK_NULL_HANDLE || m_terrainIB.buffer != VK_NULL_HANDLE)
-        vkDeviceWaitIdle(m_device);
+    if ((m_terrainVB.buffer != VK_NULL_HANDLE || m_terrainIB.buffer != VK_NULL_HANDLE) &&
+        !wait_for_inflight_gpu("terrain regeneration")) return;
     if (m_terrainVB.buffer != VK_NULL_HANDLE) { destroy_buffer(m_terrainVB); m_terrainVB = GPUBuffer{}; }
     if (m_terrainIB.buffer != VK_NULL_HANDLE) { destroy_buffer(m_terrainIB); m_terrainIB = GPUBuffer{}; }
     m_terrainValid = false;

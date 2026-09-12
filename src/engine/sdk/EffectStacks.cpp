@@ -6,6 +6,7 @@
 #include "engine/gameplay/IEffectStacks.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <unordered_map>
 
 namespace engine::gameplay {
@@ -30,6 +31,10 @@ public:
                 errorOut = "effect_stacks: maxStacks == 0";
                 return false;
             }
+            if (!std::isfinite(spec.durationSeconds) || spec.durationSeconds < 0.0f) {
+                errorOut = "effect_stacks: durationSeconds must be finite and >= 0";
+                return false;
+            }
             if (parsed.count(spec.effectId)) {
                 errorOut = "effect_stacks: efeito duplicado";
                 return false;
@@ -39,6 +44,7 @@ public:
             parsed[spec.effectId] = effect;
         }
         effects_ = std::move(parsed);
+        errorOut.clear();
         return true;
     }
 
@@ -46,10 +52,9 @@ public:
         auto found = effects_.find(effectId);
         if (found == effects_.end()) return 0;
         Effect& effect = found->second;
+        const bool wasInactive = effect.stacks == 0;
         if (effect.stacks < effect.spec.maxStacks) ++effect.stacks;
-        if (effect.spec.refreshOnApply) {
-            effect.remaining = effect.spec.durationSeconds;
-        } else if (effect.remaining < effect.spec.durationSeconds) {
+        if (wasInactive || effect.spec.refreshOnApply) {
             effect.remaining = effect.spec.durationSeconds;
         }
         return effect.stacks;
@@ -72,7 +77,7 @@ public:
     }
 
     std::vector<std::uint16_t> tick(float dt) override {
-        if (dt < 0.0f) dt = 0.0f;
+        if (!std::isfinite(dt) || dt < 0.0f) dt = 0.0f;
         std::vector<std::uint16_t> removed;
         for (auto& [id, effect] : effects_) {
             if (effect.stacks == 0) continue;

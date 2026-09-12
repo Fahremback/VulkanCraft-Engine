@@ -137,13 +137,23 @@ public:
                           std::size_t resp_bytes) const override {
         if (!limits_.amplification_guard) return true;
         const auto winIt = activeWindows_.find(currentWindowId_);
-        if (winIt == activeWindows_.end()) return resp_bytes <= req_bytes * limits_.max_response_ratio;
+        if (winIt == activeWindows_.end()) {
+            const bool ok = resp_bytes <= req_bytes * limits_.max_response_ratio;
+            if (!ok) ++droppedAmp_;
+            return ok;
+        }
         const auto connIt = winIt->second.find(connection_id);
-        if (connIt == winIt->second.end()) return resp_bytes <= req_bytes * limits_.max_response_ratio;
+        if (connIt == winIt->second.end()) {
+            const bool ok = resp_bytes <= req_bytes * limits_.max_response_ratio;
+            if (!ok) ++droppedAmp_;
+            return ok;
+        }
         std::size_t req = req_bytes;
         if (!connIt->second.request_sizes.empty()) req = connIt->second.request_sizes.back();
         if (req == 0) req = 1;
-        return resp_bytes <= req * limits_.max_response_ratio;
+        const bool ok = resp_bytes <= req * limits_.max_response_ratio;
+        if (!ok) ++droppedAmp_;
+        return ok;
     }
 
     bool journal_record(const std::string& kind, const std::uint8_t* data,

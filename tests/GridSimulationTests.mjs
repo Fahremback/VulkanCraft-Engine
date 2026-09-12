@@ -114,7 +114,11 @@ const MAJOR_GRID_STEP = 10.0;
 const RAY_SCALE = 1.0 / 24.0; // vertex: one fixed constant scale
 
 function unproject(invViewProj, ndc, clipZ) {
-  const p = mulMat4Vec4(invViewProj, [ndc[0], -ndc[1], clipZ, 1.0]); // vertex flips ndc.y
+  // The grid fragment is rasterized at clip `ndc`, and its ray must be
+  // invViewProj * vec4(ndc.x, ndc.y, ...) — the SAME unflipped convention the
+  // pick ray and the mesh vertex shader use (BUG-EDITOR-GRID-006 fixed: the
+  // older `-ndc.y` mirrored the plane vertically against the meshes).
+  const p = mulMat4Vec4(invViewProj, [ndc[0], ndc[1], clipZ, 1.0]);
   return [p[0] / p[3], p[1] / p[3], p[2] / p[3]];
 }
 

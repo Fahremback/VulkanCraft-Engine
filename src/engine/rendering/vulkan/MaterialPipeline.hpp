@@ -90,6 +90,31 @@ static_assert(sizeof(MaterialPushConstants) == 128);
 [[nodiscard]] std::vector<uint32_t> compile_glsl_to_spirv(const std::string& source,
                                                           VkShaderStageFlagBits stage);
 
+// Reflection-backed contract used immediately before a shader module is
+// accepted for a Vulkan pipeline. `descriptorBindings` describes the layout
+// visible to this shader stage; the validator permits additional layout
+// bindings but every descriptor statically declared by the SPIR-V module must
+// have a compatible set/binding/type/count and stage visibility.
+struct SpirvPipelineDescriptorBinding {
+    uint32_t set{0};
+    VkDescriptorSetLayoutBinding binding{};
+};
+
+struct SpirvPipelineInterfaceExpectation {
+    VkShaderStageFlagBits stage{VK_SHADER_STAGE_VERTEX_BIT};
+    std::string entryPoint{"main"};
+    std::vector<SpirvPipelineDescriptorBinding> descriptorBindings;
+    std::vector<VkPushConstantRange> pushConstantRanges;
+    bool validateDescriptorLayout{false};
+    bool requireAllDescriptorBindings{false};
+    bool validatePushConstantLayout{false};
+};
+
+[[nodiscard]] bool validate_spirv_pipeline_interface(
+    const std::vector<uint32_t>& spirv,
+    const SpirvPipelineInterfaceExpectation& expected,
+    std::string* error = nullptr);
+
 // ─── Render Graph → Vulkan executor ───
 // Executes a compiled RenderGraph on real Vulkan resources. The graph's
 // compiled pass order drives the command stream: each pass begins its real

@@ -14,6 +14,8 @@
 #include "../physics/Vehicle.hpp"
 #include "../public/engine/vehicles/IBeamGraphAsset.hpp"
 #include "../public/engine/deformable/IDeformableProvider.hpp"
+#include "../public/engine/gameplay/IEffectStacks.hpp"
+#include "../public/engine/gameplay/IReplay.hpp"
 
 #include <memory>
 #include <string>
@@ -112,6 +114,16 @@ private:
     std::vector<float> occupantMass_;
     std::vector<Physics::VehiclePartInfo> parts_;
     Physics::VehiclePower power_;
+    // CONTA 4: these public gameplay contracts are owned by a runtime that is
+    // transitively exercised by IGameplayRuntime::create_beam_vehicle in the
+    // live showcase. Structural damage applies a short-lived stack that feeds
+    // back into force delivery; replay records the exact mapped controls used
+    // by each solver tick. The input byte buffer is persistent to avoid a
+    // per-frame allocation.
+    std::unique_ptr<engine::gameplay::IEffectStacks> effectStacks_;
+    std::unique_ptr<engine::gameplay::IReplay> replay_;
+    std::vector<std::uint8_t> replayInput_;
+    std::uint64_t replayTick_{ 0 };
     std::size_t wheelPartOffset_{ 1 };   // parts index of the first wheel
     std::size_t beamPartOffset_{ 1 };    // parts index of the first beam
     void refresh_beam_stiffness();

@@ -52,6 +52,8 @@ public:
         uint32_t nearSurfaceInstanceCount{ 0 };
         uint32_t farSurfaceInstanceCount{ 0 };
         uint32_t shadowSurfaceInstanceCount{ 0 };
+        uint32_t grassProxyVertexCount{ 0 };
+        uint32_t treeProxyVertexCount{ 0 };
         std::vector<VoxelVertex> terrainVertices;
         std::vector<VoxelVertex> waterVertices;
         std::vector<std::array<uint32_t, 2>> shadowDrawRanges; // first vertex, count
@@ -59,8 +61,8 @@ public:
 
     void request(ThreadPool& pool, int centerChunkX, int centerChunkZ,
                  int reachChunks, float endpointQualityFraction);
-    void upload_ready(VkDevice device, VmaAllocator allocator,
-                      std::vector<AllocatedBuffer>* retiredBuffers);
+    void upload_ready(VmaAllocator allocator,
+                      std::vector<AllocatedBuffer>& retiredBuffers);
     void draw(VkCommandBuffer cmd) const;
     void draw_near_surface(VkCommandBuffer cmd) const;
     void draw_far_surface(VkCommandBuffer cmd) const;
@@ -74,6 +76,18 @@ public:
     [[nodiscard]] uint32_t water_vertex_count() const { return waterVertexCount; }
     [[nodiscard]] uint32_t near_surface_instance_count() const { return nearSurfaceInstanceCount; }
     [[nodiscard]] uint32_t far_surface_instance_count() const { return farSurfaceInstanceCount; }
+    [[nodiscard]] uint32_t grass_proxy_vertex_count() const {
+        return publishedGrassProxyVertices.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] uint32_t tree_proxy_vertex_count() const {
+        return publishedTreeProxyVertices.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] uint64_t last_upload_bytes() const {
+        return publishedUploadBytes.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] uint64_t upload_version() const {
+        return publishedUploadVersion.load(std::memory_order_acquire);
+    }
     [[nodiscard]] int represented_reach_chunks() const {
         return representedReachChunks.load(std::memory_order_acquire);
     }
@@ -119,4 +133,8 @@ private:
     std::atomic_int publishedClipmapLevels{ 0 };
     std::atomic_uint64_t lastBuildMicroseconds{ 0 };
     std::atomic<float> publishedEndpointQuality{ 0.0f };
+    std::atomic_uint32_t publishedGrassProxyVertices{ 0 };
+    std::atomic_uint32_t publishedTreeProxyVertices{ 0 };
+    std::atomic_uint64_t publishedUploadBytes{ 0 };
+    std::atomic_uint64_t publishedUploadVersion{ 0 };
 };

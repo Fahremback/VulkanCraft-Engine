@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 namespace engine::scripting {
+class IScriptingBridge;
 struct ScriptError { std::string code; std::string message; std::uint64_t node_id{0}; };
 struct ScriptProfile { std::uint64_t steps{0}; std::uint64_t elapsed_ticks{0}; };
 struct ScriptBreakpoint { std::uint64_t node_id{0}; bool enabled{true}; };
@@ -25,6 +26,10 @@ public:
  virtual const ScriptError* last_error() const = 0;
  virtual ScriptProfile profile() const = 0;
  virtual bool paused() const noexcept = 0;
+ // The runtime owns the canonical ECS bridge. Product diagnostics may inspect
+ // it read-only so bridge consumption/health is observable without creating a
+ // second scripting world or bypassing the visual-script runtime.
+ virtual const IScriptingBridge* scripting_bridge() const noexcept = 0;
 };
 std::unique_ptr<IVisualScriptRuntime> create_visual_script_runtime();
 }

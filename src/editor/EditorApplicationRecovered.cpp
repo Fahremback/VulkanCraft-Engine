@@ -259,6 +259,33 @@ void EditorApplication::render_frame() {
         return;
     }
 
+    // This slot's previous submission is complete because its frame fence just
+    // signalled. Read GPU timestamps without WAIT_BIT, pair them with the CPU
+    // record times captured for that same submission, then reuse the pool.
+    if (m_gpuTimestampSubmitted[m_currentFrame] &&
+        m_gpuTimestampComplete[m_currentFrame] &&
+        m_gpuTimestampPools[m_currentFrame] != VK_NULL_HANDLE && m_renderMetrics) {
+        std::array<std::uint64_t, kEditorGpuTimestampSlots> values{};
+        const VkResult queryResult = vkGetQueryPoolResults(
+            m_device, m_gpuTimestampPools[m_currentFrame], 0, kEditorGpuTimestampSlots,
+            sizeof(values), values.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (queryResult == VK_SUCCESS) {
+            const auto gpuMs = [this](std::uint64_t begin, std::uint64_t end) {
+                return end >= begin
+                    ? static_cast<double>(end - begin) * m_gpuTimestampPeriodNs / 1.0e6
+                    : 0.0;
+            };
+            static constexpr const char* kPassNames[3] = { "shadow", "scene", "env" };
+            for (std::size_t pass = 0; pass < 3; ++pass) {
+                m_renderMetrics->recordPass(
+                    kPassNames[pass], m_pendingCpuPassMs[m_currentFrame][pass],
+                    gpuMs(values[pass * 2], values[pass * 2 + 1]));
+            }
+        }
+    }
+    m_gpuTimestampSubmitted[m_currentFrame] = false;
+    m_gpuTimestampComplete[m_currentFrame] = false;
+
     // A pick requested from the previous frame is resolved before this frame's
     // scene pass so the freshly selected entity is highlighted immediately.
     // Hover pick uses the same pass (one extra pixel read, zero extra GPU cost).
@@ -291,6 +318,9 @@ void EditorApplication::render_frame() {
 
     VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(cmd, &beginInfo);
+    if (m_gpuTimestampPools[m_currentFrame] != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(cmd, m_gpuTimestampPools[m_currentFrame], 0, kEditorGpuTimestampSlots);
+    }
 
     if (!m_inLauncherMode) {
         // Size the offscreen to the panel (not the fitted image) so its aspect
@@ -346,15 +376,6 @@ void EditorApplication::render_frame() {
         if (m_showRenderDebugger) draw_render_debugger_panel();
         if (m_showAiDebug) draw_ai_debug_panel();
         if (m_showScriptCanvas) { if (!m_scriptCanvasLoaded) load_script_canvas(); draw_script_canvas_panel(); }
-        {
-            // Feed cooked texture assets to the Material Editor texture pickers.
-            std::vector<std::pair<std::string, UUID>> textureAssets;
-            for (const AssetMetadata& meta : m_assetRegistry.snapshot()) {
-                if (meta.type == AssetType::Texture && meta.isCooked)
-                    textureAssets.emplace_back(meta.sourcePath.filename().string(), meta.id);
-            }
-            m_specializedEditors.set_texture_assets(std::move(textureAssets));
-        }
         Scene* activeScene = m_playMode.get_active_scene();
         if (!activeScene) activeScene = m_editorScene.get();
         m_specializedEditors.set_scene_context(activeScene, m_selectedEntity.get_id());
@@ -406,7 +427,7 @@ void EditorApplication::render_frame() {
             });
             m_wickedTools.set_hot_reload_status_callback([this]() -> std::string {
                 if (!m_assetHotReload) return tr("inativo", "inactive");
-                const size_t watched = m_assetRegistry.snapshot().size();
+                const size_t watched = m_assetRegistry.size();
                 return tr("ativo — vigia ", "active — watches ") + std::to_string(watched) +
                        tr(" asset(s) e reimporta mudanças nos arquivos de origem",
                           " asset(s) and reimports source-file changes");
@@ -454,7 +475,26 @@ void EditorApplication::render_frame() {
     submitInfo.signalSemaphoreCount = 1;
     submitInfo.pSignalSemaphores = signalSemaphores;
 
-    vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, m_inFlightFences[m_currentFrame]);
+    const VkResult submitResult =
+        vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, m_inFlightFences[m_currentFrame]);
+    if (submitResult != VK_SUCCESS) {
+        std::cerr << "[Vulkan] editor frame submit failed: " << static_cast<int>(submitResult) << "\n";
+        m_gpuTimestampComplete[m_currentFrame] = false;
+        // vkResetFences happened before recording. A failed submit never owns
+        // this fence, so recreate it signaled or the next frame would wait on
+        // an unsignaled fence forever.
+        vkDestroyFence(m_device, m_inFlightFences[m_currentFrame], nullptr);
+        VkFenceCreateInfo recoverFenceInfo{
+            VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT
+        };
+        m_inFlightFences[m_currentFrame] = VK_NULL_HANDLE;
+        if (vkCreateFence(m_device, &recoverFenceInfo, nullptr,
+                          &m_inFlightFences[m_currentFrame]) != VK_SUCCESS) {
+            std::cerr << "[Vulkan] failed to recreate editor frame fence after submit failure\n";
+        }
+        return;
+    }
+    m_gpuTimestampSubmitted[m_currentFrame] = true;
 
     VkPresentInfoKHR presentInfo{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
     presentInfo.waitSemaphoreCount = 1;
@@ -472,7 +512,7 @@ void EditorApplication::render_frame() {
 
 
 void EditorApplication::recreate_swapchain() {
-    vkDeviceWaitIdle(m_device);
+    if (!wait_for_inflight_gpu("swapchain resize")) return;
     for (auto fb : m_framebuffers) vkDestroyFramebuffer(m_device, fb, nullptr);
     for (auto view : m_swapchainViews) vkDestroyImageView(m_device, view, nullptr);
     m_framebuffers.clear();
@@ -485,8 +525,6 @@ void EditorApplication::recreate_swapchain() {
         glfwGetFramebufferSize(m_window, &width, &height);
         glfwWaitEvents();
     }
-    vkDeviceWaitIdle(m_device);
-
     VkSurfaceCapabilitiesKHR capabilities{};
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(m_physicalDevice, m_surface, &capabilities) != VK_SUCCESS) {
         return;
@@ -914,6 +952,10 @@ void EditorApplication::cleanup() {
             vkDestroySemaphore(m_device, m_imageAvailableSemaphores[i], nullptr);
             vkDestroySemaphore(m_device, m_renderFinishedSemaphores[i], nullptr);
             vkDestroyFence(m_device, m_inFlightFences[i], nullptr);
+            if (m_gpuTimestampPools[i] != VK_NULL_HANDLE) {
+                vkDestroyQueryPool(m_device, m_gpuTimestampPools[i], nullptr);
+                m_gpuTimestampPools[i] = VK_NULL_HANDLE;
+            }
         }
 
         if (m_commandPool != VK_NULL_HANDLE) {

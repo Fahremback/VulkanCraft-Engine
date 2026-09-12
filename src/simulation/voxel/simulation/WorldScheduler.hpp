@@ -16,6 +16,7 @@
 // next tick in the same sorted order: no event is lost and none reorders
 // across ticks.
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -57,6 +58,38 @@ struct TickChunkHash {
         return h;
     }
 };
+
+// Product bridge for the public ISimulationFarm implementation.  The voxel
+// runtime itself stays independent from the SDK object module: when the SDK is
+// present it installs this hook during process startup; scheduler-only targets
+// simply leave it null.  The live scheduler feeds a bounded window of actual
+// queue/progress observations through the hook, so the farm is reached from
+// World::update without creating a link dependency from vc_voxel_runtime back
+// to vc_sdk_world.
+struct SimulationFarmWatchdogSample {
+    std::size_t pending{ 0 };
+    std::array<std::size_t, 5> executed{};
+};
+
+struct SimulationFarmWatchdogResult {
+    bool ok{ true };
+    bool finding{ false };
+    std::string reportJson;
+    std::string error;
+};
+
+using SimulationFarmWatchdogHook = SimulationFarmWatchdogResult (*)(
+    const SimulationFarmWatchdogSample*, std::size_t);
+
+inline SimulationFarmWatchdogHook& simulation_farm_watchdog_hook() noexcept {
+    static SimulationFarmWatchdogHook hook = nullptr;
+    return hook;
+}
+
+inline void install_simulation_farm_watchdog_hook(
+    SimulationFarmWatchdogHook hook) noexcept {
+    simulation_farm_watchdog_hook() = hook;
+}
 
 class WorldScheduler {
 public:
@@ -175,6 +208,22 @@ public:
     [[nodiscard]] std::size_t executed_count(Phase phase) const {
         return executed_[static_cast<int>(phase)];
     }
+    // Live product observability for the SimulationFarm watchdog.  A false
+    // value means the last bounded farm sweep found a stalled actionable queue
+    // or the farm refused the sweep; the JSON/error fields carry the exact
+    // machine-readable evidence.
+    [[nodiscard]] bool simulation_farm_healthy() const noexcept {
+        return simulationFarmHealthy_;
+    }
+    [[nodiscard]] std::uint64_t simulation_farm_checks() const noexcept {
+        return simulationFarmChecks_;
+    }
+    [[nodiscard]] const std::string& simulation_farm_report_json() const noexcept {
+        return simulationFarmReportJson_;
+    }
+    [[nodiscard]] const std::string& simulation_farm_error() const noexcept {
+        return simulationFarmError_;
+    }
 
 private:
     void run_tick();
@@ -186,6 +235,8 @@ private:
     [[nodiscard]] TickCell random_cell(int chunkX, int chunkZ, uint64_t tick) const;
     // True when the cell's chunk is inside the active region (or none set).
     [[nodiscard]] bool is_active(const TickCell& cell) const;
+    [[nodiscard]] bool has_actionable_pending() const;
+    void observe_simulation_farm_watchdog();
     static int floor_div(int value, int divisor);
 
     uint64_t seed_;
@@ -212,5 +263,16 @@ private:
     int activeCenterZ_{ -1 };
     int activeRadius_{ -1 };
 
-    std::size_t executed_[5]{ 0, 0, 0, 0 };
+    std::size_t executed_[5]{ 0, 0, 0, 0, 0 };
+
+    static constexpr std::size_t kSimulationFarmWindow = 16;
+    std::array<SimulationFarmWatchdogSample, kSimulationFarmWindow>
+        simulationFarmSamples_{};
+    std::size_t simulationFarmSampleHead_{ 0 };
+    std::size_t simulationFarmSampleCount_{ 0 };
+    std::uint64_t simulationFarmChecks_{ 0 };
+    bool simulationFarmHealthy_{ true };
+    bool simulationFarmFindingReported_{ false };
+    std::string simulationFarmReportJson_;
+    std::string simulationFarmError_;
 };

@@ -50,8 +50,24 @@ const contractRe = /(?:class|struct)\s+(I[A-Za-z0-9_]+)\b/g;
 
 const caps = new Map(); // key -> { name, kind, headers[], factories[] }
 const factoryOwner = new Map(); // factory name -> header
+
+// A compatibility header that contains only comments/preprocessor directives
+// and includes does not declare a public capability of its own. Treating the
+// filename as a capability manufactured false rows for forwarding headers such
+// as IPluginIsolationRuntime.hpp and IPluginManifestCodec.hpp after their
+// declarations were consolidated into the canonical headers.
+export function isForwardingPublicHeader(source) {
+  const semanticBody = String(source)
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/\/\/[^\n]*/g, ' ')
+    .replace(/^\s*#.*$/gm, ' ')
+    .trim();
+  return semanticBody.length === 0;
+}
+
 for (const h of publicHeaders) {
   const text = readFileSync(h, 'utf8');
+  if (isForwardingPublicHeader(text)) continue;
   const hRel = rel(h);
   const origin = basename(h).replace(/\.(hpp|h)$/, '');
   const seeds = new Set([origin]);
@@ -97,6 +113,214 @@ const joinText = (files) => files.map(readText).join('\n');
 const text = (p) => readText(p);
 const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+export function detectConstantUnavailableFactories(source) {
+  const stripped = String(source)
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/\/\/[^\n]*/g, ' ');
+  const factories = [];
+  const availabilityMethods = [];
+  const factoryBodyRe = /\b(?:std::unique_ptr|std::shared_ptr)\s*<[^>{};]+>\s+(create_[a-z0-9_]+)\s*\([^)]*\)\s*(?:const\s*)?(?:noexcept\s*)?\{([^{}]*)\}/g;
+  let m;
+  while ((m = factoryBodyRe.exec(stripped)) !== null) {
+    const body = m[2].trim().replace(/\s+/g, ' ');
+    if (/^return\s+(?:nullptr|false|\{\})\s*;$/.test(body)) factories.push(m[1]);
+  }
+  const availableBodyRe = /\bbool\s+([A-Za-z_][A-Za-z0-9_:]*available[A-Za-z0-9_:]*)\s*\([^)]*\)\s*(?:const\s*)?(?:noexcept\s*)?\{([^{}]*)\}/g;
+  while ((m = availableBodyRe.exec(stripped)) !== null) {
+    const body = m[2].trim().replace(/\s+/g, ' ');
+    if (/^return\s+false\s*;$/.test(body)) availabilityMethods.push(m[1]);
+  }
+  return {
+    factories: [...new Set(factories)].sort(),
+    availabilityMethods: [...new Set(availabilityMethods)].sort()
+  };
+}
+
+export function detectParallelPublicContracts(interfaceNames) {
+  const names = [...new Set(interfaceNames.map(String))].sort();
+  const nameSet = new Set(names);
+  const suffixRe = /(Runtime|Codec|Legacy|V[0-9]+)$/;
+  const grouped = new Map();
+  for (const name of names) {
+    const base = name.replace(suffixRe, '');
+    if (base === name || !nameSet.has(base)) continue;
+    const group = grouped.get(base) || new Set([base]);
+    group.add(name);
+    grouped.set(base, group);
+  }
+  return [...grouped.entries()]
+    .map(([base, contracts]) => ({ base, contracts: [...contracts].sort() }))
+    .sort((a, b) => a.base.localeCompare(b.base));
+}
+
+export function detectNotImplementedLines(source) {
+  const findings = [];
+  String(source).split('\n').forEach((line, index) => {
+    if (!/not\s+implemented(?:\s+yet)?/i.test(line)) return;
+    findings.push({ line: index + 1, snippet: line.trim() });
+  });
+  return findings;
+}
+
+export function textReferencesAnySymbol(source, symbols) {
+  const haystack = String(source);
+  return [...new Set((symbols || []).map(String).filter(Boolean))]
+    .some((symbol) => new RegExp(`\\b${escapeRe(symbol)}\\b`).test(haystack));
+}
+
+// A public leaf factory may be intentionally owned by a product-consumed
+// composition root instead of being called directly by an executable. Resolve
+// that case only from structural evidence:
+//   1. the leaf factory is actually called from an SDK implementation file;
+//   2. that same file defines another public factory (the composition root);
+//   3. the root factory is called directly by Game/Editor/Server; and
+//   4. the leaf capability itself is already consumed by the product graph.
+// Comments, same-header grouping, or mere SDK linkage are insufficient.
+export function resolveTransitivelyOwnedFactories(factoryRows, capabilityRows,
+                                                   sdkSources, productZoneText) {
+  const rows = Array.isArray(factoryRows) ? factoryRows : [];
+  const capabilities = Array.isArray(capabilityRows) ? capabilityRows : [];
+  const sources = Array.isArray(sdkSources) ? sdkSources : [];
+  const zones = productZoneText && typeof productZoneText === 'object'
+    ? productZoneText : {};
+
+  const stripComments = (source) => String(source)
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/\/\/[^\n]*/g, ' ');
+  const cleanZones = Object.entries(zones)
+    .map(([zone, source]) => [zone, stripComments(source)]);
+  const capabilityByFactory = new Map();
+  for (const capability of capabilities) {
+    for (const factory of capability?.factories || []) {
+      capabilityByFactory.set(factory, capability);
+    }
+  }
+  const normalizePath = (value) => String(value ?? '').replace(/\\/g, '/');
+  const capabilityForFactoryRow = (row) => {
+    const explicit = capabilityByFactory.get(row.factory);
+    if (explicit) return explicit;
+    const rowHeaders = new Set((row.headers || []).map(normalizePath));
+    if (rowHeaders.size === 0) return null;
+    return capabilities.find((capability) =>
+      (capability?.headers || []).some((header) => rowHeaders.has(normalizePath(header)))) || null;
+  };
+
+  const allFactoryNames = rows.map((row) => row?.factory).filter(Boolean);
+  const directProductZones = (factory) => cleanZones
+    .filter(([, source]) => new RegExp(`\\b${escapeRe(factory)}\\s*\\(`).test(source))
+    .map(([zone]) => zone)
+    .sort();
+  const definesFactory = (source, factory) => new RegExp(
+    `\\b(?:std::unique_ptr|std::shared_ptr)\\s*<[^;{}]+>\\s+${escapeRe(factory)}\\s*\\([^;{}]*\\)\\s*\\{`
+  ).test(stripComments(source));
+
+  const resolved = [];
+  for (const row of rows) {
+    if (!row?.factory || !['TEST-ONLY', 'SDK-INTERNAL'].includes(row.kind)) continue;
+    if (!(Number(row.sdkSites) > 0)) continue;
+
+    // The capability inventory is contract-centric, so some contract rows do
+    // not carry their factory names even though the factory-consumption audit
+    // reports the declaring header. Fall back to the shared public header.
+    const capability = capabilityForFactoryRow(row);
+    if (!capability?.state?.CONSUMED) continue;
+
+    const leafCall = new RegExp(`\\b${escapeRe(row.factory)}\\s*\\(`);
+    for (const sdk of sources) {
+      const source = stripComments(sdk?.text ?? '');
+      if (!leafCall.test(source)) continue;
+      if (!textReferencesAnySymbol(source, capability.symbols || [capability.capability])) continue;
+
+      const parents = [];
+      const parentZones = new Set();
+      for (const candidate of allFactoryNames) {
+        if (candidate === row.factory || !definesFactory(source, candidate)) continue;
+        const consumedZones = directProductZones(candidate);
+        if (consumedZones.length === 0) continue;
+        parents.push(candidate);
+        for (const zone of consumedZones) parentZones.add(zone);
+      }
+      if (parents.length === 0) continue;
+
+      resolved.push({
+        factory: row.factory,
+        capability: capability.capability,
+        sdkSource: sdk?.path ?? '',
+        compositionRoots: [...new Set(parents)].sort(),
+        consumerZones: [...parentZones].sort()
+      });
+      break;
+    }
+  }
+  return resolved.sort((a, b) => a.factory.localeCompare(b.factory));
+}
+
+export function propagatePublicConsumerZones(rows) {
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const parent of rows) {
+      if (!parent?.state?.CONSUMED || !parent.headerText) continue;
+      for (const child of rows) {
+        if (child === parent || !child?.symbols?.length) continue;
+        if (!textReferencesAnySymbol(parent.headerText, child.symbols)) continue;
+
+        const beforeConsumed = Boolean(child.state.CONSUMED);
+        const beforeObservable = Boolean(child.state.OBSERVABLE);
+        const zones = new Set(child.state.consumerZones || []);
+        for (const zone of parent.state.consumerZones || []) zones.add(zone);
+        child.state.consumerZones = [...zones].sort();
+        child.state.CONSUMED = child.state.consumerZones.length > 0;
+        child.state.OBSERVABLE = Boolean(child.state.OBSERVABLE || parent.state.OBSERVABLE);
+        const evidence = new Set(child.state.consumerEvidence || []);
+        evidence.add(`public-dependency:${parent.capability}`);
+        child.state.consumerEvidence = [...evidence].sort();
+
+        if (child.state.CONSUMED !== beforeConsumed ||
+            child.state.OBSERVABLE !== beforeObservable) changed = true;
+      }
+    }
+  }
+  return rows;
+}
+
+export function validateStructuredClassification(row, entry, readEvidence) {
+  const classification = String(entry?.classification ?? '').trim();
+  const justification = String(entry?.justification ?? '').trim();
+  const evidence = Array.isArray(entry?.evidence)
+    ? entry.evidence.map(String).filter(Boolean)
+    : [];
+  if (!['internal', 'data-only'].includes(classification)) {
+    return { valid: false, reason: 'unsupported-classification' };
+  }
+  if (justification.length < 20) {
+    return { valid: false, reason: 'justification-too-short' };
+  }
+  if (evidence.length === 0 || typeof readEvidence !== 'function') {
+    return { valid: false, reason: 'missing-evidence' };
+  }
+
+  let symbolHit = false;
+  for (const evidencePath of evidence) {
+    const content = readEvidence(evidencePath);
+    if (typeof content !== 'string') {
+      return { valid: false, reason: `evidence-unreadable:${evidencePath}` };
+    }
+    if (textReferencesAnySymbol(content, row?.symbols || [row?.capability])) {
+      symbolHit = true;
+    }
+  }
+  if (!symbolHit) {
+    return { valid: false, reason: 'evidence-does-not-reference-capability' };
+  }
+  return {
+    valid: true,
+    classification,
+    justification,
+    evidence: [...new Set(evidence)].sort()
+  };
+}
+
 // Hoisted zone joined-texts (shared by capability-state loop and parallel-track scan).
 const ZONE_TEXT = {
   src: joinText(srcFiles),
@@ -121,7 +345,7 @@ const capRows = [];
 for (const c of caps.values()) {
   const { src, test, app, editor, server, sdk, tool } = ZONE_TEXT;
 
-  const isImpl = (needle) => new RegExp(`\\b${needle}\\b`).test(src);
+  const isImpl = (needle) => new RegExp(`\\b${escapeRe(needle)}\\b`).test(src);
   // A self-contained, header-only contract — e.g. the core Allocator adapter,
   // every function defined `inline` in the public header with real bodies — is
   // genuinely implemented even though no implementation TU references it.
@@ -136,36 +360,30 @@ for (const c of caps.values()) {
       // opening brace appears after an inline declaration (not just `inline;`).
       return /\binline\b[^{;]*\{/.test(body);
     });
-  const isConsumedAnywhere = (needle) =>
-    [app, editor, server].some((zone) => new RegExp(`\\b${needle}\\b`).test(zone));
-  const consumedZone = { app: app.includes(c.name), editor: editor.includes(c.name), server: server.includes(c.name) };
-
-  // If a factory exists, it's the primary needle; else use the contract name;
-  // else (data/function contracts with no I* interface and no create_ factory,
-  // e.g. ISteering, UiDoc, the *Asset data structs) fall back to the header
-  // basename — a real capability is IMPLEMENTED when an implementation TU
-  // (src/engine/sdk/...) actually references that name, and the false-negative
-  // list of core headers (Log/Allocator/version) goes away. A pure-header
-  // orphan (OtlpExporter, IScriptingBridge, IPluginIsolation...) has no impl
-  // TU and stays correctly unimplemented.
-  const needles = c.factories.length ? c.factories : (c.contractInterfaces.length ? c.contractInterfaces : [c.name]);
-  const needle = c.factories[0] || c.contractInterfaces[0] || c.name || null;
+  // Every public symbol owned by a capability is valid evidence. Some headers
+  // intentionally contain a result/data type before the actual I* service, so
+  // looking only at the first regex hit under-counts real product consumers.
+  const needles = [...new Set([
+    ...c.factories,
+    ...c.contractInterfaces,
+    c.name
+  ].filter(Boolean))];
+  const needle = needles[0] || null;
 
   const declared = c.headers.length > 0;
-  const implemented = needle ? (isImpl(needle) || isInlineHeaderOnly(needle)) : isInlineHeaderOnly(c.name);
+  const implemented = needles.some((candidate) => isImpl(candidate)) || isInlineHeaderOnly(c.name);
   // CONSUMED: real call site in an executable zone (app/editor/server) or cooker.
-  const consumedInExe =
-    (needle && isConsumedAnywhere(needle)) ||
-    /^src\/(cooker|package|tools).*/i.test(rel(c.headers[0] || '')) ? true : c.factories.some((f) => isConsumedAnywhere(f));
+  const consumedInExe = [app, editor, server].some((zone) =>
+    textReferencesAnySymbol(zone, needles));
 
   const zonesHit = [];
   if (consumedInExe) {
-    if (app.includes(needle) || app.includes(c.name)) zonesHit.push('Game');
-    if (editor.includes(needle) || editor.includes(c.name)) zonesHit.push('Editor');
-    if (server.includes(needle) || server.includes(c.name)) zonesHit.push('Server');
+    if (textReferencesAnySymbol(app, needles)) zonesHit.push('Game');
+    if (textReferencesAnySymbol(editor, needles)) zonesHit.push('Editor');
+    if (textReferencesAnySymbol(server, needles)) zonesHit.push('Server');
   }
-  const sdkHit = needle ? sdk.includes(needle) : false;
-  const testHit = needle ? test.includes(needle) : false;
+  const sdkHit = textReferencesAnySymbol(sdk, needles);
+  const testHit = textReferencesAnySymbol(test, needles);
 
   // OBSERVABLE: the consumer zone references it within update/render/serialize context.
   // We approximate by checking the consumer's file set is non-trivial and includes loop keywords.
@@ -187,19 +405,23 @@ for (const c of caps.values()) {
   const isSdkTestOnly = testHit && !consumedInExe;
   const isSdkInternal = sdkHit && !consumedInExe && !testHit;
 
-  // CERTIFIED: a test or gate references the factory/contract (testHit) and the
-  // capability is not sdkTestOnly dead — i.e. it has a real consumer or SDK TU.
-  // Approximation of "gate/test proves runtime behavior (evidence recorded)"; the
-  // authoritative certification record for A5 lives in bugs.md RESOLVIDO + gates.
+  // CERTIFIED: certification is product-level evidence. A test/gate can certify
+  // only a capability that is consumed by a real executable. SDK presence or a
+  // test reference by itself can never certify an unconsumed public contract.
   let certified = false;
-  if (needle) {
+  let hasCertificationEvidence = false;
+  if (needles.length) {
     const gateText = joinText(walk(join(root, 'tools', 'portability'), /\.(mjs|cpp)$/));
-    certified = (testHit || new RegExp(`\\b${escapeRe(needle)}\\b`).test(gateText)) && !(isSdkTestOnly && !consumedInExe && !sdkHit);
+    hasCertificationEvidence = testHit || textReferencesAnySymbol(gateText, needles);
+    certified = consumedInExe && hasCertificationEvidence;
   }
 
   capRows.push({
     capability: c.name,
     kind: c.kind,
+    symbols: needles,
+    headerText: c.headers.map((h) => text(join(root, h))).join('\n'),
+    certificationEvidence: hasCertificationEvidence,
     contracts: c.contractInterfaces,
     factories: c.factories,
     headers: c.headers,
@@ -211,14 +433,161 @@ for (const c of caps.values()) {
       OBSERVABLE: observable,
       CERTIFIED: certified,
       consumerZones: zonesHit,
+      consumerEvidence: zonesHit.map((z) => `direct:${z}`),
       sdkTestOnly: isSdkTestOnly,
       sdkInternal: isSdkInternal
     }
   });
 }
 
+// Public services can expose other public services through their canonical
+// interface (e.g. INetworkServer::authority() -> IAuthoritativeRpc). If the
+// parent contract is consumed by a product executable, that child service is
+// consumed transitively through the same public path. Keep the evidence chain
+// in the report instead of requiring executable code to repeat the child type.
+propagatePublicConsumerZones(capRows);
+for (const row of capRows) {
+  row.state.CERTIFIED = Boolean(row.state.CONSUMED && row.certificationEvidence);
+  row.state.sdkTestOnly = Boolean(row.state.sdkTestOnly && !row.state.CONSUMED);
+  row.state.sdkInternal = Boolean(row.state.sdkInternal && !row.state.CONSUMED);
+}
+
 // ---------------- violations ----------------
 const violations = [];
+
+// Structured exceptions are intentionally narrow. They do not mutate the
+// derived state cells; they explain why a public header is data-only/internal
+// and provide source files that mechanically prove that classification.
+const classificationPath = join(root, 'manifests', 'integration-classifications.json');
+let classificationDocument = { version: 1, capabilities: {} };
+if (existsSync(classificationPath)) {
+  try {
+    classificationDocument = JSON.parse(readFileSync(classificationPath, 'utf8'));
+  } catch (error) {
+    violations.push({
+      code: 'AUDIT-CLASSIFICATION-INVALID',
+      file: rel(classificationPath),
+      detail: `classification manifest is not valid JSON: ${error.message}`,
+      severity: 'warn'
+    });
+  }
+}
+
+const classificationEntries = classificationDocument?.capabilities ?? {};
+for (const [capability, entry] of Object.entries(classificationEntries)) {
+  const row = capRows.find((candidate) => candidate.capability === capability);
+  if (!row) {
+    violations.push({
+      code: 'AUDIT-CLASSIFICATION-INVALID',
+      capability,
+      detail: 'classification names a capability that is not present in the public inventory',
+      severity: 'warn'
+    });
+    continue;
+  }
+  const validated = validateStructuredClassification(row, entry, (evidencePath) => {
+    const absolute = join(root, evidencePath);
+    if (!existsSync(absolute)) return null;
+    return readText(absolute);
+  });
+  if (!validated.valid) {
+    violations.push({
+      code: 'AUDIT-CLASSIFICATION-INVALID',
+      capability,
+      detail: `structured classification rejected: ${validated.reason}`,
+      severity: 'warn'
+    });
+    continue;
+  }
+  row.classification = validated;
+  row.state.EXEMPT = true;
+}
+
+// 0) State invariants. Public capabilities are product claims. Negative state
+// cells must be visible as violations instead of being hidden behind a green
+// aggregate. Structured exceptions may be introduced later only as explicit
+// machine-readable classifications; there is intentionally no comment-based
+// suppression path here.
+for (const row of capRows) {
+  if (!row.state.DECLARED) continue;
+  const exempt = row.state.EXEMPT === true;
+  if (!row.state.IMPLEMENTED) {
+    if (exempt) continue;
+    violations.push({
+      code: 'CAPABILITY-NOT-IMPLEMENTED',
+      capability: row.capability,
+      header: row.headers[0] || '',
+      detail: `${row.capability} is publicly declared but no implementation evidence was derived`,
+      severity: 'warn'
+    });
+  }
+  if (!row.state.CONSUMED) {
+    if (exempt) continue;
+    violations.push({
+      code: 'CAPABILITY-NOT-CONSUMED',
+      capability: row.capability,
+      header: row.headers[0] || '',
+      detail: `${row.capability} has no consuming call site in Game, Editor or Server`,
+      severity: 'warn'
+    });
+  }
+  if (!row.state.OBSERVABLE) {
+    if (exempt) continue;
+    violations.push({
+      code: 'CAPABILITY-NOT-OBSERVABLE',
+      capability: row.capability,
+      header: row.headers[0] || '',
+      detail: `${row.capability} has no observable product-loop evidence`,
+      severity: 'warn'
+    });
+  }
+  if (!row.state.CERTIFIED) {
+    if (exempt) continue;
+    violations.push({
+      code: 'CAPABILITY-NOT-CERTIFIED',
+      capability: row.capability,
+      header: row.headers[0] || '',
+      detail: `${row.capability} lacks product-level certification evidence`,
+      severity: 'warn'
+    });
+  }
+}
+
+const publicContractNames = [...caps.values()].flatMap((c) => c.contractInterfaces || []);
+const publicContractDeclarationHeaders = new Map();
+for (const h of publicHeaders) {
+  const source = readText(h);
+  contractRe.lastIndex = 0;
+  let declaration;
+  while ((declaration = contractRe.exec(source)) !== null) {
+    const name = declaration[1];
+    const headers = publicContractDeclarationHeaders.get(name) || new Set();
+    headers.add(rel(h));
+    publicContractDeclarationHeaders.set(name, headers);
+  }
+}
+for (const duplicate of detectParallelPublicContracts(publicContractNames)) {
+  // A suffix relationship alone is not a parallel public authority. Some
+  // canonical APIs intentionally expose two different roles in the same
+  // header (for example a per-plugin isolation object and its host runtime
+  // manager). Only report the pair when the declarations actually come from
+  // different public authority headers. Compatibility include-only headers do
+  // not create a second declaration and therefore do not count here.
+  const authorityHeaders = new Set();
+  for (const contract of duplicate.contracts) {
+    for (const header of publicContractDeclarationHeaders.get(contract) || []) {
+      authorityHeaders.add(header);
+    }
+  }
+  if (authorityHeaders.size <= 1) continue;
+  violations.push({
+    code: 'PUBLIC-CONTRACT-DUPLICATE',
+    capability: duplicate.base,
+    detail: `parallel public contracts share one authority: ${duplicate.contracts.join(', ')}`,
+    contracts: duplicate.contracts,
+    severity: 'warn'
+  });
+}
 
 // 1) factory with no real consumer outside sdk/tests. We delegate the authoritative
 // per-factory classification to factory-consumption-audit.mjs (single combined-regex
@@ -231,9 +600,21 @@ try {
   const out = execFileSync(process.execPath, [auditPath, '--json'], { encoding: 'utf8', maxBuffer: 1e8 });
   consumption = JSON.parse(out);
 } catch { /* consumption audit unavailable; fall back to in-tool heuristic */ }
+const factoryCompositionResolution = consumption
+  ? resolveTransitivelyOwnedFactories(
+      consumption.rows || [],
+      capRows,
+      sdkFiles.map((file) => ({ path: rel(file), text: readText(file) })),
+      { Game: ZONE_TEXT.app, Editor: ZONE_TEXT.editor, Server: ZONE_TEXT.server }
+    )
+  : [];
+const transitivelyOwnedFactories = new Set(
+  factoryCompositionResolution.map((entry) => entry.factory)
+);
 if (consumption) {
   for (const r of consumption.rows || []) {
     if (r.kind === 'TEST-ONLY' || r.kind === 'DECLARED-ONLY') {
+      if (transitivelyOwnedFactories.has(r.factory)) continue;
       violations.push({ code: 'FACTORY-NO-CONSUMER', factory: r.factory, header: r.headers[0] || '',
         detail: `${r.kind}: ${r.factory} has no consuming call site outside sdk/tests`,
         severity: r.kind === 'DECLARED-ONLY' ? 'warn' : 'info' });
@@ -320,7 +701,7 @@ for (const t of toolFiles) {
 const stubRe = new RegExp([
   '\\bstub\\b', 'gameplay stub', 'not\\s+wired', 'not_wired',
   'headless[-_ ]only', 'TODO\\s*\\(frontend[-_ ]?port', 'FIXME',
-  '/\\/\\s*not\\s+implemented', 'callback (?:não|nao|not) (?:ligado|wired)',
+  'callback (?:não|nao|not) (?:ligado|wired)',
   'impersonat', 'x-fake', 'nullptr\\s*;\\s*/\\/\\s*stub',
   'produce the stub', 'executable stub', 'the chain is a gameplay stub'
 ].join('|'), 'i');
@@ -337,6 +718,39 @@ const productFiles = [
     return r.startsWith('src/engine/') && !r.startsWith('src/engine/public/');
   })
 ];
+for (const f of productFiles) {
+  for (const finding of detectNotImplementedLines(readText(f))) {
+    violations.push({
+      code: 'NOT-IMPLEMENTED-BRANCH',
+      file: rel(f),
+      line: finding.line,
+      snippet: finding.snippet.slice(0, 120),
+      detail: 'product path still contains an explicit not-implemented branch or marker',
+      severity: 'warn'
+    });
+  }
+}
+for (const f of productFiles) {
+  const constantUnavailable = detectConstantUnavailableFactories(readText(f));
+  for (const factory of constantUnavailable.factories) {
+    violations.push({
+      code: 'CONSTANT-UNAVAILABLE',
+      file: rel(f),
+      factory,
+      detail: `${factory} unconditionally returns an unavailable value`,
+      severity: 'warn'
+    });
+  }
+  for (const method of constantUnavailable.availabilityMethods) {
+    violations.push({
+      code: 'CONSTANT-UNAVAILABLE',
+      file: rel(f),
+      method,
+      detail: `${method} unconditionally reports unavailable`,
+      severity: 'warn'
+    });
+  }
+}
 for (const f of productFiles) {
   const lines = readText(f).split('\n');
   lines.forEach((line, i) => {
@@ -546,6 +960,9 @@ const derived = {
   },
   violationCount: violations.length,
   violations: violations.map((v) => ({ ...v, commitNeeds: 'owner-domain' })),
+  // Factories reached only through a real product composition root are kept
+  // explicit here so suppression of FACTORY-NO-CONSUMER remains inspectable.
+  factoryCompositionResolution,
   // CONTA 6 (integração): per-domain proof that Game/Editor/Server consume the
   // SAME canonical public contract (not two headers) — derived from real call
   // sites, so zero PARALLEL-TRACK is a derived result, never a hardcode.

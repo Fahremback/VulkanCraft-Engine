@@ -6,6 +6,7 @@
 // reference only), so no object type is rendered twice with incompatible
 // lighting/material.
 #include "GameApplication.hpp"
+#include "engine/core/memory/Allocator.hpp"
 
 #include <cstdlib>
 #include <exception>
@@ -13,6 +14,7 @@
 
 int main() {
     try {
+        vc::alloc::install_global();
         GameApplication application;
         return application.run();
     } catch (const std::exception& error) {

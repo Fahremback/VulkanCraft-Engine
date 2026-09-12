@@ -128,7 +128,7 @@ assert.match(assetsImplEarly, /ensure_texture_pipeline\s*\(\s*range\.blockId\s*,
 
 // BUG-EDITOR-SHADOWS-001/002 + BUG-EDITOR-GI-001: the basic viewport path must
 // sample the REAL shadow targets (sun map, spot atlas, point slot-0 atlas)
-// and the Agente 1 probe-grid irradiance uploaded through EditorShadowUbo.
+// and canonical DDGI irradiance uploaded through EditorShadowUbo.
 const vulkanImpl = read("../src/editor/EditorApplicationVulkan.cpp");
 const assetsImpl = read("../src/editor/EditorApplicationAssets.cpp");
 
@@ -183,7 +183,15 @@ assert.match(assetsImpl, /bindings\[i\]\.descriptorType = VK_DESCRIPTOR_TYPE_COM
   "shadow targets must be combined image samplers (bindings 1-3)");
 assert.match(assetsImpl, /bindings\[4\]\.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;/);
 assert.match(assetsImpl, /init_gi_probes\s*\(\s*\)\s*;/,
-  "the probe grid core must be created with the scene light resources");
+  "the canonical DDGI provider must be created with the scene light resources");
+assert.match(vulkanImpl,
+  /create_global_illumination_provider\s*\([\s\S]{0,180}?GiBackend::Ddgi/,
+  "the editor viewport must instantiate the public canonical DDGI provider");
+assert.match(vulkanImpl,
+  /core\.update\s*\(\s*m_editorCamera\.position/,
+  "the editor frame must update canonical DDGI from the real editor camera");
+assert.match(vulkanImpl, /m_shadowUboData\.probeIrradiance\[idx\]\s*=\s*probe\.radianceVisibility/,
+  "canonical DDGI probe output must feed the UBO consumed by the viewport shader");
 assert.match(assetsImpl, /data\.shadowParams = glm::vec4\(m_shadowMap\.enabled \? 1\.0f : 0\.0f/,
   "the basic path's sun shadow flag must follow the shadow map state");
 assert.match(header, /static_assert\(sizeof\(EditorShadowUbo\) == 64 \* kEditorSpotShadowSlots \+ 16 \* 5 \+ 16 \* kEditorProbeCount/,

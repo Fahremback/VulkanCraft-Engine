@@ -24,6 +24,7 @@ glm::vec3 turbulence_vector(const glm::vec3& p, float time) {
 ParticleSimulation::ParticleSimulation(std::size_t capacity, std::uint32_t seed)
     : particles_(capacity), randomState_(seed ? seed : 1u) {
     freeParticles_.reserve(capacity);
+    renderScratch_.reserve(capacity);
     for (std::size_t i = capacity; i > 0; --i) freeParticles_.push_back(i - 1);
 }
 
@@ -161,11 +162,14 @@ void ParticleSimulation::clear() {
     for (auto& emitter : emitters_) emitter.accumulator = 0.0f;
 }
 
-std::vector<ParticleRenderData> ParticleSimulation::render_data() const {
-    std::vector<ParticleRenderData> result;
-    result.reserve(aliveCount_);
-    for (const Particle& particle : particles_) if (particle.alive) result.push_back({particle.position, particle.color, particle.size, particle.rotation});
-    return result;
+std::span<const ParticleRenderData> ParticleSimulation::render_data() {
+    renderScratch_.clear();
+    for (const Particle& particle : particles_) {
+        if (!particle.alive) continue;
+        renderScratch_.push_back({particle.position, particle.color,
+                                  particle.size, particle.rotation});
+    }
+    return renderScratch_;
 }
 
 } // namespace Engine::Gameplay

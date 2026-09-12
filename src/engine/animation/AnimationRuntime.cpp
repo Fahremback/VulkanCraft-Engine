@@ -70,6 +70,7 @@ TransformPose sample_track(const BoneTrack& track, float time) {
 struct SkeletonMotionState {
     std::unique_ptr<engine::animation::IMotionDatabase> db;
     std::unordered_map<const AnimationClip*, engine::animation::CookedMotion> clips;
+    engine::animation::MotionPose sampleScratch;
 };
 
 struct MotionStatePool {
@@ -87,6 +88,34 @@ engine::animation::IMotionDatabase& blending_database() {
     static std::unique_ptr<engine::animation::IMotionDatabase> db =
         engine::animation::create_motion_database();
     return *db;
+}
+
+std::mutex& blending_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+struct BlendScratch {
+    engine::animation::MotionPose a;
+    engine::animation::MotionPose b;
+    engine::animation::MotionPose out;
+};
+
+BlendScratch& blend_scratch() {
+    thread_local BlendScratch scratch;
+    return scratch;
+}
+
+void fill_motion_pose(const Pose& pose, std::size_t count,
+                      engine::animation::MotionPose& motion) {
+    motion.translations.resize(count);
+    motion.rotations.resize(count);
+    motion.scales.resize(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        motion.translations[i] = pose.local[i].translation;
+        motion.rotations[i] = pose.local[i].rotation;
+        motion.scales[i] = pose.local[i].scale;
+    }
 }
 
 engine::animation::MotionClip to_motion_clip(const SkeletonAsset& skeleton,
@@ -112,14 +141,18 @@ engine::animation::MotionClip to_motion_clip(const SkeletonAsset& skeleton,
     return motion;
 }
 
-Pose pose_from_motion(const engine::animation::MotionPose& motion) {
-    Pose pose;
+void pose_from_motion_into(const engine::animation::MotionPose& motion, Pose& pose) {
     pose.local.resize(motion.translations.size());
     for (std::size_t i = 0; i < motion.translations.size(); ++i) {
         pose.local[i].translation = motion.translations[i];
         pose.local[i].rotation = motion.rotations[i];
         pose.local[i].scale = motion.scales[i];
     }
+}
+
+Pose pose_from_motion(const engine::animation::MotionPose& motion) {
+    Pose pose;
+    pose_from_motion_into(motion, pose);
     return pose;
 }
 
@@ -178,6 +211,13 @@ Pose AnimationSampler::bind_pose(const SkeletonAsset& skeleton) {
 }
 
 Pose AnimationSampler::sample(const SkeletonAsset& skeleton, const AnimationClip& clip, float time) {
+    Pose pose;
+    sample_into(skeleton, clip, time, pose);
+    return pose;
+}
+
+void AnimationSampler::sample_into(const SkeletonAsset& skeleton, const AnimationClip& clip,
+                                   float time, Pose& pose) {
     // FALTANTES §18 item 2: sampling routes through the ozz+ACL motion
     // database (per-skeleton cook, exact ozz path; the clip is also
     // ACL-compressed at first use so the compression stage runs). On a
@@ -187,7 +227,10 @@ Pose AnimationSampler::sample(const SkeletonAsset& skeleton, const AnimationClip
     MotionStatePool& pool = motion_pool();
     std::lock_guard<std::mutex> lock(pool.mutex);
     SkeletonMotionState* state = motion_state_for(skeleton);
-    if (state == nullptr) return bind_pose(skeleton);
+    if (state == nullptr) {
+        pose = bind_pose(skeleton);
+        return;
+    }
     auto clipFound = state->clips.find(&clip);
     if (clipFound == state->clips.end()) {
         const engine::animation::MotionClip motionClip =
@@ -195,7 +238,8 @@ Pose AnimationSampler::sample(const SkeletonAsset& skeleton, const AnimationClip
         std::string error;
         if (!state->db->cook_clip(motionClip, error)) {
             VC_LOG_WARN("[animation] sample refused by motion database for clip '{}': {}", clip.name, error);
-            return bind_pose(skeleton);
+            pose = bind_pose(skeleton);
+            return;
         }
         // Capture the ozz handle FIRST — cooked() would return the ACL slot
         // after compression; sampling stays on the exact ozz path while the
@@ -206,15 +250,18 @@ Pose AnimationSampler::sample(const SkeletonAsset& skeleton, const AnimationClip
         if (!state->db->compress_clip(motionClip, cerror)) {
             VC_LOG_WARN("[animation] clip '{}' compression refused (sampling continues on ozz): {}", clip.name, cerror);
         }
-        if (ozzSlot == nullptr) return bind_pose(skeleton);
+        if (ozzSlot == nullptr) {
+            pose = bind_pose(skeleton);
+            return;
+        }
         clipFound = state->clips.emplace(&clip, *ozzSlot).first;
     }
-    engine::animation::MotionPose motion;
-    if (!state->db->sample(clipFound->second, clip_time(clip, time), motion)) {
+    if (!state->db->sample(clipFound->second, clip_time(clip, time), state->sampleScratch)) {
         VC_LOG_ERROR("[animation] motion database sample failed for clip '{}'", clip.name);
-        return bind_pose(skeleton);
+        pose = bind_pose(skeleton);
+        return;
     }
-    return pose_from_motion(motion);
+    pose_from_motion_into(state->sampleScratch, pose);
 }
 
 RootMotionDelta AnimationSampler::root_motion(const AnimationClip& clip, float previousTime, float currentTime) {
@@ -228,53 +275,60 @@ RootMotionDelta AnimationSampler::root_motion(const AnimationClip& clip, float p
     return {current.translation - previous.translation, glm::normalize(current.rotation * glm::inverse(previous.rotation))};
 }
 
-std::vector<glm::mat4> AnimationSampler::global_matrices(const SkeletonAsset& skeleton, const Pose& pose) {
-    std::vector<glm::mat4> result(pose.local.size(), glm::mat4(1.0f));
+void AnimationSampler::global_matrices_into(const SkeletonAsset& skeleton, const Pose& pose,
+                                            std::vector<glm::mat4>& result) {
+    result.resize(pose.local.size());
     for (size_t i = 0; i < pose.local.size(); ++i) {
         const glm::mat4 local = compose(pose.local[i]);
         const int parent = i < skeleton.bones.size() ? skeleton.bones[i].parentIndex : -1;
         result[i] = parent >= 0 && static_cast<size_t>(parent) < i ? result[parent] * local : local;
     }
+}
+
+std::vector<glm::mat4> AnimationSampler::global_matrices(const SkeletonAsset& skeleton, const Pose& pose) {
+    std::vector<glm::mat4> result;
+    global_matrices_into(skeleton, pose, result);
     return result;
 }
 
 Pose AnimationBlender::blend(const Pose& a, const Pose& b, float weight) {
+    Pose result;
+    blend_into(a, b, weight, result);
+    return result;
+}
+
+void AnimationBlender::blend_into(const Pose& a, const Pose& b, float weight, Pose& result) {
     // FALTANTES §18 item 2: 2-pose blending goes through the ozz BlendingJob
     // (SoA, lerp translations/scales, nlerp rotations) via the public motion
     // database. The legacy lerp/slerp remains only as the defensive fallback
     // for size-mismatched poses (with a diagnostic — never silent).
     const size_t count = std::min(a.local.size(), b.local.size());
-    if (count == 0) return {};
-    engine::animation::MotionPose pa, pb, out;
-    pa.translations.reserve(count); pa.rotations.reserve(count); pa.scales.reserve(count);
-    pb.translations.reserve(count); pb.rotations.reserve(count); pb.scales.reserve(count);
-    for (size_t i = 0; i < count; ++i) {
-        pa.translations.push_back(a.local[i].translation);
-        pa.rotations.push_back(a.local[i].rotation);
-        pa.scales.push_back(a.local[i].scale);
-        pb.translations.push_back(b.local[i].translation);
-        pb.rotations.push_back(b.local[i].rotation);
-        pb.scales.push_back(b.local[i].scale);
+    if (count == 0) {
+        result.local.clear();
+        return;
     }
-    if (blending_database().blend_poses(pa, pb, weight, out)) {
-        Pose result;
-        result.local.resize(count);
-        for (size_t i = 0; i < count; ++i) {
-            result.local[i].translation = out.translations[i];
-            result.local[i].rotation = out.rotations[i];
-            result.local[i].scale = out.scales[i];
+    BlendScratch& scratch = blend_scratch();
+    fill_motion_pose(a, count, scratch.a);
+    fill_motion_pose(b, count, scratch.b);
+    {
+        std::lock_guard<std::mutex> lock(blending_mutex());
+        if (blending_database().blend_poses(scratch.a, scratch.b, weight, scratch.out)) {
+            result.local.resize(count);
+            for (size_t i = 0; i < count; ++i) {
+                result.local[i].translation = scratch.out.translations[i];
+                result.local[i].rotation = scratch.out.rotations[i];
+                result.local[i].scale = scratch.out.scales[i];
+            }
+            return;
         }
-        return result;
     }
     VC_LOG_WARN("[animation] ozz blend refused — falling back to legacy blend (size mismatch)");
     weight = std::clamp(weight, 0.0f, 1.0f);
-    Pose result;
     result.local.resize(count);
     for (size_t i = 0; i < count; ++i) result.local[i] = {
         glm::mix(a.local[i].translation, b.local[i].translation, weight),
         glm::normalize(glm::slerp(a.local[i].rotation, b.local[i].rotation, weight)),
         glm::mix(a.local[i].scale, b.local[i].scale, weight)};
-    return result;
 }
 
 Pose AnimationBlender::additive(const Pose& base, const Pose& additivePose, float weight, const std::vector<float>& mask) {
@@ -325,11 +379,14 @@ void AnimationStateMachine::update(const SkeletonAsset& skeleton, float deltaTim
             triggers_[transition.parameter] = false; break;
         }
     }
-    pose_ = AnimationSampler::sample(skeleton, *states_.at(currentState_), stateTime_);
+    AnimationSampler::sample_into(skeleton, *states_.at(currentState_), stateTime_, pose_);
     if (!previousState_.empty()) {
         blendTime_ += std::max(deltaTime, 0.0f);
-        const Pose previous = AnimationSampler::sample(skeleton, *states_.at(previousState_), previousStateTime_ + blendTime_);
-        pose_ = AnimationBlender::blend(previous, pose_, blendDuration_ > 0 ? blendTime_ / blendDuration_ : 1.0f);
+        AnimationSampler::sample_into(skeleton, *states_.at(previousState_),
+                                      previousStateTime_ + blendTime_, previousPoseScratch_);
+        AnimationBlender::blend_into(previousPoseScratch_, pose_,
+                                     blendDuration_ > 0 ? blendTime_ / blendDuration_ : 1.0f,
+                                     pose_);
         if (blendTime_ >= blendDuration_) previousState_.clear();
     }
 }
@@ -414,19 +471,23 @@ Pose RagdollPoseBridge::blend_physics_pose(const SkeletonAsset& skeleton, const 
 void AnimationGraph::update(float deltaTime, float movementSpeed, std::vector<glm::mat4>& outPose) {
     if (!skeleton_ || !idle_) { outPose.clear(); return; }
     time_ += std::max(deltaTime, 0.0f);
-    Pose pose;
+    thread_local Pose poseScratch;
+    thread_local Pose sampleAScratch;
+    thread_local Pose sampleBScratch;
     if (movementSpeed <= 0.0f || !walk_) {
-        pose = AnimationSampler::sample(*skeleton_, *idle_, time_);
+        AnimationSampler::sample_into(*skeleton_, *idle_, time_, poseScratch);
     } else if (movementSpeed < 1.0f || !run_) {
-        pose = AnimationBlender::blend(AnimationSampler::sample(*skeleton_, *idle_, time_),
-                                       AnimationSampler::sample(*skeleton_, *walk_, time_),
-                                       std::clamp(movementSpeed, 0.0f, 1.0f));
+        AnimationSampler::sample_into(*skeleton_, *idle_, time_, sampleAScratch);
+        AnimationSampler::sample_into(*skeleton_, *walk_, time_, sampleBScratch);
+        AnimationBlender::blend_into(sampleAScratch, sampleBScratch,
+                                     std::clamp(movementSpeed, 0.0f, 1.0f), poseScratch);
     } else {
-        pose = AnimationBlender::blend(AnimationSampler::sample(*skeleton_, *walk_, time_),
-                                       AnimationSampler::sample(*skeleton_, *run_, time_),
-                                       std::clamp(movementSpeed - 1.0f, 0.0f, 1.0f));
+        AnimationSampler::sample_into(*skeleton_, *walk_, time_, sampleAScratch);
+        AnimationSampler::sample_into(*skeleton_, *run_, time_, sampleBScratch);
+        AnimationBlender::blend_into(sampleAScratch, sampleBScratch,
+                                     std::clamp(movementSpeed - 1.0f, 0.0f, 1.0f), poseScratch);
     }
-    outPose = AnimationSampler::global_matrices(*skeleton_, pose);
+    AnimationSampler::global_matrices_into(*skeleton_, poseScratch, outPose);
     for (size_t i = 0; i < outPose.size() && i < skeleton_->bones.size(); ++i)
         outPose[i] *= skeleton_->bones[i].inverseBindMatrix;
 }

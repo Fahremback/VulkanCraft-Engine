@@ -772,6 +772,15 @@ void main() {
     }
     ambient *= mix(.62,1.0,shadowVisibility);
     vec3    color = ambient + (diffuse + specular) * sunColor * ndl * directShadow * 1.28;
+    if (!isViewModel && !isGrassBlade && !isFoliage) {
+        vec3 environmentReflection = sample_reflection_cache(
+            fragWorldPos + normal * 0.08, normal, viewDir, roughness);
+        vec3 environmentFresnel = fresnelSchlick(ndv, f0);
+        float reflectionStrength = mix(0.72, 0.12,
+            smoothstep(0.08, 0.92, roughness));
+        reflectionStrength *= mix(0.45, 1.0, metallic);
+        color += environmentReflection * environmentFresnel * reflectionStrength;
+    }
     // L45 (reabertura): luzes point/spot REAIS do jogo — atenuação quadrática
     // por range + cone cos(inner/outer) do spot, acumuladas no BRDF difuso+
     // especular igual ao sol (real, não sintético).

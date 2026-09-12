@@ -18,8 +18,9 @@
 
 namespace Engine::Networking {
 
-// Reliable, ordered transport on top of an unreliable UDP socket
-// (README §35 "networking with a real transport"):
+// Reliable, ordered protocol over the selected socket backend. UDP provides
+// retransmission/loss recovery; TCP uses the same framing/handshake surface
+// over SocketTransport's length-framed stream implementation:
 //   • 32-bit sequence numbers + cumulative ACKs
 //   • Selective retransmission with timeout and max-retry
 //   • In-order delivery with gap handling (reorder buffer)
@@ -28,8 +29,7 @@ namespace Engine::Networking {
 //   • Connection handshake (SYN/ACK), heartbeat keepalive, timeout
 //
 // The transport is endpoint-agnostic: the same class runs on both client and
-// server sides, identified by a peer address (UDP is connectionless, so the
-// "connection" is the peer address + our local socket).
+// server sides and identifies the active peer by its endpoint string.
 class ReliableTransport final {
 public:
     enum class Status { Disconnected, Handshaking, Connected, TimedOut };
@@ -41,6 +41,10 @@ public:
         std::uint32_t maxRetransmits{5};
         std::size_t maxPayload{1200};      // fragment size (MTU budget)
         std::size_t receiveBuffer{8192};   // reorder window
+        // Socket backend used end-to-end by the reliable protocol.  UDP stays
+        // the compatibility default; TCP can be selected explicitly, and the
+        // product path may override it with VC_RELIABLE_TRANSPORT=tcp.
+        SocketKind socketKind{SocketKind::Udp};
         // Hard limits against malformed/bloody fragments (DoS hardening):
         //   • a single message may have at most this many fragments;
         //   • the reorder/partial buffers may hold at most this many entries;
@@ -64,7 +68,7 @@ public:
     explicit ReliableTransport(Config config);
     ~ReliableTransport();
 
-    // Binds a local UDP socket (0 = ephemeral) and marks us listening.
+    // Binds/listens with the configured socket backend (0 = ephemeral).
     // Returns false if the socket cannot be bound.
     [[nodiscard]] bool listen(std::uint16_t port = 0);
 
@@ -98,6 +102,7 @@ public:
     // non-zero (growable) counter means hostile/glitched input is being
     // dropped instead of poisoning the reassembly buffers.
     [[nodiscard]] std::uint32_t rejected_fragments() const noexcept { return rejectedFragments_; }
+    [[nodiscard]] SocketKind socket_kind() const noexcept { return config_.socketKind; }
 
     void disconnect();
     // disconnect() + tears down the local socket and receive thread — the

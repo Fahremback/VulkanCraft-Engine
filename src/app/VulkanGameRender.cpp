@@ -198,7 +198,9 @@ void VulkanGame::initPipelines(){
 
         VkPipelineRasterizationStateCreateInfo raster{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
         raster.polygonMode = VK_POLYGON_MODE_FILL;
-        raster.cullMode = VK_CULL_MODE_NONE;
+        // Opaque authored/procedural meshes use the engine's canonical CCW
+        // exterior winding; discard back faces instead of rasterizing both.
+        raster.cullMode = VK_CULL_MODE_BACK_BIT;
         raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         raster.lineWidth = 1.0f;
 
@@ -358,7 +360,9 @@ void main() {
         viewportState.scissorCount = 1;
         VkPipelineRasterizationStateCreateInfo raster{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
         raster.polygonMode = VK_POLYGON_MODE_FILL;
-        raster.cullMode = VK_CULL_MODE_NONE;
+        // Shadow casters are the same closed opaque meshes as the scene pass,
+        // so their back faces do not need to consume shadow raster bandwidth.
+        raster.cullMode = VK_CULL_MODE_BACK_BIT;
         raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         raster.lineWidth = 1.0f;
         raster.depthBiasEnable = VK_TRUE;
@@ -602,6 +606,8 @@ void main() {
         VkPipelineRasterizationStateCreateInfo raster{};
         raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
         raster.polygonMode = VK_POLYGON_MODE_FILL;
+        // Full-screen procedural triangle: there is no authored surface side
+        // to reject, and clip-space winding can flip with framebuffer setup.
         raster.cullMode = VK_CULL_MODE_NONE;
         raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         raster.lineWidth = 1.0f;
@@ -912,7 +918,9 @@ void main() {
         viewportState.scissorCount = 1;
         VkPipelineRasterizationStateCreateInfo raster{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
         raster.polygonMode = VK_POLYGON_MODE_FILL;
-        raster.cullMode = VK_CULL_MODE_NONE;
+        // Skinned assets use the same canonical CCW exterior winding as rigid
+        // glTF meshes; opaque back faces are not visible.
+        raster.cullMode = VK_CULL_MODE_BACK_BIT;
         raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         raster.lineWidth = 1.0f;
         VkPipelineMultisampleStateCreateInfo multisample{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
@@ -1077,6 +1085,8 @@ void main() {
         VkPipelineRasterizationStateCreateInfo raster{};
         raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
         raster.polygonMode = VK_POLYGON_MODE_FILL;
+        // Full-screen procedural composite triangle is intentionally two-sided
+        // in clip space; culling provides no useful rejection here.
         raster.cullMode = VK_CULL_MODE_NONE;
         raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         raster.lineWidth = 1.0f;
@@ -1205,6 +1215,22 @@ void VulkanGame::drawComposite(VkCommandBuffer cb){
     }
 
 VkShaderModule VulkanGame::createModuleFromSpirv(const std::vector<uint32_t>& spirv){
+        // Product-side final guard: reflection is consumed at the actual
+        // VkShaderModule creation boundary, after compilation and before
+        // Vulkan accepts the module. This catches malformed/entry-less SPIR-V
+        // even when a future compiler path bypasses MaterialPipeline's earlier
+        // interface validation.
+        std::string reflectionError;
+        std::unique_ptr<Engine::Rendering::SpirvReflection> reflected =
+            Engine::Rendering::reflect_spirv_module(
+                spirv.data(), spirv.size(), reflectionError);
+        if (!reflected || reflected->stage == Engine::Rendering::SpirvShaderStage::Unknown ||
+            reflected->entryPoint != "main") {
+            throw std::runtime_error(
+                "SPIR-V reflection rejected shader module: " +
+                (reflectionError.empty() ? std::string("invalid stage/entry point")
+                                         : reflectionError));
+        }
         VkShaderModuleCreateInfo info{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
         info.codeSize = spirv.size() * sizeof(uint32_t);
         info.pCode = spirv.data();

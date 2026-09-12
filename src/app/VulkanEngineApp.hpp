@@ -171,6 +171,8 @@
 #include "engine/procgen/IWorldFeatures.hpp"
 #include "engine/procgen/IWorldProfile.hpp"
 #include "WorldProcgen.hpp"
+#include <array>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -208,15 +210,19 @@ struct FrameData {
     VkCommandBuffer mainCommandBuffer;
     VkFence renderFence;
     VkSemaphore swapchainSemaphore;
-    // 2 queries per timed pass (frame-start + pass-start) — sized generously to
-    // hold every per-pass boundary the frame records. Both the pool and the
-    // readback buffer live per frame so the previous frame's query results are
-    // still valid while the current frame is being recorded/submitted.
+    // 2 queries per timed pass. The pool lives with the same frame slot/fence,
+    // so its results are read only after that slot's renderFence has signaled.
     VkQueryPool timestampPool{ VK_NULL_HANDLE };
+    std::array<double, 4> cpuPassMs{};
+    double cpuFrameMs{ 0.0 };
+    std::uint64_t farUploadVersion{ 0 };
+    std::uint64_t farUploadBytes{ 0 };
+    std::uint64_t farGrassVertices{ 0 };
+    std::uint64_t farTreeVertices{ 0 };
+    std::uint64_t farSurfaceInstances{ 0 };
     // True once this frame's command buffer (with its timestamp queries) has
     // been submitted to the queue. Guards publish_timestamp_metrics against
-    // reading queries that were never submitted (which would make a
-    // VK_QUERY_RESULT_WAIT_BIT read block forever on the very first frames).
+    // reading query slots that have never been written.
     bool submitted{ false };
 };
 
@@ -394,7 +400,13 @@ public:
     SoundEngine soundEngine;
     MobRenderer mobRenderer;
     World world;
-    WorldRenderer worldRenderer{world};
+    // Composition-root ownership: the executable creates the public queue
+    // service with its explicit contract type and injects it into the renderer
+    // that consumes it every draw.
+    static std::unique_ptr<Engine::Rendering::ISceneRenderQueues> create_scene_queue_service() {
+        return Engine::Rendering::create_scene_render_queues();
+    }
+    WorldRenderer worldRenderer{world, create_scene_queue_service()};
     AppWorldMobQuery mobQuery{world};
     // LOTE 1 — block entities/scheduler/noise/save/time-travel (A2 46-73).
     app::WorldLote1 worldLote1;
@@ -1476,6 +1488,7 @@ public:
     // (vkCmdWriteTimestamp2 between pass boundaries), NOT the fabricated CPU
     // fractions that existed before. Guarded by renderPassMetrics != nullptr.
     std::unique_ptr<Engine::Rendering::IRenderPassMetrics> renderPassMetrics;
+    std::uint64_t lastProfiledFarUploadVersion{ 0 };
     std::chrono::steady_clock::time_point passFrameStart{};
     // B.4: the deterministic scene-culling core consumed by the real draw path
     // (WorldRenderer::set_scene_culling). Its per-draw observable counts

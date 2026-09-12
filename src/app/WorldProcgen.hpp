@@ -27,6 +27,7 @@
 #include "engine/procgen/IMultiScaleStreaming.hpp"
 #include "engine/procgen/IMeshCooking.hpp"
 #include "engine/procgen/IMeshGeometryProcessing.hpp"
+#include "engine/procgen/IJobService.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -79,6 +80,12 @@ private:
     // ---- group 6: mesh geometry post-processing (geodesic/smooth/decimate)
     std::unique_ptr<Engine::Procgen::IMeshGeometryProcessing> geomProcessor_;
     std::size_t smoothedVertices_{ 0 };
+
+    // Product-visible lifecycle for the expensive procgen bootstrap. This is
+    // the canonical IJobService consumer: creation, phased progress, failure
+    // and completion are all observable through summary().
+    std::unique_ptr<engine::jobs::IJobService> initJobService_;
+    std::uint64_t initJobId_{ 0 };
 
     // Surviving cooked-mesh output (never a dead local).
     std::vector<float> cookedPositions_;

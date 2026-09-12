@@ -10,6 +10,76 @@
 #include <imgui_impl_vulkan.h>
 
 namespace Engine {
+
+bool EditorApplication::wait_for_inflight_gpu(const char* reason) {
+    if (m_device == VK_NULL_HANDLE) return true;
+    constexpr std::uint64_t kFenceTimeoutNs = 2'000'000'000ull;
+    bool ok = true;
+    for (VkFence fence : m_inFlightFences) {
+        if (fence == VK_NULL_HANDLE) continue;
+        VkResult status = vkGetFenceStatus(m_device, fence);
+        if (status == VK_SUCCESS) continue;
+        if (status != VK_NOT_READY) {
+            std::cerr << "[Vulkan] fence status failed during "
+                      << (reason ? reason : "interactive update") << ": "
+                      << static_cast<int>(status) << "\n";
+            ok = false;
+            continue;
+        }
+
+        const auto begin = std::chrono::steady_clock::now();
+        const VkResult waited = vkWaitForFences(
+            m_device, 1, &fence, VK_TRUE, kFenceTimeoutNs);
+        const auto end = std::chrono::steady_clock::now();
+        ++m_gpuFenceStallCount;
+        m_gpuFenceWaitMs += std::chrono::duration<double, std::milli>(end - begin).count();
+        if (waited != VK_SUCCESS) {
+            std::cerr << "[Vulkan] fence wait failed during "
+                      << (reason ? reason : "interactive update") << ": "
+                      << static_cast<int>(waited) << "\n";
+            ok = false;
+        }
+    }
+    if (!ok || m_graphicsQueue == VK_NULL_HANDLE) return ok;
+
+    // A queue checkpoint fence is ordered after earlier graphics submissions
+    // and presents. This covers swapchain/image-view retirement without
+    // draining unrelated queues or the entire device.
+    VkFence checkpoint = VK_NULL_HANDLE;
+    VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if (vkCreateFence(m_device, &fenceInfo, nullptr, &checkpoint) != VK_SUCCESS) {
+        std::cerr << "[Vulkan] failed to create queue checkpoint fence during "
+                  << (reason ? reason : "interactive update") << "\n";
+        return false;
+    }
+    VkSubmitInfo checkpointSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    const VkResult submitResult = vkQueueSubmit(m_graphicsQueue, 1, &checkpointSubmit, checkpoint);
+    if (submitResult != VK_SUCCESS) {
+        vkDestroyFence(m_device, checkpoint, nullptr);
+        std::cerr << "[Vulkan] queue checkpoint submit failed during "
+                  << (reason ? reason : "interactive update") << ": "
+                  << static_cast<int>(submitResult) << "\n";
+        return false;
+    }
+    const auto checkpointBegin = std::chrono::steady_clock::now();
+    // Once submitted, the fence itself is referenced by the queue until the
+    // submission completes. Do not destroy it after a timeout while it may
+    // still be in use; this checkpoint is intentionally local to this queue.
+    const VkResult checkpointWait =
+        vkWaitForFences(m_device, 1, &checkpoint, VK_TRUE, UINT64_MAX);
+    const auto checkpointEnd = std::chrono::steady_clock::now();
+    ++m_gpuFenceStallCount;
+    m_gpuFenceWaitMs += std::chrono::duration<double, std::milli>(
+        checkpointEnd - checkpointBegin).count();
+    vkDestroyFence(m_device, checkpoint, nullptr);
+    if (checkpointWait != VK_SUCCESS) {
+        std::cerr << "[Vulkan] queue checkpoint wait failed during "
+                  << (reason ? reason : "interactive update") << ": "
+                  << static_cast<int>(checkpointWait) << "\n";
+        return false;
+    }
+    return ok;
+}
 // Assinatura restaurada: o split havia cortado o cabeçalho de run()
 // (run/try/init_window/init_vulkan/init_imgui) — ver git 408c2d3.
 int EditorApplication::run() {
@@ -230,6 +300,19 @@ void EditorApplication::init_vulkan() {
         vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &m_imageAvailableSemaphores[i]);
         vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &m_renderFinishedSemaphores[i]);
         vkCreateFence(m_device, &fenceInfo, nullptr, &m_inFlightFences[i]);
+    }
+
+    VkPhysicalDeviceProperties deviceProperties{};
+    vkGetPhysicalDeviceProperties(m_physicalDevice, &deviceProperties);
+    m_gpuTimestampPeriodNs = std::max(1.0, static_cast<double>(deviceProperties.limits.timestampPeriod));
+    VkQueryPoolCreateInfo queryInfo{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+    queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    queryInfo.queryCount = kEditorGpuTimestampSlots;
+    for (VkQueryPool& pool : m_gpuTimestampPools) {
+        if (vkCreateQueryPool(m_device, &queryInfo, nullptr, &pool) != VK_SUCCESS) {
+            pool = VK_NULL_HANDLE;
+            std::cerr << "[Vulkan] editor GPU timestamp query pool unavailable\n";
+        }
     }
 }
 
@@ -535,11 +618,21 @@ int EditorApplication::run_render_graph_self_test() {
     VkSubmitInfo submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cb;
-    const VkResult result = vkQueueSubmit(m_graphicsQueue, 1, &submit, VK_NULL_HANDLE);
-    vkDeviceWaitIdle(m_device);
-    vkQueueWaitIdle(m_graphicsQueue);
+    VkFence selfTestFence = VK_NULL_HANDLE;
+    VkFenceCreateInfo selfTestFenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    const VkResult createFenceResult =
+        vkCreateFence(m_device, &selfTestFenceInfo, nullptr, &selfTestFence);
+    const VkResult submitResult = createFenceResult == VK_SUCCESS
+        ? vkQueueSubmit(m_graphicsQueue, 1, &submit, selfTestFence)
+        : createFenceResult;
+    VkResult waitResult = submitResult;
+    if (submitResult == VK_SUCCESS) {
+        waitResult = vkWaitForFences(m_device, 1, &selfTestFence, VK_TRUE, 2'000'000'000ull);
+    }
+    if (selfTestFence != VK_NULL_HANDLE) vkDestroyFence(m_device, selfTestFence, nullptr);
 
-    const bool ok = result == VK_SUCCESS && executor.executed_pass_count() == 2 &&
+    const bool ok = submitResult == VK_SUCCESS && waitResult == VK_SUCCESS &&
+                    executor.executed_pass_count() == 2 &&
                     executor.total_barriers() >= 1;
     std::cout << "[Editor] RENDERGRAPH_TEST " << (ok ? "PASS" : "FAIL")
               << " (passes=" << executor.executed_pass_count()
@@ -688,9 +781,10 @@ void EditorApplication::main_loop() {
             m_recreateShadowMap = false;
             const uint32_t newSize = shadow_size_from_quality(m_shadowQuality);
             if (m_shadowMap.size != newSize) {
-                vkDeviceWaitIdle(m_device);
-                m_shadowMap.size = newSize;
-                create_shadow_map();
+                if (wait_for_inflight_gpu("shadow-map resize")) {
+                    m_shadowMap.size = newSize;
+                    create_shadow_map();
+                }
             }
         }
 
@@ -902,6 +996,11 @@ void EditorApplication::main_loop() {
         // 3D asset thumbnails (mesh + block cubes): a few renders per frame.
         pump_asset_thumbnails(4);
 
+        // One revision-gated registry snapshot feeds every texture name/picker
+        // lookup. No material/decal/video path scans the full registry in the
+        // render frame anymore.
+        refresh_asset_lookup_cache();
+
         // Voxel block pipelines are built here, outside the render pass:
         // creating pipelines/uploading atlases while record_viewport_scene
         // content is recording the viewport pass hung the GPU (device lost).
@@ -913,6 +1012,11 @@ void EditorApplication::main_loop() {
         Scene* simScene = m_playMode.get_active_scene();
         if (!simScene) simScene = m_editorScene.get();
         tick_special_runtimes(simScene, deltaTime);
+
+        // Resolve all material cache misses before render command recording.
+        // record_viewport_scene_content() is therefore draw-only with respect
+        // to shader compilation and VkPipeline creation.
+        prepare_frame_material_pipelines(simScene);
 
         render_frame();
 
@@ -929,7 +1033,7 @@ void EditorApplication::main_loop() {
             }
             std::cout << "[Editor] PLAY_TEST " << (fell ? "PASS" : "FAIL")
                       << " (cube y=" << y << ")" << std::endl;
-            vkDeviceWaitIdle(m_device);
+            (void)wait_for_inflight_gpu("play-test shutdown");
             std::exit(fell ? 0 : 1);
         }
     }

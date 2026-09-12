@@ -1061,8 +1061,8 @@ void EditorApplication::register_render_providers() {
             "record_shadow_pass()/record_spot_shadow_pass()/record_point_shadow_pass()",
             "src/editor", "default" });
         m_renderProviderRegistry->set({
-            "gi", "editor-probe-grid (IRendering IProbeGrid)",
-            "update_gi_probes(): probe->update() + toroidal wrap into EditorShadowUbo",
+            "gi", "editor-ddgi (IGlobalIlluminationProvider)",
+            "update_gi_probes(): canonical DDGI core update + toroidal wrap into EditorShadowUbo binding 4",
             "src/editor", "default" });
         m_renderProviderRegistry->set({
             "lights", "editor-scene-light-ubo (Rendering::LightUboData)",
@@ -1085,7 +1085,7 @@ void EditorApplication::register_render_providers() {
 
 // Feeds the public IRenderingDebugView from the editor's REAL frame state so
 // the cards/probes/overdraw/tracing debug-overlay contract reflects actual
-// data (probe irradiance from the live m_probeGrid, real capture counts) and
+// data (probe irradiance from the live canonical DDGI provider, real counts) and
 // never fabricated data. `refresh_render_diagnostics()` then serializes the
 // debug-view snapshot alongside the pass metrics.
 
@@ -1095,23 +1095,24 @@ void EditorApplication::feed_render_debug_view() {
         m_renderDebugView = Engine::Rendering::create_rendering_debug_view(dbgError);
         if (!m_renderDebugView) return;
     }
-    // Probes: the editor's real DDGI probe grid (m_probeGrid) is the source.
+    // Probes: the editor's canonical DDGI provider is the source.
     std::vector<Engine::Rendering::DebugProbe> probes;
     std::uint32_t pending = 0;
     std::uint32_t sunRev = 0;
-    if (m_probeGrid) {
-        const std::uint32_t count = m_probeGrid->probe_count();
+    if (m_editorGiProvider) {
+        const auto& core = m_editorGiProvider->core();
+        const std::uint32_t count = core.total_probe_count();
         probes.reserve(count);
         for (std::uint32_t i = 0; i < count; ++i) {
-            Engine::Rendering::ProbeGridProbe src;
-            if (!m_probeGrid->probe(i, src)) continue;
+            Engine::Rendering::IGiCore::Probe src;
+            if (!core.probe(i, src)) continue;
             Engine::Rendering::DebugProbe dp;
-            dp.radianceVisibility = glm::vec4(src.irradiance, 1.0f);
-            dp.worldCellCascade = glm::ivec4(src.cell, -1);
+            dp.radianceVisibility = src.radianceVisibility;
+            dp.worldCellCascade = src.worldCellCascade;
             probes.push_back(dp);
         }
-        pending = m_probeGrid->relocation_count() + m_probeGrid->classification_count();
-        sunRev = static_cast<std::uint32_t>(m_fps); // nominal revision counter
+        pending = core.pending_probe_count();
+        sunRev = core.sun_revision();
     }
     m_renderDebugView->bind_probes(probes, pending, sunRev);
     // Cards: the editor's block/character per-face atlases act as the surface

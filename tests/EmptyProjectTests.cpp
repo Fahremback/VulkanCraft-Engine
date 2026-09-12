@@ -19,7 +19,7 @@
 #include <iostream>
 
 using namespace Engine;
-int main(){
+int main(int argc,char** argv){
  const auto root=std::filesystem::temp_directory_path()/("hermes-verify-empty-project-"+UUID().to_string());
  const auto fail=[&](const char*m){std::cerr<<m<<'\n';std::error_code ec;std::filesystem::remove_all(root,ec);return EXIT_FAILURE;};
  std::filesystem::create_directories(root);
@@ -213,11 +213,21 @@ if(loaded.lightComponents.at(spot.get_id()).type!=LightType::Spot)return fail("l
      ProjectConfig config;
      config.name = "PipelineGame";
      config.projectDirectory = projRoot;
-     #ifdef VULKANCRAFT_SOURCE_DIR
-     config.enginePath = std::filesystem::path(VULKANCRAFT_SOURCE_DIR);
-     #else
-     config.enginePath = std::filesystem::current_path().parent_path().parent_path(); // engine/build/Release -> engine
-     #endif
+     // BuildPipeline must stage a native executable from the canonical engine
+     // build tree.  Seed that tree with this already-built test executable so
+     // the test verifies real executable bytes without recursively invoking a
+     // full engine build from inside the unit test.
+     const std::filesystem::path fakeEngine = root / "PipelineEngine";
+     const std::filesystem::path canonicalBin = fakeEngine / "out" / "dev-shared";
+     std::filesystem::create_directories(canonicalBin);
+     if (argc < 1 || argv == nullptr || argv[0] == nullptr) return fail("test executable path unavailable");
+     std::error_code selfEc;
+     const std::filesystem::path selfExe = std::filesystem::canonical(std::filesystem::path(argv[0]), selfEc);
+     if (selfEc || !std::filesystem::is_regular_file(selfExe)) return fail("cannot resolve test executable");
+     const std::filesystem::path seededGame = canonicalBin / "VulkanEngineGame.exe";
+     std::filesystem::copy_file(selfExe, seededGame, std::filesystem::copy_options::overwrite_existing, selfEc);
+     if (selfEc) return fail("cannot seed canonical game executable");
+     config.enginePath = fakeEngine;
      config.initialScene = "Scenes/Main.scene";
      config.activeProfile = BuildProfile::Shipping;
      config.enabledPlugins = {"VoxelWorld", "Missions"};
@@ -245,8 +255,11 @@ if(loaded.lightComponents.at(spot.get_id()).type!=LightType::Spot)return fail("l
      }
      if (buildReport.stages.size() != 9) return fail("build pipeline stage count mismatch");
      const auto distributable = projRoot / "Build" / "Shipping" / "Distributable";
-     if (!std::filesystem::exists(distributable / "Binaries" / "PipelineGame.exe"))
+     const auto packagedExe = distributable / "Binaries" / "PipelineGame.exe";
+     if (!std::filesystem::exists(packagedExe))
          return fail("distributable executable missing");
+     if (std::filesystem::file_size(packagedExe) != std::filesystem::file_size(seededGame))
+         return fail("build pipeline emitted a stub instead of staging the native game executable");
      if (!std::filesystem::exists(distributable / "run_game.bat"))
          return fail("distributable launch script missing");
 

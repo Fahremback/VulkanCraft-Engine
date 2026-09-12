@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace Engine::Gameplay {
 
@@ -17,6 +18,31 @@ namespace {
 glm::vec3 normalized_or(const glm::vec3& v, const glm::vec3& fallback) {
     const float len = glm::length(v);
     return len > 1.0e-6f ? v / len : fallback;
+}
+
+constexpr std::uint16_t kStructuralStrainEffect = 1;
+constexpr std::size_t kReplayControlBytes = sizeof(float) * 4;
+constexpr std::size_t kReplayFrames = 3600;
+
+void encode_controls(const Physics::VehicleInput& input,
+                     std::vector<std::uint8_t>& bytes) {
+    if (bytes.size() != kReplayControlBytes) bytes.resize(kReplayControlBytes);
+    const float values[4] = {
+        input.throttle, input.steering, input.brake, input.handbrake
+    };
+    std::memcpy(bytes.data(), values, sizeof(values));
+}
+
+bool decode_controls(const std::vector<std::uint8_t>& bytes,
+                     Physics::VehicleInput& input) {
+    if (bytes.size() != kReplayControlBytes) return false;
+    float values[4]{};
+    std::memcpy(values, bytes.data(), sizeof(values));
+    input.throttle = glm::clamp(values[0], -1.0f, 1.0f);
+    input.steering = glm::clamp(values[1], -1.0f, 1.0f);
+    input.brake = glm::clamp(values[2], 0.0f, 1.0f);
+    input.handbrake = glm::clamp(values[3], 0.0f, 1.0f);
+    return true;
 }
 
 }  // namespace
@@ -134,6 +160,22 @@ BeamChassisRuntime::BeamChassisRuntime(Physics::PhysicsRuntime& world,
         beamPart.componentIndex = j;
         parts_.push_back(beamPart);
     }
+
+    // CONTA 4: public gameplay services are part of the live deformable
+    // vehicle lifecycle rather than isolated SDK/test objects. Structural
+    // strain stacks temporarily reduce delivered forces after impacts/damage;
+    // the replay is a bounded control journal used to restore the last
+    // deterministic control frame when a separated chassis is repaired.
+    effectStacks_ = engine::gameplay::create_effect_stacks();
+    if (effectStacks_) {
+        std::string effectError;
+        const std::vector<engine::gameplay::EffectStackSpec> specs{
+            { kStructuralStrainEffect, 5u, 1.5f, true }
+        };
+        if (!effectStacks_->configure(specs, effectError)) effectStacks_.reset();
+    }
+    replay_ = engine::gameplay::create_replay(kReplayFrames);
+    replayInput_.resize(kReplayControlBytes);
     valid_ = true;
 }
 
@@ -254,6 +296,7 @@ bool BeamChassisRuntime::apply_damage(Physics::PhysicsRuntime& world,
     Physics::VehiclePartInfo& part = parts_[partIndex];
     part.health = std::max(0.0f, part.health - amount);
     part.separated = part.health <= 0.0f;
+    if (effectStacks_) effectStacks_->apply(kStructuralStrainEffect);
     refresh_beam_stiffness();  // chassis/beam damage changes the solver
     return true;
 }
@@ -265,9 +308,22 @@ bool BeamChassisRuntime::repair(Physics::PhysicsRuntime& world,
     if (partIndex >= parts_.size()) { errorOut = "part index out of range"; return false; }
     if (!(amount > 0.0f)) { errorOut = "repair amount must be positive"; return false; }
     Physics::VehiclePartInfo& part = parts_[partIndex];
+    const bool wasSeparated = part.separated;
     part.health = std::min(part.maxHealth, part.health + amount);
     part.separated = false;
     refresh_beam_stiffness();
+    // A separated chassis has its force delivery suppressed. When it returns
+    // to service, replay the exact last recorded mapped-control frame instead
+    // of inventing controls or relying on stale transient input state.
+    if (partIndex == 0 && wasSeparated && replay_ && replay_->frame_count() > 0) {
+        std::string replayError;
+        engine::gameplay::ReplayFrame frame;
+        if (replay_->begin_replay(replayError) &&
+            replay_->seek_tick(replay_->last_tick()) &&
+            replay_->next_frame(frame)) {
+            decode_controls(frame.inputs, input_);
+        }
+    }
     return true;
 }
 
@@ -385,9 +441,32 @@ float BeamChassisRuntime::speed(const Physics::PhysicsRuntime& world) const {
 void BeamChassisRuntime::update(float deltaTime, std::uint32_t drivableLayers) {
     if (!valid_ || deltaTime <= 0.0f) return;
 
+    if (effectStacks_) {
+        // Empty expiry lists do not allocate; allocation only occurs on the
+        // infrequent frame where an effect actually expires.
+        (void)effectStacks_->tick(deltaTime);
+    }
+    if (replay_) {
+        encode_controls(input_, replayInput_);
+        std::string replayError;
+        // IReplay's maxFrames is a hard cap. Rotate the bounded journal before
+        // it fills so a long-running vehicle keeps recording instead of
+        // silently stopping after one minute at 60 Hz. Repair only needs the
+        // latest deterministic controls, so segment rotation preserves the
+        // runtime behavior while keeping memory bounded.
+        if (replay_->frame_count() >= kReplayFrames) {
+            replay_ = engine::gameplay::create_replay(kReplayFrames);
+        }
+        (void)replay_->record_tick(++replayTick_, 0u, replayInput_, replayError);
+    }
+
     // Power (FALTANTES §17 item 7): burn fuel / draw-or-regen energy by the
     // input; without power the wheel drive/brake forces die.
     const float powerScale = consume_power(deltaTime);
+    const float strainScale = effectStacks_
+        ? std::max(0.60f, 1.0f - 0.08f * static_cast<float>(
+              effectStacks_->stack_count(kStructuralStrainEffect)))
+        : 1.0f;
 
     // Chassis frame from the CURRENT deformed nodes (drives where tilted).
     const glm::vec3 forward = chassis_forward();
@@ -438,13 +517,15 @@ void BeamChassisRuntime::update(float deltaTime, std::uint32_t drivableLayers) {
         const float springForce = std::max(0.0f, state.compression * wheel.springStrength +
                                                   suspensionVelocity * wheel.damperStrength);
         solver_->apply_force(body_, static_cast<std::uint32_t>(node),
-                             hit->normal * (springForce * forceScale_ * wheelScale));
+                             hit->normal * (springForce * forceScale_ * wheelScale * strainScale));
 
         // Longitudinal drive/brake along the steered forward.
         const float lateralSpeed = glm::dot(nodeVelocity, right);
         solver_->apply_force(body_, static_cast<std::uint32_t>(node),
-                             -right * (lateralSpeed * wheel.tireGrip * 20.0f * forceScale_ * wheelScale));
-        float drive = wheel.driven ? input_.throttle * wheel.maxDriveForce * wheelScale * powerScale : 0.0f;
+                             -right * (lateralSpeed * wheel.tireGrip * 20.0f * forceScale_ * wheelScale * strainScale));
+        float drive = wheel.driven
+            ? input_.throttle * wheel.maxDriveForce * wheelScale * powerScale * strainScale
+            : 0.0f;
         if (input_.brake > 0.0f) {
             drive -= input_.brake * wheel.maxBrakeForce * wheelScale * powerScale *
                      (drive > 0.0f ? 1.0f : -1.0f);

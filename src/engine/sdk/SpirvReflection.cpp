@@ -89,54 +89,87 @@ std::unique_ptr<SpirvReflection> reflect_spirv_module(
     if (spvModule.entry_point_name != nullptr) result->entryPoint = spvModule.entry_point_name;
 
     std::uint32_t setCount = 0;
-    if (spvReflectEnumerateDescriptorSets(&spvModule, &setCount, nullptr) == SPV_REFLECT_RESULT_SUCCESS &&
-        setCount > 0) {
+    const SpvReflectResult setCountResult =
+        spvReflectEnumerateDescriptorSets(&spvModule, &setCount, nullptr);
+    if (setCountResult != SPV_REFLECT_RESULT_SUCCESS) {
+        spvReflectDestroyShaderModule(&spvModule);
+        errorOut = "spirv-reflect: descriptor set enumeration failed";
+        return nullptr;
+    }
+    if (setCount > 0) {
         std::vector<SpvReflectDescriptorSet*> sets(setCount);
         const SpvReflectResult setsResult = spvReflectEnumerateDescriptorSets(
             &spvModule, &setCount, sets.data());
-        if (setsResult == SPV_REFLECT_RESULT_SUCCESS) {
-            for (std::uint32_t i = 0; i < setCount; ++i) {
-                const SpvReflectDescriptorSet* set = sets[i];
-                SpirvDescriptorSet outSet;
-                outSet.set = set->set;
-                for (std::uint32_t b = 0; b < set->binding_count; ++b) {
-                    const SpvReflectDescriptorBinding* binding = set->bindings[b];
-                    SpirvDescriptorBinding outBinding;
-                    if (binding->name != nullptr) outBinding.name = binding->name;
-                    outBinding.set = binding->set;
-                    outBinding.binding = binding->binding;
-                    outBinding.type = map_descriptor_type(binding->descriptor_type);
-                    outBinding.count = binding->count;
-                    outBinding.accessed = binding->accessed;
-                    outSet.bindings.push_back(std::move(outBinding));
-                }
-                std::sort(outSet.bindings.begin(), outSet.bindings.end(),
-                          [](const SpirvDescriptorBinding& a, const SpirvDescriptorBinding& b) {
-                              return a.binding < b.binding;
-                          });
-                result->descriptorBindingCount += static_cast<std::uint32_t>(outSet.bindings.size());
-                result->sets.push_back(std::move(outSet));
+        if (setsResult != SPV_REFLECT_RESULT_SUCCESS) {
+            spvReflectDestroyShaderModule(&spvModule);
+            errorOut = "spirv-reflect: descriptor set extraction failed";
+            return nullptr;
+        }
+        for (std::uint32_t i = 0; i < setCount; ++i) {
+            const SpvReflectDescriptorSet* set = sets[i];
+            if (set == nullptr) {
+                spvReflectDestroyShaderModule(&spvModule);
+                errorOut = "spirv-reflect: null descriptor set";
+                return nullptr;
             }
+            SpirvDescriptorSet outSet;
+            outSet.set = set->set;
+            for (std::uint32_t b = 0; b < set->binding_count; ++b) {
+                const SpvReflectDescriptorBinding* binding = set->bindings[b];
+                if (binding == nullptr) {
+                    spvReflectDestroyShaderModule(&spvModule);
+                    errorOut = "spirv-reflect: null descriptor binding";
+                    return nullptr;
+                }
+                SpirvDescriptorBinding outBinding;
+                if (binding->name != nullptr) outBinding.name = binding->name;
+                outBinding.set = binding->set;
+                outBinding.binding = binding->binding;
+                outBinding.type = map_descriptor_type(binding->descriptor_type);
+                outBinding.count = binding->count;
+                outBinding.accessed = binding->accessed;
+                outSet.bindings.push_back(std::move(outBinding));
+            }
+            std::sort(outSet.bindings.begin(), outSet.bindings.end(),
+                      [](const SpirvDescriptorBinding& a, const SpirvDescriptorBinding& b) {
+                          return a.binding < b.binding;
+                      });
+            result->descriptorBindingCount += static_cast<std::uint32_t>(outSet.bindings.size());
+            result->sets.push_back(std::move(outSet));
         }
     }
     std::sort(result->sets.begin(), result->sets.end(),
               [](const SpirvDescriptorSet& a, const SpirvDescriptorSet& b) { return a.set < b.set; });
 
     std::uint32_t pushCount = 0;
-    if (spvReflectEnumeratePushConstantBlocks(&spvModule, &pushCount, nullptr) == SPV_REFLECT_RESULT_SUCCESS &&
-        pushCount > 0) {
+    const SpvReflectResult pushCountResult =
+        spvReflectEnumeratePushConstantBlocks(&spvModule, &pushCount, nullptr);
+    if (pushCountResult != SPV_REFLECT_RESULT_SUCCESS) {
+        spvReflectDestroyShaderModule(&spvModule);
+        errorOut = "spirv-reflect: push constant enumeration failed";
+        return nullptr;
+    }
+    if (pushCount > 0) {
         std::vector<SpvReflectBlockVariable*> pushBlocks(pushCount);
         const SpvReflectResult pushResult = spvReflectEnumeratePushConstantBlocks(
             &spvModule, &pushCount, pushBlocks.data());
-        if (pushResult == SPV_REFLECT_RESULT_SUCCESS) {
-            for (std::uint32_t i = 0; i < pushCount; ++i) {
-                const SpvReflectBlockVariable* block = pushBlocks[i];
-                SpirvPushConstantBlock outBlock;
-                if (block->name != nullptr) outBlock.name = block->name;
-                outBlock.size = static_cast<std::uint32_t>(block->size);
-                outBlock.offset = block->offset;
-                result->pushConstants.push_back(std::move(outBlock));
+        if (pushResult != SPV_REFLECT_RESULT_SUCCESS) {
+            spvReflectDestroyShaderModule(&spvModule);
+            errorOut = "spirv-reflect: push constant extraction failed";
+            return nullptr;
+        }
+        for (std::uint32_t i = 0; i < pushCount; ++i) {
+            const SpvReflectBlockVariable* block = pushBlocks[i];
+            if (block == nullptr) {
+                spvReflectDestroyShaderModule(&spvModule);
+                errorOut = "spirv-reflect: null push constant block";
+                return nullptr;
             }
+            SpirvPushConstantBlock outBlock;
+            if (block->name != nullptr) outBlock.name = block->name;
+            outBlock.size = static_cast<std::uint32_t>(block->size);
+            outBlock.offset = block->offset;
+            result->pushConstants.push_back(std::move(outBlock));
         }
     }
     std::sort(result->pushConstants.begin(), result->pushConstants.end(),

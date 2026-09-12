@@ -118,6 +118,10 @@ void VulkanGame::createLogicalDevice(){
         queueCreateInfo.pQueuePriorities = &queuePriority;
 
         VkPhysicalDeviceFeatures deviceFeatures{};
+        // Texture samplers in the renderer use anisotropic filtering. Enable
+        // the core Vulkan feature before creating the device so validation
+        // does not reject samplerCreateInfo::anisotropyEnable = VK_TRUE.
+        deviceFeatures.samplerAnisotropy = VK_TRUE;
 
         VkDeviceCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;

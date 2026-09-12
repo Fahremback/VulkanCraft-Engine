@@ -2,8 +2,13 @@
 #include "engine/voxel/IVoxelServices.hpp"
 #include "engine/registry/BlockRegistry.hpp"
 #include "engine/registry/FluidRegistry.hpp"
+#include "engine/storage/IChunkStoreFactory.hpp"
 #include "engine/compression/ICompressionProvider.hpp"
 #include "engine/hashing/IHashProvider.hpp"
+#include "engine/entity/IEntityArchetype.hpp"
+#include "engine/entity/IEntityLifecycle.hpp"
+#include "engine/entity/IReflection.hpp"
+#include "engine/timeline/ICausalResolver.hpp"
 #if VC_ENABLE_FLATBUFFERS
 #include "world_save_generated.h"
 #endif
@@ -34,6 +39,67 @@ namespace {
 
 // VoxelWorldFacade implementation sections are kept private to this adapter;
 // public contracts remain in engine/voxel and engine/entity headers.
+
+class ProductStreamingMonitor final : public engine::voxel::IVoxelStreamingMonitor {
+public:
+    void on_streaming_update(const engine::voxel::StreamingSnapshot& snapshot) override {
+        last_ = snapshot;
+        ++revision_;
+    }
+
+    [[nodiscard]] const engine::voxel::StreamingSnapshot& last() const noexcept {
+        return last_;
+    }
+
+    [[nodiscard]] std::uint64_t revision() const noexcept { return revision_; }
+
+private:
+    engine::voxel::StreamingSnapshot last_{};
+    std::uint64_t revision_{ 0 };
+};
+
+std::uint64_t stable_entity_key(const engine::entity::EntityId handle,
+                                const std::string& stableId) {
+    if (!stableId.empty()) {
+        // Stable FNV-1a key so the lifecycle mirror keeps the same identity
+        // after a save/load rebuilds world-local generational handles.
+        std::uint64_t hash = 1469598103934665603ull;
+        for (const unsigned char c : stableId) {
+            hash ^= static_cast<std::uint64_t>(c);
+            hash *= 1099511628211ull;
+        }
+        return hash == 0 ? 1ull : hash;
+    }
+    const std::uint64_t packed =
+        (static_cast<std::uint64_t>(handle.generation) << 32u) |
+        static_cast<std::uint64_t>(handle.id);
+    return packed == 0 ? 1ull : packed;
+}
+
+engine::entity::EntityKind classify_entity_kind(const std::string& type) {
+    if (type.find("player") != std::string::npos) {
+        return engine::entity::EntityKind::Player;
+    }
+    if (type.find("vehicle") != std::string::npos ||
+        type.find("car") != std::string::npos) {
+        return engine::entity::EntityKind::Vehicle;
+    }
+    if (type.find("projectile") != std::string::npos ||
+        type.find("bullet") != std::string::npos) {
+        return engine::entity::EntityKind::Projectile;
+    }
+    if (type.find("mob") != std::string::npos ||
+        type.find("npc") != std::string::npos) {
+        return engine::entity::EntityKind::Mob;
+    }
+    return engine::entity::EntityKind::Interactive;
+}
+
+std::int64_t streaming_pressure_compute(
+    const std::vector<std::int64_t>& inputs) {
+    if (inputs.size() < 2) return 0;
+    return std::max<std::int64_t>(0, inputs[1] - inputs[0]);
+}
 
 // Derives the world's dynamic block table from the registry. Catalog entries
 // (no builtin mapping) receive dynamic runtime ids (>= BlockType::Count) in
@@ -471,9 +537,15 @@ public:
     VoxelWorldFacade()
         : world_(),
           registry_(std::make_shared<engine::registry::BlockRegistry>()),
+          fluidRegistry_(std::make_shared<engine::registry::FluidRegistry>()),
           compression_(engine::compression::create_zstd_compression_provider()),
           hash_(engine::hashing::create_blake3_hash_provider()),
-          entityWorld_(engine::entity::create_entity_world()) {
+          entityWorld_(engine::entity::create_entity_world()),
+          entityArchetypes_(engine::entity::create_entity_archetype_registry()),
+          entityLifecycle_(engine::entity::create_entity_lifecycle()),
+          entityReflection_(engine::entity::create_reflection()),
+          causalResolver_(engine::timeline::create_causal_resolver()),
+          storage_(engine::storage::create_region_chunk_storage()) {
         // The world's dynamic block table comes from the attached registry
         // (empty dynamic set with the builtin default; catalog blocks enter via
         // set_block_registry before boot). The fluid table starts with the
@@ -482,8 +554,31 @@ public:
         push_runtime_table();
         std::string fluidError;
         std::unordered_map<RuntimeBlockId, FluidParams> fluidTable;
-        build_fluid_table(*registry_, nullptr, world_, fluidTable, fluidError);
+        build_fluid_table(*registry_, fluidRegistry_.get(), world_, fluidTable,
+                          fluidError);
         world_.set_fluid_table(std::move(fluidTable));
+        if (entityLifecycle_) {
+            std::string lifecycleError;
+            if (!entityLifecycle_->configure(1u << 20u, lifecycleError)) {
+                entityLifecycle_.reset();
+            }
+        }
+        if (causalResolver_) {
+            std::string causalError;
+            causalLoadedNode_ = causalResolver_->add_leaf(
+                "stream.loaded", 0, causalError);
+            if (causalLoadedNode_ != 0) {
+                causalPendingNode_ = causalResolver_->add_leaf(
+                    "stream.pending", 0, causalError);
+            }
+            if (causalLoadedNode_ != 0 && causalPendingNode_ != 0) {
+                causalPressureNode_ = causalResolver_->add_derived(
+                    "stream.pressure", { causalLoadedNode_, causalPendingNode_ },
+                    &streaming_pressure_compute, causalError);
+            }
+            if (causalPressureNode_ == 0) causalResolver_.reset();
+        }
+        sync_entity_contracts();
     }
 
     uint32_t get_block(int x, int y, int z) const override {
@@ -703,6 +798,7 @@ public:
     void register_entity_world(
         std::shared_ptr<engine::entity::IEntityWorld> world) override {
         entityWorld_ = std::move(world);
+        reset_entity_contracts();
     }
 
     void register_mesher(std::shared_ptr<engine::voxel::IVoxelMesher> mesher) override {
@@ -745,6 +841,25 @@ public:
         if (lighting_) names.push_back(std::string("lighting:") + lighting_->name());
         if (fluid_) names.push_back(std::string("fluid:") + fluid_->name());
         if (replication_) names.push_back(std::string("replication:") + replication_->name());
+        if (entityArchetypes_) {
+            names.push_back("entity-archetypes:" +
+                            std::to_string(entityArchetypes_->count()));
+        }
+        if (entityLifecycle_) {
+            names.push_back("entity-lifecycle:" +
+                            std::to_string(entityLifecycle_->pool_used()));
+        }
+        if (entityReflection_) {
+            names.push_back("entity-reflection:" +
+                            std::to_string(entityReflection_->count()));
+        }
+        names.push_back("voxel-streaming:" +
+                        std::to_string(productStreamingMonitor_.revision()));
+        if (causalResolver_) {
+            names.push_back("causal-stream-pressure:" +
+                            std::to_string(causalStreamingPressure_) + ":" +
+                            std::to_string(causalRecomputeCount_));
+        }
         return names;
     }
 
@@ -1302,7 +1417,14 @@ public:
     // ---- Persistence (META section 10) ----
 
     std::string serialize_world(std::string& errorOut) override {
-        if (storage_) return storage_->serialize_world(errorOut);
+        // A paged backend only owns opaque region pages and intentionally
+        // refuses the monolithic IChunkStorage surface. Keep serialize_world()
+        // as the portable in-memory/legacy representation; file persistence
+        // selects save_world_regions() in save_world(). Custom non-paged
+        // backends still retain the historical delegation behavior.
+        if (storage_ && !storage_->supports_regions()) {
+            return storage_->serialize_world(errorOut);
+        }
         // Drain the worker pool first: boot returns as soon as the center chunk
         // is Uploaded, but other chunks may still be mid-generation. Reading
         // blocks[] while a worker writes it is a data race (UB) — the exact
@@ -1885,6 +2007,7 @@ public:
         std::map<std::pair<int, int>, bool> preUnsaved_;
         World::BlockEntityMap blockEntities_;
         std::vector<engine::entity::EntitySnapshot> worldEntities_;
+        World::RestoreRuntimeState runtimeState_;
         // World identity + registry stamp (FALTANTES §4 item 4): the load
         // restores them from the save's meta; a rollback must bring back the
         // pre-load values exactly like the chunk/entity state.
@@ -1894,6 +2017,11 @@ public:
 
         explicit LoadRollback(VoxelWorldFacade& facade, World& world)
             : facade_(facade), world_(world) {
+            // Snapshotting chunks while a generation/lighting worker is
+            // writing them is a data race. RestoreModeGuard already suppresses
+            // eviction; drain the pool before taking the transactional image.
+            world_.threadPool.wait_idle();
+            runtimeState_ = world_.capture_restore_runtime_state();
             const std::size_t layerBytes =
                 static_cast<std::size_t>(CHUNK_SIZE_X) * CHUNK_SIZE_Z;
             std::lock_guard<std::recursive_mutex> lock(world_.chunksMutex);
@@ -1994,17 +2122,51 @@ public:
             // restaura os valores pré-load.
             facade_.metadata_ = metadata_;
             facade_.savedRegistryVersion_ = savedRegistryVersion_;
+            // restore_chunk_data/restore_block_entity intentionally schedule
+            // fresh work. For rollback, however, the exact pre-load queues and
+            // fixed-tick clock are authoritative, so restore them last.
+            world_.restore_runtime_state(std::move(runtimeState_));
         }
     };
+
+    bool prepare_replacement_restore(std::string& errorOut) {
+        // Both monolithic and region-paged loads are replacement operations.
+        // Registries/factories stay installed, while all persisted live
+        // content is reset before the save image is applied.
+        world_.reset_content_for_restore(bridge_);
+        if (entityWorld_) {
+            std::vector<engine::entity::EntitySnapshot> empty;
+            std::string entityError;
+            if (!entityWorld_->deserialize_entities(empty, entityError)) {
+                errorOut = "world restore: could not clear entity population: " +
+                           entityError;
+                return false;
+            }
+        }
+        errorOut.clear();
+        return true;
+    }
+
+    void commit_replacement_restore(LoadRollback& rollback) {
+        rollback.commit();
+        reset_session_history();
+        // The loaded population is now authoritative. Rebuild the public
+        // archetype/lifecycle/reflection mirrors immediately instead of
+        // leaving stale pre-load metadata until the next frame update.
+        reset_entity_contracts();
+    }
 
     bool deserialize_world(const std::string& data, std::string& errorOut) override {
         RestoreModeGuard restoreGuard(*this, world_);
         LoadRollback loadRollback(*this, world_);
-        if (storage_) {
+        // Region stores persist through load_world_regions(); they do not own
+        // the monolithic byte format accepted here. This preserves direct
+        // deserialize_world() for network/checkpoint/legacy callers while the
+        // default region store remains the on-disk authority.
+        if (storage_ && !storage_->supports_regions()) {
             const bool ok = storage_->deserialize_world(data, errorOut);
             if (ok) {
-                loadRollback.commit();
-                reset_session_history();
+                commit_replacement_restore(loadRollback);
             }
             return ok;
         }
@@ -2051,13 +2213,16 @@ public:
             errorOut = "world save corrupt (checksum mismatch)";
             return false;
         }
+        // Do not tear down the live world for malformed input. Framing,
+        // version and checksum are proven first; from here onward failures are
+        // transactional and LoadRollback can restore the pre-load image.
+        if (!prepare_replacement_restore(errorOut)) return false;
         // v5 body is a FlatBuffers container; v1-v4 use the manual parser.
         if (version >= kWorldSaveVersion) {
 #if VC_ENABLE_FLATBUFFERS
             const bool ok = deserialize_world_v5(body, errorOut);
             if (ok) {
-                loadRollback.commit();
-                reset_session_history();
+                commit_replacement_restore(loadRollback);
             }
             return ok;
 #else
@@ -2244,8 +2409,7 @@ public:
             }
         }
         errorOut.clear();
-        loadRollback.commit();
-        reset_session_history();
+        commit_replacement_restore(loadRollback);
         return true;
     }
 
@@ -2693,14 +2857,44 @@ public:
     void update(const glm::vec3& playerPosition, float deltaTime) override {
         playerPos_ = playerPosition;
         world_.update(playerPosition, bridge_, deltaTime);
+        sync_entity_contracts();
         tick_autosave(deltaTime);
-        if (monitor_) {
-            const engine::voxel::StreamingSnapshot snapshot = world_.streaming_snapshot();
-            // Change-gated: only fire when streaming state actually moved.
-            if (!(snapshot == lastSnapshot_)) {
-                lastSnapshot_ = snapshot;
-                monitor_->on_streaming_update(snapshot);
+        const engine::voxel::StreamingSnapshot snapshot = world_.streaming_snapshot();
+        if (causalResolver_) {
+            const std::int64_t loaded =
+                static_cast<std::int64_t>(snapshot.chunksLoaded);
+            const std::int64_t pending = static_cast<std::int64_t>(
+                snapshot.chunksGenerating + snapshot.chunksDirty +
+                snapshot.lightDirtyChunks + snapshot.pendingLightJobs +
+                snapshot.pendingFluidTicks);
+            bool changed = false;
+            std::string causalError;
+            if (loaded != causalLastLoaded_) {
+                changed = causalResolver_->set_leaf_value(
+                              causalLoadedNode_, loaded, causalError) || changed;
+                if (causalError.empty()) causalLastLoaded_ = loaded;
             }
+            if (pending != causalLastPending_) {
+                causalError.clear();
+                changed = causalResolver_->set_leaf_value(
+                              causalPendingNode_, pending, causalError) || changed;
+                if (causalError.empty()) causalLastPending_ = pending;
+            }
+            if (changed) {
+                causalRecomputeCount_ += causalResolver_->resolve();
+                engine::timeline::CausalNodeState pressure;
+                if (causalResolver_->state(causalPressureNode_, pressure)) {
+                    causalStreamingPressure_ = pressure.value;
+                }
+            }
+        }
+        // IVoxelStreaming is consumed by the product even when an external
+        // observer is not attached: the internal monitor tracks every real
+        // streaming transition and exposes its revision via registered_services().
+        if (!(snapshot == lastSnapshot_)) {
+            lastSnapshot_ = snapshot;
+            productStreamingMonitor_.on_streaming_update(snapshot);
+            if (monitor_) monitor_->on_streaming_update(snapshot);
         }
     }
 
@@ -3007,22 +3201,33 @@ private:
         if (!storage_->load_world(filePath, errorOut)) return false;
         std::string manifest;
         if (!storage_->load_page("world", manifest, errorOut)) return false;
-        // The manifest is a v5 body with zero chunks: the shared deserializer
-        // applies palette + block entities + world entities (all-or-nothing),
-        // and region pages restore the chunk data.
-        if (!deserialize_world_v5(manifest, errorOut)) return false;
         std::vector<std::pair<int, int>> regions;
         if (!manifest_region_list(manifest, regions, errorOut)) return false;
+        // Read every page before mutating the live world. A missing/corrupt IO
+        // page therefore leaves the current world untouched; decode failures
+        // are still protected by LoadRollback below.
+        std::vector<std::string> regionPayloads;
+        regionPayloads.reserve(regions.size());
         for (const auto& [rx, rz] : regions) {
             std::string payload;
             if (!storage_->load_page(region_page_id(rx, rz), payload, errorOut)) {
                 return false;
             }
-            if (!decode_region_payload(payload, errorOut)) return false;
+            regionPayloads.push_back(std::move(payload));
+        }
+        if (!prepare_replacement_restore(errorOut)) return false;
+        // The manifest is a v5 body with zero chunks: it applies palette,
+        // block entities, world entities and metadata to the now-empty target;
+        // region pages then materialize exactly the saved chunk set.
+        if (!deserialize_world_v5(manifest, errorOut)) return false;
+        for (std::size_t i = 0; i < regionPayloads.size(); ++i) {
+            if (!decode_region_payload(regionPayloads[i], regions[i].first,
+                                       regions[i].second, errorOut)) {
+                return false;
+            }
         }
         errorOut.clear();
-        loadRollback.commit();
-        reset_session_history();
+        commit_replacement_restore(loadRollback);
         return true;
     }
 #endif  // VC_ENABLE_FLATBUFFERS
@@ -3322,25 +3527,31 @@ private:
 
     // Parses a region page (layout v1 or v2) and restores its chunks in batch
     // (one invalidation per chunk, through the shared apply_saved_chunk path).
-    bool decode_region_payload(const std::string& payload, std::string& errorOut) {
+    bool decode_region_payload(const std::string& payload, int regionX, int regionZ,
+                               std::string& errorOut) {
         if (payload.size() >= 4 && payload.compare(0, 4, kRegionMagicV2) == 0) {
-            return decode_region_payload_v2(payload, errorOut);
+            return decode_region_payload_v2(payload, regionX, regionZ, errorOut);
         }
         if (payload.size() >= 4 && payload.compare(0, 4, kRegionMagic) == 0) {
-            return decode_region_payload_v1(payload, errorOut);
+            return decode_region_payload_v1(payload, regionX, regionZ, errorOut);
         }
         errorOut = "region page corrupt (bad magic)";
         return false;
     }
 
     // Layout v1: raw u16 block ids + fluid bytes (pre-palette/compression).
-    bool decode_region_payload_v1(const std::string& payload,
+    bool decode_region_payload_v1(const std::string& payload, int regionX, int regionZ,
                                   std::string& errorOut) {
         const std::size_t layerBytes =
             static_cast<std::size_t>(CHUNK_SIZE_X) * CHUNK_SIZE_Z;
+        if (payload.size() < 8) {
+            errorOut = "region page corrupt (truncated chunk count)";
+            return false;
+        }
         std::size_t offset = 4;
         const uint32_t count = read_u32(payload, offset);
         offset += 4;
+        std::set<std::pair<int, int>> seenChunks;
         for (uint32_t i = 0; i < count; ++i) {
             if (offset + 12 > payload.size()) {
                 errorOut = "region page corrupt (truncated chunk header)";
@@ -3350,6 +3561,15 @@ private:
             const int32_t cz = static_cast<int32_t>(read_u32(payload, offset + 4));
             const uint32_t extent = read_u32(payload, offset + 8);
             offset += 12;
+            if (floor_div(cx, kRegionChunks) != regionX ||
+                floor_div(cz, kRegionChunks) != regionZ) {
+                errorOut = "region page corrupt (chunk outside declared tile)";
+                return false;
+            }
+            if (!seenChunks.emplace(cx, cz).second) {
+                errorOut = "region page corrupt (duplicate chunk coordinate)";
+                return false;
+            }
             if (extent == 0 || extent > static_cast<uint32_t>(CHUNK_SIZE_Y)) {
                 errorOut = "region page corrupt (bad extent)";
                 return false;
@@ -3384,18 +3604,27 @@ private:
                 return false;
             }
         }
+        if (offset != payload.size()) {
+            errorOut = "region page corrupt (trailing bytes)";
+            return false;
+        }
         return true;
     }
 
     // Layout v2: flags byte, optional palette, u32 payload size, payload
     // (palette indices or raw ids + fluid), optionally a zstd frame.
-    bool decode_region_payload_v2(const std::string& payload,
+    bool decode_region_payload_v2(const std::string& payload, int regionX, int regionZ,
                                   std::string& errorOut) {
         const std::size_t layerBytes =
             static_cast<std::size_t>(CHUNK_SIZE_X) * CHUNK_SIZE_Z;
+        if (payload.size() < 8) {
+            errorOut = "region page corrupt (truncated chunk count)";
+            return false;
+        }
         std::size_t offset = 4;
         const uint32_t count = read_u32(payload, offset);
         offset += 4;
+        std::set<std::pair<int, int>> seenChunks;
         for (uint32_t i = 0; i < count; ++i) {
             if (offset + 13 > payload.size()) {
                 errorOut = "region page corrupt (truncated chunk header)";
@@ -3406,6 +3635,21 @@ private:
             const uint32_t extent = read_u32(payload, offset + 8);
             const uint8_t flags = static_cast<uint8_t>(payload[offset + 12]);
             offset += 13;
+            if (floor_div(cx, kRegionChunks) != regionX ||
+                floor_div(cz, kRegionChunks) != regionZ) {
+                errorOut = "region page corrupt (chunk outside declared tile)";
+                return false;
+            }
+            if (!seenChunks.emplace(cx, cz).second) {
+                errorOut = "region page corrupt (duplicate chunk coordinate)";
+                return false;
+            }
+            constexpr uint8_t kKnownRegionFlags =
+                kRegionFlagPalette | kRegionFlagCompressed | kRegionFlagState;
+            if ((flags & static_cast<uint8_t>(~kKnownRegionFlags)) != 0) {
+                errorOut = "region page corrupt (unknown chunk flags)";
+                return false;
+            }
             if (extent == 0 || extent > static_cast<uint32_t>(CHUNK_SIZE_Y)) {
                 errorOut = "region page corrupt (bad extent)";
                 return false;
@@ -3541,6 +3785,10 @@ private:
                 return false;
             }
         }
+        if (offset != payload.size()) {
+            errorOut = "region page corrupt (trailing bytes)";
+            return false;
+        }
         return true;
     }
 
@@ -3568,6 +3816,11 @@ private:
             errorOut = "region manifest too small";
             return false;
         }
+        if (body.compare(0, 5, kWorldMagic) != 0 ||
+            read_u32(body, 5) != kWorldSaveVersion) {
+            errorOut = "region manifest has invalid world framing";
+            return false;
+        }
         const char* buffer = body.data() + prefix;
         const std::size_t bufferSize = body.size() - prefix;
         flatbuffers::Verifier verifier(
@@ -3582,10 +3835,23 @@ private:
             errorOut = "region manifest corrupt (no region list)";
             return false;
         }
+        regionsOut.clear();
         regionsOut.reserve(save->regions()->size());
+        std::set<std::pair<int, int>> seen;
         for (flatbuffers::uoffset_t i = 0; i < save->regions()->size(); ++i) {
             const engine::voxel::save::RegionEntry* entry = save->regions()->Get(i);
-            regionsOut.emplace_back(entry->x(), entry->z());
+            if (!entry) {
+                errorOut = "region manifest corrupt (null region entry)";
+                regionsOut.clear();
+                return false;
+            }
+            const std::pair<int, int> region{ entry->x(), entry->z() };
+            if (!seen.insert(region).second) {
+                errorOut = "region manifest corrupt (duplicate region entry)";
+                regionsOut.clear();
+                return false;
+            }
+            regionsOut.push_back(region);
         }
         return true;
 #else
@@ -3614,6 +3880,109 @@ private:
         editLog_ = 0;
     }
 
+    void reset_entity_contracts() {
+        previousEntityKeys_.clear();
+        entityKeysScratch_.clear();
+        if (entityArchetypes_) entityArchetypes_->clear();
+        if (entityReflection_) entityReflection_->clear();
+        if (entityLifecycle_) {
+            std::string error;
+            if (!entityLifecycle_->configure(1u << 20u, error)) {
+                entityLifecycle_.reset();
+            }
+        }
+        sync_entity_contracts();
+    }
+
+    // Mirrors the live EnTT entity world into the public archetype/lifecycle/
+    // reflection contracts. The source of identity remains IEntityWorld:
+    // stable ids survive save/load, tickInterval drives Active/Sleeping, and
+    // missing handles transition to Despawned. Scratch vectors are swapped so
+    // their capacity is reused instead of allocating every frame.
+    void sync_entity_contracts() {
+        if (!entityWorld_) return;
+        entityKeysScratch_.clear();
+        entityWorld_->for_each_entity([&](engine::entity::EntityId handle) {
+            const std::string stableId = entityWorld_->stable_id(handle);
+            const std::uint64_t lifecycleKey = stable_entity_key(handle, stableId);
+            entityKeysScratch_.push_back(lifecycleKey);
+
+            if (entityLifecycle_) {
+                if (!entityLifecycle_->is_registered(lifecycleKey)) {
+                    std::string lifecycleError;
+                    if (entityLifecycle_->register_entity(lifecycleKey,
+                                                          lifecycleError)) {
+                        entityLifecycle_->spawn(lifecycleKey);
+                    }
+                } else if (entityLifecycle_->state(lifecycleKey) ==
+                           engine::entity::LifecycleState::Despawned) {
+                    entityLifecycle_->spawn(lifecycleKey);
+                }
+                float tickInterval = 0.0f;
+                if (entityWorld_->get_tick_interval(handle, tickInterval)) {
+                    const auto state = entityLifecycle_->state(lifecycleKey);
+                    if (tickInterval > 0.0f &&
+                        state == engine::entity::LifecycleState::Active) {
+                        entityLifecycle_->sleep(lifecycleKey);
+                    } else if (tickInterval <= 0.0f &&
+                               state == engine::entity::LifecycleState::Sleeping) {
+                        entityLifecycle_->wake(lifecycleKey);
+                    }
+                }
+                entityLifecycle_->set_persistent(lifecycleKey, !stableId.empty());
+            }
+
+            const std::string type = entityWorld_->type_of(handle);
+            if (type.empty()) return;
+            if (entityArchetypes_ && entityArchetypes_->find(type) == nullptr) {
+                engine::entity::EntityArchetype archetype;
+                archetype.name = type;
+                archetype.kind = classify_entity_kind(type);
+                archetype.components = {
+                    { "position", "{}" },
+                    { "health", "{}" },
+                    { "tick_interval", "{}" },
+                    { "stable_id", "{}" },
+                    { "project_components", "{}" },
+                };
+                std::string archetypeError;
+                entityArchetypes_->register_archetype(archetype, archetypeError);
+            }
+            if (entityReflection_ && entityReflection_->type(type) == nullptr) {
+                engine::entity::TypeInfo info;
+                info.name = type;
+                info.stable_id = "entity:" + type;
+                info.version = "1.0.0";
+                info.fields = {
+                    { "position", engine::entity::FieldKind::Vec3 },
+                    { "health", engine::entity::FieldKind::Float },
+                    { "tick_interval", engine::entity::FieldKind::Float },
+                    { "stable_id", engine::entity::FieldKind::String },
+                    { "project_components", engine::entity::FieldKind::Map },
+                };
+                std::string reflectionError;
+                entityReflection_->register_type(info, reflectionError);
+            }
+        });
+
+        std::sort(entityKeysScratch_.begin(), entityKeysScratch_.end());
+        entityKeysScratch_.erase(
+            std::unique(entityKeysScratch_.begin(), entityKeysScratch_.end()),
+            entityKeysScratch_.end());
+        if (entityLifecycle_) {
+            for (const std::uint64_t previous : previousEntityKeys_) {
+                if (!std::binary_search(entityKeysScratch_.begin(),
+                                        entityKeysScratch_.end(), previous) &&
+                    entityLifecycle_->is_registered(previous) &&
+                    entityLifecycle_->state(previous) !=
+                        engine::entity::LifecycleState::Despawned) {
+                    entityLifecycle_->despawn(previous);
+                }
+            }
+        }
+        previousEntityKeys_.swap(entityKeysScratch_);
+    }
+
     // Derives the world's dynamic block table from the registry and pushes it,
     // merging the registered mesher plugin's per-block policy overrides
     // (FALTANTES §3 item 2). Called at construction, on set_block_registry and
@@ -3639,6 +4008,7 @@ private:
 
     // Streaming/budget observability (FALTANTES §3): optional push monitor +
     // last snapshot for change-gating the dispatch.
+    ProductStreamingMonitor productStreamingMonitor_;
     std::shared_ptr<engine::voxel::IVoxelStreamingMonitor> monitor_;
     engine::voxel::StreamingSnapshot lastSnapshot_;
 
@@ -3664,6 +4034,27 @@ private:
     // through the world save (v5 world_entities). Default: EnTT-backed;
     // replaceable via register_entity_world.
     std::shared_ptr<engine::entity::IEntityWorld> entityWorld_;
+    // Public ECS contracts mirrored from the SAME live entity world. They do
+    // not create a parallel population: lifecycle keys derive from stable ids
+    // (or the current generational handle), while archetype/reflection metadata
+    // is rebuilt from live types after load or world replacement.
+    std::unique_ptr<engine::entity::IEntityArchetypeRegistry> entityArchetypes_;
+    std::unique_ptr<engine::entity::IEntityLifecycle> entityLifecycle_;
+    std::unique_ptr<engine::entity::IReflection> entityReflection_;
+    std::vector<std::uint64_t> previousEntityKeys_;
+    std::vector<std::uint64_t> entityKeysScratch_;
+    // Causal streaming graph: live chunk/work census feeds two leaves every
+    // update and recomputes only the affected pressure descendant.  This is a
+    // real IVoxelWorld tick consumer; the result/recompute count are exposed by
+    // registered_services() for headless/editor observability.
+    std::unique_ptr<engine::timeline::ICausalResolver> causalResolver_;
+    engine::timeline::CausalNodeId causalLoadedNode_{ 0 };
+    engine::timeline::CausalNodeId causalPendingNode_{ 0 };
+    engine::timeline::CausalNodeId causalPressureNode_{ 0 };
+    std::int64_t causalLastLoaded_{ -1 };
+    std::int64_t causalLastPending_{ -1 };
+    std::int64_t causalStreamingPressure_{ 0 };
+    std::uint64_t causalRecomputeCount_{ 0 };
     // Optional service overrides (see IVoxelServices.hpp for wiring status).
     std::shared_ptr<engine::voxel::IChunkStorage> storage_;
     std::shared_ptr<engine::voxel::IVoxelMesher> mesher_;

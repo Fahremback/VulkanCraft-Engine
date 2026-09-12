@@ -1,11 +1,15 @@
 #include "RadianceCache.hpp"
+#include "GiProviderBridge.hpp"
+#include "RenderProviderSelection.hpp"
 
 #include "TerrainGenerator.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
+#include <tuple>
 
 namespace {
 
@@ -133,9 +137,62 @@ void RadianceCache::init(VkDevice device, VmaAllocator allocator, const Config& 
         dirtyMin_[cascade] = cascades_[cascade].baseProbe;
         dirtyMax_[cascade] = cascades_[cascade].baseProbe + static_cast<uint32_t>(probesPerCascade) - 1;
     }
+
+    // The renderer owns the canonical GI provider. Prefer RT GI and fall back
+    // inside the public factory to engine DDGI when ray query is unavailable.
+    // This makes the provider selected by the registry the same provider whose
+    // probe publications are copied into descriptor binding 6.
+    std::string providerError;
+    Engine::Rendering::GiCapabilities capabilities;
+    capabilities.radianceCache = true;
+    capabilities.ddgi = true;
+    capabilities.rayTraced = true;
+    canonicalGiProvider_ = Engine::Rendering::create_global_illumination_provider(
+        Engine::Rendering::GiBackend::RayTraced, capabilities, providerError);
+    if (!canonicalGiProvider_) {
+        canonicalGiProvider_ = Engine::Rendering::create_global_illumination_provider(
+            Engine::Rendering::GiBackend::Ddgi, capabilities, providerError);
+    }
+    if (canonicalGiProvider_) {
+        Engine::Rendering::GiClipmapConfig giConfig;
+        giConfig.cascadeCount = config_.cascadeCount;
+        giConfig.resolution = config_.resolution;
+        giConfig.probesPerFrame = config_.probesPerFrame;
+        giConfig.baseSpacing = config_.baseSpacing;
+        giConfig.cascadeScale = config_.cascadeScale;
+        giConfig.sunRefreshAngleDegrees = config_.sunRefreshAngleDegrees;
+        std::string configureError;
+        if (!canonicalGiProvider_->core().configure(giConfig, configureError)) {
+            canonicalGiProvider_.reset();
+            vc::rendering::provider_selection::retire("giProvider");
+        } else {
+            const char* providerName = "radiance-cache";
+            switch (canonicalGiProvider_->backend()) {
+                case Engine::Rendering::GiBackend::RayTraced:
+                    providerName = "vulkan-ray-query-gi";
+                    break;
+                case Engine::Rendering::GiBackend::Ddgi:
+                    providerName = "ddgi-probe-grid";
+                    break;
+                case Engine::Rendering::GiBackend::RadianceCache:
+                default:
+                    providerName = "radiance-cache";
+                    break;
+            }
+            vc::rendering::provider_selection::record_canonical(
+                "giProvider", providerName,
+                "renderer-owned descriptor-6 provider");
+        }
+    }
+    frameRevision_ = 0u;
+    sceneRevision_ = 1u;
+    lastSceneHash_ = 0u;
+    lastSceneAnchor_ = glm::ivec2(std::numeric_limits<int32_t>::max());
 }
 
 void RadianceCache::cleanup() {
+    canonicalGiProvider_.reset();
+    vc::rendering::provider_selection::retire("giProvider");
     if (allocator_ != VK_NULL_HANDLE) {
         destroy_buffer(stagingBuffer_);
         destroy_buffer(cacheBuffer_);
@@ -146,6 +203,10 @@ void RadianceCache::cleanup() {
     device_ = VK_NULL_HANDLE;
     allocator_ = VK_NULL_HANDLE;
     metadataDirty_ = true;
+    frameRevision_ = 0u;
+    sceneRevision_ = 1u;
+    lastSceneHash_ = 0u;
+    lastSceneAnchor_ = glm::ivec2(std::numeric_limits<int32_t>::max());
 }
 
 bool RadianceCache::contains_cell(uint32_t cascadeIndex, const glm::ivec3& cell) const {
@@ -265,11 +326,150 @@ void RadianceCache::mark_dirty(uint32_t cascadeIndex, uint32_t globalSlot) {
     dirtyMax_[cascadeIndex] = std::max(dirtyMax_[cascadeIndex], globalSlot);
 }
 
+void RadianceCache::update_scene_revision(const glm::vec3& cameraPosition) {
+    const glm::ivec2 anchor(static_cast<int>(std::floor(cameraPosition.x / 8.0f)),
+                            static_cast<int>(std::floor(cameraPosition.z / 8.0f)));
+    // Re-evaluate periodically as well as after crossing an anchor so terrain
+    // edits/provider invalidation cannot leave an RT acceleration structure stale.
+    if (glm::all(glm::equal(anchor, lastSceneAnchor_)) &&
+        (frameRevision_ % 30u) != 0u) return;
+
+    std::uint64_t hash = 1469598103934665603ull;
+    const auto mix = [&hash](std::uint64_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    for (int z = -4; z <= 4; ++z) {
+        for (int x = -4; x <= 4; ++x) {
+            const float wx = static_cast<float>(anchor.x * 8 + x * 8);
+            const float wz = static_cast<float>(anchor.y * 8 + z * 8);
+            const TerrainSample sample = TerrainGenerator::sample_coarse(wx, wz);
+            mix(static_cast<std::uint64_t>(static_cast<std::int64_t>(sample.height) + 0x100000ll));
+            mix(static_cast<std::uint64_t>(sample.biome));
+        }
+    }
+    mix(static_cast<std::uint32_t>(anchor.x));
+    mix(static_cast<std::uint32_t>(anchor.y));
+    if (hash != lastSceneHash_) {
+        lastSceneHash_ = hash;
+        ++sceneRevision_;
+    }
+    lastSceneAnchor_ = anchor;
+}
+
+void RadianceCache::update_canonical_gi(const glm::vec3& cameraPosition,
+                                        const glm::vec3& sunDirection,
+                                        const glm::vec3& sunColor,
+                                        uint32_t probeBudgetOverride) {
+    if (!canonicalGiProvider_) return;
+    const Engine::Rendering::GiTerrainSampler sampler =
+        [](float worldX, float worldZ) -> Engine::Rendering::GiSurfaceSample {
+            const TerrainSample terrain = TerrainGenerator::sample_coarse(worldX, worldZ);
+            Engine::Rendering::GiSurfaceSample sample;
+            sample.height = static_cast<float>(terrain.height);
+            sample.albedo = biome_albedo(terrain.biome);
+            return sample;
+        };
+    canonicalGiProvider_->core().update(cameraPosition, sunDirection, sunColor,
+                                        sampler, probeBudgetOverride);
+}
+
+void RadianceCache::update_reflection_field(const glm::vec3& cameraPosition,
+                                            const glm::vec3& sunDirection,
+                                            const glm::vec3& sunColor) {
+    struct Candidate {
+        float distanceSquared{0.0f};
+        uint32_t slot{0u};
+        uint32_t cascade{0u};
+        vc::rendering::gi_bridge::ReflectionProbeSeed seed{};
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(256u);
+    for (uint32_t cascade = 0; cascade < std::min(config_.cascadeCount, 2u); ++cascade) {
+        const uint32_t begin = cascades_[cascade].baseProbe;
+        const uint32_t count = config_.resolution * config_.resolution * config_.resolution;
+        const float spacing = metadataCpu_.cascades[cascade].spacingBase.x;
+        for (uint32_t local = 0; local < count; ++local) {
+            const uint32_t slot = begin + local;
+            const ProbeGpu& probe = probesCpu_[slot];
+            if (probe.worldCellCascade.w != static_cast<int>(cascade)) continue;
+            const glm::vec3 position =
+                (glm::vec3(glm::ivec3(probe.worldCellCascade)) + 0.5f) * spacing;
+            Candidate candidate;
+            candidate.distanceSquared = glm::dot(position - cameraPosition,
+                                                 position - cameraPosition);
+            candidate.slot = slot;
+            candidate.cascade = cascade;
+            candidate.seed.position = position;
+            candidate.seed.normal = safe_normalize(
+                glm::vec3(probe.directionConfidence), glm::vec3(0.0f, 1.0f, 0.0f));
+            candidate.seed.cell = glm::ivec3(probe.worldCellCascade);
+            candidate.seed.cascade = cascade;
+            candidates.push_back(candidate);
+        }
+    }
+    if (candidates.empty()) return;
+    constexpr std::size_t kReflectionProbeBudget = 96u;
+    const std::size_t selected = std::min(kReflectionProbeBudget, candidates.size());
+    std::partial_sort(candidates.begin(), candidates.begin() + selected, candidates.end(),
+        [](const Candidate& a, const Candidate& b) {
+            return a.distanceSquared < b.distanceSquared;
+        });
+    candidates.resize(selected);
+
+    vc::rendering::gi_bridge::ReflectionFrameInput frame;
+    frame.cameraPosition = cameraPosition;
+    frame.sunDirection = safe_normalize(sunDirection, glm::vec3(0.0f, 1.0f, 0.0f));
+    frame.sunColor = sunColor;
+    frame.frameRevision = frameRevision_;
+    frame.sceneRevision = sceneRevision_;
+    frame.maxTraceDistance = 128.0f;
+    frame.heightAt = [](float x, float z) {
+        return static_cast<float>(TerrainGenerator::sample_coarse(x, z).height);
+    };
+    frame.albedoAt = [](float x, float z) {
+        return biome_albedo(TerrainGenerator::sample_coarse(x, z).biome);
+    };
+
+    std::vector<vc::rendering::gi_bridge::ReflectionProbeSeed> seeds;
+    seeds.reserve(candidates.size());
+    for (const Candidate& candidate : candidates) seeds.push_back(candidate.seed);
+    std::vector<vc::rendering::gi_bridge::ReflectionProbeResult> results;
+    const bool updated = vc::rendering::gi_bridge::update_reflections(frame, seeds, results);
+
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        ProbeGpu& probe = probesCpu_[candidates[i].slot];
+        if (updated && i < results.size()) {
+            const auto& result = results[i];
+            probe.reflectionRadianceDistance = glm::vec4(
+                glm::max(result.radiance, glm::vec3(0.0f)),
+                std::max(result.hitDistance, 0.01f));
+        } else {
+            // Probe reflections remain real and spatial even without hardware
+            // RT: reuse the captured DDGI irradiance and its persistent depth.
+            const float fallbackDistance = probe.depthMoments.x > 0.0f
+                ? probe.depthMoments.x : metadataCpu_.cascades[candidates[i].cascade].spacingBase.x * 4.0f;
+            probe.reflectionRadianceDistance = glm::vec4(
+                glm::vec3(probe.radianceVisibility) * 0.65f,
+                fallbackDistance);
+        }
+        std::memcpy(static_cast<std::byte*>(stagingBuffer_.mapped) +
+                        ProbeDataOffset + candidates[i].slot * sizeof(ProbeGpu),
+                    &probe, sizeof(ProbeGpu));
+        mark_dirty(candidates[i].cascade, candidates[i].slot);
+    }
+}
+
 uint32_t RadianceCache::update(const glm::vec3& cameraPosition,
                                const glm::vec3& sunDirection,
                                const glm::vec3& sunColor,
                                uint32_t probeBudgetOverride) {
     if (!initialized()) return 0;
+
+    ++frameRevision_;
+    update_scene_revision(cameraPosition);
+    update_canonical_gi(cameraPosition, sunDirection, sunColor,
+                        probeBudgetOverride);
 
     const glm::vec3 normalizedSun = safe_normalize(sunDirection, cachedSunDirection_);
     const float cosineThreshold = std::cos(glm::radians(config_.sunRefreshAngleDegrees));
@@ -366,6 +566,59 @@ uint32_t RadianceCache::update(const glm::vec3& cameraPosition,
         }
         if (!progressed) break;
     }
+
+    // Import live DDGI/probe-provider output after the legacy cache update so
+    // provider data wins for matching cells.  The existing descriptor/buffer
+    // ABI remains unchanged: record_uploads() pushes these exact probes to the
+    // storage buffer sampled by radiance_cache.glsl in the real material pass.
+    auto publications = vc::rendering::gi_bridge::snapshot();
+    std::sort(publications.begin(), publications.end(),
+              [](const auto& a, const auto& b) { return a.revision < b.revision; });
+    for (const auto& publication : publications) {
+        if (canonicalGiProvider_ &&
+            publication.publicationClass !=
+                vc::rendering::gi_bridge::PublicationClass::CanonicalGi) {
+            continue;
+        }
+        uint32_t targetCascade = MaxCascades;
+        for (uint32_t cascade = 0; cascade < config_.cascadeCount; ++cascade) {
+            const float spacing = metadataCpu_.cascades[cascade].spacingBase.x;
+            const float tolerance = std::max(0.01f, spacing * 0.01f);
+            if (std::fabs(spacing - publication.cellSize) <= tolerance) {
+                targetCascade = cascade;
+                break;
+            }
+        }
+        if (targetCascade >= config_.cascadeCount) continue;
+
+        for (const auto& source : publication.probes) {
+            if (!contains_cell(targetCascade, source.cell)) continue;
+            const uint32_t slot = slot_index(targetCascade, source.cell);
+            ProbeGpu probe{};
+            probe.radianceVisibility = glm::vec4(source.irradiance, source.visibility);
+            probe.directionConfidence = glm::vec4(
+                safe_normalize(source.direction, glm::vec3(0.0f, 1.0f, 0.0f)),
+                source.confidence);
+            probe.worldCellCascade =
+                glm::ivec4(source.cell, static_cast<int>(targetCascade));
+            probe.depthMoments = source.depthMoments;
+            // Preserve the temporally filtered reflection field for a slot
+            // when the same cell is refreshed by GI in this frame.
+            if (glm::all(glm::equal(probesCpu_[slot].worldCellCascade,
+                                    probe.worldCellCascade))) {
+                probe.reflectionRadianceDistance =
+                    probesCpu_[slot].reflectionRadianceDistance;
+            }
+            probesCpu_[slot] = probe;
+            std::memcpy(static_cast<std::byte*>(stagingBuffer_.mapped) +
+                            ProbeDataOffset + slot * sizeof(ProbeGpu),
+                        &probesCpu_[slot], sizeof(ProbeGpu));
+            mark_dirty(targetCascade, slot);
+        }
+    }
+
+
+    update_reflection_field(cameraPosition, normalizedSun, sunColor);
 
     if (metadataDirty_) {
         std::memcpy(stagingBuffer_.mapped, &metadataCpu_, sizeof(metadataCpu_));

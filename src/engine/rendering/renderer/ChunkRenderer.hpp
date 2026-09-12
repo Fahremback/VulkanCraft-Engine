@@ -8,8 +8,8 @@
 
 class ChunkRenderer final {
 public:
-    void upload(ChunkMeshResult result, VkDevice device, VmaAllocator allocator,
-                std::vector<AllocatedBuffer>* retiredBuffers = nullptr);
+    void upload(ChunkMeshResult result, VmaAllocator allocator,
+                std::vector<AllocatedBuffer>& retiredBuffers);
     void draw(ChunkId id, VkCommandBuffer commandBuffer) const;
     void draw_water(ChunkId id, VkCommandBuffer commandBuffer) const;
     void draw_grass(ChunkId id, VkCommandBuffer commandBuffer) const;

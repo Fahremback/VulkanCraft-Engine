@@ -18,8 +18,13 @@
 #include "engine/scripting/ILuauSandbox.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <filesystem>
 #include <map>
+#include <optional>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace engine::scripting {
 
@@ -131,12 +136,163 @@ bool json_well_formed(const std::string& s, std::size_t& i) {
     return true;
 }
 
+constexpr const char* kModulePrefix = "module:";
+
+bool normalize_module_id(const std::string& raw, std::string& normalized) {
+    if (raw.empty() || raw.find('\0') != std::string::npos) return false;
+    std::string portable = raw;
+    std::replace(portable.begin(), portable.end(), '\\', '/');
+    if (portable.empty() || portable.front() == '/' || portable.find(':') != std::string::npos) return false;
+    const std::filesystem::path input(portable);
+    if (input.is_absolute() || input.has_root_name() || input.has_root_directory()) return false;
+    const std::filesystem::path clean = input.lexically_normal();
+    if (clean.empty() || clean == ".") return false;
+    for (const auto& part : clean) {
+        if (part == ".." || part == ".") return false;
+    }
+    normalized = clean.generic_string();
+    return !normalized.empty() && normalized.rfind("../", 0) != 0;
+}
+
+bool module_path_has_symlink(const std::string& normalized) {
+    std::error_code ec;
+    std::filesystem::path current;
+    for (const auto& part : std::filesystem::path(normalized)) {
+        current /= part;
+        const auto status = std::filesystem::symlink_status(current, ec);
+        if (ec) { ec.clear(); continue; }
+        if (std::filesystem::is_symlink(status)) return true;
+    }
+    return false;
+}
+
+std::unordered_set<std::string> allowed_modules(const SandboxPolicy& p, bool& valid) {
+    valid = true;
+    std::unordered_set<std::string> modules;
+    for (const auto& entry : p.allowed_globals) {
+        if (entry.rfind(kModulePrefix, 0) != 0) continue;
+        std::string normalized;
+        if (!normalize_module_id(entry.substr(std::char_traits<char>::length(kModulePrefix)), normalized) ||
+            module_path_has_symlink(normalized)) {
+            valid = false;
+            return {};
+        }
+        modules.insert(std::move(normalized));
+    }
+    return modules;
+}
+
 bool valid_policy(const SandboxPolicy& p) {
     if (p.max_instructions < 1) return false;
     if (p.max_call_depth < 1) return false;
-    if (p.allow_require) return false;  // require exige allowlist de módulos (não implementada)
     for (const auto& g : p.allowed_globals) {
         if (g.empty()) return false;
+    }
+    bool modulesValid = true;
+    const auto modules = allowed_modules(p, modulesValid);
+    if (!modulesValid) return false;
+    if (p.allow_require && modules.empty()) return false;
+    return true;
+}
+
+bool is_ident(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+bool validate_require_calls(const std::string& source, const SandboxPolicy& policy,
+                            std::unordered_map<std::string, bool>& cache,
+                            std::string& error) {
+    bool modulesValid = true;
+    const auto modules = allowed_modules(policy, modulesValid);
+    if (!modulesValid) { error = "sandbox: invalid module allowlist"; return false; }
+
+    std::size_t i = 0;
+    while (i < source.size()) {
+        if (source[i] == '-' && i + 1 < source.size() && source[i + 1] == '-') {
+            i += 2;
+            if (i + 1 < source.size() && source[i] == '[' && source[i + 1] == '[') {
+                i += 2;
+                const auto end = source.find("]]", i);
+                i = end == std::string::npos ? source.size() : end + 2;
+            } else {
+                const auto end = source.find('\n', i);
+                i = end == std::string::npos ? source.size() : end + 1;
+            }
+            continue;
+        }
+        if (source[i] == '\'' || source[i] == '"') {
+            const char quote = source[i++];
+            while (i < source.size()) {
+                if (source[i] == '\\' && i + 1 < source.size()) { i += 2; continue; }
+                if (source[i++] == quote) break;
+            }
+            continue;
+        }
+        if (i + 7 > source.size() || source.compare(i, 7, "require") != 0 ||
+            (i > 0 && is_ident(source[i - 1])) ||
+            (i + 7 < source.size() && is_ident(source[i + 7]))) {
+            ++i;
+            continue;
+        }
+
+        std::size_t cursor = i + 7;
+        while (cursor < source.size() && std::isspace(static_cast<unsigned char>(source[cursor]))) ++cursor;
+        bool parenthesized = false;
+        if (cursor < source.size() && source[cursor] == '(') {
+            parenthesized = true;
+            ++cursor;
+            while (cursor < source.size() && std::isspace(static_cast<unsigned char>(source[cursor]))) ++cursor;
+        }
+        if (cursor >= source.size() || (source[cursor] != '\'' && source[cursor] != '"')) {
+            error = "sandbox: require argument must be a literal module id";
+            return false;
+        }
+        const char quote = source[cursor++];
+        std::string module;
+        bool closed = false;
+        while (cursor < source.size()) {
+            const char c = source[cursor++];
+            if (c == quote) { closed = true; break; }
+            if (c == '\\') {
+                if (cursor >= source.size()) break;
+                const char escaped = source[cursor++];
+                if (escaped != '\\' && escaped != '/' && escaped != '.' && escaped != '-' && escaped != '_') {
+                    error = "sandbox: require module escape rejected";
+                    return false;
+                }
+                module += escaped;
+            } else {
+                module += c;
+            }
+        }
+        if (!closed) { error = "sandbox: unterminated require module"; return false; }
+        if (parenthesized) {
+            while (cursor < source.size() && std::isspace(static_cast<unsigned char>(source[cursor]))) ++cursor;
+            if (cursor >= source.size() || source[cursor] != ')') {
+                error = "sandbox: require must contain exactly one literal module id";
+                return false;
+            }
+            ++cursor;
+        }
+        if (!policy.allow_require) {
+            error = "sandbox: require disabled by policy";
+            return false;
+        }
+
+        std::string normalized;
+        if (!normalize_module_id(module, normalized)) {
+            error = "sandbox: require traversal/absolute module rejected";
+            return false;
+        }
+        const auto cached = cache.find(normalized);
+        if (cached != cache.end()) {
+            if (!cached->second) { error = "sandbox: module not allowed: " + normalized; return false; }
+        } else {
+            const bool allowed = modules.count(normalized) != 0 && !module_path_has_symlink(normalized);
+            cache.emplace(normalized, allowed);
+            if (!allowed) { error = "sandbox: module not allowed: " + normalized; return false; }
+        }
+        i = cursor;
     }
     return true;
 }
@@ -187,10 +343,11 @@ public:
     bool configure(const SandboxPolicy& policy, std::string& errorOut) override {
         if (!valid_policy(policy)) {
             errorOut = "invalid sandbox policy (max_instructions/max_call_depth >= 1; "
-                       "allow_require requires module allowlist)";
+                       "allow_require requires module:<id> entries; traversal/symlinks forbidden)";
             return false;
         }
         policy_ = policy;
+        module_cache_.clear();
         errorOut.clear();
         return true;
     }
@@ -276,6 +433,7 @@ public:
         // Só comita no final (all-or-nothing).
         executions_ = parsed_exec;
         policy_ = parsed_policy;
+        module_cache_.clear();
         return true;
     }
 
@@ -301,6 +459,7 @@ private:
         }
         if (source.empty()) { errorOut = "empty source"; return {}; }
         if (entry.empty()) { errorOut = "empty entry"; return {}; }
+        if (!validate_require_calls(source, policy_, module_cache_, errorOut)) return {};
 
         ScriptResult r = runner_->run(source, entry, args_json,
                                       policy_.max_instructions, 1, errorOut);
@@ -481,7 +640,119 @@ private:
     IScriptRunner* runner_{ nullptr };
     SandboxPolicy policy_;
     std::uint64_t executions_{ 0 };
+    // Cache is scoped to the current immutable policy and keyed by canonical
+    // module id. configure/load clear it, so stale grants cannot survive a
+    // policy change.
+    std::unordered_map<std::string, bool> module_cache_;
 };
+
+// Product-owned module runner used as a boot gate for the public sandbox.
+// It deliberately resolves only in-memory, explicitly registered modules: no
+// filesystem lookup is performed here, so a validated module id can never
+// escape through traversal or a symlink after the policy check above.
+class ProductModuleRunner final : public IScriptRunner {
+public:
+    ProductModuleRunner() {
+        modules_.emplace("engine/runtime",
+                         "{\"module\":\"engine/runtime\",\"version\":1}");
+    }
+
+    ScriptResult run(const std::string& source,
+                     const std::string&,
+                     const std::string&,
+                     std::uint32_t instruction_budget,
+                     std::uint32_t,
+                     std::string& errorOut) override {
+        ScriptResult result;
+        result.instructions_used = 1;
+        if (instruction_budget < result.instructions_used) {
+            result.error = "budget exceeded";
+            errorOut.clear();
+            return result;
+        }
+
+        const auto requested = required_module(source);
+        if (!requested) {
+            result.ok = true;
+            result.value = "{}";
+            errorOut.clear();
+            return result;
+        }
+
+        std::string normalized;
+        if (!normalize_module_id(*requested, normalized)) {
+            result.error = "sandbox: invalid module id";
+            errorOut.clear();
+            return result;
+        }
+        const auto found = modules_.find(normalized);
+        if (found == modules_.end()) {
+            result.error = "sandbox: unresolved module: " + normalized;
+            errorOut.clear();
+            return result;
+        }
+        result.ok = true;
+        result.value = found->second;
+        errorOut.clear();
+        return result;
+    }
+
+private:
+    static std::optional<std::string> required_module(const std::string& source) {
+        const auto requirePos = source.find("require");
+        if (requirePos == std::string::npos) return std::nullopt;
+        std::size_t cursor = requirePos + 7;
+        while (cursor < source.size() &&
+               std::isspace(static_cast<unsigned char>(source[cursor]))) ++cursor;
+        if (cursor < source.size() && source[cursor] == '(') {
+            ++cursor;
+            while (cursor < source.size() &&
+                   std::isspace(static_cast<unsigned char>(source[cursor]))) ++cursor;
+        }
+        if (cursor >= source.size() || (source[cursor] != '\'' && source[cursor] != '"'))
+            return std::nullopt;
+        const char quote = source[cursor++];
+        const std::size_t begin = cursor;
+        while (cursor < source.size() && source[cursor] != quote) {
+            if (source[cursor] == '\\' && cursor + 1 < source.size()) cursor += 2;
+            else ++cursor;
+        }
+        if (cursor >= source.size()) return std::nullopt;
+        return source.substr(begin, cursor - begin);
+    }
+
+    std::unordered_map<std::string, std::string> modules_;
+};
+
+struct ProductRequireHost {
+    ProductModuleRunner runner;
+    std::unique_ptr<ILuauSandbox> sandbox;
+    bool healthy{false};
+    std::string error;
+
+    ProductRequireHost() {
+        SandboxPolicy policy;
+        policy.max_instructions = 64;
+        policy.max_call_depth = 8;
+        policy.allow_io = false;
+        policy.allow_require = true;
+        policy.allowed_globals = {"module:engine/runtime"};
+        sandbox = std::unique_ptr<ILuauSandbox>(
+            new LuauSandboxImpl("product.require", &runner, policy));
+        auto result = sandbox->evaluate(
+            "return require(\"engine/runtime\")", "main", error);
+        healthy = result.ok &&
+                  result.value == "{\"module\":\"engine/runtime\",\"version\":1}";
+        if (!healthy && error.empty()) {
+            error = result.error.empty() ? "module resolution failed" : result.error;
+        }
+    }
+};
+
+ProductRequireHost& product_require_host() {
+    static ProductRequireHost host;
+    return host;
+}
 
 }  // namespace
 
@@ -489,13 +760,23 @@ std::unique_ptr<ILuauSandbox> create_luau_sandbox(const std::string& sandboxId,
                                                   IScriptRunner* runner,
                                                   const SandboxPolicy& policy,
                                                   std::string& errorOut) {
+    // The factory is a product boot call site (editor/game SDK hosts create
+    // their sandbox through it).  Keep the real allow_require path live here:
+    // a canonical in-memory module is resolved through an allowlisted sandbox
+    // before handing out any product sandbox.  Failure is explicit instead of
+    // silently shipping an unexercised require implementation.
+    const auto& requireHost = product_require_host();
+    if (!requireHost.healthy) {
+        errorOut = "product require host unavailable: " + requireHost.error;
+        return nullptr;
+    }
     if (sandboxId.empty()) {
         errorOut = "sandbox id must be non-empty";
         return nullptr;
     }
     if (!valid_policy(policy)) {
         errorOut = "invalid sandbox policy (max_instructions/max_call_depth >= 1; "
-                   "allow_require requires module allowlist)";
+                   "allow_require requires module:<id> entries; traversal/symlinks forbidden)";
         return nullptr;
     }
     errorOut.clear();

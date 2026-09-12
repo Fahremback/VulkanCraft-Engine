@@ -2996,7 +2996,9 @@ void VulkanEngineApp::init_mesh_shader_path() {
     viewportState.scissorCount = 1u;
     VkPipelineRasterizationStateCreateInfo rasterizer{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
-    rasterizer.cullMode = VK_CULL_MODE_NONE;      // soup winding is not guaranteed outward
+    // VIS-TERRAIN-001: upload_meshlet_gpu() now receives an outward-only soup;
+    // opaque meshlets therefore use the same back-face policy as voxel/FAR.
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizer.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo multisampling{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
@@ -3350,8 +3352,12 @@ void VulkanEngineApp::initialize_screen_target_layouts() {
     VkSubmitInfo2 submitInfo{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
     submitInfo.commandBufferInfoCount = 1;
     submitInfo.pCommandBufferInfos = &commandInfo;
-    VK_CHECK(vkQueueSubmit2(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE));
-    VK_CHECK(vkQueueWaitIdle(graphicsQueue));
+    VkFence layoutFence = VK_NULL_HANDLE;
+    VkFenceCreateInfo layoutFenceInfo{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VK_CHECK(vkCreateFence(device, &layoutFenceInfo, nullptr, &layoutFence));
+    VK_CHECK(vkQueueSubmit2(graphicsQueue, 1, &submitInfo, layoutFence));
+    VK_CHECK(vkWaitForFences(device, 1, &layoutFence, VK_TRUE, UINT64_MAX));
+    vkDestroyFence(device, layoutFence, nullptr);
     vkFreeCommandBuffers(device, frames[0].commandPool, 1, &commandBuffer);
 }
 
@@ -3395,7 +3401,20 @@ bool VulkanEngineApp::recreate_swapchain() {
     }
     if (glfwWindowShouldClose(window)) return false;
 
-    VK_CHECK(vkDeviceWaitIdle(device));
+    // Resize only needs the graphics/present work that can reference the old
+    // swapchain to finish. Wait this app's frame fences, then enqueue an empty
+    // graphics-queue checkpoint ordered after prior presents. This avoids a
+    // device-wide drain and leaves unrelated queues alone.
+    for (int i = 0; i < FRAME_OVERLAP; ++i) {
+        VK_CHECK(vkWaitForFences(device, 1, &frames[i].renderFence, VK_TRUE, UINT64_MAX));
+    }
+    VkFence resizeFence = VK_NULL_HANDLE;
+    VkFenceCreateInfo resizeFenceInfo{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VK_CHECK(vkCreateFence(device, &resizeFenceInfo, nullptr, &resizeFence));
+    VkSubmitInfo2 resizeCheckpoint{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    VK_CHECK(vkQueueSubmit2(graphicsQueue, 1, &resizeCheckpoint, resizeFence));
+    VK_CHECK(vkWaitForFences(device, 1, &resizeFence, VK_TRUE, UINT64_MAX));
+    vkDestroyFence(device, resizeFence, nullptr);
 
     const VkSwapchainKHR oldSwapchain = swapchain;
     auto oldImageViews = std::move(swapchainImageViews);
@@ -3603,48 +3622,82 @@ void VulkanEngineApp::destroy_timestamp_queries() {
 
 bool VulkanEngineApp::publish_timestamp_metrics() {
     if (!renderPassMetrics) return true;
-    // The PREVIOUS frame's fence has been waited on at the top of draw(), so its
-    // timestamp queries have completed. Read the two boundary stamps of each
-    // pass, convert the delta to ms with the device timestamp period, and feed
-    // the real per-pass GPU timings into the IRenderPassMetrics window. The CPU
-    // (record) timings are the wall-clock frame delta (kept as a coarse frame
-    // marker; the per-pass GPU numbers are the honest measurement).
-    FrameData& prev = frames[(frameNumber - 1 + FRAME_OVERLAP) % FRAME_OVERLAP];
-    if (prev.timestampPool == VK_NULL_HANDLE) return false;
-    // Guard against reading timestamp queries that were never submitted: the
-    // WAIT_BIT read below would block forever on the first frames (the
-    // previous frame's queries only exist once its command buffer was
-    // submitted to the queue).
-    if (!prev.submitted) return false;
+    // draw() has just waited this exact frame slot's renderFence. With
+    // FRAME_OVERLAP=2 this slot contains frame N-2, whose query results are now
+    // guaranteed complete. Reading N-1 here would force a hidden CPU stall.
+    FrameData& completed = get_current_frame();
+    if (!completed.submitted) return false;
 
-    std::array<std::uint64_t, kFrameTimestampSlots> values{};
-    VkResult res = vkGetQueryPoolResults(
-        device, prev.timestampPool, 0, kFrameTimestampSlots, values.size() * sizeof(std::uint64_t),
-        values.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-    if (res != VK_SUCCESS && res != VK_NOT_READY) return false;
+    bool gpuMetricsReady = false;
+    double gpuFrameMs = 0.0;
+    if (completed.timestampPool != VK_NULL_HANDLE) {
+        std::array<std::uint64_t, kFrameTimestampSlots> values{};
+        const VkResult res = vkGetQueryPoolResults(
+            device, completed.timestampPool, 0, kFrameTimestampSlots,
+            values.size() * sizeof(std::uint64_t), values.data(), sizeof(std::uint64_t),
+            VK_QUERY_RESULT_64_BIT);
+        if (res == VK_SUCCESS) {
+            const auto nsToMs = [this](std::uint64_t start, std::uint64_t end) {
+                return (end >= start ? static_cast<double>(end - start) : 0.0) *
+                       timestampPeriodNs / 1.0e6;
+            };
 
-    // Reset the pool so the next frame's recording reuses the slots.
-    vkResetQueryPool(device, prev.timestampPool, 0, kFrameTimestampSlots);
+            // Execution order matches the recording order the frame wrote the slots in.
+            std::array<const char*, 4> passNames{ "shadow", "scene", "water", "post" };
+            double gpuPassTotalMs = 0.0;
+            for (int p = 0; p < 4 && (2 * p + 1) < kFrameTimestampSlots; ++p) {
+                const std::uint64_t start = values[2 * p];
+                const std::uint64_t end = values[2 * p + 1];
+                if (start == 0 && end == 0) continue;  // slot never recorded
+                const double gpuMs = nsToMs(start, end);
+                gpuPassTotalMs += gpuMs;
+                renderPassMetrics->recordPass(passNames[p], completed.cpuPassMs[p], gpuMs);
+            }
+            // Slots 8/9 bracket the whole graphics command buffer, including minimap,
+            // feature compute work, scene copies and barriers omitted by the four pass
+            // pairs above. Fall back to the pass sum only if those frame stamps are absent.
+            gpuFrameMs = (values[8] != 0 || values[9] != 0)
+                ? nsToMs(values[8], values[9])
+                : gpuPassTotalMs;
+            renderPassMetrics->recordPass("frame", completed.cpuFrameMs, gpuFrameMs);
+            gpuMetricsReady = true;
+        }
+    }
+    // The slot is being retired/reused now. A signaled render fence guarantees
+    // no command still references these query slots, even if metric readback failed.
+    completed.submitted = false;
 
-    const auto nsToMs = [this](std::uint64_t start, std::uint64_t end) {
-        return (end >= start ? static_cast<double>(end - start) : 0.0) * timestampPeriodNs / 1.0e6;
-    };
+    const std::uint64_t farUploadBytes = completed.farUploadBytes;
+    const std::uint64_t vegetationVertices =
+        completed.farGrassVertices + completed.farTreeVertices;
+    // farUploadBytes is transfer traffic, not resident memory. Report it only
+    // through the streaming counters below; treating it as a memory pool makes
+    // current/peak residency telemetry lie whenever upload size changes.
+    renderPassMetrics->recordMemory("far-vegetation",
+        vegetationVertices * static_cast<std::uint64_t>(sizeof(VoxelVertex)));
 
-    // Execution order matches the recording order the frame wrote the slots in.
-    std::array<const char*, 4> passNames{ "shadow", "scene", "water", "post" };
-    for (int p = 0; p < 4 && (2 * p + 1) < kFrameTimestampSlots; ++p) {
-        const std::uint64_t start = values[2 * p];
-        const std::uint64_t end = values[2 * p + 1];
-        if (start == 0 && end == 0) continue;  // slot never recorded
-        const double gpuMs = nsToMs(start, end);
-        renderPassMetrics->recordPass(passNames[p], 0.0, gpuMs);
+    const std::uint64_t farVersion = completed.farUploadVersion;
+    if (farVersion != 0 && farVersion != lastProfiledFarUploadVersion) {
+        const std::uint64_t grass = completed.farGrassVertices;
+        const std::uint64_t trees = completed.farTreeVertices;
+        const std::uint64_t surfaces = completed.farSurfaceInstances;
+        renderPassMetrics->recordStreaming("far-upload", 1, 0, farUploadBytes);
+        renderPassMetrics->recordStreaming(
+            "far-grass-proxy", grass, 0, grass * static_cast<std::uint64_t>(sizeof(VoxelVertex)));
+        renderPassMetrics->recordStreaming(
+            "far-tree-proxy", trees, 0, trees * static_cast<std::uint64_t>(sizeof(VoxelVertex)));
+        renderPassMetrics->recordStreaming(
+            "far-surface-instances", surfaces, 0,
+            surfaces * static_cast<std::uint64_t>(sizeof(FarSurfaceInstance)));
+        lastProfiledFarUploadVersion = farVersion;
     }
     renderPassMetrics->endFrame();
-    const auto snapshot = renderPassMetrics->snapshot();
-    if (!snapshot.passes.empty()) {
-        gpuFeatures.debugCounts.w = static_cast<float>(snapshot.passes.front().gpuMsAvg);
+    // Keep the render hot path allocation-free: snapshot() materializes the
+    // aggregate vectors and is reserved for debugger/UI consumers.
+    if (gpuMetricsReady) {
+        gpuFeatures.debugCounts.w = static_cast<float>(gpuFrameMs);
     }
-    return true;
+    return gpuMetricsReady;
 }
 
 void VulkanEngineApp::init_sync_structures() {
@@ -3929,6 +3982,9 @@ void VulkanEngineApp::init_pipeline() {
                                        &shadowFarSurfacePipeline));
     vertexInputInfo.pVertexBindingDescriptions=&bindingDesc;
     vertexInputInfo.pVertexAttributeDescriptions=attributeDescs;
+    // Alpha-cut plant cards are the only world geometry intentionally rendered
+    // from both sides. Their shadow silhouettes must follow the same rule.
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
     stageInfos[0].module=shadowFoliageVertShader;
     bindingDesc.stride=sizeof(FoliageInstance); bindingDesc.inputRate=VK_VERTEX_INPUT_RATE_INSTANCE;
     attributeDescs[0].format=VK_FORMAT_R32G32B32A32_SFLOAT; attributeDescs[0].offset=offsetof(FoliageInstance,positionScale);
@@ -3937,6 +3993,7 @@ void VulkanEngineApp::init_pipeline() {
     stageInfos[0].module=shadowGrassVertShader;
     bindingDesc.stride=sizeof(GrassInstance); attributeDescs[0].offset=offsetof(GrassInstance,positionRotation);
     VK_CHECK(vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&pipelineInfo,nullptr,&shadowGrassPipeline));
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     bindingDesc.stride=sizeof(VoxelVertex); bindingDesc.inputRate=VK_VERTEX_INPUT_RATE_VERTEX;
     attributeDescs[0].format=VK_FORMAT_R32G32B32_SFLOAT; attributeDescs[0].offset=offsetof(VoxelVertex,position);
     vertexInputInfo.vertexAttributeDescriptionCount=4;
@@ -3946,7 +4003,7 @@ void VulkanEngineApp::init_pipeline() {
     // Water is composed as an opaque surface. It must write depth so different
     // water faces occlude one another; disabling this created the stacked/flying
     // sheets seen when several chunk surfaces overlapped on screen.
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     colorBlendAttachment.blendEnable = VK_FALSE;
     depthStencil.depthWriteEnable = VK_TRUE;
     depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
@@ -3962,6 +4019,8 @@ void VulkanEngineApp::init_pipeline() {
     rasterizer.depthBiasEnable = VK_FALSE;
 
     stageInfos[0].module = grassVertShader;
+    // Grass and foliage are crossed alpha cards and intentionally two-sided.
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
     colorBlendAttachment.blendEnable = VK_FALSE;
     bindingDesc.stride = sizeof(GrassInstance);
     bindingDesc.inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
@@ -4406,7 +4465,17 @@ void VulkanEngineApp::draw_showcase_pose(VkCommandBuffer cmd, const glm::mat4& v
 }
 
 void VulkanEngineApp::draw() {
+    const auto cpuFrameStart = std::chrono::steady_clock::now();
+    const auto fenceWaitStart = std::chrono::steady_clock::now();
     VK_CHECK(vkWaitForFences(device, 1, &get_current_frame().renderFence, VK_TRUE, 1000000000));
+    const double fenceWaitMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - fenceWaitStart).count();
+    if (renderPassMetrics) {
+        renderPassMetrics->recordPass("gpu-fence-wait", fenceWaitMs, 0.0);
+    }
+    // Publish the query pool belonging to the fence we just waited. This must
+    // happen before that slot is reset/reused later in the frame.
+    publish_timestamp_metrics();
     // L39: os samplers retirados só podem ser destruídos depois que o fence
     // garante que nenhum frame em flight os referencia mais.
     reap_retired_samplers();
@@ -5661,8 +5730,15 @@ void VulkanEngineApp::draw() {
             offlineSoupTris.reserve(3u * 2u * 3u * 24u);
         }
         offlineSoupTris.clear();
-        const auto pushQuadBoth = [this](const glm::vec3& a, const glm::vec3& b,
-                                         const glm::vec3& c, const glm::vec3& d) {
+        // The CPU ray tracer intentionally needs both windings, while the GPU
+        // mesh-shader path is opaque and must receive one canonical exterior
+        // winding. Keep distinct streams so culling is never disabled to hide
+        // tracer-oriented duplicate triangles.
+        std::vector<vc::rendering::RayTracerTriangle> meshletSoupTris;
+        meshletSoupTris.reserve(3u * 2u * 3u * 12u);
+        const auto pushQuadBoth = [this, &meshletSoupTris](const glm::vec3& a, const glm::vec3& b,
+                                         const glm::vec3& c, const glm::vec3& d,
+                                         std::uint8_t outwardWinding) {
             const glm::vec3 corners[4] = { a, b, c, d };
             const std::uint8_t order[2][6] = { {0, 1, 2, 0, 2, 3}, {0, 3, 2, 0, 2, 1} };
             for (std::uint8_t w = 0u; w < 2u; ++w) {
@@ -5675,6 +5751,7 @@ void VulkanEngineApp::draw() {
                     tri.v1[0] = p1.x; tri.v1[1] = p1.y; tri.v1[2] = p1.z;
                     tri.v2[0] = p2.x; tri.v2[1] = p2.y; tri.v2[2] = p2.z;
                     offlineSoupTris.push_back(tri);
+                    if (w == outwardWinding) meshletSoupTris.push_back(tri);
                 }
             }
         };
@@ -5687,12 +5764,12 @@ void VulkanEngineApp::draw() {
                     const float x1 = x0 + 1.0f, y1 = y0 + 1.0f, z1 = z0 + 1.0f;
                     const glm::vec3 v000(x0, y0, z0), v100(x1, y0, z0), v110(x1, y1, z0), v010(x0, y1, z0);
                     const glm::vec3 v001(x0, y0, z1), v101(x1, y0, z1), v111(x1, y1, z1), v011(x0, y1, z1);
-                    pushQuadBoth(v000, v100, v101, v001);  // -y face
-                    pushQuadBoth(v010, v110, v111, v011);  // +y face
-                    pushQuadBoth(v000, v001, v011, v010);  // -x face
-                    pushQuadBoth(v100, v101, v111, v110);  // +x face
-                    pushQuadBoth(v000, v100, v110, v010);  // -z face
-                    pushQuadBoth(v001, v101, v111, v011);  // +z face
+                    pushQuadBoth(v000, v100, v101, v001, 0u);  // -y face
+                    pushQuadBoth(v010, v110, v111, v011, 1u);  // +y face
+                    pushQuadBoth(v000, v001, v011, v010, 0u);  // -x face
+                    pushQuadBoth(v100, v101, v111, v110, 1u);  // +x face
+                    pushQuadBoth(v000, v100, v110, v010, 1u);  // -z face
+                    pushQuadBoth(v001, v101, v111, v011, 0u);  // +z face
                 }
         // L29 (reabertura): meshlets REAIS da geometria voxel (soup de blocos
         // acima). Agrupamento greedy com limites de meshlet (64 vértices / 126
@@ -5703,9 +5780,11 @@ void VulkanEngineApp::draw() {
         // indexado funcional mantido.
         {
             constexpr std::uint32_t kMaxVerts = 64u;
-            constexpr std::uint32_t kMaxTris = 126u;
+            // meshlet.mesh declares max_primitives=64; never build a group the
+            // shader would have to truncate.
+            constexpr std::uint32_t kMaxTris = 64u;
             const auto soupCorner = [&](std::uint32_t g) -> const float* {
-                const auto& t = offlineSoupTris[g / 3u];
+                const auto& t = meshletSoupTris[g / 3u];
                 return (g % 3u == 0u) ? t.v0 : (g % 3u == 1u) ? t.v1 : t.v2;
             };
             std::vector<std::uint32_t> localVerts;
@@ -5794,7 +5873,7 @@ void VulkanEngineApp::draw() {
                 }
                 localTris.push_back(ti);
             };
-            const std::uint32_t triCount = static_cast<std::uint32_t>(offlineSoupTris.size());
+            const std::uint32_t triCount = static_cast<std::uint32_t>(meshletSoupTris.size());
             for (std::uint32_t t = 0u; t < triCount; ++t) tryAddTriangle(t);
             flushGroup();
             meshletCount = groupCount;
@@ -5878,9 +5957,13 @@ void VulkanEngineApp::draw() {
                 : 0.0f;
         }
     }
-    if (fluidSimulation) {
-        // Keep the generic fluid provider on the same fixed simulation cadence
-        // as the world; this state is the source for future stream renderables.
+    static double fluidAccumulator = 0.0;
+    fluidAccumulator += deltaTime;
+    const bool runFluidStep = fluidAccumulator >= (1.0 / 30.0);
+    if (fluidSimulation && runFluidStep) {
+        fluidAccumulator = std::fmod(fluidAccumulator, (1.0 / 30.0));
+        // Keep the generic fluid provider on a fixed cadence instead of tying a
+        // full grid solve to every render frame.
         static auto fluidState = fluidSimulation->createState();
         fluidSimulation->simulate(fluidState, fluidSimulation->getConfig());
     }
@@ -6053,7 +6136,11 @@ void VulkanEngineApp::draw() {
             confidenceOut.clear();
             radianceOut.clear();
             std::string denoiseError;
-            const bool ok = temporalDenoiser->denoise(dSamples, denoiserHistories,
+            static double denoiseAccumulator = 0.0;
+            denoiseAccumulator += deltaTime;
+            const bool runDenoise = denoiseAccumulator >= (1.0 / 60.0);
+            if (runDenoise) denoiseAccumulator = std::fmod(denoiseAccumulator, (1.0 / 60.0));
+            const bool ok = runDenoise && temporalDenoiser->denoise(dSamples, denoiserHistories,
                                                       confidenceOut, radianceOut,
                                                       denoiseError);
             if (ok && !confidenceOut.empty()) {
@@ -6269,17 +6356,20 @@ void VulkanEngineApp::draw() {
     // Advance the renderer-owned upload/retirement epoch before recording this
     // frame. Simulation publishes completed chunk snapshots through this same
     // real Vulkan renderer seam.
-    // AGENT-4 2026-08-29: real per-pass GPU timing. The previous frame's fence
-    // was waited on above, so publish its completed timestamp queries now and
-    // reset this frame's pool before recording new boundary stamps below. No
-    // fabricated CPU fractions — the window is fed by vkGetQueryPoolResults.
+    // Reuse the completed slot after its metrics were published at draw start.
+    // Reset on the command buffer so hostQueryReset is not a required device
+    // feature (the app does not request VkPhysicalDeviceVulkan12Features::hostQueryReset).
     VkQueryPool& tsPool = get_current_frame().timestampPool;
-    if (tsPool != VK_NULL_HANDLE) {
-        vkResetQueryPool(device, tsPool, 0, kFrameTimestampSlots);
-    }
-    publish_timestamp_metrics();
 { static int s=0; if(s++==0) std::cout<<"[DS] bisect B before begin_frame\n" << std::flush; } // [L1 diag]
     worldRenderer.begin_frame();
+    {
+        FrameData& frame = get_current_frame();
+        frame.farUploadVersion = worldRenderer.far_upload_version();
+        frame.farUploadBytes = worldRenderer.far_last_upload_bytes();
+        frame.farGrassVertices = worldRenderer.far_grass_proxy_vertices();
+        frame.farTreeVertices = worldRenderer.far_tree_proxy_vertices();
+        frame.farSurfaceInstances = worldRenderer.far_surface_instances();
+    }
 
     VkCommandBuffer cmd = get_current_frame().mainCommandBuffer;
     VK_CHECK(vkResetCommandBuffer(cmd, 0));
@@ -6290,10 +6380,9 @@ void VulkanEngineApp::draw() {
     // For each pair, the "start" stamp is written just before the pass's
     // vkCmdBeginRendering and the "end" stamp just after vkCmdEndRendering, so
     // the delta (end-start)*timestampPeriod is the pass's real GPU time.
-    const VkPipelineStageFlags2 kTsStage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    auto tsWrite = [&](std::uint32_t slot) {
+    auto tsWrite = [&](std::uint32_t slot, VkPipelineStageFlags2 stage) {
         if (tsPool != VK_NULL_HANDLE && slot < kFrameTimestampSlots) {
-            vkCmdWriteTimestamp2(cmd, kTsStage, tsPool, slot);
+            vkCmdWriteTimestamp2(cmd, stage, tsPool, slot);
         }
     };
 
@@ -6302,6 +6391,10 @@ void VulkanEngineApp::draw() {
     cmdBeginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
     VK_CHECK(vkBeginCommandBuffer(cmd, &cmdBeginInfo));
+    if (tsPool != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(cmd, tsPool, 0, kFrameTimestampSlots);
+        tsWrite(8, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);  // full frame start
+    }
 
     // Make the current probe clipmap visible to the real fragment passes. This
     // is intentionally recorded on the same command buffer as the world draw,
@@ -6364,7 +6457,8 @@ void VulkanEngineApp::draw() {
     shadowDepth.imageLayout=VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL; shadowDepth.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR; shadowDepth.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
     shadowDepth.clearValue.depthStencil={1.0f,0};
     VkRenderingInfo shadowInfo{.sType=VK_STRUCTURE_TYPE_RENDERING_INFO}; shadowInfo.renderArea.extent={2048,2048}; shadowInfo.layerCount=1; shadowInfo.pDepthAttachment=&shadowDepth;
-    tsWrite(0);  // shadow pass start
+    const auto shadowCpuStart = std::chrono::steady_clock::now();
+    tsWrite(0, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);  // shadow pass start
     vkCmdBeginRendering(cmd,&shadowInfo);
     VkViewport shadowViewport{0,0,2048,2048,0,1}; VkRect2D shadowScissor{{0,0},{2048,2048}};
     vkCmdSetViewport(cmd,0,1,&shadowViewport); vkCmdSetScissor(cmd,0,1,&shadowScissor); vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,shadowPipeline);
@@ -6392,7 +6486,9 @@ void VulkanEngineApp::draw() {
         vkCmdPushConstants(cmd,voxelPipelineLayout,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(PushData),&shadowPush);
         VkDeviceSize o=0; vkCmdBindVertexBuffers(cmd,0,1,&characterBuffer.buffer,&o); vkCmdDraw(cmd,characterVertexCount,1,0,0); }
     vkCmdEndRendering(cmd);
-    tsWrite(1);  // shadow pass end
+    tsWrite(1, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);  // shadow pass end
+    get_current_frame().cpuPassMs[0] = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - shadowCpuStart).count();
     record_graph_barriers(cmd, "scene");
 
     VkRenderingAttachmentInfo colorAttachment{.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -6418,7 +6514,8 @@ void VulkanEngineApp::draw() {
     renderingInfo.pColorAttachments = &colorAttachment;
     renderingInfo.pDepthAttachment = &depthAttachment;
 
-    tsWrite(2);  // scene pass start (opaque world render)
+    const auto sceneCpuStart = std::chrono::steady_clock::now();
+    tsWrite(2, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);  // scene pass start (opaque world render)
     vkCmdBeginRendering(cmd, &renderingInfo);
 
     VkViewport viewport{ 0.0f, 0.0f, static_cast<float>(swapchainExtent.width), static_cast<float>(swapchainExtent.height), 0.0f, 1.0f };
@@ -6601,7 +6698,9 @@ void VulkanEngineApp::draw() {
     // Bliss-style translucent stage: preserve the fully lit opaque scene and its
     // depth before drawing water. These copies drive refraction, absorption and SSR.
     vkCmdEndRendering(cmd);
-    tsWrite(3);  // scene pass end
+    tsWrite(3, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);  // scene pass end
+    get_current_frame().cpuPassMs[1] = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - sceneCpuStart).count();
 
 
     // A.4/A.5/A.6: graph-driven transition of the opaque scene/depth copies.
@@ -6624,7 +6723,8 @@ void VulkanEngineApp::draw() {
 
     colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    tsWrite(4);  // water pass start
+    const auto waterCpuStart = std::chrono::steady_clock::now();
+    tsWrite(4, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);  // water pass start
     vkCmdBeginRendering(cmd, &renderingInfo);
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
@@ -6639,7 +6739,9 @@ void VulkanEngineApp::draw() {
     else draw_arm(cmd, view, proj);
 
     vkCmdEndRendering(cmd);
-    tsWrite(5);  // water pass end
+    tsWrite(5, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);  // water pass end
+    get_current_frame().cpuPassMs[2] = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - waterCpuStart).count();
 
     record_graph_barriers(cmd, "post");
 
@@ -6654,7 +6756,8 @@ void VulkanEngineApp::draw() {
     postRenderingInfo.layerCount = 1;
     postRenderingInfo.colorAttachmentCount = 1;
     postRenderingInfo.pColorAttachments = &postColorAttachment;
-    tsWrite(6);  // post pass start
+    const auto postCpuStart = std::chrono::steady_clock::now();
+    tsWrite(6, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);  // post pass start
     vkCmdBeginRendering(cmd, &postRenderingInfo);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, postPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, postPipelineLayout, 0, 1, &postDescriptorSet, 0, nullptr);
@@ -6702,10 +6805,13 @@ void VulkanEngineApp::draw() {
     vkCmdPushConstants(cmd, postPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PostPushData), &postPush);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRendering(cmd);
-    tsWrite(7);  // post pass end
+    tsWrite(7, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);  // post pass end
+    get_current_frame().cpuPassMs[3] = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - postCpuStart).count();
 
 { static int s=0; if(s++==0) std::cout<<"[DS] bisect D before present submit\n"; } // [L1 diag]
     record_graph_barriers(cmd, "present");
+    tsWrite(9, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);  // full frame end
 
     VK_CHECK(vkEndCommandBuffer(cmd));
 
@@ -6759,6 +6865,8 @@ void VulkanEngineApp::draw() {
         }
     }
 
+    get_current_frame().cpuFrameMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - cpuFrameStart).count();
     frameNumber++;
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR ||
         acquiredSuboptimal || framebufferResized) {

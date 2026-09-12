@@ -6,7 +6,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 namespace engine::gameplay {
@@ -70,6 +73,25 @@ bool json_number(const std::string& s, std::size_t& i, double& out) {
     return true;
 }
 
+bool json_unsigned(const std::string& s, std::size_t& i, std::uint64_t limit,
+                   std::uint64_t& out) {
+    while (i < s.size() &&
+           (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) {
+        ++i;
+    }
+    if (i >= s.size() || s[i] < '0' || s[i] > '9') return false;
+
+    std::uint64_t value = 0;
+    while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+        const std::uint64_t digit = static_cast<std::uint64_t>(s[i] - '0');
+        if (value > (limit - digit) / 10u) return false;
+        value = value * 10u + digit;
+        ++i;
+    }
+    out = value;
+    return true;
+}
+
 bool json_string(const std::string& s, std::size_t& i, std::string& out) {
     while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
     if (i >= s.size() || s[i] != '"') return false;
@@ -124,21 +146,20 @@ bool json_bytes(const std::string& s, std::size_t& i, std::vector<std::uint8_t>&
     }
 }
 
-std::string bytes_json(const std::vector<std::uint8_t>& bytes) {
-    std::string out = "[";
-    for (std::size_t n = 0; n < bytes.size(); ++n) {
-        if (n) out += ",";
-        out += std::to_string(static_cast<unsigned>(bytes[n]));
-    }
-    out += "]";
-    return out;
-}
+struct StoredReplayFrame {
+    std::uint64_t tick{ 0 };
+    std::uint32_t seed{ 0 };
+    std::size_t inputOffset{ 0 };
+    std::size_t inputSize{ 0 };
+};
 
 }  // namespace
 
 class ReplayImpl final : public IReplay {
 public:
-    explicit ReplayImpl(std::size_t maxFrames) : maxFrames_(maxFrames) {}
+    explicit ReplayImpl(std::size_t maxFrames) : maxFrames_(maxFrames) {
+        if (maxFrames_ > 0) frames_.reserve(std::min<std::size_t>(maxFrames_, 4096));
+    }
 
     bool record_tick(std::uint64_t tick, std::uint32_t seed,
                      const std::vector<std::uint8_t>& inputs,
@@ -152,11 +173,18 @@ public:
             errorOut = "replay: limite de frames atingido (" + std::to_string(maxFrames_) + ")";
             return false;
         }
-        ReplayFrame frame;
-        frame.tick = tick;
-        frame.seed = seed;
-        frame.inputs = inputs;
-        frames_.push_back(std::move(frame));
+        if (frames_.empty() && maxFrames_ > 0 && !inputs.empty() &&
+            maxFrames_ <= std::numeric_limits<std::size_t>::max() / inputs.size()) {
+            // Fixed-size gameplay inputs (the live beam vehicle records 16 B)
+            // get one contiguous allocation for the whole replay segment.
+            // Larger/unbounded generic replays still grow geometrically.
+            constexpr std::size_t kMaxEagerInputReserve = 4u * 1024u * 1024u;
+            inputBytes_.reserve(std::min(maxFrames_ * inputs.size(), kMaxEagerInputReserve));
+        }
+        const std::size_t inputOffset = inputBytes_.size();
+        inputBytes_.insert(inputBytes_.end(), inputs.begin(), inputs.end());
+        frames_.push_back(StoredReplayFrame{tick, seed, inputOffset, inputs.size()});
+        errorOut.clear();
         return true;
     }
 
@@ -169,33 +197,43 @@ public:
     }
 
     bool begin_replay(std::string& errorOut) override {
-        (void)errorOut;
         cursor_ = 0;
+        errorOut.clear();
         return true;
     }
 
     bool next_frame(ReplayFrame& out) override {
         if (cursor_ >= frames_.size()) return false;
-        out = frames_[cursor_++];
+        const StoredReplayFrame& stored = frames_[cursor_++];
+        out.tick = stored.tick;
+        out.seed = stored.seed;
+        const auto first = inputBytes_.begin() + static_cast<std::ptrdiff_t>(stored.inputOffset);
+        out.inputs.assign(first, first + static_cast<std::ptrdiff_t>(stored.inputSize));
         return true;
     }
 
     bool seek_tick(std::uint64_t tick) override {
         auto found = std::lower_bound(
             frames_.begin(), frames_.end(), tick,
-            [](const ReplayFrame& frame, std::uint64_t value) { return frame.tick < value; });
+            [](const StoredReplayFrame& frame, std::uint64_t value) { return frame.tick < value; });
         if (found == frames_.end()) return false;
         cursor_ = static_cast<std::size_t>(found - frames_.begin());
         return true;
     }
 
     bool truncate_after(std::uint64_t tick, std::string& errorOut) override {
-        (void)errorOut;
         auto first = std::upper_bound(
             frames_.begin(), frames_.end(), tick,
-            [](std::uint64_t value, const ReplayFrame& frame) { return value < frame.tick; });
+            [](std::uint64_t value, const StoredReplayFrame& frame) { return value < frame.tick; });
         frames_.erase(first, frames_.end());
+        if (frames_.empty()) {
+            inputBytes_.clear();
+        } else {
+            const StoredReplayFrame& tail = frames_.back();
+            inputBytes_.resize(tail.inputOffset + tail.inputSize);
+        }
         if (cursor_ > frames_.size()) cursor_ = frames_.size();
+        errorOut.clear();
         return true;
     }
 
@@ -248,8 +286,36 @@ public:
             errorOut = "replay: documento excede o limite de frames";
             return false;
         }
-        frames_ = std::move(parsed);
+        while (i < json.size() &&
+               (json[i] == ' ' || json[i] == '\t' || json[i] == '\n' || json[i] == '\r')) {
+            ++i;
+        }
+        if (i != json.size()) {
+            errorOut = "replay: dados extras após o objeto raiz";
+            return false;
+        }
+        std::vector<StoredReplayFrame> storedFrames;
+        std::vector<std::uint8_t> storedBytes;
+        storedFrames.reserve(parsed.size());
+        std::size_t totalInputBytes = 0;
+        for (const ReplayFrame& frame : parsed) {
+            if (frame.inputs.size() > std::numeric_limits<std::size_t>::max() - totalInputBytes) {
+                errorOut = "replay: inputs excedem o tamanho representável";
+                return false;
+            }
+            totalInputBytes += frame.inputs.size();
+        }
+        storedBytes.reserve(totalInputBytes);
+        for (const ReplayFrame& frame : parsed) {
+            const std::size_t offset = storedBytes.size();
+            storedBytes.insert(storedBytes.end(), frame.inputs.begin(), frame.inputs.end());
+            storedFrames.push_back(
+                StoredReplayFrame{frame.tick, frame.seed, offset, frame.inputs.size()});
+        }
+        frames_ = std::move(storedFrames);
+        inputBytes_ = std::move(storedBytes);
         cursor_ = 0;
+        errorOut.clear();
         return true;
     }
 
@@ -258,10 +324,15 @@ public:
         out << "{\"frames\":[";
         for (std::size_t n = 0; n < frames_.size(); ++n) {
             if (n) out << ",";
-            const ReplayFrame& frame = frames_[n];
+            const StoredReplayFrame& frame = frames_[n];
             out << "{\"tick\":" << frame.tick
                 << ",\"seed\":" << frame.seed
-                << ",\"inputs\":" << bytes_json(frame.inputs) << "}";
+                << ",\"inputs\":[";
+            for (std::size_t byte = 0; byte < frame.inputSize; ++byte) {
+                if (byte) out << ',';
+                out << static_cast<unsigned>(inputBytes_[frame.inputOffset + byte]);
+            }
+            out << "]}";
         }
         out << "]}";
         return out.str();
@@ -282,16 +353,16 @@ private:
                 return false;
             }
             if (key == "tick") {
-                double value = 0.0;
-                if (!json_number(s, i, value) || value < 0.0 || std::floor(value) != value) {
+                std::uint64_t value = 0;
+                if (!json_unsigned(s, i, std::numeric_limits<std::uint64_t>::max(), value)) {
                     errorOut = "replay: tick inválido";
                     return false;
                 }
-                out.tick = static_cast<std::uint64_t>(value);
+                out.tick = value;
                 sawTick = true;
             } else if (key == "seed") {
-                double value = 0.0;
-                if (!json_number(s, i, value) || value < 0.0 || std::floor(value) != value) {
+                std::uint64_t value = 0;
+                if (!json_unsigned(s, i, std::numeric_limits<std::uint32_t>::max(), value)) {
                     errorOut = "replay: seed inválido";
                     return false;
                 }
@@ -318,7 +389,8 @@ private:
         return true;
     }
 
-    std::vector<ReplayFrame> frames_;
+    std::vector<StoredReplayFrame> frames_;
+    std::vector<std::uint8_t> inputBytes_;
     std::size_t cursor_{ 0 };
     std::size_t maxFrames_{ 0 };
 };

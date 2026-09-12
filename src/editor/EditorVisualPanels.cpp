@@ -85,6 +85,15 @@ void EditorApplication::draw_render_debugger_panel() {
     ImGui::Text("FPS: %.1f", m_fps);
     ImGui::Text("Frame: %.2f ms", m_frameTimeMs);
     ImGui::Text("RAM: %.1f MB", m_ramUsageMb);
+    if (m_frameProfiler) {
+        const auto frame = m_frameProfiler->snapshot();
+        ImGui::Text("Frame p95/p99: %.2f / %.2f ms | spikes %llu",
+                    frame.p95Ms, frame.p99Ms,
+                    static_cast<unsigned long long>(frame.spikeCount));
+        ImGui::Text("RAM peak: %.1f MB", frame.heapPeakMb);
+    }
+    ImGui::Text("GPU sync stalls: %llu | %.3f ms blocked",
+                static_cast<unsigned long long>(m_gpuFenceStallCount), m_gpuFenceWaitMs);
     ImGui::Text("Viewport: %u x %u", m_offscreen.width, m_offscreen.height);
     ImGui::Text("Swapchain: %u x %u", m_swapchainExtent.width, m_swapchainExtent.height);
     ImGui::Text("MSAA: %u", static_cast<unsigned>(m_viewportSamples));
@@ -101,9 +110,10 @@ void EditorApplication::draw_render_debugger_panel() {
         if (!snapshot.passes.empty()) {
             ImGui::SeparatorText(tr("Tempos reais", "Real pass timings"));
             for (const auto& pass : snapshot.passes) {
-                ImGui::BulletText("%s: cpu %.3f ms avg (p95 %.3f) x %zu",
-                                  pass.name.c_str(), pass.cpuMsAvg, pass.cpuMsP95,
-                                  pass.samples);
+                ImGui::BulletText(
+                    "%s: CPU avg %.3f p95 %.3f p99 %.3f | GPU avg %.3f p95 %.3f p99 %.3f ms | x %zu",
+                    pass.name.c_str(), pass.cpuMsAvg, pass.cpuMsP95, pass.cpuMsP99,
+                    pass.gpuMsAvg, pass.gpuMsP95, pass.gpuMsP99, pass.samples);
             }
         } else {
             ImGui::TextDisabled("%s", tr("Sem passes registrados ainda", "No passes recorded yet"));
@@ -114,6 +124,16 @@ void EditorApplication::draw_render_debugger_panel() {
                 ImGui::BulletText("%s: %llu B (pico %llu)", pool.name.c_str(),
                                   static_cast<unsigned long long>(pool.currentBytes),
                                   static_cast<unsigned long long>(pool.peakBytes));
+            }
+        }
+        if (!snapshot.streams.empty()) {
+            ImGui::SeparatorText(tr("Uploads", "Uploads"));
+            for (const auto& stream : snapshot.streams) {
+                ImGui::BulletText("%s: loaded %llu | %llu B | pico em voo %llu B",
+                    stream.name.c_str(),
+                    static_cast<unsigned long long>(stream.totalLoaded),
+                    static_cast<unsigned long long>(stream.bytesLoaded),
+                    static_cast<unsigned long long>(stream.peakBytesInFlight));
             }
         }
     }
@@ -150,7 +170,7 @@ void EditorApplication::draw_render_debugger_panel() {
         ImGui::BulletText("Passes executados: %zu", m_viewportRenderGraphExecutor.executed_pass_count());
     }
     ImGui::SeparatorText(tr("Streaming", "Streaming"));
-    ImGui::Text("Asset registry: %zu", m_assetRegistry.snapshot().size());
+    ImGui::Text("Asset registry: %zu", m_assetRegistry.size());
     ImGui::Text("Thumbnail queue: %zu", m_thumbnailQueue.size());
     ImGui::Text("Hot reload: %s", m_assetHotReload ? "active" : "inactive");
     ImGui::End();

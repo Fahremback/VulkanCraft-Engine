@@ -3,6 +3,7 @@
 #include "../physics/PhysicsRuntime.hpp"
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace Engine::Gameplay {
@@ -80,7 +81,9 @@ public:
     std::size_t alive_count() const noexcept { return aliveCount_; }
     std::size_t capacity() const noexcept { return particles_.size(); }
     const std::vector<Particle>& particles() const noexcept { return particles_; }
-    std::vector<ParticleRenderData> render_data() const;
+    // Reuses one simulation-owned scratch buffer. The returned view remains
+    // valid until the next non-const ParticleSimulation call that rebuilds it.
+    std::span<const ParticleRenderData> render_data();
 
 private:
     struct EmitterSlot { ParticleEmitterDesc description; float accumulator{0.0f}; bool alive{true}; };
@@ -91,6 +94,7 @@ private:
     std::vector<Particle> particles_;
     std::vector<std::size_t> freeParticles_;
     std::vector<EmitterSlot> emitters_;
+    std::vector<ParticleRenderData> renderScratch_;
     std::size_t aliveCount_{0};
     std::uint32_t randomState_{0};
 };

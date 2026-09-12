@@ -11,6 +11,11 @@
 #include <vector>
 
 namespace Engine::Editor { class EditorRegistry; }
+namespace engine::plugins {
+class IPluginLoader;
+class IPluginPermissionPolicy;
+class IPluginTypeRegistry;
+}
 
 namespace Engine::Plugins {
 
@@ -48,5 +53,12 @@ void register_asset_tool(Editor::EditorRegistry& registry, std::string assetType
                          std::string menuPath, std::string owner);
 void register_viewport_tool(Editor::EditorRegistry& registry, std::string toolId,
                             std::string menuPath, std::string owner);
+
+// Product accessors expose the canonical plugin services already owned by
+// PluginContract.cpp. They do not allocate a second loader/policy/registry;
+// editor/game diagnostics query the same instances that gate on_load/on_unload.
+engine::plugins::IPluginLoader* product_plugin_loader() noexcept;
+engine::plugins::IPluginPermissionPolicy* product_plugin_permissions() noexcept;
+engine::plugins::IPluginTypeRegistry* product_plugin_type_registry() noexcept;
 
 } // namespace Engine::Plugins

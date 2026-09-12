@@ -82,6 +82,24 @@ public:
         uint8_t absorption{ 15 };
     };
 
+    // Runtime-only state that must survive a failed transactional world load.
+    // Chunk voxel bytes and block entities are captured by VoxelWorldFacade;
+    // this snapshot covers the queues/caches that a replacement load resets.
+    struct RestoreRuntimeState {
+        WorldScheduler::State scheduler;
+        std::deque<FluidCell> activeFluidCells;
+        std::unordered_set<FluidCell, FluidCellHash> activeFluidSet;
+        std::unordered_set<std::pair<int, int>, ChunkHash> structurePopulatedChunks;
+        std::unordered_set<std::pair<int, int>, ChunkHash> lightDirtyChunks;
+        std::unordered_map<std::pair<int, int>, uint64_t, ChunkHash>
+            lightContentRevision;
+        std::unordered_map<std::pair<int, int>, std::vector<uint32_t>, ChunkHash>
+            pendingLightEdits;
+        int visibleCenterChunkX{ 0 };
+        int visibleCenterChunkZ{ 0 };
+        int stableVisibleRadius{ -1 };
+    };
+
     // Alcance visual em chunks. Apenas a janela de interação próxima vira
     // chunks/voxels completos; o restante é um clipmap de superfície.
     int chunkBudget{ 4096 };
@@ -296,6 +314,14 @@ public:
     // load survive the load's own update() calls (each restore may wait out an
     // in-flight generator, and that wait advances the pipeline via update()).
     void set_restoring(bool active);
+    // Transactional load support. capture_restore_runtime_state() is taken
+    // before mutation; reset_content_for_restore() turns the live world into
+    // an empty replacement target while preserving registries/factories and
+    // configuration; restore_runtime_state() reinstates queues/caches after a
+    // failed load once the caller has restored the chunk/entity payloads.
+    [[nodiscard]] RestoreRuntimeState capture_restore_runtime_state() const;
+    void reset_content_for_restore(WorldRenderBridge& renderBridge);
+    void restore_runtime_state(RestoreRuntimeState state);
     // Makes chunk (cx,cz) writable for a restore — creates it in the world map
     // (or takes over an existing one, waiting out an in-flight generator via
     // update()) and marks it Uploaded + dirty so the next remesh pass rebuilds

@@ -31,6 +31,7 @@ private:
     const SkeletonAsset* skeleton_{};
     std::vector<SkinnedVertex> source_;
     std::vector<SkinnedVertex> skinned_;
+    std::vector<glm::mat4> globalMatrices_;
     std::vector<glm::mat4> skinMatrices_;
 };
 } // namespace Engine

@@ -1,8 +1,10 @@
 #include "EditorApplication.hpp"
 #include "EditorInternalHelpers.hpp"
+#include "../engine/rendering/lighting/RenderProviderSelection.hpp"
 // ImGui_ImplVulkan_AddTexture é da backend layer do ImGui — o monólito
 // incluía <imgui_impl_vulkan.h> aqui; o split havia perdido o include.
 #include <imgui_impl_vulkan.h>
+#include <cmath>
 
 namespace Engine {
 
@@ -182,8 +184,29 @@ void EditorApplication::end_single_time_commands(VkCommandBuffer cmd) {
     VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_graphicsQueue);
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if (vkCreateFence(m_device, &fenceInfo, nullptr, &fence) == VK_SUCCESS) {
+        const VkResult submitResult = vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, fence);
+        if (submitResult == VK_SUCCESS) {
+            const auto begin = std::chrono::steady_clock::now();
+            // The command buffer and fence cannot be freed while this submit
+            // is still in flight. A submit-local fence preserves the old
+            // synchronous helper semantics without draining the whole queue.
+            const VkResult waitResult =
+                vkWaitForFences(m_device, 1, &fence, VK_TRUE, UINT64_MAX);
+            const auto end = std::chrono::steady_clock::now();
+            ++m_gpuFenceStallCount;
+            m_gpuFenceWaitMs += std::chrono::duration<double, std::milli>(end - begin).count();
+            if (waitResult != VK_SUCCESS) {
+                std::cerr << "[Vulkan] one-shot command fence wait failed: "
+                          << static_cast<int>(waitResult) << "\n";
+            }
+        }
+        vkDestroyFence(m_device, fence, nullptr);
+    } else {
+        std::cerr << "[Vulkan] failed to create one-shot command fence\n";
+    }
     vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
 }
 
@@ -798,7 +821,7 @@ void EditorApplication::recreate_offscreen_if_needed(uint32_t w, uint32_t h) {
     if (m_offscreen.framebuffer != VK_NULL_HANDLE && m_offscreen.width == w && m_offscreen.height == h) {
         return;
     }
-    if (m_device != VK_NULL_HANDLE) vkDeviceWaitIdle(m_device); // old attachments are in flight
+    if (m_device != VK_NULL_HANDLE && !wait_for_inflight_gpu("offscreen resize")) return;
     cleanup_offscreen_target();
     create_offscreen_buffers(w, h);
     // The offscreen cleanup also destroys the shadow map (size-independent
@@ -956,7 +979,7 @@ void EditorApplication::init_scene_pipeline() {
     m_gridVertShader = make_module(m_device, read_spv("editor_grid.vert.spv"));
     m_gridFragShader = make_module(m_device, read_spv("editor_grid.frag.spv"));
     if (!m_gridVertShader || !m_gridFragShader) {
-        throw std::runtime_error("Grid shaders failed to compile (run the compile_shaders target)");
+        throw std::runtime_error("Grid SPIR-V failed to load from the canonical shader directory");
     }
     VkPushConstantRange gridRange{};
     gridRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -972,7 +995,7 @@ void EditorApplication::init_scene_pipeline() {
                                            m_gridVertShader, m_gridFragShader, m_viewportSamples,
                                            false /*wireframe*/, true /*depthTest*/, false /*cull*/,
                                            false /*withUv*/, true /*noVertexInput*/, true /*blend*/,
-                                           true /*lessOrEqualDepth*/, true /*depthBias*/,
+                                           true /*lessOrEqualDepth*/, false /*depthBias: frag writes gl_FragDepth*/,
                                            false /*depthWrite*/);
     if (!m_gridPipeline) {
         throw std::runtime_error("Failed to create grid pipeline");
@@ -1741,7 +1764,15 @@ void EditorApplication::draw_shadow_casters(VkCommandBuffer cmd, VkPipelineLayou
 
     // Terrain: procedural heightfield mesh (previously shadow-invisible —
     // BUG-EDITOR-SHADOWS-001).
-    if (m_terrainValid && m_terrainVB.buffer != VK_NULL_HANDLE && m_terrainIB.buffer != VK_NULL_HANDLE) {
+    // Flat terrain (amount ~ 0) is skipped here: a perfectly flat plane is at
+    // Y=0 everywhere, so it can never occlude anything above it (nothing below
+    // it exists) and its only shadow contribution is its own self-shadowing
+    // acne — the alternating lit/shadowed triangle pattern that reads as a
+    // "bugged mesh" over the ground (reported against the editor viewport).
+    // Keeping the plane out of the shadow map leaves it fully lit in the
+    // viewport and removes the artifact with zero cost to real shadow casters.
+    if (m_terrainValid && m_terrainVB.buffer != VK_NULL_HANDLE && m_terrainIB.buffer != VK_NULL_HANDLE &&
+        std::abs(m_terrainParams.amount) >= 0.001f) {
         push_for_model(glm::mat4(1.0f));
         bind_and_draw_indexed(m_terrainVB.buffer, m_terrainIB.buffer, m_terrainIndexCount);
     }
@@ -1766,32 +1797,44 @@ void EditorApplication::draw_shadow_casters(VkCommandBuffer cmd, VkPipelineLayou
 }
 
 // ---------------------------------------------------------------------------
-// BUG-EDITOR-GI-001: editor probe grid — the Agente 1 IProbeGrid headless core
-// captures radiance through a deterministic seam bound to the editor scene
-// (sphere proxies + the Y=0 ground plane + one sun shadow ray per hit). The
-// accumulated irradiance is wrapped into a dense 8^3 array consumed by the
-// viewport shader as spatially-varying ambient (indirect light on screen).
+// BUG-EDITOR-GI-001 / CONTA2-GI-EDITOR-005: the editor now drives the same
+// public DDGI provider contract used by the renderer. Its canonical probe
+// output is wrapped into the existing dense 8^3 UBO consumed by the viewport
+// shader, so the editor no longer owns a parallel IProbeGrid-only GI path.
 // ---------------------------------------------------------------------------
 void EditorApplication::init_gi_probes() {
-    if (m_probeGrid) return;
+    if (m_editorGiProvider) return;
     std::string error;
-    m_probeGrid = Engine::Rendering::create_probe_grid(error);
-    if (!m_probeGrid) return;
-    Engine::Rendering::ProbeGridConfig config{};
-    config.resolution = kEditorProbeResolution;   // 8 → 8^3 probes
-    config.cellSize = 4.0f;                       // 32 m window around the orbit target
-    config.probesPerFrame = 32;
-    config.historyWeight = 0.15f;
-    config.relocationEnabled = true;
-    config.classificationEnabled = true;
+    Engine::Rendering::GiCapabilities caps{};
+    caps.radianceCache = true;
+    caps.ddgi = true;
+    caps.rayTraced = false;
+    m_editorGiProvider = Engine::Rendering::create_global_illumination_provider(
+        Engine::Rendering::GiBackend::Ddgi, caps, error);
+    if (!m_editorGiProvider) return;
+
+    Engine::Rendering::GiClipmapConfig config{};
+    config.cascadeCount = 1u;
+    config.resolution = kEditorProbeResolution;   // 8 -> 8^3 probes
+    config.probesPerFrame = 32u;
+    config.baseSpacing = 4.0f;                    // 32 m window around the camera
+    config.cascadeScale = 2.0f;
+    config.sunRefreshAngleDegrees = 2.0f;
     std::string configError;
-    if (!m_probeGrid->configure(config, configError)) {
-        m_probeGrid.reset();
+    if (!m_editorGiProvider->core().configure(config, configError)) {
+        m_editorGiProvider.reset();
+        vc::rendering::provider_selection::retire("giProvider");
+        return;
     }
+    vc::rendering::provider_selection::record_canonical(
+        "giProvider", "ddgi-probe-grid", "editor-viewport-binding-4");
 }
 
 void EditorApplication::update_gi_probes(const Scene* scene) {
-    if (!m_giEnabled || !m_probeGrid) return;
+    if (!m_giEnabled || !m_editorGiProvider) {
+        m_shadowUboData.probeParams.y = 0.0f;
+        return;
+    }
 
     struct GiOccluder {
         glm::vec3 center;
@@ -1821,105 +1864,55 @@ void EditorApplication::update_gi_probes(const Scene* scene) {
             if (r > 0.05f) occluders.push_back({ t.position, r });
         }
     }
-    const glm::vec3 sunToScene = glm::normalize(sunDir);
-    constexpr float kSkyRadiance = 0.22f; // matches the flat ambient used pre-GI
-    constexpr float kAlbedo = 0.6f;
+    const glm::vec3 sunToScene = glm::length(sunDir) > 1.0e-5f
+        ? glm::normalize(sunDir) : glm::vec3(0.0f, -1.0f, 0.0f);
+    const glm::vec3 giSunDirection = hasSun ? -sunToScene : glm::vec3(0.0f, 1.0f, 0.0f);
 
-    auto occluded_from = [&](const glm::vec3& origin, const glm::vec3& dir, float maxDist) {
-        for (const auto& o : occluders) {
-            const glm::vec3 m = origin - o.center;
-            const float b = glm::dot(m, dir);
-            const float c = glm::dot(m, m) - o.radius * o.radius;
-            if (c > 0.0f && b > 0.0f) continue;
-            const float disc = b * b - c;
-            if (disc < 0.0f) continue;
-            const float t = -b - std::sqrt(std::max(disc, 0.0f));
-            if (t > 1e-3f && t < maxDist) return true;
+    // The public GI contract consumes a deterministic XZ surface sampler.
+    // Represent editor entities as sphere-heightfield proxies over the real
+    // ground plane; this keeps the DDGI core bound to the live scene rather
+    // than feeding it a synthetic flat-only fixture.
+    Engine::Rendering::GiTerrainSampler sampler =
+        [&occluders](float worldX, float worldZ) -> Engine::Rendering::GiSurfaceSample {
+        Engine::Rendering::GiSurfaceSample sample{};
+        sample.height = 0.0f;
+        sample.albedo = glm::vec3(0.6f);
+        for (const GiOccluder& o : occluders) {
+            const float dx = worldX - o.center.x;
+            const float dz = worldZ - o.center.z;
+            const float radial2 = dx * dx + dz * dz;
+            const float radius2 = o.radius * o.radius;
+            if (radial2 >= radius2) continue;
+            const float top = o.center.y + std::sqrt(std::max(radius2 - radial2, 0.0f));
+            sample.height = std::max(sample.height, top);
         }
-        if (dir.y < -1e-4f) {
-            const float t = -origin.y / dir.y;
-            if (t > 1e-3f && t < maxDist) return true; // ground plane
-        }
-        return false;
-    };
-
-    Engine::Rendering::ProbeCaptureSampler sampler =
-        [&](const glm::vec3& probePos,
-            const glm::vec3& dirIn) -> Engine::Rendering::ProbeCaptureSample {
-        Engine::Rendering::ProbeCaptureSample sample{};
-        // Backface flag: probe inside a solid (or under the ground) — the
-        // grid core uses it for relocation/classification.
-        for (const auto& o : occluders) {
-            if (glm::length(probePos - o.center) < o.radius) {
-                sample.backface = true;
-                break;
-            }
-        }
-        if (probePos.y < -0.05f) sample.backface = true;
-
-        const glm::vec3 d = glm::normalize(dirIn);
-        float bestT = 1e9f;
-        glm::vec3 n(0.0f, 1.0f, 0.0f);
-        bool hit = false;
-        if (d.y < -1e-4f) {
-            const float t = -probePos.y / d.y;
-            if (t > 1e-3f) {
-                bestT = t;
-                hit = true;
-                n = glm::vec3(0.0f, 1.0f, 0.0f);
-            }
-        }
-        for (const auto& o : occluders) {
-            const glm::vec3 m = probePos - o.center;
-            const float b = glm::dot(m, d);
-            const float c = glm::dot(m, m) - o.radius * o.radius;
-            const float disc = b * b - c;
-            if (disc < 0.0f) continue;
-            const float sq = std::sqrt(std::max(disc, 0.0f));
-            const float roots[2] = { -b - sq, -b + sq };
-            for (const float t : roots) {
-                if (t > 1e-3f && t < bestT) {
-                    bestT = t;
-                    hit = true;
-                    n = glm::normalize(probePos + d * t - o.center);
-                }
-            }
-        }
-        if (!hit) {
-            sample.radiance = glm::vec3(kSkyRadiance);
-            return sample;
-        }
-        const glm::vec3 hp = probePos + d * bestT;
-        float sunTerm = 0.0f;
-        if (hasSun) {
-            const float ndl = std::max(glm::dot(n, -sunToScene), 0.0f);
-            if (ndl > 0.0f && !occluded_from(hp + n * 0.02f, -sunToScene, 1e9f)) sunTerm = ndl;
-        }
-        sample.radiance = kAlbedo * (sunColor * sunTerm + glm::vec3(kSkyRadiance));
         return sample;
     };
 
-    // Anchor on the orbit target (same principle as the sun shadow fit: a
-    // slow orbit must not scroll the probe window).
-    m_probeGrid->update(m_editorCamera.orbitTarget, sampler, 0, nullptr);
+    auto& core = m_editorGiProvider->core();
+    core.update(m_editorCamera.position, giSunDirection, sunColor, sampler, 0u);
 
-    // Dense wrap: toroidal window → 8^3 array. Index formula mirrors the GLSL
-    // lookup in editor_viewport.frag (x + y*res + z*res*res).
-    const float cs = std::max(m_probeGrid->config().cellSize, 0.01f);
-    const glm::ivec3 origin = glm::ivec3(glm::floor(m_editorCamera.orbitTarget / cs)) -
-                              glm::ivec3(int(kEditorProbeResolution / 2));
+    // Dense wrap: the canonical DDGI cascade -> existing 8^3 viewport UBO.
+    // Index formula mirrors editor_viewport.frag (x + y*res + z*res*res).
+    const auto ranges = core.clipmap_ranges();
+    if (ranges.empty() || ranges[0].resolution <= 0 || ranges[0].inverseSpacing <= 0.0f) {
+        m_shadowUboData.probeParams.y = 0.0f;
+        return;
+    }
+    const float cs = 1.0f / ranges[0].inverseSpacing;
+    const glm::ivec3 origin = ranges[0].minCell;
     for (auto& v : m_shadowUboData.probeIrradiance) v = glm::vec4(0.0f);
     const int res = int(kEditorProbeResolution);
-    const uint32_t count = m_probeGrid->probe_count();
+    const uint32_t count = core.total_probe_count();
     for (uint32_t slot = 0; slot < count; ++slot) {
-        Engine::Rendering::ProbeGridProbe probe;
-        if (!m_probeGrid->probe(slot, probe)) continue;
-        const glm::ivec3 off = probe.cell - origin;
+        Engine::Rendering::IGiCore::Probe probe;
+        if (!core.probe(slot, probe) || probe.worldCellCascade.w != 0) continue;
+        const glm::ivec3 off = glm::ivec3(probe.worldCellCascade) - origin;
         const glm::bvec3 outOfRange = glm::lessThan(off, glm::ivec3(0)) ||
                                       glm::greaterThanEqual(off, glm::ivec3(res));
         if (glm::any(outOfRange)) continue;
         const int idx = off.x + off.y * res + off.z * res * res;
-        m_shadowUboData.probeIrradiance[idx] = glm::vec4(probe.irradiance, 1.0f);
+        m_shadowUboData.probeIrradiance[idx] = probe.radianceVisibility;
     }
     m_shadowUboData.probeOrigin = glm::vec4(float(origin.x), float(origin.y), float(origin.z), cs);
     m_shadowUboData.probeParams = glm::vec4(float(kEditorProbeResolution), 1.0f, 0.0f, 0.0f);
@@ -1958,8 +1951,16 @@ void EditorApplication::render_scene_to_offscreen(VkCommandBuffer cmd) {
     // the actual render loop recorded through the public IRenderPassMetrics
     // consumer (a real call site in the frame loop, closed once per frame).
     register_render_providers();
+    const VkQueryPool timestampPool = m_gpuTimestampPools[m_currentFrame];
+    const auto timestamp = [&](std::uint32_t slot) {
+        if (timestampPool != VK_NULL_HANDLE && slot < kEditorGpuTimestampSlots) {
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampPool, slot);
+        }
+    };
     const auto t0 = std::chrono::steady_clock::now();
+    timestamp(0);
     record_shadow_pass(cmd, renderScene);
+    timestamp(1);
     auto tShadow = std::chrono::steady_clock::now();
 
     build_viewport_render_graph();
@@ -1978,22 +1979,27 @@ void EditorApplication::render_scene_to_offscreen(VkCommandBuffer cmd) {
 
     // Scene pass recorded by the compiled graph: begins the offscreen render
     // pass, runs the content callback, ends — same executor the game uses.
+    timestamp(2);
     m_viewportRenderGraphExecutor.record(cmd, 0, { m_offscreen.width, m_offscreen.height });
+    timestamp(3);
 
     auto tScene = std::chrono::steady_clock::now();
 
     // Env-probe cubemap capture: recorded AFTER the viewport pass so the
     // command buffer is free to open its own 6-face render passes.
+    timestamp(4);
     record_env_capture(cmd, renderScene);
+    timestamp(5);
 
     auto tEnv = std::chrono::steady_clock::now();
     if (m_renderMetrics) {
         const auto ms = [](const auto& a, const auto& b) -> double {
             return std::chrono::duration<double, std::milli>(b - a).count();
         };
-        m_renderMetrics->recordPass("shadow", ms(t0, tShadow), 0.0);
-        m_renderMetrics->recordPass("scene", ms(tShadow, tScene), 0.0);
-        m_renderMetrics->recordPass("env", ms(tScene, tEnv), 0.0);
+        m_pendingCpuPassMs[m_currentFrame] = {
+            ms(t0, tShadow), ms(tShadow, tScene), ms(tScene, tEnv)
+        };
+        m_gpuTimestampComplete[m_currentFrame] = timestampPool != VK_NULL_HANDLE;
         m_renderMetrics->recordMemory("viewport",
             static_cast<std::uint64_t>(m_offscreen.width) * m_offscreen.height * 4);
         m_renderMetrics->endFrame();
@@ -2086,7 +2092,14 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                             0, 1, &m_sceneLightSet, 0, nullptr);
 
     // Terrain (Terreno panel): procedural heightmap mesh on the ground.
-    if (m_terrainValid && m_terrainVB.buffer != VK_NULL_HANDLE) {
+    // A flat terrain (amount ~ 0) is a degenerate plane at Y=0: it adds no
+    // relief to the view (the analytic grid already is the ground reference)
+    // and its coplanar triangles/self-shadowing read as a dense "bugged mesh"
+    // pattern over the ground (reported against the editor viewport). Skip the
+    // draw for the flat case; non-flat heightfields render normally. The
+    // shadow caster pass skips the same flat case (see draw_shadow_casters).
+    if (m_terrainValid && m_terrainVB.buffer != VK_NULL_HANDLE &&
+        std::abs(m_terrainParams.amount) >= 0.001f) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_scenePipeline);
         const glm::mat4 model(1.0f);
         draw_indexed_editor_mesh(cmd, m_scenePipelineLayout, m_terrainVB.buffer, m_terrainIB.buffer,
@@ -2150,19 +2163,8 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                         const bool useLive = m_specializedEditors.previewOnSelected && selected;
                         if (useLive) {
                             const uint64_t liveHash = hash_material_graph(m_specializedEditors.live_material_graph());
-                            if (liveHash != m_liveGraphHash || !m_liveGraphPipeline.valid) {
-                                destroy_graph_pipeline(m_liveGraphPipeline);
-                                if (!build_graph_pipeline(m_specializedEditors.live_material_graph(), m_liveGraphPipeline)) {
-                                    if (!m_liveGraphLastErrorLogged) {
-                                        std::cerr << "[Editor] Material preview: " << m_liveGraphPipeline.lastError << std::endl;
-                                        m_liveGraphLastErrorLogged = true;
-                                    }
-                                } else {
-                                    m_liveGraphLastErrorLogged = false;
-                                }
-                                m_liveGraphHash = liveHash;
-                            }
-                            gmp = m_liveGraphPipeline.valid ? &m_liveGraphPipeline : nullptr;
+                            gmp = m_liveGraphPipeline.valid && liveHash == m_liveGraphHash
+                                ? &m_liveGraphPipeline : nullptr;
                         } else if (const auto vidIt = renderScene->videoComponents.find(id);
                                    vidIt != renderScene->videoComponents.end() &&
                                    !vidIt->second.framePaths.empty()) {
@@ -2174,7 +2176,7 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                             const UUID frameTex =
                                 resolve_texture_asset_by_name(vc.framePaths[frame]);
                             if (frameTex.is_valid()) {
-                                gmp = ensure_texture_pipeline(frameTex, m_videoGraphPipelines);
+                                gmp = cached_texture_pipeline(frameTex, m_videoGraphPipelines);
                             }
                         } else if (const auto blockMeta = m_assetRegistry.find(meshComp->second.meshAssetID);
                                    blockMeta && blockMeta->type == AssetType::Block) {
@@ -2188,7 +2190,7 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                                 // Keep the alpha channel in the shared material
                                 // path so transparent texels never become black
                                 // solid faces in the editor viewport.
-                                gmp = ensure_texture_pipeline(texId, m_blockGraphPipelines, true);
+                                gmp = cached_texture_pipeline(texId, m_blockGraphPipelines);
                             }
                         } else if (const auto skinMeta = m_assetRegistry.find(meshComp->second.meshAssetID);
                                    skinMeta && skinMeta->type == AssetType::Texture &&
@@ -2201,29 +2203,15 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                             // outer-layer transparency belongs to a separate overlay mesh, and
                             // mixing the two paths made the base skin pipeline unstable on some
                             // Vulkan drivers.
-                            gmp = ensure_texture_pipeline(meshComp->second.meshAssetID, m_skinGraphPipelines, true);
+                            gmp = cached_texture_pipeline(meshComp->second.meshAssetID, m_skinGraphPipelines);
                             if (!gmp) {
                                 std::cerr << "[Editor] skin pipeline failed for "
                                           << meshComp->second.meshAssetID.to_string() << std::endl;
                             }
-                        } else if (meshComp->second.materialAssetID.is_valid() &&
-                                   load_material_asset(meshComp->second.materialAssetID)) {
+                        } else if (meshComp->second.materialAssetID.is_valid()) {
                             const UUID matId = meshComp->second.materialAssetID;
-                            const MaterialAsset& mat = m_materialAssets.at(matId);
-                            const Rendering::MaterialGraph graph = material_graph_from_asset(mat);
-                            const uint64_t graphHash = hash_material_graph(graph);
                             auto it = m_graphMaterialPipelines.find(matId);
-                            if (it == m_graphMaterialPipelines.end() ||
-                                !it->second.valid || it->second.graphHash != graphHash) {
-                                if (it != m_graphMaterialPipelines.end()) destroy_graph_pipeline(it->second);
-                                GraphMaterialPipeline built;
-                                built.graphHash = graphHash;
-                                if (!build_graph_pipeline(graph, built)) {
-                                    std::cerr << "[Editor] Material pipeline: " << built.lastError << std::endl;
-                                }
-                                it = m_graphMaterialPipelines.insert_or_assign(matId, std::move(built)).first;
-                            }
-                            if (it->second.valid) gmp = &it->second;
+                            if (it != m_graphMaterialPipelines.end() && it->second.valid) gmp = &it->second;
                         }
                         if (gmp) {
                             const MaterialAsset* matAsset = nullptr;
@@ -2350,7 +2338,7 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
                 const DecalComponent& dec = decalIt->second;
                 const UUID texId = resolve_texture_asset_by_name(dec.texturePath);
                 if (texId.is_valid()) {
-                    if (GraphMaterialPipeline* dgmp = ensure_texture_pipeline(texId, m_blockGraphPipelines, true)) {
+                    if (GraphMaterialPipeline* dgmp = cached_texture_pipeline(texId, m_blockGraphPipelines)) {
                         write_material_ubo(*dgmp, nullptr, nullptr);
                         write_light_ubo(*dgmp, renderScene, m_editorCamera.position);
                         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, dgmp->pipeline);
@@ -2425,14 +2413,9 @@ void EditorApplication::record_viewport_scene_content(VkCommandBuffer cmd) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_splatPipeline);
         const VkDeviceSize off = 0;
         vkCmdBindVertexBuffers(cmd, 0, 1, &m_playParticleVB.buffer, &off);
-        // Particle size from the real sim (uv.x carries size per particle);
-        // splat push takes a single px size — use the max over the frame.
-        float particleSizePx = 8.0f;
-        const std::vector<Engine::Gameplay::ParticleRenderData> pdata =
-            m_playParticles.render_data();
-        for (const Engine::Gameplay::ParticleRenderData& p : pdata) {
-            particleSizePx = std::max(particleSizePx, p.size * 32.0f);
-        }
+        // upload_play_particles() computes the per-frame max while it already
+        // walks the persistent render view; do not materialize/scan it again.
+        const float particleSizePx = m_playParticleMaxSizePx;
         const SplatPushConstants ppc{ viewProj,
             glm::vec4(particleSizePx, static_cast<float>(m_offscreen.height), 1.0f, 0.0f) };
         vkCmdPushConstants(cmd, m_splatPipelineLayout,

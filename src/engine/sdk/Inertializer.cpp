@@ -3,12 +3,13 @@
 // alvo ⊕ resíduo·d. JSON bit-exact all-or-nothing.
 
 #include "engine/animation/IInertializer.hpp"
+#include "engine/animation/IAnimBudget.hpp"
 
 #include "engine/sdk/RegistryJson.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
-#include <map>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -55,6 +56,13 @@ public:
     Inertializer() {
         decay_ = 0.25;
         time_ = 0.0;
+        budget_ = create_anim_budget();
+        if (budget_) {
+            std::string ignored;
+            (void)budget_->configure(0.25, 0.25, ignored);
+        }
+        budgetEntries_.reserve(1);
+        budgetEntries_.push_back(AnimUpdateEntry{ "inertializer.entity", 1.0, 0.05 });
     }
 
     void set_decay_time(double seconds, std::string& errorOut) override {
@@ -75,18 +83,24 @@ public:
             errorOut = "current and target poses must have the same size";
             return false;
         }
-        std::map<std::string, const BonePose*> tmap;
-        for (const BonePose& p : target) tmap[p.bone] = &p;
         residual_.clear();
         residual_.reserve(current.size());
+        targetIndex_.clear();
+        targetIndex_.reserve(current.size());
         for (const BonePose& c : current) {
-            const auto it = tmap.find(c.bone);
-            if (it == tmap.end()) {
+            std::size_t targetIndex = target.size();
+            for (std::size_t i = 0; i < target.size(); ++i) {
+                if (target[i].bone == c.bone) {
+                    targetIndex = i;
+                    break;
+                }
+            }
+            if (targetIndex == target.size()) {
                 errorOut = "bone \"" + c.bone +
                            "\" missing from target pose";
                 return false;
             }
-            const AnimTransform& t = it->second->local;
+            const AnimTransform& t = target[targetIndex].local;
             ResidualBone r;
             r.pos = {c.local.position.x - t.position.x,
                      c.local.position.y - t.position.y,
@@ -96,6 +110,7 @@ public:
                        c.local.scale.y / t.scale.y,
                        c.local.scale.z / t.scale.z};
             residual_.push_back(r);
+            targetIndex_.push_back(targetIndex);
         }
         order_.clear();
         for (const BonePose& p : current) order_.push_back(p.bone);
@@ -121,19 +136,59 @@ public:
             errorOut = "target pose size mismatch with active residual";
             return out;
         }
-        std::map<std::string, std::size_t> idx;
-        for (std::size_t i = 0; i < target.size(); ++i) idx[target[i].bone] = i;
+
+        // This object is the live per-entity inertialization consumer used by
+        // the game showcase. Run the public animation budget on that same
+        // update. The cost model is deterministic and proportional to the
+        // skeleton size; the single active entity normally fits, while the
+        // budget/fairness state remains real and serializable/observable.
+        if (budget_) {
+            budgetEntries_[0].importance = is_active() ? 1.0 : 0.25;
+            budgetEntries_[0].cost_ms =
+                0.05 + std::min<std::size_t>(target.size(), 100u) * 0.001;
+            std::string budgetError;
+            const BudgetFrame frame = budget_->select(budgetEntries_, budgetError);
+            if (!budgetError.empty()) {
+                errorOut = "animation budget refused inertializer update: " + budgetError;
+                return out;
+            }
+            lastBudgetUsedMs_ = frame.used_ms;
+            lastBudgetSelected_ = !frame.selected.empty();
+            lastBudgetPriority_ = budget_->effective_priority(budgetEntries_[0].id);
+            if (!lastBudgetSelected_) {
+                // Hold simulation time when this entity loses the frame
+                // budget. The target pose is still returned so root motion,
+                // sockets and collision authority are never stalled.
+                out.pose = target;
+                out.settled = false;
+                errorOut.clear();
+                return out;
+            }
+        }
+
         time_ += dt;
         const double d = envelope(time_, decay_);
         out.pose.reserve(target.size());
         for (std::size_t i = 0; i < residual_.size(); ++i) {
-            const auto it = idx.find(order_[i]);
-            if (it == idx.end()) {
-                errorOut = "bone \"" + order_[i] +
-                           "\" missing from target pose";
-                return out;
+            if (i >= targetIndex_.size()) targetIndex_.resize(residual_.size(), target.size());
+            if (targetIndex_[i] >= target.size() ||
+                target[targetIndex_[i]].bone != order_[i]) {
+                auto found = std::find_if(
+                    target.begin(), target.end(), [&](const BonePose& pose) {
+                        return pose.bone == order_[i];
+                    });
+                if (found == target.end()) {
+                    errorOut = "bone \"" + order_[i] +
+                               "\" missing from target pose";
+                    return out;
+                }
+                // A serialized inertializer stores stable bone names, not
+                // caller-local vector indices. Rebuild the index lazily when
+                // a caller presents the same skeleton in another order.
+                targetIndex_[i] = static_cast<std::size_t>(
+                    std::distance(target.begin(), found));
             }
-            const BonePose& t = target[it->second];
+            const BonePose& t = target[targetIndex_[i]];
             const ResidualBone& r = residual_[i];
             BonePose p;
             p.bone = t.bone;
@@ -157,7 +212,12 @@ public:
     void clear() override {
         residual_.clear();
         order_.clear();
+        targetIndex_.clear();
         time_ = 0.0;
+        if (budget_) budget_->reset();
+        lastBudgetUsedMs_ = 0.0;
+        lastBudgetPriority_ = 0.0;
+        lastBudgetSelected_ = false;
     }
 
     bool is_active() const override { return !residual_.empty(); }
@@ -166,6 +226,10 @@ public:
         std::ostringstream out;
         out << std::setprecision(9);
         out << "{\"decay\":" << decay_ << ",\"time\":" << time_
+            << ",\"budgetUsedMs\":" << lastBudgetUsedMs_
+            << ",\"budgetLimitMs\":" << (budget_ ? budget_->budget_ms() : 0.0)
+            << ",\"budgetPriority\":" << lastBudgetPriority_
+            << ",\"budgetSelected\":" << (lastBudgetSelected_ ? "true" : "false")
             << ",\"residual\":[";
         for (std::size_t i = 0; i < residual_.size(); ++i) {
             if (i > 0) out << ",";
@@ -202,6 +266,42 @@ public:
             errorOut = "decay must be finite and > 0";
             return false;
         }
+
+        double parsedBudgetUsedMs = 0.0;
+        double parsedBudgetLimitMs = budget_ ? budget_->budget_ms() : 0.25;
+        double parsedBudgetPriority = 0.0;
+        bool parsedBudgetSelected = false;
+        if (const sdk::JsonValue* v = doc.field("budgetUsedMs")) {
+            if (v->kind != sdk::JsonValue::Kind::Number ||
+                !std::isfinite(v->number) || v->number < 0.0) {
+                errorOut = "budgetUsedMs must be a finite non-negative number";
+                return false;
+            }
+            parsedBudgetUsedMs = v->number;
+        }
+        if (const sdk::JsonValue* v = doc.field("budgetLimitMs")) {
+            if (v->kind != sdk::JsonValue::Kind::Number ||
+                !std::isfinite(v->number) || v->number <= 0.0) {
+                errorOut = "budgetLimitMs must be a finite positive number";
+                return false;
+            }
+            parsedBudgetLimitMs = v->number;
+        }
+        if (const sdk::JsonValue* v = doc.field("budgetPriority")) {
+            if (v->kind != sdk::JsonValue::Kind::Number || !std::isfinite(v->number)) {
+                errorOut = "budgetPriority must be a finite number";
+                return false;
+            }
+            parsedBudgetPriority = v->number;
+        }
+        if (const sdk::JsonValue* v = doc.field("budgetSelected")) {
+            if (v->kind != sdk::JsonValue::Kind::Bool) {
+                errorOut = "budgetSelected must be a boolean";
+                return false;
+            }
+            parsedBudgetSelected = v->boolean;
+        }
+
         std::vector<ResidualBone> parsedResidual;
         std::vector<std::string> parsedOrder;
         for (const sdk::JsonValue& item : residual->array) {
@@ -234,10 +334,22 @@ public:
             parsedResidual.push_back(r);
             parsedOrder.push_back(bone->string);
         }
+        if (budget_) {
+            std::string budgetError;
+            if (!budget_->configure(parsedBudgetLimitMs, budget_->boost(), budgetError)) {
+                errorOut = "invalid restored animation budget: " + budgetError;
+                return false;
+            }
+        }
         decay_ = decay->number;
         time_ = time->number;
         residual_ = std::move(parsedResidual);
         order_ = std::move(parsedOrder);
+        targetIndex_.resize(order_.size());
+        for (std::size_t i = 0; i < targetIndex_.size(); ++i) targetIndex_[i] = i;
+        lastBudgetUsedMs_ = parsedBudgetUsedMs;
+        lastBudgetPriority_ = parsedBudgetPriority;
+        lastBudgetSelected_ = parsedBudgetSelected;
         errorOut.clear();
         return true;
     }
@@ -247,6 +359,12 @@ private:
     double time_ = 0.0;
     std::vector<ResidualBone> residual_;
     std::vector<std::string> order_;
+    std::vector<std::size_t> targetIndex_;
+    std::unique_ptr<IAnimBudget> budget_;
+    std::vector<AnimUpdateEntry> budgetEntries_;
+    double lastBudgetUsedMs_{ 0.0 };
+    double lastBudgetPriority_{ 0.0 };
+    bool lastBudgetSelected_{ false };
 };
 
 }  // namespace

@@ -40,6 +40,47 @@
 namespace app {
 namespace {
 
+class ProcgenInitJobScope final {
+public:
+    ProcgenInitJobScope(engine::jobs::IJobService* service, std::uint64_t id)
+        : service_(service), id_(id) {}
+
+    ~ProcgenInitJobScope() {
+        if (!service_ || id_ == 0 || completed_) return;
+        std::string ignored;
+        service_->fail(id_, "world_procgen_init_failed", ignored);
+    }
+
+    void progress(double value, const char* stage) {
+        if (!service_ || id_ == 0) return;
+        std::string ignored;
+        service_->update(id_, value, stage, ignored);
+    }
+
+    void complete() {
+        if (!service_ || id_ == 0) return;
+        std::string error;
+        if (service_->complete(id_, {}, error)) completed_ = true;
+    }
+
+private:
+    engine::jobs::IJobService* service_{ nullptr };
+    std::uint64_t id_{ 0 };
+    bool completed_{ false };
+};
+
+const char* job_state_name(engine::jobs::JobState state) noexcept {
+    switch (state) {
+        case engine::jobs::JobState::Queued: return "queued";
+        case engine::jobs::JobState::Running: return "running";
+        case engine::jobs::JobState::Completed: return "completed";
+        case engine::jobs::JobState::Failed: return "failed";
+        case engine::jobs::JobState::Cancelled: return "cancelled";
+        case engine::jobs::JobState::TimedOut: return "timedout";
+    }
+    return "unknown";
+}
+
 // Small, valid, engine-native surface/ore/decorator/carver assets. Block ids
 // are the engine's stable BlockType values (see Voxel.hpp). Every
 // _from_json factory below parses + validates its own document all-or-nothing;
@@ -194,6 +235,16 @@ void build_surface_grid(const engine::voxel::IVoxelGenerator* gen, int gridW,
 void WorldProcgen::init(World& world) {
     std::string error;
 
+    initJobService_ = engine::jobs::create_job_service();
+    if (!require_factory("jobService", {}, !!initJobService_)) return;
+    initJobId_ = initJobService_->start("world-procgen-init", 60'000, error);
+    if (initJobId_ == 0) {
+        std::cerr << "[WorldProcgen] failed to start init job: " << error << '\n';
+        return;
+    }
+    ProcgenInitJobScope initJob(initJobService_.get(), initJobId_);
+    initJob.progress(0.05, "noise-graphs");
+
     // ---- group 3: noise graph (height + caves/ores density) ----
     // Classification: heightGraph = Required; climate axes, caves, ores =
     // Required (the composed generator and LOD sampler need all of them to
@@ -325,6 +376,8 @@ void WorldProcgen::init(World& world) {
         heightGraph_, cavesDensity_, oresDensity_, kBaseHeight, kAmplitude);
     if (!require_factory("graphGenerator", {}, !!graphGenerator_)) return;
 
+    initJob.progress(0.40, "world-generator");
+
     // ---- Register the composed generator on the app's LIVE world. Every
     // chunk World::update dispatches now samples the data-driven generator
     // (biome/climate/surface/ores/carver/decorators) — the real build path.
@@ -377,6 +430,8 @@ void WorldProcgen::init(World& world) {
     }
     erosionCacheSize_ = erosionCache_ ? erosionCache_->size() : 0;
 
+    initJob.progress(0.68, "erosion");
+
     // ---- group 5: LOD sampler + multi-scale streaming + mesh cooker ----
     // Optional: these degrade distant terrain quality but don't block world gen.
     lodSampler_ = engine::procgen::create_lod_terrain_sampler();
@@ -416,7 +471,9 @@ void WorldProcgen::init(World& world) {
         }
     }
 
+    initJob.progress(0.92, "runtime-wiring");
     samplerInitialized_ = true;
+    initJob.complete();
 }
 
 void WorldProcgen::tick(World& world, float playerX, float playerZ) {
@@ -595,17 +652,30 @@ void WorldProcgen::tick(World& world, float playerX, float playerZ) {
 
 std::string WorldProcgen::summary() const {
     if (!samplerInitialized_) return std::string("procgen n/a");
+    std::string jobState = "none";
+    double jobProgress = 0.0;
+    if (initJobService_ && initJobId_ != 0) {
+        engine::jobs::JobSnapshot snapshot;
+        std::string error;
+        if (initJobService_->poll(initJobId_, snapshot, error)) {
+            jobState = job_state_name(snapshot.state);
+            jobProgress = snapshot.progress;
+        } else {
+            jobState = "poll-error";
+        }
+    }
     return std::format(
         "procgen bio {}/{} plain {} len{} dec {}/{}/{}/{} cl {:.2f}/{:.2f} srf {} "
         "bm {} h {:.2f} car {} ore {} lod {} h {:.1f} str {}/{} er {}/{}/{} "
-        "cook {}/{}->{}/{} acmr {:.2f} smooth {}",
+        "cook {}/{}->{}/{} acmr {:.2f} smooth {} job {} {:.0f}%",
         biomeCount_, biomeCountJson_, plainBiomeIndex_, plainBiomeSerializeLen_,
         decoratorCount_, decoratorSetCount_, decoratorPlaced_, decoratorJsonPlaced_,
         climateTemperature_, climateMoisture_, surfaceBlockAtPlayer_, biomeAtPlayer_,
         graphHeightAtPlayer_, carverRules_, oreRuleCount_, lodCells_,
         lodInterpHeight_, streamLevels_, streamCells_, erosionCacheSize_,
         erosionTileW_, erosionTileH_, cookInVertices_, cookInIndices_,
-        cookOutVertices_, cookOutIndices_, cookAcmr_, smoothedVertices_);
+        cookOutVertices_, cookOutIndices_, cookAcmr_, smoothedVertices_, jobState,
+        jobProgress * 100.0);
 }
 
 bool WorldProcgen::require_factory(const char* name, const std::string& diag,

@@ -29,7 +29,7 @@ public:
  // double-click: e.g. double-clicking a Material asset opens the Material
  // editor).
  void open_editor(const std::string& tab) { open = true; openTab_ = tab; }
- void set_texture_assets(std::vector<std::pair<std::string, UUID>> assets) { textureAssets_ = std::move(assets); }
+ void set_texture_assets(const std::vector<std::pair<std::string, UUID>>& assets) { textureAssets_ = assets; }
  // Scene context for panel → scene integration (Weapon tab applies the
  // authored parameters as a real WeaponComponent on the selected entity).
  void set_scene_context(Scene* scene, UUID selected) { scene_ = scene; selected_ = selected; }

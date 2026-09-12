@@ -14,6 +14,14 @@
 
 #include "VisualScriptGraph.hpp"
 #include "ScriptRuntime.hpp"
+#include "engine/scripting/IScriptingBridge.hpp"
+
+#include <functional>
+#include <memory>
+#include <unordered_map>
+#include <vector>
+
+namespace engine::entity { class IEntityWorld; }
 
 namespace Engine {
 
@@ -31,3 +39,21 @@ VisualScriptGraph to_visual_graph(const ScriptGraphAsset& asset);
 ScriptGraphAsset from_visual_graph(const VisualScriptGraph& graph, const ScriptGraphAsset& original = {});
 
 } // namespace Engine
+
+namespace engine::scripting {
+
+// Internal composition contract used by the real visual/Luau runtime.  The
+// public scripting surface remains IScriptingBridge; this factory binds it to
+// the canonical IEntityWorld instead of maintaining a second script-only ECS.
+struct EcsScriptingBridgeConfig {
+    std::string context_id{"runtime.scripting"};
+    std::vector<BridgePermission> permissions;
+    std::string spawn_type{"script.entity"};
+    std::unordered_map<std::string, std::string> component_schemas;
+    std::function<bool(const std::string&, const std::string&, std::string&)> event_sink;
+};
+
+std::unique_ptr<IScriptingBridge> create_ecs_scripting_bridge(
+    engine::entity::IEntityWorld& world, EcsScriptingBridgeConfig config);
+
+} // namespace engine::scripting
