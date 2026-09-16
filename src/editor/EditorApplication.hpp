@@ -314,13 +314,14 @@ inline constexpr uint32_t kEditorProbeCount = kEditorProbeResolution * kEditorPr
 struct EditorShadowUbo {
     glm::mat4 spotViewProj[kEditorSpotShadowSlots]; // tile i projection (depth remapped to [0,1])
     glm::vec4 spotEnabled;                          // per-slot 0/1
+    glm::mat4 pointViewProj[6];                    // +X,-X,+Y,-Y,+Z,-Z face projections
     glm::vec4 pointLight;                           // xyz = light position, w = range
-    glm::vec4 pointParams;                          // x = enabled, y = near, z = far, w = unused
+    glm::vec4 pointParams;                          // x=enabled, y=1/faceSize, z=range, w=LightUbo point slot
     glm::vec4 probeOrigin;                          // xyz = window min CELL index, w = cellSize
     glm::vec4 probeParams;                          // x = resolution, y = enabled, z/w unused
     glm::vec4 probeIrradiance[kEditorProbeCount];   // rgb = irradiance, wrapped cell lookup
 };
-static_assert(sizeof(EditorShadowUbo) == 64 * kEditorSpotShadowSlots + 16 * 5 + 16 * kEditorProbeCount,
+static_assert(sizeof(EditorShadowUbo) == 64 * (kEditorSpotShadowSlots + 6) + 16 * 5 + 16 * kEditorProbeCount,
               "EditorShadowUbo must stay within the guaranteed uniform range");
 
 // Slot layout shared by the shadow passes and the UBO writer so tile i always
@@ -341,6 +342,7 @@ struct EditorShadowLightSlots {
         bool castShadows{ true };
         glm::vec3 position{ 0.0f };
         float range{ 50.0f };
+        uint32_t lightIndex{ 0u }; // matching LightUboData::pointLight* slot
     } point0{};
 };
 void collect_editor_shadow_lights(const Scene* scene, EditorShadowLightSlots& out);
@@ -454,8 +456,9 @@ private:
                              VkShaderStageFlags pushStages, uint32_t pushSize,
                              const glm::mat4& viewProj, const glm::vec4* extraPush,
                              const Scene* scene);
-    // Re-writes the shadow image bindings (1-3) of the scene light set —
-    // called after the shadow targets are (re)created, e.g. on resize.
+    // Re-writes the shadow image bindings of both the basic scene-light set
+    // and every cached material-graph set after the shadow targets are
+    // (re)created, e.g. on resize.
     void refresh_shadow_descriptors();
     void init_scene_pipeline();
     void init_geometry_buffers();
@@ -817,10 +820,13 @@ private:
         VkBuffer lightBuffer{ VK_NULL_HANDLE };
         VkDeviceMemory lightMemory{ VK_NULL_HANDLE };
         uint32_t lightUboBinding{ 1 };
-        // Optional shadow-map sampler: the editor has no shadow pass, so a
-        // 1x1 white dummy is bound and shadows stay disabled (shadowParams.x=0).
+        // Shadow samplers generated after the light UBO. The sun keeps a
+        // fallback dummy for bootstrap; spot/point bind the real editor atlases
+        // and are disabled by LightUboData metadata when no caster owns them.
         GraphTexture shadowDummy;
         uint32_t shadowSamplerBinding{ 2 };
+        uint32_t spotShadowSamplerBinding{ 3 };
+        uint32_t pointShadowSamplerBinding{ 4 };
         std::vector<std::string> uniformNames;
         std::vector<Rendering::MaterialValueType> uniformTypes;
         std::vector<Rendering::MaterialValue> uniformDefaults;
@@ -1184,7 +1190,17 @@ private:
     bool m_inLauncherMode{ true };
     int m_selectedProjectIndex{ 0 };
     std::string m_currentProjectName{ "EmptyProject" };
+    // Two-step launcher -> editor transition. Stage 0 presents the loading
+    // screen once before any expensive editor warm-up. Stage 1 warms the
+    // viewport/dock layout behind that loading screen; only after that frame
+    // has been presented is the complete editor shell revealed.
+    bool m_projectTransitionActive{ false };
+    uint32_t m_projectTransitionStage{ 0 };
+    std::string m_projectTransitionName;
+    std::chrono::steady_clock::time_point m_projectTransitionStarted{};
+    void begin_project_transition(const std::string& projectName);
     void draw_project_launcher();
+    void draw_project_loading_screen();
 
     // Panel visibility (Janelas menu). The EditorGUI duplicate panels are
     // disabled (see init_default_scene) — these flags drive the real panels.

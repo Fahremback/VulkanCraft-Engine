@@ -3112,10 +3112,10 @@ bool EditorApplication::build_graph_pipeline(const Rendering::MaterialGraph& gra
 
     // Descriptor set layout: binding 0 = material params UBO; bindings 1..N =
     // combined image samplers (one per TextureSample node, node order); then the
-    // LightParams UBO and the shadow-map sampler at the bindings the generated
-    // shader declared.
+    // LightParams UBO plus sun/spot/point shadow samplers at the bindings the
+    // generated shader declared.
     std::vector<VkDescriptorSetLayoutBinding> bindings;
-    bindings.reserve(3 + out.textures.size());
+    bindings.reserve(5 + out.textures.size());
     VkDescriptorSetLayoutBinding uboBinding{};
     uboBinding.binding = 0;
     uboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -3155,6 +3155,20 @@ bool EditorApplication::build_graph_pipeline(const Rendering::MaterialGraph& gra
     shadowBinding.descriptorCount = 1;
     shadowBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     bindings.push_back(shadowBinding);
+    out.spotShadowSamplerBinding = gen.spotShadowSamplerBinding;
+    VkDescriptorSetLayoutBinding spotShadowBinding{};
+    spotShadowBinding.binding = out.spotShadowSamplerBinding;
+    spotShadowBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    spotShadowBinding.descriptorCount = 1;
+    spotShadowBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings.push_back(spotShadowBinding);
+    out.pointShadowSamplerBinding = gen.pointShadowSamplerBinding;
+    VkDescriptorSetLayoutBinding pointShadowBinding{};
+    pointShadowBinding.binding = out.pointShadowSamplerBinding;
+    pointShadowBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    pointShadowBinding.descriptorCount = 1;
+    pointShadowBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings.push_back(pointShadowBinding);
     VkDescriptorSetLayoutCreateInfo dslInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     dslInfo.bindingCount = static_cast<uint32_t>(bindings.size());
     dslInfo.pBindings = bindings.data();
@@ -3209,7 +3223,7 @@ bool EditorApplication::build_graph_pipeline(const Rendering::MaterialGraph& gra
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = 2;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = static_cast<uint32_t>(out.textures.size()) + 1;
+    poolSizes[1].descriptorCount = static_cast<uint32_t>(out.textures.size()) + 3;
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     poolInfo.maxSets = 1;
     poolInfo.poolSizeCount = 2;
@@ -3228,9 +3242,9 @@ bool EditorApplication::build_graph_pipeline(const Rendering::MaterialGraph& gra
         return false;
     }
     std::vector<VkDescriptorImageInfo> imageInfos;
-    imageInfos.reserve(out.textures.size() + 2);
+    imageInfos.reserve(out.textures.size() + 3);
     std::vector<VkWriteDescriptorSet> writes;
-    writes.reserve(3 + out.textures.size());
+    writes.reserve(5 + out.textures.size());
     VkDescriptorBufferInfo bufferInfo{ out.uboBuffer, 0, out.uboSize };
     VkWriteDescriptorSet uboWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
     uboWrite.dstSet = out.descriptorSet;
@@ -3278,6 +3292,40 @@ bool EditorApplication::build_graph_pipeline(const Rendering::MaterialGraph& gra
     shadowWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     shadowWrite.pImageInfo = &imageInfos.back();
     writes.push_back(shadowWrite);
+
+    // Local-light shadow atlases. They are created together with the sun map
+    // before material pipelines are built. If one is momentarily absent during
+    // bootstrap, bind the sun depth target; the corresponding LightUboData
+    // enable flag remains zero so the shader never samples the fallback.
+    VkDescriptorImageInfo spotShadowImageInfo{};
+    spotShadowImageInfo.sampler = m_spotShadow.sampler != VK_NULL_HANDLE
+        ? m_spotShadow.sampler : m_shadowMap.sampler;
+    spotShadowImageInfo.imageView = m_spotShadow.view != VK_NULL_HANDLE
+        ? m_spotShadow.view : m_shadowMap.view;
+    spotShadowImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageInfos.push_back(spotShadowImageInfo);
+    VkWriteDescriptorSet spotShadowWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    spotShadowWrite.dstSet = out.descriptorSet;
+    spotShadowWrite.dstBinding = out.spotShadowSamplerBinding;
+    spotShadowWrite.descriptorCount = 1;
+    spotShadowWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    spotShadowWrite.pImageInfo = &imageInfos.back();
+    writes.push_back(spotShadowWrite);
+
+    VkDescriptorImageInfo pointShadowImageInfo{};
+    pointShadowImageInfo.sampler = m_pointShadow.sampler != VK_NULL_HANDLE
+        ? m_pointShadow.sampler : m_shadowMap.sampler;
+    pointShadowImageInfo.imageView = m_pointShadow.view != VK_NULL_HANDLE
+        ? m_pointShadow.view : m_shadowMap.view;
+    pointShadowImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageInfos.push_back(pointShadowImageInfo);
+    VkWriteDescriptorSet pointShadowWrite{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    pointShadowWrite.dstSet = out.descriptorSet;
+    pointShadowWrite.dstBinding = out.pointShadowSamplerBinding;
+    pointShadowWrite.descriptorCount = 1;
+    pointShadowWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    pointShadowWrite.pImageInfo = &imageInfos.back();
+    writes.push_back(pointShadowWrite);
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
     // Graphics pipeline: same EditorVertex layout, no culling (glTF winding varies).
@@ -3352,8 +3400,10 @@ void EditorApplication::destroy_graph_material_pipelines() {
 static void fill_scene_light_entries(Rendering::LightUboData& data, const Scene* scene) {
     uint32_t pointCount = 0, spotCount = 0, areaCount = 0;
     bool hasDirectionalSun = false;
+    bool hasAnyAuthoredLight = false;
     if (scene) {
         for (const auto& [id, light] : scene->lightComponents) {
+            hasAnyAuthoredLight = true;
             glm::vec3 dir(0.0f, -1.0f, 0.0f);
             glm::vec3 position(0.0f);
             glm::vec2 areaHalf(2.0f, 1.0f);
@@ -3378,45 +3428,59 @@ static void fill_scene_light_entries(Rendering::LightUboData& data, const Scene*
             // decals) get balanced light instead of white-out or ambient-only.
             const glm::vec3 colorIntensity = light.color * (light.intensity / 10000.0f);
             if (is_directional_sun(light)) {
-                data.sunDirection = glm::vec4(dir, 1.0f);
-                data.sunColor = glm::vec4(colorIntensity, 1.0f);
-                hasDirectionalSun = true;
-            } else if (light.type == LightType::Spot && spotCount < Rendering::kMaxSpotLights) {
-                data.spotLightPos[spotCount] = glm::vec4(position, light.range);
-                data.spotLightDir[spotCount] = glm::vec4(dir, 1.0f);
-                // Real cone (agente 4 — B.3): the editable LightComponent
-                // coneAngle drives cos(inner/outer); inner = 55% of the outer
-                // cone. The shadow pass uses this same outer angle for its FOV.
-                const float outerCone = glm::clamp(light.coneAngle, 0.05f, 1.45f);
-                const float innerCone = outerCone * 0.55f;
-                data.spotLightParams[spotCount] = glm::vec4(
-                    std::cos(innerCone), std::cos(outerCone), 0.0f, 0.0f);
-                data.spotLightColor[spotCount] = glm::vec4(colorIntensity, 1.0f);
-                ++spotCount;
-            } else if (light.type == LightType::Area && areaCount < Rendering::kMaxAreaLights) {
-                data.areaLightPos[areaCount] = glm::vec4(position, 1.0f);
-                data.areaLightNormal[areaCount] = glm::vec4(dir, 1.0f);
-                // xy = authored emitter half-size (Transform scale), z = real
-                // attenuation range. Previously range was ignored completely
-                // for area lights despite being editable in the inspector.
-                data.areaLightHalf[areaCount] = glm::vec4(
-                    areaHalf.x, areaHalf.y, std::max(light.range, 0.01f), 0.0f);
-                data.areaLightColor[areaCount] = glm::vec4(colorIntensity, 1.0f);
-                ++areaCount;
-            } else if (pointCount < Rendering::kMaxPointLights) {
-                data.pointLightPos[pointCount] = glm::vec4(position, light.range);
-                data.pointLightColor[pointCount] = glm::vec4(colorIntensity, 1.0f);
-                ++pointCount;
+                // Shadow/GI/sky all consume the FIRST directional sun. The
+                // previous UBO writer kept overwriting this with later suns,
+                // so direct light could disagree with the first sun's shadow.
+                if (!hasDirectionalSun) {
+                    data.sunDirection = glm::vec4(dir, 1.0f);
+                    data.sunColor = glm::vec4(colorIntensity, 1.0f);
+                    hasDirectionalSun = true;
+                }
+            } else if (light.type == LightType::Spot) {
+                // Never reinterpret an overflow Spot as a Point. Capacity is
+                // a storage limit, not a type conversion.
+                if (spotCount < Rendering::kMaxSpotLights) {
+                    data.spotLightPos[spotCount] = glm::vec4(position, light.range);
+                    data.spotLightDir[spotCount] = glm::vec4(dir, 1.0f);
+                    // Real cone (agente 4 — B.3): the editable LightComponent
+                    // coneAngle drives cos(inner/outer); inner = 55% of the outer
+                    // cone. The shadow pass uses this same outer angle for its FOV.
+                    const float outerCone = glm::clamp(light.coneAngle, 0.05f, 1.45f);
+                    const float innerCone = outerCone * 0.55f;
+                    data.spotLightParams[spotCount] = glm::vec4(
+                        std::cos(innerCone), std::cos(outerCone), 0.0f, 0.0f);
+                    data.spotLightColor[spotCount] = glm::vec4(colorIntensity, 1.0f);
+                    ++spotCount;
+                }
+            } else if (light.type == LightType::Area) {
+                // Same rule for Area: exceeding kMaxAreaLights drops the
+                // excess light instead of silently turning it into a Point.
+                if (areaCount < Rendering::kMaxAreaLights) {
+                    data.areaLightPos[areaCount] = glm::vec4(position, 1.0f);
+                    data.areaLightNormal[areaCount] = glm::vec4(dir, 1.0f);
+                    // xy = authored emitter half-size (Transform scale), z = real
+                    // attenuation range. Previously range was ignored completely
+                    // for area lights despite being editable in the inspector.
+                    data.areaLightHalf[areaCount] = glm::vec4(
+                        areaHalf.x, areaHalf.y, std::max(light.range, 0.01f), 0.0f);
+                    data.areaLightColor[areaCount] = glm::vec4(colorIntensity, 1.0f);
+                    ++areaCount;
+                }
+            } else {
+                if (pointCount < Rendering::kMaxPointLights) {
+                    data.pointLightPos[pointCount] = glm::vec4(position, light.range);
+                    data.pointLightColor[pointCount] = glm::vec4(colorIntensity, 1.0f);
+                    ++pointCount;
+                }
             }
         }
     }
 
-    // The editor viewport has a procedural daytime sky even before a Sun
-    // entity exists. Give material-graph objects (notably spawned blocks) the
-    // same environment daylight instead of leaving them at the 0.22 ambient
-    // floor while the rest of the viewport visibly looks like noon. An
-    // authored directional Sun replaces this fallback and keeps real shadows.
-    if (!hasDirectionalSun) {
+    // Keep the procedural daylight fallback only for a scene with NO authored
+    // lights at all. Previously changing the sole sun to Point/Spot/Area
+    // silently injected a full-strength fake sun, so local-light edits looked
+    // identical to "no light" and could completely mask their contribution.
+    if (!hasDirectionalSun && !hasAnyAuthoredLight) {
         data.sunDirection = glm::vec4(0.0f, -1.0f, 0.0f, 1.0f);
         data.sunColor = glm::vec4(1.0f, 0.95f, 0.85f, 1.0f);
     }
@@ -3427,8 +3491,8 @@ void EditorApplication::init_scene_light_resources() {
     //   0: SceneLights UBO (LightUboData)
     //   1: sun shadow map        (sampler2DShadow)
     //   2: spot shadow atlas     (sampler2DShadow, 4 tiles)
-    //   3: point shadow atlas    (sampler2DShadow, 6 face tiles, linear depth)
-    //   4: EditorShadowUbo       (spot VPs, point slot-0, probe irradiance grid)
+    //   3: point shadow atlas    (sampler2DShadow, 6 projected-depth face tiles)
+    //   4: EditorShadowUbo       (spot VPs, point face VPs/index, probe irradiance grid)
     VkDescriptorSetLayoutBinding bindings[5]{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -3523,10 +3587,10 @@ void EditorApplication::init_scene_light_resources() {
 }
 
 void EditorApplication::refresh_shadow_descriptors() {
-    // Re-writes bindings 1-3 after the shadow targets were (re)created — a
-    // resize destroys and rebuilds the samplers/views, which would otherwise
-    // leave the scene light set pointing at dead objects.
-    if (m_sceneLightSet == VK_NULL_HANDLE) return;
+    // Re-writes every descriptor that references a shadow image after the
+    // targets were (re)created. A resize destroys and rebuilds samplers/views;
+    // updating only the basic viewport set used to leave cached block/material
+    // graph descriptor sets pointing at dead Vulkan objects.
     if (m_shadowMap.sampler == VK_NULL_HANDLE || m_spotShadow.sampler == VK_NULL_HANDLE ||
         m_pointShadow.sampler == VK_NULL_HANDLE) {
         return;
@@ -3536,15 +3600,39 @@ void EditorApplication::refresh_shadow_descriptors() {
         { m_spotShadow.sampler, m_spotShadow.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
         { m_pointShadow.sampler, m_pointShadow.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
     };
-    VkWriteDescriptorSet writes[3]{};
-    for (uint32_t i = 0; i < 3; ++i) {
-        writes[i].dstSet = m_sceneLightSet;
-        writes[i].dstBinding = 1 + i;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[i].pImageInfo = &infos[i];
+    if (m_sceneLightSet != VK_NULL_HANDLE) {
+        VkWriteDescriptorSet writes[3]{};
+        for (uint32_t i = 0; i < 3; ++i) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = m_sceneLightSet;
+            writes[i].dstBinding = 1 + i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i].pImageInfo = &infos[i];
+        }
+        vkUpdateDescriptorSets(m_device, 3, writes, 0, nullptr);
     }
-    vkUpdateDescriptorSets(m_device, 3, writes, 0, nullptr);
+
+    auto refreshGraphSet = [&](GraphMaterialPipeline& p) {
+        if (!p.valid || p.descriptorSet == VK_NULL_HANDLE) return;
+        VkWriteDescriptorSet writes[3]{};
+        const uint32_t bindings[3] = {
+            p.shadowSamplerBinding, p.spotShadowSamplerBinding, p.pointShadowSamplerBinding };
+        for (uint32_t i = 0; i < 3; ++i) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = p.descriptorSet;
+            writes[i].dstBinding = bindings[i];
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i].pImageInfo = &infos[i];
+        }
+        vkUpdateDescriptorSets(m_device, 3, writes, 0, nullptr);
+    };
+    for (auto& [id, p] : m_graphMaterialPipelines) { (void)id; refreshGraphSet(p); }
+    for (auto& [id, p] : m_blockGraphPipelines) { (void)id; refreshGraphSet(p); }
+    for (auto& [id, p] : m_skinGraphPipelines) { (void)id; refreshGraphSet(p); }
+    for (auto& [id, p] : m_videoGraphPipelines) { (void)id; refreshGraphSet(p); }
+    refreshGraphSet(m_liveGraphPipeline);
 }
 
 void EditorApplication::destroy_scene_light_resources() {
@@ -3595,9 +3683,13 @@ void EditorApplication::update_scene_light_ubo(const Scene* scene) {
         data.sunCascadeVP[c] = m_sunCascadeVP[c];
     }
     data.sunCascadeSplits = m_sunCascadeSplits;
-    const glm::mat4 view = m_editorCamera.get_view_matrix();
-    data.cameraForward = glm::vec4(
-        glm::normalize(glm::vec3(-view[2][0], -view[2][1], -view[2][2])), 0.0f);
+    // Cascade selection happens in world space:
+    //   viewDepth = dot(worldPos - cameraPosition, cameraForward)
+    // Use the camera's canonical world-space forward vector directly. Reading
+    // a row/column out of glm::lookAt is convention-sensitive (GLM is
+    // column-major) and previously produced the wrong direction for yaw/pitch,
+    // selecting the wrong sun-shadow cascade on material-graph geometry.
+    data.cameraForward = glm::vec4(glm::normalize(m_editorCamera.get_front()), 0.0f);
     fill_scene_light_entries(data, scene);
     void* mapped = nullptr;
     if (vkMapMemory(m_device, m_sceneLightMemory, 0, sizeof(data), 0, &mapped) != VK_SUCCESS) return;
@@ -3622,8 +3714,21 @@ void EditorApplication::write_light_ubo(GraphMaterialPipeline& p, const Scene* s
         data.sunCascadeVP[c] = m_sunCascadeVP[c];
     }
     data.sunCascadeSplits = m_sunCascadeSplits;
-    const glm::mat4 view = m_editorCamera.get_view_matrix();
-    data.cameraForward = glm::vec4(glm::normalize(glm::vec3(-view[2][0], -view[2][1], -view[2][2])), 0.0f);
+    // Must match update_scene_light_ubo(): material-graph cascade selection
+    // consumes the same canonical world-space editor camera direction.
+    data.cameraForward = glm::vec4(glm::normalize(m_editorCamera.get_front()), 0.0f);
+    // Material-graph local-shadow parity: copy the exact metadata already
+    // produced for editor_viewport.frag. The generated shader samples the same
+    // spot/point atlases, so blocks/skins/materials no longer ignore those
+    // shadows while basic meshes receive them.
+    for (uint32_t i = 0; i < Rendering::kMaxSpotLights; ++i) {
+        data.spotShadowVP[i] = m_shadowUboData.spotViewProj[i];
+    }
+    data.spotShadowEnabled = m_shadowUboData.spotEnabled;
+    for (uint32_t face = 0; face < 6; ++face) {
+        data.pointShadowVP[face] = m_shadowUboData.pointViewProj[face];
+    }
+    data.pointShadowParams = m_shadowUboData.pointParams;
     fill_scene_light_entries(data, scene);
     void* mapped = nullptr;
     if (vkMapMemory(m_device, p.lightMemory, 0, sizeof(data), 0, &mapped) != VK_SUCCESS) return;

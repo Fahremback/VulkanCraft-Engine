@@ -324,11 +324,24 @@ void VulkanEngineApp::showcase_gameplay_init() {
             std::string jsonError;
             if (engine::sdk::json_parse(content, root, jsonError) && root.is_object()) {
                 const engine::sdk::JsonValue* lights = root.field("lights");
+                // Accept both the historical {"lights":[...]} aggregate and
+                // the canonical author_light_asset flat document. The MCP
+                // authoring path writes the latter, so requiring only the
+                // array shape made a successfully authored asset a dead input.
+                std::vector<const engine::sdk::JsonValue*> authoredLights;
                 if (lights && lights->is_array()) {
+                    authoredLights.reserve(lights->array.size());
                     for (const auto& light : lights->array) {
-                        if (!light.is_object()) continue;
+                        if (light.is_object()) authoredLights.push_back(&light);
+                    }
+                } else if (root.field("type") != nullptr) {
+                    authoredLights.push_back(&root);
+                }
+                if (!authoredLights.empty()) {
+                    for (const auto* lightDoc : authoredLights) {
+                        const auto& light = *lightDoc;
                         const std::string name =
-                            engine::sdk::json_string(light, "name", "light");
+                            engine::sdk::json_string(light, "name", "");
                         const std::string type =
                             engine::sdk::json_string(light, "type", "point");
                         const std::vector<double> color =
@@ -354,23 +367,47 @@ void VulkanEngineApp::showcase_gameplay_init() {
                         else if (type == "area") lc.type = Engine::LightType::Area;
                         else lc.type = Engine::LightType::Point;
 
+                        const std::string resolvedName = !name.empty() ? name :
+                            (lc.type == Engine::LightType::Directional ? "Sun" :
+                             lc.type == Engine::LightType::Spot ? "Spot" :
+                             lc.type == Engine::LightType::Area ? "Area" : "Point");
+
                         // Apply into the loaded project scene: reuse the named
                         // entity when the scene already declares it (e.g. the
                         // scene's "Sun"), else create one.
                         Engine::Entity lightEntity;
                         for (const auto& [id, entity] : showcaseScene.get_entities()) {
                             (void)id;
-                            if (entity.get_name() == name) {
+                            if (entity.get_name() == resolvedName) {
                                 lightEntity = entity;
                                 break;
                             }
                         }
                         if (!lightEntity.is_valid()) {
-                            lightEntity = showcaseScene.create_entity(name);
+                            lightEntity = showcaseScene.create_entity(resolvedName);
                         }
                         showcaseScene.lightComponents[lightEntity.get_id()] = lc;
-                        showcaseScene.transformComponents[lightEntity.get_id()] =
-                            Engine::TransformComponent{};
+                        // Preserve an authored scene transform when reusing an
+                        // entity. The old loader reset every matched light to
+                        // identity, erasing the Sun/Spot direction from the
+                        // scene at the exact moment the config was consumed.
+                        auto [transformIt, inserted] = showcaseScene.transformComponents.try_emplace(
+                            lightEntity.get_id(), Engine::TransformComponent{});
+                        (void)inserted;
+                        const std::vector<double> position =
+                            engine::sdk::json_number_array(light, "position");
+                        const std::vector<double> rotation =
+                            engine::sdk::json_number_array(light, "rotation");
+                        if (position.size() >= 3) {
+                            transformIt->second.position = glm::vec3(
+                                static_cast<float>(position[0]), static_cast<float>(position[1]),
+                                static_cast<float>(position[2]));
+                        }
+                        if (rotation.size() >= 3) {
+                            transformIt->second.rotation = glm::vec3(
+                                static_cast<float>(rotation[0]), static_cast<float>(rotation[1]),
+                                static_cast<float>(rotation[2]));
+                        }
                         ++showcaseLightCount;
                     }
                     showcaseLightsAssetLoaded = true;

@@ -8,31 +8,31 @@ void applyForgeTheme() {
     ImGuiStyle& s = ImGui::GetStyle();
 
     // Geometry — roomier, modern spacing.
-    s.WindowPadding    = ImVec2(12, 12);
-    s.FramePadding     = ImVec2(10, 7);
-    s.CellPadding      = ImVec2(8, 6);
-    s.ItemSpacing      = ImVec2(8, 8);
-    s.ItemInnerSpacing = ImVec2(6, 5);
-    s.IndentSpacing    = 18.0f;
-    s.ScrollbarSize    = 11.0f;
-    s.GrabMinSize      = 9.0f;
+    s.WindowPadding    = ImVec2(14, 14);
+    s.FramePadding     = ImVec2(11, 7);
+    s.CellPadding      = ImVec2(10, 7);
+    s.ItemSpacing      = ImVec2(10, 9);
+    s.ItemInnerSpacing = ImVec2(7, 6);
+    s.IndentSpacing    = 20.0f;
+    s.ScrollbarSize    = 9.0f;
+    s.GrabMinSize      = 10.0f;
 
     // Rounded, modern corners.
-    s.WindowRounding    = 8.0f;
-    s.ChildRounding     = 8.0f;
-    s.FrameRounding     = 6.0f;
-    s.PopupRounding     = 8.0f;
+    s.WindowRounding    = 10.0f;
+    s.ChildRounding     = 10.0f;
+    s.FrameRounding     = 8.0f;
+    s.PopupRounding     = 10.0f;
     s.ScrollbarRounding = 12.0f;
-    s.GrabRounding      = 6.0f;
-    s.TabRounding       = 6.0f;
+    s.GrabRounding      = 8.0f;
+    s.TabRounding       = 7.0f;
     // Docked-window tab bars use the FittingPolicyMixed policy: tabs shrink to
     // TabMinWidthShrink before scrolling. FLT_MAX means "never shrink", so tab
     // titles keep their natural width and the bar scrolls horizontally instead
     // of squashing labels.
     s.TabMinWidthShrink = FLT_MAX;
 
-    s.WindowBorderSize  = 1.0f;
-    s.ChildBorderSize   = 1.0f;
+    s.WindowBorderSize  = 0.0f;
+    s.ChildBorderSize   = 0.0f;
     s.PopupBorderSize   = 1.0f;
     s.FrameBorderSize   = 0.0f;
     s.TabBorderSize     = 0.0f;
@@ -68,7 +68,7 @@ void applyForgeTheme() {
 
     c[ImGuiCol_Button]               = Colors::SurfaceAlt;
     c[ImGuiCol_ButtonHovered]        = Colors::AccentSoft;
-    c[ImGuiCol_ButtonActive]         = ImVec4(0.20f, 0.28f, 0.42f, 1.0f);
+    c[ImGuiCol_ButtonActive]         = Colors::Accent;
 
     c[ImGuiCol_Header]               = Colors::SurfaceAlt;
     c[ImGuiCol_HeaderHovered]        = Colors::AccentSoft;
@@ -93,9 +93,9 @@ void applyForgeTheme() {
     c[ImGuiCol_DockingEmptyBg]       = Colors::Background;
 
     c[ImGuiCol_ScrollbarBg]          = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.35f, 0.38f, 0.45f, 0.8f);
-    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.45f, 0.50f, 0.58f, 0.9f);
-    c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.52f, 0.57f, 0.66f, 1.0f);
+    c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.25f, 0.28f, 0.36f, 0.72f);
+    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.36f, 0.40f, 0.52f, 0.90f);
+    c[ImGuiCol_ScrollbarGrabActive]  = Colors::Accent;
 
     c[ImGuiCol_PlotLines]            = Colors::Accent;
     c[ImGuiCol_PlotLinesHovered]     = Colors::AccentHover;

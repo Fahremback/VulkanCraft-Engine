@@ -54,7 +54,7 @@ void VulkanGame::initPipelines(){
         // Descriptor set: binding 0 = material params UBO; the generated
         // shader's binding = LightParams UBO (lights from LightComponents);
         // then the shadow-map sampler.
-        VkDescriptorSetLayoutBinding bindings[3]{};
+        VkDescriptorSetLayoutBinding bindings[5]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[0].descriptorCount = 1;
@@ -67,9 +67,17 @@ void VulkanGame::initPipelines(){
         bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings[2].descriptorCount = 1;
         bindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        bindings[3].binding = gen.spotShadowSamplerBinding;
+        bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[3].descriptorCount = 1;
+        bindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        bindings[4].binding = gen.pointShadowSamplerBinding;
+        bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[4].descriptorCount = 1;
+        bindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         VkDescriptorSetLayoutCreateInfo dslInfo{};
         dslInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dslInfo.bindingCount = 3;
+        dslInfo.bindingCount = 5;
         dslInfo.pBindings = bindings;
         if (vkCreateDescriptorSetLayout(device, &dslInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
             throw std::runtime_error("failed to create descriptor set layout");
@@ -107,7 +115,7 @@ void VulkanGame::initPipelines(){
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         poolSizes[0].descriptorCount = 2;
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        poolSizes[1].descriptorCount = 1;
+        poolSizes[1].descriptorCount = 3;
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         poolInfo.maxSets = 1;
@@ -160,8 +168,17 @@ void VulkanGame::initPipelines(){
         shadowWrite.descriptorCount = 1;
         shadowWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         shadowWrite.pImageInfo = &shadowImageInfo;
-        VkWriteDescriptorSet writes[3] = { write, lightWrite, shadowWrite };
-        vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+        // The legacy VulkanGame path has no local-light shadow atlases. Bind
+        // its valid sun depth target to the two extra sampler descriptors; the
+        // appended LightUboData enable flags remain zero, so generated shaders
+        // never sample these fallbacks.
+        VkWriteDescriptorSet spotShadowWrite = shadowWrite;
+        spotShadowWrite.dstBinding = gen.spotShadowSamplerBinding;
+        VkWriteDescriptorSet pointShadowWrite = shadowWrite;
+        pointShadowWrite.dstBinding = gen.pointShadowSamplerBinding;
+        VkWriteDescriptorSet writes[5] = {
+            write, lightWrite, shadowWrite, spotShadowWrite, pointShadowWrite };
+        vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
 
         // Graphics pipeline.
         VkPipelineShaderStageCreateInfo stages[2]{};
@@ -1510,9 +1527,11 @@ void VulkanGame::writeLightUbo(const glm::vec3& camPos){
         data.sunCascadeSplits = sunCascadeSplits;
         data.cameraForward = glm::vec4(cameraFront(), 0.0f);
         uint32_t pointCount = 0, spotCount = 0, areaCount = 0;
+        bool hasDirectionalSun = false;
         for (const auto& [id, light] : scene.lightComponents) {
             glm::vec3 dir(0.0f, -1.0f, 0.0f);
             glm::vec3 position(0.0f);
+            glm::vec2 areaHalf(2.0f, 1.0f);
             const auto tit = scene.transformComponents.find(id);
             if (tit != scene.transformComponents.end()) {
                 position = tit->second.position;
@@ -1521,28 +1540,49 @@ void VulkanGame::writeLightUbo(const glm::vec3& camPos){
                 dir = glm::normalize(glm::vec3(
                     std::cos(pitch) * std::sin(yaw), std::sin(pitch),
                     std::cos(pitch) * std::cos(yaw)));
+                areaHalf.x *= std::max(std::abs(tit->second.scale.x), 0.01f);
+                areaHalf.y *= std::max(std::abs(tit->second.scale.y), 0.01f);
             }
-            const glm::vec3 colorIntensity = light.color * light.intensity;
+            // Same lux-like authoring contract as the editor: 10000 is the
+            // reference full-strength sun. Feeding raw values (1000..10000)
+            // into the material shader saturated every lit surface.
+            const glm::vec3 colorIntensity = light.color * (light.intensity / 10000.0f);
             if (is_directional_sun(light)) {
-                data.sunDirection = glm::vec4(dir, 1.0f);
-                data.sunColor = glm::vec4(colorIntensity, 1.0f);
-            } else if (light.type == LightType::Spot && spotCount < Rendering::kMaxSpotLights) {
-                data.spotLightPos[spotCount] = glm::vec4(position, light.range);
-                data.spotLightDir[spotCount] = glm::vec4(dir, 1.0f);
-                data.spotLightParams[spotCount] = glm::vec4(
-                    std::cos(glm::radians(25.0f)), std::cos(glm::radians(45.0f)), 0.0f, 0.0f);
-                data.spotLightColor[spotCount] = glm::vec4(colorIntensity, 1.0f);
-                ++spotCount;
-            } else if (light.type == LightType::Area && areaCount < Rendering::kMaxAreaLights) {
-                data.areaLightPos[areaCount] = glm::vec4(position, 1.0f);
-                data.areaLightNormal[areaCount] = glm::vec4(dir, 1.0f);
-                data.areaLightHalf[areaCount] = glm::vec4(2.0f, 1.0f, 0.0f, 0.0f);
-                data.areaLightColor[areaCount] = glm::vec4(colorIntensity, 1.0f);
-                ++areaCount;
-            } else if (pointCount < Rendering::kMaxPointLights) {
-                data.pointLightPos[pointCount] = glm::vec4(position, light.range);
-                data.pointLightColor[pointCount] = glm::vec4(colorIntensity, 1.0f);
-                ++pointCount;
+                // updateSunShadow(), volumetrics and the editor all use the
+                // first directional sun. Keep direct-light color/direction on
+                // that same entity when scenes contain accidental duplicates.
+                if (!hasDirectionalSun) {
+                    data.sunDirection = glm::vec4(dir, 1.0f);
+                    data.sunColor = glm::vec4(colorIntensity, 1.0f);
+                    hasDirectionalSun = true;
+                }
+            } else if (light.type == LightType::Spot) {
+                if (spotCount < Rendering::kMaxSpotLights) {
+                    data.spotLightPos[spotCount] = glm::vec4(position, light.range);
+                    data.spotLightDir[spotCount] = glm::vec4(dir, 1.0f);
+                    const float outerCone = glm::clamp(light.coneAngle, 0.05f, 1.45f);
+                    const float innerCone = outerCone * 0.55f;
+                    data.spotLightParams[spotCount] = glm::vec4(
+                        std::cos(innerCone), std::cos(outerCone), 0.0f, 0.0f);
+                    data.spotLightColor[spotCount] = glm::vec4(colorIntensity, 1.0f);
+                    ++spotCount;
+                }
+            } else if (light.type == LightType::Area) {
+                if (areaCount < Rendering::kMaxAreaLights) {
+                    data.areaLightPos[areaCount] = glm::vec4(position, 1.0f);
+                    data.areaLightNormal[areaCount] = glm::vec4(dir, 1.0f);
+                    data.areaLightHalf[areaCount] = glm::vec4(
+                        areaHalf.x, areaHalf.y, std::max(light.range, 0.01f), 0.0f);
+                    data.areaLightColor[areaCount] = glm::vec4(colorIntensity, 1.0f);
+                    ++areaCount;
+                }
+            } else {
+                // Capacity overflow never changes the authored light type.
+                if (pointCount < Rendering::kMaxPointLights) {
+                    data.pointLightPos[pointCount] = glm::vec4(position, light.range);
+                    data.pointLightColor[pointCount] = glm::vec4(colorIntensity, 1.0f);
+                    ++pointCount;
+                }
             }
         }
         if (!lightStatusLogged) {

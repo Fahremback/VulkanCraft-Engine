@@ -292,9 +292,22 @@ void EditorApplication::load_settings() {
     // settings: the Forge light design system is the base theme, and the
     // Theme Editor panel tunes the live style during the session (applied
     // here via set_theme, so a saved theme survives a restart).
-    const glm::vec3 bg = findVec("themeBg");
-    const glm::vec3 panel = findVec("themePanel");
+    glm::vec3 bg = findVec("themeBg");
+    glm::vec3 panel = findVec("themePanel");
     if (bg.x >= 0.0f && panel.x >= 0.0f) {
+        // One-time migration of the old Wicked charcoal defaults. They were
+        // persisted as if they were user customization, so merely changing the
+        // new defaults would leave existing installations with the blocky grey
+        // palette forever. Only migrate the exact legacy pair; real custom
+        // themes remain untouched.
+        const auto near3 = [](const glm::vec3& a, const glm::vec3& b) {
+            return glm::all(glm::lessThan(glm::abs(a - b), glm::vec3(0.001f)));
+        };
+        if (near3(bg, glm::vec3(0.10f, 0.11f, 0.14f)) &&
+            near3(panel, glm::vec3(0.20f, 0.20f, 0.20f))) {
+            bg = glm::vec3(0.045f, 0.052f, 0.068f);
+            panel = glm::vec3(0.068f, 0.078f, 0.102f);
+        }
         m_wickedTools.set_theme(bg, panel);
     }
     std::cout << "[Editor] Configurações carregadas: " << m_settingsPath << std::endl;

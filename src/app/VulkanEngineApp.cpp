@@ -111,6 +111,28 @@ namespace {
 using Engine::Rendering::RenderResourceState;
 using Engine::Rendering::RenderAccess;
 
+glm::vec3 authored_local_light_direction(const Engine::TransformComponent& t) {
+    const float yaw = glm::radians(t.rotation.y);
+    const float pitch = glm::radians(t.rotation.x);
+    return glm::normalize(glm::vec3(
+        std::cos(pitch) * std::sin(yaw), std::sin(pitch),
+        std::cos(pitch) * std::cos(yaw)));
+}
+
+// Canonical world renderer uses surface->sun while LightComponent authoring
+// uses the light's forward ray (sun->scene). Match the editor convention:
+// a positioned sun looks back at the world origin; identity at the origin is
+// a useful noon default rather than a horizontal +Z ray.
+glm::vec3 authored_sun_surface_direction(const Engine::TransformComponent& t) {
+    glm::vec3 lightToScene(0.0f, -1.0f, 0.0f);
+    if (glm::length(t.position) > 1.0e-3f) {
+        lightToScene = glm::normalize(-t.position);
+    } else if (std::abs(t.rotation.x) > 1.0e-4f || std::abs(t.rotation.y) > 1.0e-4f) {
+        lightToScene = authored_local_light_direction(t);
+    }
+    return glm::normalize(-lightToScene);
+}
+
 VkPipelineStageFlags2 graph_src_stage(RenderResourceState state) noexcept {
     switch (state) {
     case RenderResourceState::ShaderRead: return VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
@@ -5535,6 +5557,26 @@ void VulkanEngineApp::draw() {
     const glm::vec3 daylightColor = glm::mix(glm::vec3(1.34f, 0.48f, 0.16f), glm::vec3(1.18f, 1.10f, 0.94f), 1.0f - horizonWarmth);
     currentLightColor = glm::mix(glm::vec3(0.12f, 0.18f, 0.34f), daylightColor, currentDaylight);
     currentExposure = glm::mix(1.32f, 0.86f, currentDaylight);
+
+    // Data-driven showcase directional light overrides the synthetic clock
+    // sun when present. Previously showcase_lights.json populated a real
+    // LightComponent tree that the canonical renderer never read, so changing
+    // that asset had no visible effect. Keep the world-space convention used
+    // by voxel/GI/shadow passes: currentSunDirection points surface -> sun.
+    if (showcaseLightsAssetLoaded) {
+        for (const auto& [id, light] : showcaseScene.lightComponents) {
+            if (light.type != Engine::LightType::Directional) continue;
+            Engine::TransformComponent transform{};
+            const auto tit = showcaseScene.transformComponents.find(id);
+            if (tit != showcaseScene.transformComponents.end()) transform = tit->second;
+            currentSunDirection = authored_sun_surface_direction(transform);
+            currentDaylight = smoothUnit((currentSunDirection.y + 0.10f) / 0.24f);
+            const float authoredStrength = std::clamp(light.intensity / 10000.0f, 0.0f, 16.0f);
+            currentLightColor = light.color * authoredStrength;
+            currentExposure = glm::mix(1.32f, 0.86f, currentDaylight);
+            break;
+        }
+    }
     refresh_gpu_features();
 
     // AGENT-1 B.1/B.2: the immutable per-frame render snapshot — built ONCE
@@ -6570,46 +6612,94 @@ void VulkanEngineApp::draw() {
     const float worldFogDensity = std::min(0.0016f, 1.5f / farPlane);
     pushData.environment = glm::vec4(worldVisualTime, currentDaylight, worldFogDensity, currentExposure);
 
-    // L45 (reabertura): luzes point/spot REAIS do jogo alimentando o pipeline
-    // voxel. Point0 = tocha do jogador (canônica do avatar); Point1 = bloco
-    // emissivo real mais próximo (runtime_block_table -> lightEmission > 0);
-    // Spot0 = lanterna do jogador pelo camera.front (cone real). O voxel.frag
-    // acumula essas luzes no BRDF junto do sol.
+    // L45 (reabertura): local lights feeding the real voxel BRDF. Authored
+    // showcase LightComponents have priority; gameplay lights only fill empty
+    // slots. This makes showcase_lights.json a renderer input instead of a
+    // scene-only observable. The compact push contract has 2 point + 1 spot;
+    // authored Area lights use a point approximation when a point slot exists.
     {
-        pushData.pointLightPos[0] = glm::vec4(player.position.x, player.position.y + 1.55f,
-                                              player.position.z, 8.0f);
-        pushData.pointLightColor[0] = glm::vec4(1.0f, 0.70f, 0.40f, 1.0f);
-        const auto runtimeTable = world.runtime_block_table();
-        const glm::ivec3 pc(static_cast<int>(std::floor(player.position.x)),
-                            static_cast<int>(std::floor(player.position.y)),
-                            static_cast<int>(std::floor(player.position.z)));
-        constexpr int kScan = 5;
-        float bestDist = 1e9f;
-        bool found = false;
-        for (int dy = -kScan; dy <= kScan && !found; ++dy)
-            for (int dz = -kScan; dz <= kScan && !found; ++dz)
-                for (int dx = -kScan; dx <= kScan && !found; ++dx) {
-                    const glm::ivec3 c(pc.x + dx, pc.y + dy, pc.z + dz);
-                    const RuntimeBlockId cell = world.get_block_at(glm::vec3(c));
-                    // runtime_table() é um vector<pair>; busca linear pelo bloco.
-                    const auto it = std::find_if(runtimeTable.begin(), runtimeTable.end(),
-                                                 [cell](const auto& e) { return e.first == cell; });
-                    if (it == runtimeTable.end() || it->second.lightEmission == 0u) continue;
-                    const float dist = glm::length(glm::vec3(c) + 0.5f - player.position);
-                    if (dist < bestDist) {
-                        bestDist = dist;
-                        pushData.pointLightPos[1] = glm::vec4(
-                            glm::vec3(c) + 0.5f, std::min(10.0f, 3.0f + dist * 0.6f));
-                        pushData.pointLightColor[1] = glm::vec4(1.0f, 0.65f, 0.30f, 1.0f);
-                        found = true;
-                    }
+        uint32_t pointSlot = 0u;
+        bool spotAuthored = false;
+        if (showcaseLightsAssetLoaded) {
+            for (const auto& [id, light] : showcaseScene.lightComponents) {
+                if (light.type == Engine::LightType::Directional) continue;
+                Engine::TransformComponent transform{};
+                const auto tit = showcaseScene.transformComponents.find(id);
+                if (tit != showcaseScene.transformComponents.end()) transform = tit->second;
+                const float strength = std::clamp(light.intensity / 1000.0f, 0.0f, 16.0f);
+                const glm::vec3 color = light.color * strength;
+                if (light.type == Engine::LightType::Spot && !spotAuthored) {
+                    const float outer = glm::clamp(light.coneAngle, 0.05f, 1.45f);
+                    const float inner = outer * 0.55f;
+                    pushData.spotLightPos = glm::vec4(transform.position, std::max(light.range, 0.01f));
+                    pushData.spotLightDir = glm::vec4(authored_local_light_direction(transform), 1.0f);
+                    pushData.spotLightParam = glm::vec4(std::cos(inner), std::cos(outer), 0.0f, 0.0f);
+                    pushData.spotLightColor = glm::vec4(color, 1.0f);
+                    spotAuthored = true;
+                } else if ((light.type == Engine::LightType::Point || light.type == Engine::LightType::Area) &&
+                           pointSlot < 2u) {
+                    pushData.pointLightPos[pointSlot] =
+                        glm::vec4(transform.position, std::max(light.range, 0.01f));
+                    pushData.pointLightColor[pointSlot] = glm::vec4(color, 1.0f);
+                    ++pointSlot;
                 }
-        if (!found) pushData.pointLightColor[1].w = 0.0f;
-        pushData.spotLightPos = glm::vec4(player.camera.position, 16.0f);
-        pushData.spotLightDir = glm::vec4(player.camera.front, 1.0f);
-        pushData.spotLightParam = glm::vec4(std::cos(glm::radians(12.0f)),
-                                            std::cos(glm::radians(24.0f)), 0.0f, 0.0f);
-        pushData.spotLightColor = glm::vec4(0.95f, 0.88f, 0.72f, 1.0f);
+            }
+        }
+
+        // Gameplay/player lamp fills the first point slot still available.
+        if (pointSlot < 2u) {
+            pushData.pointLightPos[pointSlot] = glm::vec4(
+                player.position.x, player.position.y + 1.55f, player.position.z, 8.0f);
+            pushData.pointLightColor[pointSlot] = glm::vec4(1.0f, 0.70f, 0.40f, 1.0f);
+            ++pointSlot;
+        }
+
+        // Fill the remaining slot with the ACTUAL nearest emissive voxel. The
+        // old loop stopped on the first scan-order match despite tracking a
+        // best distance, so it could select a farther light source.
+        if (pointSlot < 2u) {
+            const auto runtimeTable = world.runtime_block_table();
+            const glm::ivec3 pc(static_cast<int>(std::floor(player.position.x)),
+                                static_cast<int>(std::floor(player.position.y)),
+                                static_cast<int>(std::floor(player.position.z)));
+            constexpr int kScan = 5;
+            float bestDist = 1e9f;
+            glm::ivec3 bestCell(0);
+            bool found = false;
+            for (int dy = -kScan; dy <= kScan; ++dy)
+                for (int dz = -kScan; dz <= kScan; ++dz)
+                    for (int dx = -kScan; dx <= kScan; ++dx) {
+                        const glm::ivec3 c(pc.x + dx, pc.y + dy, pc.z + dz);
+                        const RuntimeBlockId cell = world.get_block_at(glm::vec3(c));
+                        const auto it = std::find_if(runtimeTable.begin(), runtimeTable.end(),
+                                                     [cell](const auto& e) { return e.first == cell; });
+                        if (it == runtimeTable.end() || it->second.lightEmission == 0u) continue;
+                        const float dist = glm::length(glm::vec3(c) + 0.5f - player.position);
+                        if (dist < bestDist) {
+                            bestDist = dist;
+                            bestCell = c;
+                            found = true;
+                        }
+                    }
+            if (found) {
+                pushData.pointLightPos[pointSlot] = glm::vec4(
+                    glm::vec3(bestCell) + 0.5f, std::min(10.0f, 3.0f + bestDist * 0.6f));
+                pushData.pointLightColor[pointSlot] = glm::vec4(1.0f, 0.65f, 0.30f, 1.0f);
+                ++pointSlot;
+            }
+        }
+        while (pointSlot < 2u) {
+            pushData.pointLightColor[pointSlot].w = 0.0f;
+            ++pointSlot;
+        }
+
+        if (!spotAuthored) {
+            pushData.spotLightPos = glm::vec4(player.camera.position, 16.0f);
+            pushData.spotLightDir = glm::vec4(player.camera.front, 1.0f);
+            pushData.spotLightParam = glm::vec4(std::cos(glm::radians(12.0f)),
+                                                std::cos(glm::radians(24.0f)), 0.0f, 0.0f);
+            pushData.spotLightColor = glm::vec4(0.95f, 0.88f, 0.72f, 1.0f);
+        }
     }
 
     // Push constants are command-buffer state, not pipeline-owned state. Entity

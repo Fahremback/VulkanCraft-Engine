@@ -356,11 +356,21 @@ void EditorApplication::init_imgui() {
     io.IniFilename = "imgui.ini";
     io.FontGlobalScale = 1.0f; // Forge design system: roomy, not oversized
 
-    // Frontend port (Wicked Editor, MIT): the base UI font is Liberation Sans
-    // (the same font the Wicked editor ships, embedded zstd-compressed here),
-    // decompressed through the public compression provider. Static storage
-    // keeps the TTF alive for the atlas; the atlas must NOT take ownership.
+    // Prefer the platform UI typeface on Windows. Liberation Sans is a solid
+    // portable fallback, but its metrics make the editor look like an older
+    // desktop application. Segoe UI gives the native Windows build the same
+    // typography users see in current development tools while keeping the
+    // embedded font for portable builds.
     {
+        bool loadedPlatformFont = false;
+#ifdef _WIN32
+        constexpr const char* kSegoeUi = "C:/Windows/Fonts/segoeui.ttf";
+        if (std::filesystem::exists(kSegoeUi)) {
+            loadedPlatformFont = io.Fonts->AddFontFromFileTTF(
+                kSegoeUi, 16.0f, nullptr, io.Fonts->GetGlyphRangesDefault()) != nullptr;
+        }
+#endif
+        if (!loadedPlatformFont) {
         auto provider = ::engine::compression::create_zstd_compression_provider();
         std::string uiFontData = provider->decompress(std::string(
             reinterpret_cast<const char*>(liberation_sans_zstd), sizeof(liberation_sans_zstd)));
@@ -369,10 +379,11 @@ void EditorApplication::init_imgui() {
             ImFontConfig baseConfig{};
             baseConfig.FontDataOwnedByAtlas = false;
             io.Fonts->AddFontFromMemoryTTF(const_cast<char*>(s_uiFont.data()),
-                                           static_cast<int>(s_uiFont.size()), 15.0f,
+                                           static_cast<int>(s_uiFont.size()), 16.0f,
                                            &baseConfig, io.Fonts->GetGlyphRangesDefault());
         } else {
             io.Fonts->AddFontDefault();
+        }
         }
     }
     // Merge the Font Awesome 6 Solid icon font into the base font so ICON_FA_*
@@ -384,7 +395,7 @@ void EditorApplication::init_imgui() {
     iconConfig.GlyphOffset = ImVec2(0.0f, 1.0f);
     iconConfig.FontDataOwnedByAtlas = false;
     io.Fonts->AddFontFromMemoryTTF(const_cast<uint8_t*>(font_awesome_v6),
-                                   static_cast<int>(sizeof(font_awesome_v6)), 15.0f,
+                                   static_cast<int>(sizeof(font_awesome_v6)), 16.0f,
                                    &iconConfig, s_iconRanges);
 
     // Forge design system (light, product-grade). WindowMinSize (no panel can

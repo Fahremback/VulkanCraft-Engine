@@ -6773,6 +6773,10 @@ if(VC_NODE_EXECUTABLE)
         COMMAND "${VC_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/EditorViewportRegressionTests.mjs")
     set_tests_properties(editor_viewport_regression_tests PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME editor_project_transition_tests
+        COMMAND "${VC_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/EditorProjectTransitionTests.mjs")
+    set_tests_properties(editor_project_transition_tests PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     # Pipeline parity (A1-14/84/102): game and editor must route material-graph
     # PBR through the SAME shared compiler contract (Rendering::compile_glsl_to_spirv),
     # never through a private duplicated std::system("glslc") path. Fails (exit 1)

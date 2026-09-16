@@ -56,8 +56,9 @@ layout (set = 0, binding = 0) uniform SceneLights {
 layout (set = 0, binding = 4) uniform EditorShadow {
     mat4 spotViewProj[4];             // tile i projection (depth remapped to [0,1])
     vec4 spotEnabled;                 // per-slot 0/1
+    mat4 pointViewProj[6];            // +X,-X,+Y,-Y,+Z,-Z face projections
     vec4 pointLight;                  // xyz = light position, w = range
-    vec4 pointParams;                 // x = enabled, y = near, z = far, w = unused
+    vec4 pointParams;                 // x=enabled, y=1/faceSize, z=range, w=LightUbo point slot
     vec4 probeOrigin;                 // xyz = window min CELL index, w = cellSize
     vec4 probeParams;                 // x = resolution, y = enabled
     vec4 probeIrradiance[512];        // rgb = irradiance, wrapped cell lookup
@@ -75,21 +76,76 @@ layout(push_constant) uniform Push {
 } push;
 
 // ---------------------------------------------------------------------------
-// Sun shadow: single map, 3x3 PCF. Outside the frustum → fully lit.
+// Sun shadow: cascaded 2x2 atlas, 3x3 PCF. Outside the selected cascade is
+// fully lit. Sampling is clamped to the selected tile so PCF never leaks into
+// a neighboring cascade at an atlas seam.
 // ---------------------------------------------------------------------------
-float sun_shadow(vec3 worldPos, float ndl) {
-    if (lights.shadowParams.x < 0.5) return 1.0;
-    vec4 sc = lights.sunViewProj * vec4(worldPos, 1.0);
-    vec3 suv = sc.xyz / max(abs(sc.w), 1e-5);
-    if (any(lessThan(suv.xy, vec2(0.002))) || any(greaterThan(suv.xy, vec2(0.998)))) return 1.0;
-    if (suv.z <= 0.0 || suv.z >= 1.0) return 1.0;
-    float bias = max(lights.shadowParams.y * 4.0 * (1.0 - ndl), 0.0004);
+float sample_sun_cascade(int c, vec3 worldPos, float bias) {
+    vec4 sc = lights.sunCascadeVP[c] * vec4(worldPos, 1.0);
+    vec3 proj = sc.xyz / max(abs(sc.w), 1e-5);
+    if (proj.z <= 0.0 || proj.z >= 1.0) return 1.0;
+    vec2 tileUV = proj.xy * 0.5 + 0.5;
+    if (any(lessThan(tileUV, vec2(0.001))) || any(greaterThan(tileUV, vec2(0.999)))) return 1.0;
+    vec2 tileOff = vec2(float(c % 2), float(c / 2)) * 0.5;
+    vec2 uv = tileUV * 0.5 + tileOff;
+    vec2 tileMin = tileOff;
+    vec2 tileMax = tileOff + vec2(0.5);
     float texel = max(lights.shadowParams.w, 1e-5);
     float s = 0.0;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
-            s += texture(sunShadowMap, vec3(suv.xy + vec2(float(x), float(y)) * texel,
-                                            suv.z - bias));
+            vec2 tap = uv + vec2(float(x), float(y)) * texel;
+            tap = clamp(tap, tileMin + vec2(texel), tileMax - vec2(texel));
+            s += texture(sunShadowMap, vec3(tap, proj.z - bias));
+        }
+    }
+    return s / 9.0;
+}
+
+float sun_shadow(vec3 worldPos, float ndl) {
+    if (lights.shadowParams.x < 0.5) return 1.0;
+    const float minBias = 0.00025;
+    float bias = max(lights.shadowParams.y * 2.0 * (1.0 - ndl), minBias);
+    bool cascaded = lights.shadowParams.z > 1.5;
+    if (cascaded) {
+        float viewDepth = dot(worldPos - lights.cameraPosition.xyz, lights.cameraForward.xyz);
+        int c = 3;
+        if (viewDepth < lights.sunCascadeSplits.x) c = 0;
+        else if (viewDepth < lights.sunCascadeSplits.y) c = 1;
+        else if (viewDepth < lights.sunCascadeSplits.z) c = 2;
+
+        float s = sample_sun_cascade(c, worldPos, bias);
+        // Cross-fade the final 8% of each cascade into the next one.  A hard
+        // cascade switch makes an otherwise stable edge flash when camera
+        // rotation moves a receiver across a split plane.
+        if (c < 3) {
+            float split = c == 0 ? lights.sunCascadeSplits.x
+                                 : (c == 1 ? lights.sunCascadeSplits.y : lights.sunCascadeSplits.z);
+            float prev = c == 0 ? 0.0
+                                : (c == 1 ? lights.sunCascadeSplits.x : lights.sunCascadeSplits.y);
+            float blendWidth = max((split - prev) * 0.08, 0.35);
+            float blend = smoothstep(split - blendWidth, split, viewDepth);
+            if (blend > 0.0) {
+                float nextShadow = sample_sun_cascade(c + 1, worldPos, bias);
+                s = mix(s, nextShadow, blend);
+            }
+        }
+        return s;
+    }
+
+    // Legacy single-map fallback: sunViewProj already maps XY into [0,1].
+    vec4 sc = lights.sunViewProj * vec4(worldPos, 1.0);
+    vec3 proj = sc.xyz / max(abs(sc.w), 1e-5);
+    if (proj.z <= 0.0 || proj.z >= 1.0) return 1.0;
+    vec2 uv = proj.xy;
+    if (any(lessThan(uv, vec2(0.002))) || any(greaterThan(uv, vec2(0.998)))) return 1.0;
+    float texel = max(lights.shadowParams.w, 1e-5);
+    float s = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec2 tap = clamp(uv + vec2(float(x), float(y)) * texel,
+                             vec2(texel), vec2(1.0 - texel));
+            s += texture(sunShadowMap, vec3(tap, proj.z - bias));
         }
     }
     return s / 9.0;
@@ -113,11 +169,13 @@ float spot_shadow(int i, vec3 worldPos, float ndl) {
 }
 
 // ---------------------------------------------------------------------------
-// Point shadow (slot 0): 6-tile atlas, LINEAR depth = distance/range written
-// by the shadow fragment (gl_FragDepth). Face selection + basis mirror
-// editor_face_basis in EditorApplicationVulkan.cpp EXACTLY.
+// Point shadow: the sole atlas can belong to ANY visible point-light slot.
+// Render and sampling share the exact six pointViewProj matrices, so depth and
+// face orientation cannot diverge. pointParams.w identifies the matching
+// SceneLights point slot; a non-shadowing earlier light no longer blocks a
+// later castShadows=true point light.
 // ---------------------------------------------------------------------------
-float point_shadow(vec3 worldPos) {
+float point_shadow(vec3 worldPos, float ndl) {
     if (shadow.pointParams.x < 0.5) return 1.0;
     vec3 d = worldPos - shadow.pointLight.xyz;
     float dist = length(d);
@@ -125,25 +183,25 @@ float point_shadow(vec3 worldPos) {
     if (dist >= range || dist < 1e-4) return 1.0;
     vec3 ad = abs(d);
     int face;
-    vec3 fd;
     if (ad.x >= ad.y && ad.x >= ad.z) {
         face = d.x > 0.0 ? 0 : 1;
-        fd = vec3(d.x > 0.0 ? 1.0 : -1.0, 0.0, 0.0);
     } else if (ad.y >= ad.z) {
         face = d.y > 0.0 ? 2 : 3;
-        fd = vec3(0.0, d.y > 0.0 ? 1.0 : -1.0, 0.0);
     } else {
         face = d.z > 0.0 ? 4 : 5;
-        fd = vec3(0.0, 0.0, d.z > 0.0 ? 1.0 : -1.0);
     }
-    vec3 upPref = abs(fd.y) > 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
-    vec3 right = normalize(cross(fd, upPref));
-    vec3 up = cross(right, fd);
-    vec2 ndc = vec2(dot(d, right), dot(d, up)) / max(dot(d, fd), 1e-5);
-    vec2 tileUV = clamp(ndc * 0.5 + 0.5, vec2(0.0), vec2(1.0));
+    vec4 sc = shadow.pointViewProj[face] * vec4(worldPos, 1.0);
+    if (sc.w <= 0.0) return 1.0;
+    vec3 suv = sc.xyz / sc.w;
+    if (suv.z < 0.0 || suv.z > 1.0) return 1.0;
+    vec2 tileUV = suv.xy * 0.5 + 0.5;
+    // Keep bilinear comparison taps inside this face; otherwise the atlas
+    // seam blends depth from the neighboring cubemap face.
+    float inset = max(shadow.pointParams.y * 0.5, 0.00001);
+    tileUV = clamp(tileUV, vec2(inset), vec2(1.0 - inset));
     vec2 uv = vec2((float(face) + tileUV.x) / 6.0, tileUV.y);
-    float ref = clamp((dist - 0.05) / range, 0.0, 1.0);
-    return texture(pointShadowAtlas, vec3(uv, ref));
+    float bias = max(0.0015 * (1.0 - ndl), 0.0006);
+    return texture(pointShadowAtlas, vec3(uv, clamp(suv.z - bias, 0.0, 1.0)));
 }
 
 // ---------------------------------------------------------------------------
@@ -202,8 +260,9 @@ void main() {
         lightAccum += max(dot(n, L), 0.0) * vec3(0.18, 0.18, 0.17);
     }
 
-    // Point lights (position + range, color * intensity). The point shadow
-    // atlas covers slot 0 only — the same light the shadow pass records.
+    // Point lights (position + range, color * intensity). One visible point
+    // light may own the point-shadow atlas; pointParams.w tells which slot.
+    int shadowPointIndex = int(shadow.pointParams.w + 0.5);
     for (int i = 0; i < 8; ++i) {
         if (lights.pointLightColor[i].w <= 0.5) continue;
         vec3 toLight = lights.pointLightPos[i].xyz - fragWorldPos;
@@ -212,7 +271,8 @@ void main() {
         float att = clamp(1.0 - dist / range, 0.0, 1.0);
         att *= att;
         float ndl = max(dot(n, toLight / max(dist, 0.0001)), 0.0);
-        float sh = (i == 0) ? point_shadow(fragWorldPos) : 1.0;
+        float sh = (shadow.pointParams.x > 0.5 && i == shadowPointIndex)
+            ? point_shadow(fragWorldPos, ndl) : 1.0;
         lightAccum += ndl * att * sh * lights.pointLightColor[i].rgb;
     }
 

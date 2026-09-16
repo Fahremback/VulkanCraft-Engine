@@ -665,6 +665,31 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         } else {
             m_controlResult = "reimport: asset not found";
         }
+    } else if (cmd.rfind("screenshot-ui", 0) == 0) {
+        // Full editor frame (swapchain snapshot), not only the offscreen
+        // viewport. This must be checked before the "screenshot" prefix or the
+        // command is misparsed as a viewport path beginning with "-ui".
+        std::string path = (cmd.size() > 13) ? cmd.substr(13) : std::string();
+        while (!path.empty() && path.front() == ' ') path.erase(path.begin());
+        if (path.empty()) {
+            const auto shots = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / "screenshots";
+            std::error_code ec;
+            std::filesystem::create_directories(shots, ec);
+            const std::string stamp = std::to_string(static_cast<long long>(std::time(nullptr)));
+            path = (shots / ("ui_" + stamp + ".png")).string();
+        } else {
+            std::filesystem::path p(path);
+            if (p.is_relative()) p = std::filesystem::path(VULKANCRAFT_SOURCE_DIR) / p;
+            path = p.string();
+        }
+        const std::string err = capture_ui_screenshot(path);
+        if (!err.empty()) {
+            m_controlResult = err;
+            std::cout << "[ControlApi] screenshot-ui FAILED: " << err << std::endl;
+        } else {
+            m_controlData = path;
+            std::cout << "[ControlApi] screenshot-ui saved: " << path << std::endl;
+        }
     } else if (cmd.rfind("screenshot", 0) == 0) {
         // Save the current viewport to a PNG so an agent can SEE the result.
         // The path is absolute or relative to the engine root. Returns the

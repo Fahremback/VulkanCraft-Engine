@@ -1204,10 +1204,13 @@ void WickedToolsPanel::apply_theme_to_style() {
     style.Colors[ImGuiCol_ChildBg] = ImVec4(m_themePanel.r, m_themePanel.g, m_themePanel.b, 1.0f);
     style.Colors[ImGuiCol_PopupBg] = ImVec4(m_themePanel.r, m_themePanel.g, m_themePanel.b, 1.0f);
     style.Colors[ImGuiCol_MenuBarBg] = ImVec4(m_themePanel.r, m_themePanel.g, m_themePanel.b, 1.0f);
-    // Derive the frame/button tones from the panel color (slightly lighter).
-    const float lift = 0.08f;
-    style.Colors[ImGuiCol_FrameBg] = ImVec4(m_themePanel.r + lift, m_themePanel.g + lift, m_themePanel.b + lift, 1.0f);
-    style.Colors[ImGuiCol_Button] = ImVec4(m_themePanel.r + lift, m_themePanel.g + lift, m_themePanel.b + lift, 1.0f);
+    // Keep custom themes compatible with the Forge hierarchy: controls are a
+    // subtle layer above the panel, not Windows-style raised grey rectangles.
+    const float lift = 0.035f;
+    const auto raised = [lift](float v) { return std::min(v + lift, 1.0f); };
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(raised(m_themePanel.r), raised(m_themePanel.g),
+                                            raised(m_themePanel.b), 1.0f);
+    style.Colors[ImGuiCol_Button] = style.Colors[ImGuiCol_FrameBg];
 }
 
 void WickedToolsPanel::draw_theme_editor_window() {

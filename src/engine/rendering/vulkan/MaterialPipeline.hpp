@@ -33,6 +33,11 @@ struct GlslGenerationResult {
     // UBO). Consumers without shadows bind a dummy texture and disable the
     // shadow term via LightUboData::shadowParams.x.
     uint32_t shadowSamplerBinding{ 2 };
+    // Local-light shadow atlases. These follow the sun sampler so generated
+    // material shaders can consume the same spot/point shadows as the basic
+    // editor viewport instead of silently rendering blocks shadow-free.
+    uint32_t spotShadowSamplerBinding{ 3 };
+    uint32_t pointShadowSamplerBinding{ 4 };
     std::vector<MaterialGraphError> errors;
     [[nodiscard]] explicit operator bool() const noexcept { return errors.empty(); }
 };
@@ -66,10 +71,18 @@ struct LightUboData {
     glm::mat4 sunCascadeVP[kShadowCascadeCount]; // per-cascade light view-projection (atlas 2x2)
     glm::vec4 sunCascadeSplits;            // xyz = view-depth split points, w = cascade count
     glm::vec4 cameraForward;               // xyz = camera forward (cascade selection)
+    // Local-shadow metadata appended after the legacy/public light prefix.
+    // Basic shaders may declare only the prefix above; generated material
+    // shaders consume these fields to stay in lockstep with editor shadows.
+    glm::mat4 spotShadowVP[kMaxSpotLights]; // tile-local VP for each spot slot
+    glm::vec4 spotShadowEnabled;            // per-slot 0/1
+    glm::mat4 pointShadowVP[6];             // +X,-X,+Y,-Y,+Z,-Z face VPs
+    glm::vec4 pointShadowParams;            // x=enabled, y=1/faceSize, z=range, w=point-light slot
 };
 static_assert(sizeof(LightUboData) == 16 * 3 + 64 + 16 + 16 * kMaxPointLights * 2 +
                                     16 * kMaxSpotLights * 4 + 16 * kMaxAreaLights * 4 +
-                                    64 * kShadowCascadeCount + 16 * 2);
+                                    64 * kShadowCascadeCount + 16 * 2 +
+                                    64 * kMaxSpotLights + 16 + 64 * 6 + 16);
 
 // Push constant shared by the material vertex shader (editor_material.vert).
 struct MaterialPushConstants {

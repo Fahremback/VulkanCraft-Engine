@@ -631,7 +631,17 @@ void EditorApplication::create_shadow_map() {
     rasterizer.lineWidth = 1.0f;
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rasterizer.depthBiasEnable = VK_FALSE;
+    // Shadow maps must not rasterize the caster at exactly the same depth the
+    // receiver later compares against.  Without raster depth bias, large flat
+    // block faces self-shadow (acne) and the pattern changes whenever a stable
+    // CSM snaps by one texel, which looks like dark blotches/flicker while the
+    // camera rotates.  Keep a modest slope-scaled bias here and a smaller
+    // receiver-side bias in the shader; together they remove acne without the
+    // obvious detached/peter-panning look of a large receiver bias alone.
+    rasterizer.depthBiasEnable = VK_TRUE;
+    rasterizer.depthBiasConstantFactor = 1.25f;
+    rasterizer.depthBiasClamp = 0.0f;
+    rasterizer.depthBiasSlopeFactor = 1.75f;
     VkPipelineMultisampleStateCreateInfo multisampling{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
     multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo depthStencil{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
@@ -730,9 +740,12 @@ void EditorApplication::destroy_spot_shadow_map() {
 }
 
 // ---------------------------------------------------------------------------
-// BUG-EDITOR-SHADOWS-002: point light (slot 0) shadow — 6-tile 2D atlas with
-// LINEAR depth (distance/range) written by gl_FragDepth. Dedicated pipeline:
-// the fragment needs the light position to convert world distance to depth.
+// BUG-EDITOR-SHADOWS-002: one shadow-casting point light is rendered into a
+// 6-tile 2D atlas. Depth is the normal projected depth produced by the SAME
+// face VP matrices later uploaded to EditorShadowUbo. The old path attempted
+// to write linear world-space distance from the fragment shader, but the
+// vertex shader exported pc.mvp*position (clip space) as if it were a world
+// position, so point-shadow depth was fundamentally invalid.
 // ---------------------------------------------------------------------------
 void EditorApplication::create_point_shadow_map() {
     destroy_point_shadow_map();
@@ -758,30 +771,18 @@ void EditorApplication::create_point_shadow_map() {
         throw std::runtime_error("Failed to create point shadow sampler");
     }
 
-    // Same vertex input state as the sun shadow pipeline (all EditorVertex
-    // attributes bound; only position used). mvp = viewProj * model, so
-    // gl_Position.xyz is already the world position.
+    // Same depth-only contract as the sun shadow pipeline. The per-face
+    // viewProj*model matrix is enough; no fake "world position" varying and no
+    // fragment-written gl_FragDepth are needed.
     const std::string vertSrc =
         "#version 450\n"
-        "layout(push_constant) uniform Push { mat4 mvp; vec4 lightPosRange; } pc;\n"
+        "layout(push_constant) uniform Push { mat4 mvp; } pc;\n"
         "layout(location = 0) in vec3 inPos;\n"
         "layout(location = 1) in vec3 inNormal;\n"
         "layout(location = 2) in vec3 inColor;\n"
         "layout(location = 3) in vec2 inUv;\n"
-        "layout(location = 0) out vec3 outWorldPos;\n"
-        "void main() {\n"
-        "    vec4 world = pc.mvp * vec4(inPos, 1.0);\n"
-        "    outWorldPos = world.xyz;\n"
-        "    gl_Position = world;\n"
-        "}\n";
-    const std::string fragSrc =
-        "#version 450\n"
-        "layout(location = 0) in vec3 inWorldPos;\n"
-        "layout(push_constant) uniform Push { mat4 mvp; vec4 lightPosRange; } pc;\n"
-        "void main() {\n"
-        "    float dist = length(inWorldPos - pc.lightPosRange.xyz);\n"
-        "    gl_FragDepth = clamp(dist / max(pc.lightPosRange.w, 0.01), 0.0, 1.0);\n"
-        "}\n";
+        "void main() { gl_Position = pc.mvp * vec4(inPos, 1.0); }\n";
+    const std::string fragSrc = "#version 450\nvoid main() {}\n";
     const std::vector<uint32_t> vertSpv = compile_material_glsl(VK_SHADER_STAGE_VERTEX_BIT, vertSrc);
     const std::vector<uint32_t> fragSpv = compile_material_glsl(VK_SHADER_STAGE_FRAGMENT_BIT, fragSrc);
     if (vertSpv.empty() || fragSpv.empty()) {
@@ -791,9 +792,9 @@ void EditorApplication::create_point_shadow_map() {
     m_pointShadow.fragShader = make_module(m_device, fragSpv);
 
     VkPushConstantRange pushRange{};
-    pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     pushRange.offset = 0;
-    pushRange.size = sizeof(glm::mat4) + sizeof(glm::vec4);
+    pushRange.size = sizeof(glm::mat4);
     VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     layoutInfo.pushConstantRangeCount = 1;
     layoutInfo.pPushConstantRanges = &pushRange;
@@ -836,7 +837,13 @@ void EditorApplication::create_point_shadow_map() {
     // CCW scene path) must all cast; closed shapes give correct silhouettes.
     rasterizer.cullMode = VK_CULL_MODE_NONE;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rasterizer.depthBiasEnable = VK_FALSE;
+    // Point-light faces suffer from the same coplanar self-shadowing as the
+    // directional/spot maps.  Bias at raster time so camera-independent point
+    // shadows stay clean on large flat block faces as well.
+    rasterizer.depthBiasEnable = VK_TRUE;
+    rasterizer.depthBiasConstantFactor = 1.0f;
+    rasterizer.depthBiasClamp = 0.0f;
+    rasterizer.depthBiasSlopeFactor = 1.5f;
     VkPipelineMultisampleStateCreateInfo multisampling{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
     multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo depthStencil{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
@@ -1402,7 +1409,11 @@ glm::mat4 editor_spot_view_proj(const glm::vec3& position, const glm::vec3& dire
     const glm::mat4 proj = glm::perspective(2.0f * outer, 1.0f, 0.05f, std::max(range, 1.0f));
     glm::mat4 remap(1.0f);
     remap[2][2] = 0.5f;
-    remap[2][3] = 0.5f;
+    // GLM indexes matrices as [column][row].  The clip-depth conversion is
+    // z' = 0.5*z + 0.5*w, so the translation belongs at column 3 / row 2.
+    // [2][3] instead modifies w' and corrupts the perspective divide, which
+    // made valid shadow casters disappear from the comparison map.
+    remap[3][2] = 0.5f;
     return remap * proj * view;
 }
 
@@ -1424,21 +1435,20 @@ void editor_face_basis(int face, glm::vec3& outDir, glm::vec3& outRight, glm::ve
 glm::mat4 editor_face_view(int face, const glm::vec3& position) {
     glm::vec3 d, r, u;
     editor_face_basis(face, d, r, u);
-    glm::mat4 v(1.0f);
-    v[0] = glm::vec4(r, 0.0f);
-    v[1] = glm::vec4(u, 0.0f);
-    v[2] = glm::vec4(-d, 0.0f);
-    v[3] = glm::vec4(-glm::dot(r, position), -glm::dot(u, position), glm::dot(d, position), 1.0f);
-    return v;
+    // glm matrices are column-major; assigning r/u/-d directly to columns
+    // transposed the intended view basis. glm::lookAt builds the correct
+    // light-centered face view and removes the old sign/permutation mismatch.
+    return glm::lookAt(position, position + d, u);
 }
 
 glm::mat4 editor_face_view_proj(int face, const glm::vec3& position, float range) {
-    // The remap keeps primitive clipping inside the Vulkan [0,1] z window;
-    // the STORED depth is gl_FragDepth = dist/range (linear), independent of it.
+    // The remap keeps primitive clipping and stored depth inside Vulkan [0,1].
+    // This exact matrix is also uploaded for sampling, so render and compare
+    // cannot disagree about face orientation or depth convention.
     const glm::mat4 proj = glm::perspective(glm::radians(90.0f), 1.0f, 0.05f, std::max(range, 1.0f));
     glm::mat4 remap(1.0f);
     remap[2][2] = 0.5f;
-    remap[2][3] = 0.5f;
+    remap[3][2] = 0.5f;
     return remap * proj * editor_face_view(face, position);
 }
 
@@ -1543,11 +1553,16 @@ void draw_line_list(VkCommandBuffer cmd, VkPipelineLayout layout, const VkBuffer
 static void editor_build_sun_cascades(const glm::vec3& camPos, const glm::vec3& camFront,
                                       const glm::vec3& camUp, float aspect,
                                       float fovDeg, float zNear, float zFar,
-                                      const glm::vec3& sunDir,
+                                      const glm::vec3& sunDir, std::uint32_t shadowResolution,
                                       glm::mat4 outVP[Engine::Rendering::kShadowCascadeCount],
                                       float outSplit[Engine::Rendering::kShadowCascadeCount - 1]) {
     constexpr int kCC = Engine::Rendering::kShadowCascadeCount;
-    const float lambda = 0.5f;  // practical split (blend log/linear)
+    // Prefer logarithmic splits much more strongly than the old 50/50 mix.
+    // With zFar=350 the previous first cascade extended to ~44 m, wasting most
+    // of a 1024px tile on distant space while a 1m block received only a few
+    // useful shadow texels.  0.85 keeps long-range coverage but concentrates
+    // resolution where editor users actually inspect shadows up close.
+    const float lambda = 0.85f;
     float splits[kCC + 1];
     splits[0] = zNear;
     for (int i = 1; i <= kCC; ++i) {
@@ -1563,10 +1578,20 @@ static void editor_build_sun_cascades(const glm::vec3& camPos, const glm::vec3& 
     const glm::vec3 U = glm::normalize(glm::cross(R, F));
     const float tanHalfV = std::tan(glm::radians(fovDeg) * 0.5f);
     const glm::vec3 L = glm::normalize(-sunDir);  // light travelling direction
-    const glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
+    // A directional light close to vertical makes lookAt(..., worldUp) nearly
+    // singular. Pick a deterministic alternate up vector in that case; tiny
+    // camera rotations must never flip the light basis and make shadow edges
+    // flash.
+    const glm::vec3 worldUp = std::abs(L.y) > 0.98f
+        ? glm::vec3(0.0f, 0.0f, 1.0f)
+        : glm::vec3(0.0f, 1.0f, 0.0f);
     glm::mat4 depthRemap(1.0f);
     depthRemap[2][2] = 0.5f;
-    depthRemap[2][3] = 0.5f;
+    // GLM is column-major: [3][2] adds 0.5*w to z.  The old [2][3]
+    // accidentally added z into w, so the shadow raster pass and receiver
+    // projection disagreed after the perspective divide.  In practice this
+    // was why one block visibly failed to shadow the block behind it.
+    depthRemap[3][2] = 0.5f;
 
     for (int c = 0; c < kCC; ++c) {
         const float zn = splits[c], zf = splits[c + 1];
@@ -1578,21 +1603,52 @@ static void editor_build_sun_cascades(const glm::vec3& camPos, const glm::vec3& 
         corners[2] = cn + R * wn + U * hn; corners[3] = cn - R * wn + U * hn;
         corners[4] = cf - R * wf - U * hf; corners[5] = cf + R * wf - U * hf;
         corners[6] = cf + R * wf + U * hf; corners[7] = cf - R * wf + U * hf;
-        glm::vec3 center(0.0f);
-        for (int i = 0; i < 8; ++i) center += corners[i];
-        center /= 8.0f;
-        const glm::mat4 lightView = glm::lookAt(center + L * (zf - zn), center, worldUp);
-        glm::vec3 lmin(1e30f), lmax(-1e30f);
-        for (int i = 0; i < 8; ++i) {
-            const glm::vec4 lv = lightView * glm::vec4(corners[i], 1.0f);
-            lmin = glm::min(lmin, glm::vec3(lv));
-            lmax = glm::max(lmax, glm::vec3(lv));
+        // Compute the slice center analytically.  Averaging eight rotated
+        // world-space corners is mathematically equivalent but injects tiny
+        // orientation-dependent FP error; combined with ceil(radius) that was
+        // enough to occasionally resize a cascade by one quantization step.
+        const glm::vec3 center = camPos + F * ((zn + zf) * 0.5f);
+
+        // Stable CSM: use a rotation-invariant bounding sphere instead of a
+        // tight light-space AABB.  The old bounds changed width/height every
+        // time the editor camera rotated, so texels slid over the receiver and
+        // the shadow edge visibly flickered.  The sphere also gives cascade 0
+        // enough guard area around the camera for very-close receivers.
+        // The far corner is the farthest point from the mid-slice center.  Use
+        // only scalar frustum dimensions so the radius is bit-stable while the
+        // camera rotates; no world-space corner lengths participate here.
+        const float halfDepth = (zf - zn) * 0.5f;
+        float radius = std::sqrt(halfDepth * halfDepth + wf * wf + hf * hf);
+        radius = std::max(radius, 0.5f);
+        // Quantize the extent itself so minute floating-point changes cannot
+        // resize the orthographic projection from frame to frame.
+        radius = std::ceil(radius * 16.0f) / 16.0f;
+        const float xyRadius = radius * 1.08f;
+        const float casterPad = std::max(16.0f, radius * 1.5f);
+        const glm::mat4 lightView = glm::lookAt(center + L * (radius + casterPad), center, worldUp);
+        // Stable depth extent from the same bounding sphere.  Recomputing
+        // near/far from a light-space AABB made the depth scale vary with camera
+        // orientation even after XY stabilization, which changed self-shadow
+        // comparisons and caused residual flashes.  This fixed extent covers
+        // the receiver sphere plus a full casterPad on both sides.
+        const float ortNear = 0.1f;
+        const float ortFar = std::max(ortNear + 1.0f, 2.0f * (radius + casterPad));
+        glm::mat4 ortho = glm::ortho(-xyRadius, xyRadius, -xyRadius, xyRadius,
+                                    ortNear, ortFar);
+
+        // Snap the light projection to the shadow-map texel grid. Without
+        // this, sub-texel camera motion/rotation continuously moves the
+        // projected edge and produces the characteristic shimmering border.
+        if (shadowResolution > 0u) {
+            glm::mat4 shadowMatrix = ortho * lightView;
+            glm::vec4 origin = shadowMatrix * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+            origin *= static_cast<float>(shadowResolution) * 0.5f;
+            const glm::vec2 rounded = glm::round(glm::vec2(origin));
+            const glm::vec2 offset = (rounded - glm::vec2(origin)) *
+                (2.0f / static_cast<float>(shadowResolution));
+            ortho[3][0] += offset.x;
+            ortho[3][1] += offset.y;
         }
-        // Em view space de luz, o lookAt olha para -z; converte o range para
-        // near/far positivos do ortho.
-        const float ortNear = glm::max(0.1f, -lmax.z);
-        const float ortFar = glm::max(ortNear + 1.0f, -lmin.z);
-        const glm::mat4 ortho = glm::ortho(lmin.x, lmax.x, lmin.y, lmax.y, ortNear, ortFar);
         outVP[c] = depthRemap * ortho * lightView;
     }
 }
@@ -1600,11 +1656,17 @@ static void editor_build_sun_cascades(const glm::vec3& camPos, const glm::vec3& 
 void EditorApplication::record_shadow_pass(VkCommandBuffer cmd, const Scene* scene) {
     m_shadowMap.enabled = false;
     m_sunCascadeCount = 0u;
-    if (m_shadowMap.pipeline == VK_NULL_HANDLE) return;
+    // A local point/spot shadow must not depend on the scene also containing a
+    // directional sun.  The old early-return below made every local shadow map
+    // disappear as soon as the only light was changed from Directional to
+    // Point/Spot.  Treat the sun pass and the local-light passes independently.
 
-    // Sun direction from the scene's directional sun (or a fixed default).
+    // Sun direction from the scene's first directional sun.  Lighting itself
+    // still consumes the sun when castShadows=false; only the depth pass is
+    // gated by the authored Cast Shadows flag.
     glm::vec3 sunDir(0.0f, -1.0f, 0.0f);
     bool hasSun = false;
+    bool sunCastsShadows = false;
     if (scene) {
         for (const auto& [id, light] : scene->lightComponents) {
             if (!is_directional_sun(light)) continue;
@@ -1613,75 +1675,63 @@ void EditorApplication::record_shadow_pass(VkCommandBuffer cmd, const Scene* sce
                 sunDir = editor_sun_direction(tit->second);
             }
             hasSun = true;
+            sunCastsShadows = light.castShadows;
             break;
         }
     }
-    if (!hasSun) return;
+    if (hasSun && sunCastsShadows && m_shadowMap.pipeline != VK_NULL_HANDLE) {
+        // L47 cascatas: 4 VPs + splits reais preenchidos (não mais só template).
+        // O atlas 2x2 (tile = m_shadowMap.size) recebe uma cascata por tile.
+        const float aspect = static_cast<float>(m_offscreen.width) / std::max(1u, m_offscreen.height);
+        const float cascadeFar = std::max(m_editorCamera.nearPlane + 1.0f, 350.0f);
+        float split[Engine::Rendering::kShadowCascadeCount - 1]{};
+        editor_build_sun_cascades(m_editorCamera.position, m_editorCamera.get_front(),
+                                  m_editorCamera.get_up(), aspect,
+                                  m_editorCamera.fov, m_editorCamera.nearPlane, cascadeFar,
+                                  sunDir, m_shadowMap.size, m_sunCascadeVP, split);
+        m_sunCascadeSplits = glm::vec4(split[0], split[1], split[2],
+                                       static_cast<float>(Engine::Rendering::kShadowCascadeCount));
+        glm::mat4 tile0ndc(1.0f);
+        tile0ndc[0][0] = 0.25f; tile0ndc[1][1] = 0.25f;
+        tile0ndc[3][0] = 0.25f; tile0ndc[3][1] = 0.25f;
+        m_shadowMap.viewProj = tile0ndc * m_sunCascadeVP[0];
+        m_sunCascadeCount = static_cast<std::uint32_t>(Engine::Rendering::kShadowCascadeCount);
+        m_shadowMap.enabled = true;
 
-    // L47 cascatas: 4 VPs + splits reais preenchidos (não mais só template).
-    // O atlas 2x2 (tile = m_shadowMap.size) recebe uma cascata por tile.
-    const float aspect = static_cast<float>(m_offscreen.width) / std::max(1u, m_offscreen.height);
-    const float cascadeFar = std::max(m_editorCamera.nearPlane + 1.0f, 350.0f);
-    float split[Engine::Rendering::kShadowCascadeCount - 1]{};
-    editor_build_sun_cascades(m_editorCamera.position, m_editorCamera.get_front(),
-                              m_editorCamera.get_up(), aspect,
-                              m_editorCamera.fov, m_editorCamera.nearPlane, cascadeFar,
-                              sunDir, m_sunCascadeVP, split);
-    m_sunCascadeSplits = glm::vec4(split[0], split[1], split[2],
-                                   static_cast<float>(Engine::Rendering::kShadowCascadeCount));
-    // Cascade 0 também alimenta o single-map de fallback (sunViewProj) dos
-    // shaders que não amostram cascatas (ex.: editor_viewport.frag). Como o
-    // mapa agora é um atlas 2x2 com a cascade0 no tile superior-esquerdo
-    // (UV [0,0.5]^2), o sunViewProj projeta a cascade0 nesse tile: escala x/y
-    // de 0.5 + translação -0.5 (z fica intacto p/ comparação de profundidade).
-    // sun_shadow do editor_viewport.frag usa suv.xy DIRETO como UV (espera
-    // [0,1]) — o VP antigo embutia o remap NDC->UV. Com o atlas 2x2 e a
-    // cascade0 no tile topo-esquerdo ([0,0.5]^2), o remap correto sobre o NDC
-    // [-1,1] da cascade0 é u = 0.25*ndc + 0.25 (scale 0.25, trans +0.25).
-    // (scale 0.5 + trans -0.5 daria [-1,0] e o check <0.002 apagaria a sombra
-    // sempre — corrigido aqui.)
-    glm::mat4 tile0ndc(1.0f);
-    tile0ndc[0][0] = 0.25f; tile0ndc[1][1] = 0.25f;
-    tile0ndc[3][0] = 0.25f; tile0ndc[3][1] = 0.25f;
-    m_shadowMap.viewProj = tile0ndc * m_sunCascadeVP[0];
-    m_sunCascadeCount = static_cast<std::uint32_t>(Engine::Rendering::kShadowCascadeCount);
-    m_shadowMap.enabled = true;
-
-    const uint32_t tile = m_shadowMap.size;
-    const uint32_t atlas = tile * 2u;
-    VkRenderPassBeginInfo info{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
-    info.renderPass = m_shadowMap.renderPass;
-    info.framebuffer = m_shadowMap.framebuffer;
-    info.renderArea.offset = { 0, 0 };
-    info.renderArea.extent = { atlas, atlas };
-    VkClearValue clear;
-    clear.depthStencil = { 1.0f, 0 };
-    info.clearValueCount = 1;
-    info.pClearValues = &clear;
-    vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
-    // Renderiza cada cascata no seu tile do atlas com o VP tile-local dela.
-    for (std::uint32_t c = 0; c < m_sunCascadeCount; ++c) {
-        VkViewport vp{};
-        vp.x = static_cast<float>((c % 2) * tile);
-        vp.y = static_cast<float>((c / 2) * tile);
-        vp.width = static_cast<float>(tile);
-        vp.height = static_cast<float>(tile);
-        vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
-        vkCmdSetViewport(cmd, 0, 1, &vp);
-        VkRect2D sc{};
-        sc.offset = { static_cast<int32_t>(vp.x), static_cast<int32_t>(vp.y) };
-        sc.extent = { tile, tile };
-        vkCmdSetScissor(cmd, 0, 1, &sc);
-        // Casters (BUG-EDITOR-SHADOWS-001): meshes + cube placeholders + terrain
-        // + voxel volumes — tudo o que o scene pass desenha como superfície.
-        draw_shadow_casters(cmd, m_shadowMap.pipelineLayout, m_shadowMap.pipeline,
-                            VK_SHADER_STAGE_VERTEX_BIT, sizeof(glm::mat4), m_sunCascadeVP[c],
-                            nullptr, scene);
+        const uint32_t tile = m_shadowMap.size;
+        const uint32_t atlas = tile * 2u;
+        VkRenderPassBeginInfo info{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+        info.renderPass = m_shadowMap.renderPass;
+        info.framebuffer = m_shadowMap.framebuffer;
+        info.renderArea.offset = { 0, 0 };
+        info.renderArea.extent = { atlas, atlas };
+        VkClearValue clear;
+        clear.depthStencil = { 1.0f, 0 };
+        info.clearValueCount = 1;
+        info.pClearValues = &clear;
+        vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
+        for (std::uint32_t c = 0; c < m_sunCascadeCount; ++c) {
+            VkViewport vp{};
+            vp.x = static_cast<float>((c % 2) * tile);
+            vp.y = static_cast<float>((c / 2) * tile);
+            vp.width = static_cast<float>(tile);
+            vp.height = static_cast<float>(tile);
+            vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
+            vkCmdSetViewport(cmd, 0, 1, &vp);
+            VkRect2D sc{};
+            sc.offset = { static_cast<int32_t>(vp.x), static_cast<int32_t>(vp.y) };
+            sc.extent = { tile, tile };
+            vkCmdSetScissor(cmd, 0, 1, &sc);
+            draw_shadow_casters(cmd, m_shadowMap.pipelineLayout, m_shadowMap.pipeline,
+                                VK_SHADER_STAGE_VERTEX_BIT, sizeof(glm::mat4), m_sunCascadeVP[c],
+                                nullptr, scene);
+        }
+        vkCmdEndRenderPass(cmd);
     }
-    vkCmdEndRenderPass(cmd);
 
     // BUG-EDITOR-SHADOWS-002: spot tiles and the point slot-0 face atlas ride
-    // in the same command buffer right before the scene pass.
+    // in the same command buffer right before the scene pass. They are always
+    // considered, even when no directional sun exists or its shadows are off.
     record_spot_shadow_pass(cmd, scene);
     record_point_shadow_pass(cmd, scene);
 }
@@ -1694,6 +1744,7 @@ void EditorApplication::record_shadow_pass(VkCommandBuffer cmd, const Scene* sce
 void collect_editor_shadow_lights(const Scene* scene, EditorShadowLightSlots& out) {
     out = EditorShadowLightSlots{};
     if (!scene) return;
+    uint32_t pointSlot = 0u;
     for (const auto& [id, light] : scene->lightComponents) {
         glm::vec3 dir(0.0f, -1.0f, 0.0f);
         glm::vec3 position(0.0f);
@@ -1723,11 +1774,22 @@ void collect_editor_shadow_lights(const Scene* scene, EditorShadowLightSlots& ou
             }
         } else if (light.type == LightType::Area) {
             // Area lights have no shadow slot in v1 (documented limitation).
-        } else if (!out.point0.enabled) {
-            out.point0.enabled = true;
-            out.point0.castShadows = light.castShadows;
-            out.point0.position = position;
-            out.point0.range = std::max(light.range, 1.0f);
+        } else {
+            // The lighting UBO exposes only the first kMaxPointLights finite
+            // point lights. Select the first SHADOW-CASTING light among those
+            // visible slots and remember its UBO index. Previously point0 was
+            // simply the first point light, so a castShadows=false light in
+            // slot 0 prevented every later point from owning the sole atlas.
+            if (pointSlot < Rendering::kMaxPointLights) {
+                if (!out.point0.enabled && light.castShadows) {
+                    out.point0.enabled = true;
+                    out.point0.castShadows = true;
+                    out.point0.position = position;
+                    out.point0.range = std::max(light.range, 1.0f);
+                    out.point0.lightIndex = pointSlot;
+                }
+                ++pointSlot;
+            }
         }
     }
 }
@@ -1771,7 +1833,7 @@ void EditorApplication::record_point_shadow_pass(VkCommandBuffer cmd, const Scen
     if (m_pointShadow.pipeline == VK_NULL_HANDLE || m_pointShadow.framebuffer == VK_NULL_HANDLE) return;
     EditorShadowLightSlots slots;
     collect_editor_shadow_lights(scene, slots);
-    if (!slots.point0.enabled || !slots.point0.castShadows) return;
+    if (!slots.point0.enabled) return;
     m_pointShadow.enabled = true;
 
     VkRenderPassBeginInfo info{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
@@ -1784,14 +1846,12 @@ void EditorApplication::record_point_shadow_pass(VkCommandBuffer cmd, const Scen
     info.clearValueCount = 1;
     info.pClearValues = &clear;
     vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
-    const glm::vec4 extra(slots.point0.position, slots.point0.range);
     for (int face = 0; face < 6; ++face) {
         set_viewport_scissor_offset(cmd, static_cast<float>(face * m_pointShadow.size), 0.0f,
                                     m_pointShadow.size, m_pointShadow.size);
         const glm::mat4 vp = editor_face_view_proj(face, slots.point0.position, slots.point0.range);
         draw_shadow_casters(cmd, m_pointShadow.pipelineLayout, m_pointShadow.pipeline,
-                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                            sizeof(glm::mat4) + sizeof(glm::vec4), vp, &extra, scene);
+                            VK_SHADER_STAGE_VERTEX_BIT, sizeof(glm::mat4), vp, nullptr, scene);
     }
     vkCmdEndRenderPass(cmd);
 }
@@ -2026,10 +2086,18 @@ void EditorApplication::update_shadow_ubo(const Scene* scene) {
                                        slots.spots[i].range, slots.spots[i].coneAngle)
                : glm::mat4(1.0f);
     }
-    const bool pointOn = slots.point0.enabled && slots.point0.castShadows && m_pointShadow.enabled;
+    const bool pointOn = slots.point0.enabled && m_pointShadow.enabled;
+    for (int face = 0; face < 6; ++face) {
+        m_shadowUboData.pointViewProj[face] =
+            pointOn ? editor_face_view_proj(face, slots.point0.position, slots.point0.range)
+                    : glm::mat4(1.0f);
+    }
     m_shadowUboData.pointLight = glm::vec4(slots.point0.position, slots.point0.range);
     m_shadowUboData.pointParams =
-        glm::vec4(pointOn ? 1.0f : 0.0f, 0.05f, std::max(slots.point0.range, 1.0f), 0.0f);
+        glm::vec4(pointOn ? 1.0f : 0.0f,
+                  1.0f / static_cast<float>(std::max(m_pointShadow.size, 1u)),
+                  std::max(slots.point0.range, 1.0f),
+                  static_cast<float>(slots.point0.lightIndex));
     void* mapped = nullptr;
     if (vkMapMemory(m_device, m_editorShadowUboMemory, 0, sizeof(EditorShadowUbo), 0, &mapped) != VK_SUCCESS) {
         return;

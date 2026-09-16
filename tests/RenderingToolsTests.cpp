@@ -192,9 +192,11 @@ int main() {
         // the split points and a computeShadow helper with cascade selection.
         CHECK(glsl.source.find("mat4 sunCascadeVP[4]") != std::string::npos);
         CHECK(glsl.source.find("vec4 sunCascadeSplits") != std::string::npos);
-        CHECK(glsl.source.find("float computeShadow(vec3 worldPos)") != std::string::npos);
+        CHECK(glsl.source.find("float computeShadow(vec3 worldPos, float ndl)") != std::string::npos);
         CHECK(glsl.source.find("lights.sunCascadeVP[c]") != std::string::npos);
-        CHECK(glsl.source.find("computeShadow(vWorldPos)") != std::string::npos);
+        CHECK(glsl.source.find("uniform sampler2DShadow shadowMap") != std::string::npos);
+        CHECK(glsl.source.find("computeShadow(vWorldPos, ndl)") != std::string::npos);
+        CHECK(glsl.source.find("computeShadow(vWorldPos, NdotLsun)") != std::string::npos);
         CHECK(!glsl.uniformNames.empty());
         // The generated shader must be syntactically plausible: balanced braces.
         int depthBraces = 0;
@@ -204,6 +206,21 @@ int main() {
         }
         CHECK(depthBraces == 0);
         CHECK(glsl.source.find("void main()") != std::string::npos);
+    }
+
+    // A texture wired directly to Normal is a conventional tangent-space
+    // normal map: generated GLSL must decode [0,1] -> [-1,1] and reconstruct
+    // TBN from derivatives rather than treating RGB as a world-space vector.
+    {
+        MaterialGraph normalGraph;
+        const MaterialNodeId normalTex = normalGraph.add_texture_sample("Normal Map");
+        const MaterialNodeId normalOut = normalGraph.add_output("Normal", MaterialValueType::Vec3);
+        CHECK(normalGraph.connect(normalTex, normalOut, 0));
+        const GlslGenerationResult glsl = material_graph_to_glsl(normalGraph);
+        CHECK(glsl);
+        CHECK(glsl.source.find("mat3 vcCotangentFrame") != std::string::npos);
+        CHECK(glsl.source.find(".rgb * 2.0 - 1.0") != std::string::npos);
+        CHECK(glsl.source.find("vcCotangentFrame(normal, vWorldPos, vUv) * tangentNormal") != std::string::npos);
     }
 
     // The generated GLSL must compile to SPIR-V with glslc — the editor viewport

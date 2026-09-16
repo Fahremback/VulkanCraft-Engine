@@ -258,8 +258,8 @@ private:
     // Armature: rest poses captured by the panel (session-scoped).
     std::unordered_map<UUID, TransformComponent> m_boneRestPose;
     void create_humanoid_rig(UUID parentId);
-    glm::vec3 m_themeBg{ 0.10f, 0.11f, 0.14f };
-    glm::vec3 m_themePanel{ 0.20f, 0.20f, 0.20f };
+    glm::vec3 m_themeBg{ 0.045f, 0.052f, 0.068f };
+    glm::vec3 m_themePanel{ 0.068f, 0.078f, 0.102f };
     bool m_gfxVSync{ true };
     int m_gfxShadowQuality{ 3 };
     std::string m_importerStatus;

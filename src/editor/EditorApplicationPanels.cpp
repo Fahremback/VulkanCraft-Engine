@@ -1,4 +1,5 @@
 #include <imgui.h>
+#include <cmath>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -12,16 +13,16 @@
 // ForgeWidgets.hpp is included after EditorApplication.hpp.
 namespace Engine::UI {
 struct Colors {
-    static constexpr ImVec4 Background    { 0.06f, 0.07f, 0.09f, 1.0f };
-    static constexpr ImVec4 Surface       { 0.10f, 0.11f, 0.14f, 1.0f };
-    static constexpr ImVec4 SurfaceAlt    { 0.14f, 0.15f, 0.19f, 1.0f };
-    static constexpr ImVec4 Border        { 0.22f, 0.24f, 0.30f, 1.0f };
+    static constexpr ImVec4 Background    { 0.045f, 0.052f, 0.068f, 1.0f };
+    static constexpr ImVec4 Surface       { 0.068f, 0.078f, 0.102f, 1.0f };
+    static constexpr ImVec4 SurfaceAlt    { 0.092f, 0.105f, 0.138f, 1.0f };
+    static constexpr ImVec4 Border        { 0.145f, 0.165f, 0.210f, 1.0f };
     static constexpr ImVec4 Text          { 0.92f, 0.94f, 0.98f, 1.0f };
     static constexpr ImVec4 TextSecondary { 0.70f, 0.74f, 0.82f, 1.0f };
     static constexpr ImVec4 TextMuted     { 0.52f, 0.56f, 0.64f, 1.0f };
-    static constexpr ImVec4 Accent        { 0.32f, 0.55f, 1.00f, 1.0f };
-    static constexpr ImVec4 AccentHover   { 0.40f, 0.62f, 1.00f, 1.0f };
-    static constexpr ImVec4 AccentSoft    { 0.17f, 0.23f, 0.34f, 1.0f };
+    static constexpr ImVec4 Accent        { 0.39f, 0.43f, 1.00f, 1.0f };
+    static constexpr ImVec4 AccentHover   { 0.47f, 0.52f, 1.00f, 1.0f };
+    static constexpr ImVec4 AccentSoft    { 0.145f, 0.165f, 0.285f, 1.0f };
     static constexpr ImVec4 Success       { 0.17f, 0.72f, 0.40f, 1.0f };
     static constexpr ImVec4 Warning       { 0.92f, 0.63f, 0.15f, 1.0f };
     static constexpr ImVec4 Danger        { 0.90f, 0.28f, 0.30f, 1.0f };
@@ -69,35 +70,99 @@ const char* entityIcon(Engine::Scene* scene, const Engine::UUID& id);
 namespace Engine {
 
 // ===========================================================================
+void EditorApplication::begin_project_transition(const std::string& projectName) {
+    m_currentProjectName = projectName.empty() ? "Projeto" : projectName;
+    m_projectTransitionName = m_currentProjectName;
+    m_projectTransitionActive = true;
+    m_projectTransitionStage = 0;
+    m_projectTransitionStarted = std::chrono::steady_clock::now();
+
+    // Deliberately keep m_inLauncherMode=true until the warm-up frame has
+    // actually been presented. This guarantees that expensive first-use work
+    // (offscreen resize, dock construction, asset thumbnails, etc.) happens
+    // while the user sees the loading surface, never a half-built editor shell.
+    glfwSetWindowTitle(
+        m_window,
+        (std::string("VulkanCraft Engine - ") + tr("Abrindo [", "Opening [") +
+         m_currentProjectName + "]").c_str());
+}
+
+void EditorApplication::draw_project_loading_screen() {
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->Pos);
+    ImGui::SetNextWindowSize(viewport->Size);
+    ImGui::SetNextWindowViewport(viewport->ID);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.055f, 0.064f, 0.086f, 1.0f));
+    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs |
+        ImGuiWindowFlags_NoBringToFrontOnFocus;
+    ImGui::Begin("##ProjectLoadingTransition", nullptr, flags);
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(3);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 center(viewport->Pos.x + viewport->Size.x * 0.5f,
+                        viewport->Pos.y + viewport->Size.y * 0.5f - 16.0f);
+    const ImU32 accent = IM_COL32(82, 140, 255, 255);
+    const ImU32 accentSoft = IM_COL32(82, 140, 255, 42);
+    const ImU32 text = IM_COL32(235, 240, 250, 255);
+    const ImU32 muted = IM_COL32(145, 157, 181, 255);
+
+    // Small animated arc: enough motion to communicate that startup is alive
+    // without flashing the real editor controls underneath it.
+    const float t = static_cast<float>(ImGui::GetTime());
+    const float radius = 22.0f;
+    dl->AddCircle(center, radius, accentSoft, 48, 3.0f);
+    dl->PathArcTo(center, radius, t * 3.2f, t * 3.2f + 4.15f, 36);
+    dl->PathStroke(accent, 0, 3.5f);
+
+    const char* title = tr("Abrindo projeto", "Opening project");
+    const ImVec2 titleSize = ImGui::CalcTextSize(title);
+    dl->AddText(ImVec2(center.x - titleSize.x * 0.5f, center.y + 42.0f), text, title);
+
+    const std::string project = m_projectTransitionName.empty()
+        ? m_currentProjectName : m_projectTransitionName;
+    const ImVec2 projectSize = ImGui::CalcTextSize(project.c_str());
+    dl->AddText(ImVec2(center.x - projectSize.x * 0.5f, center.y + 66.0f), accent,
+                project.c_str());
+
+    const char* status = m_projectTransitionStage == 0
+        ? tr("Preparando o editor...", "Preparing editor...")
+        : tr("Carregando viewport e interface...", "Loading viewport and interface...");
+    const ImVec2 statusSize = ImGui::CalcTextSize(status);
+    dl->AddText(ImVec2(center.x - statusSize.x * 0.5f, center.y + 94.0f), muted, status);
+
+    const float barW = std::min(360.0f, viewport->Size.x * 0.42f);
+    const float barY = center.y + 126.0f;
+    const ImVec2 barMin(center.x - barW * 0.5f, barY);
+    const ImVec2 barMax(center.x + barW * 0.5f, barY + 4.0f);
+    dl->AddRectFilled(barMin, barMax, IM_COL32(40, 47, 63, 255), 2.0f);
+    const float base = m_projectTransitionStage == 0 ? 0.32f : 0.82f;
+    const float pulse = 0.04f * (0.5f + 0.5f * std::sin(t * 5.0f));
+    const float progress = std::min(0.94f, base + pulse);
+    dl->AddRectFilled(barMin, ImVec2(barMin.x + barW * progress, barMax.y), accent, 2.0f);
+
+    ImGui::End();
+}
+
 void EditorApplication::draw_project_launcher() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
 
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, UI::Colors::Background);
     ImGui::Begin("Project Launcher Hub", nullptr, flags);
-
-    // Modern Header Banner
-    ImGui::SetCursorPosY(35.0f);
-    ImGui::SetCursorPosX((viewport->WorkSize.x - 550.0f) * 0.5f);
-    ImGui::TextColored(ImVec4(0.39f, 0.40f, 0.95f, 1.00f), "%s", tr("GERENCIADOR DE JOGOS VULKAN ENGINE", "VULKAN ENGINE GAME LAUNCHER"));
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.4f, 1.0f), "[v1.5.0]");
-
-    ImGui::SetCursorPosX((viewport->WorkSize.x - 550.0f) * 0.5f);
-    ImGui::TextDisabled("%s", tr("Escolha um jogo para editar ou crie um novo projeto", "Select a game to edit or create a new project"));
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    // Centered Projects Card
-    ImGui::SetCursorPosX((viewport->WorkSize.x - 720.0f) * 0.5f);
-    ImGui::BeginChild("ProjectsListContainer", ImVec2(720, 480), true, ImGuiWindowFlags_None);
-
-    ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.95f, 1.0f), "%s", tr("Seus Jogos e Projetos:", "Your Games & Projects:"));
-    ImGui::Separator();
-    ImGui::Spacing();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
 
     // Filesystem discovery is intentionally cached. The launcher is rendered
     // every frame, but walking every project tree recursively at frame rate is
@@ -112,71 +177,157 @@ void EditorApplication::draw_project_launcher() {
         lastProjectScan = launcherNow;
     }
 
+    // One floating workspace instead of a full-screen form made from separators.
+    // This deliberately reads like a current launcher: brand, content card,
+    // project cards and a compact action row.
+    const float panelW = std::min(980.0f, viewport->WorkSize.x - 64.0f);
+    const float panelH = std::min(720.0f, viewport->WorkSize.y - 64.0f);
+    const float panelX = std::max(32.0f, (viewport->WorkSize.x - panelW) * 0.5f);
+    const float panelY = std::max(28.0f, (viewport->WorkSize.y - panelH) * 0.5f);
+    ImGui::SetCursorPos(ImVec2(panelX, panelY));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 18.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28.0f, 24.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, UI::Colors::Surface);
+    ImGui::BeginChild("##LauncherSurface", ImVec2(panelW, panelH), false,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+
+    // Brand/header. A slightly larger font scale creates hierarchy without a
+    // second font atlas and keeps all glyph/icon coverage intact.
+    ImGui::SetWindowFontScale(1.35f);
+    ImGui::TextColored(UI::Colors::Text, "%s", "VulkanCraft");
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::SameLine();
+    ImGui::TextColored(UI::Colors::Accent, "%s", "Studio");
+    ImGui::SameLine();
+    ImGui::TextColored(UI::Colors::Success, "%s", "  v1.5.0");
+    ImGui::TextColored(UI::Colors::TextMuted, "%s",
+                       tr("Escolha um projeto e continue de onde parou.",
+                          "Choose a project and continue where you left off."));
+    ImGui::Dummy(ImVec2(0.0f, 14.0f));
+
+    ImGui::TextColored(UI::Colors::TextSecondary, "%s", tr("Projetos recentes", "Recent projects"));
+    ImGui::SameLine();
+    ImGui::TextColored(UI::Colors::TextMuted, "  %d", static_cast<int>(projects.size()));
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
+    const float actionsH = 66.0f;
+    const float listH = std::max(220.0f, ImGui::GetContentRegionAvail().y - actionsH);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 8.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, UI::Colors::Background);
+    ImGui::BeginChild("ProjectsListContainer", ImVec2(0.0f, listH), false,
+                      ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+
     if (projects.empty()) {
-        ImGui::TextDisabled("%s", tr("Nenhum projeto encontrado em Projects/ — crie um novo acima.",
-                                      "No projects found in Projects/ — create one above."));
-        ImGui::Spacing();
+        const float emptyY = std::max(40.0f, listH * 0.35f);
+        ImGui::SetCursorPosY(emptyY);
+        const char* empty = tr("Nenhum projeto encontrado", "No projects found");
+        ImGui::SetCursorPosX(std::max(12.0f, (ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(empty).x) * 0.5f));
+        ImGui::TextColored(UI::Colors::TextSecondary, "%s", empty);
     }
 
     for (int i = 0; i < static_cast<int>(projects.size()); ++i) {
         const auto& proj = projects[i];
-        bool isSelected = (m_selectedProjectIndex == i);
-
+        const bool isSelected = (m_selectedProjectIndex == i);
         ImGui::PushID(i);
-        if (ImGui::Selectable("##ProjectSelectable", isSelected, ImGuiSelectableFlags_AllowDoubleClick, ImVec2(0, 80))) {
+
+        const ImVec2 cardMin = ImGui::GetCursorScreenPos();
+        const float cardW = ImGui::GetContentRegionAvail().x;
+        constexpr float cardH = 92.0f;
+        ImGui::InvisibleButton("##ProjectCard", ImVec2(cardW, cardH));
+        const bool hovered = ImGui::IsItemHovered();
+        const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+        if (clicked) {
             m_selectedProjectIndex = i;
             m_currentProjectName = proj.name;
-            if (ImGui::IsMouseDoubleClicked(0)) {
-                m_inLauncherMode = false; // Launch Engine Studio
-                glfwSetWindowTitle(m_window, ("VulkanCraft Engine - [" + m_currentProjectName + "]").c_str());
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                begin_project_transition(m_currentProjectName);
             }
         }
-        ImGui::SameLine();
 
-        ImGui::BeginGroup();
-        ImGui::TextColored(isSelected ? ImVec4(0.4f, 0.7f, 1.0f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "[JOGO]  %s", proj.name.c_str());
-        ImGui::SameLine();
-        ImGui::TextColored(proj.hasScene ? ImVec4(0.20f, 0.82f, 0.60f, 1.0f) : ImVec4(0.4f, 0.7f, 1.0f, 1.0f),
-                           proj.hasScene ? tr("[TEM CENA]", "[HAS SCENE]") : tr("[VAZIO]", "[EMPTY]"));
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 cardMax(cardMin.x + cardW, cardMin.y + cardH);
+        ImVec4 cardColor = UI::Colors::Surface;
+        if (hovered) cardColor = UI::Colors::SurfaceAlt;
+        if (isSelected) cardColor = UI::Colors::AccentSoft;
+        dl->AddRectFilled(cardMin, cardMax, ImGui::ColorConvertFloat4ToU32(cardColor), 10.0f);
+        if (isSelected) {
+            dl->AddRectFilled(cardMin, ImVec2(cardMin.x + 3.0f, cardMax.y),
+                              ImGui::ColorConvertFloat4ToU32(UI::Colors::Accent), 10.0f,
+                              ImDrawFlags_RoundCornersLeft);
+        }
 
-        ImGui::TextDisabled("Pasta: %s", proj.path.c_str());
-        ImGui::TextDisabled("%s: %s", tr("Modificado", "Last modified"), proj.lastModified.c_str());
-        ImGui::EndGroup();
+        // Project glyph tile.
+        const ImVec2 iconMin(cardMin.x + 16.0f, cardMin.y + 17.0f);
+        const ImVec2 iconMax(iconMin.x + 56.0f, iconMin.y + 56.0f);
+        dl->AddRectFilled(iconMin, iconMax,
+                          ImGui::ColorConvertFloat4ToU32(isSelected ? UI::Colors::Accent : UI::Colors::SurfaceAlt),
+                          12.0f);
+        dl->AddText(ImVec2(iconMin.x + 18.0f, iconMin.y + 18.0f), IM_COL32(245, 247, 255, 255), ICON_FA_CUBE);
 
+        const float tx = iconMax.x + 16.0f;
+        dl->AddText(ImVec2(tx, cardMin.y + 15.0f),
+                    ImGui::ColorConvertFloat4ToU32(UI::Colors::Text), proj.name.c_str());
+
+        const char* state = proj.hasScene ? tr("PRONTO", "READY") : tr("VAZIO", "EMPTY");
+        const ImVec2 stateSize = ImGui::CalcTextSize(state);
+        const float badgeX = cardMax.x - stateSize.x - 27.0f;
+        dl->AddRectFilled(ImVec2(badgeX - 8.0f, cardMin.y + 13.0f),
+                          ImVec2(cardMax.x - 12.0f, cardMin.y + 36.0f),
+                          ImGui::ColorConvertFloat4ToU32(proj.hasScene
+                              ? ImVec4(0.08f, 0.30f, 0.22f, 1.0f)
+                              : ImVec4(0.16f, 0.18f, 0.25f, 1.0f)), 11.0f);
+        dl->AddText(ImVec2(badgeX, cardMin.y + 17.0f),
+                    ImGui::ColorConvertFloat4ToU32(proj.hasScene ? UI::Colors::Success : UI::Colors::TextMuted), state);
+
+        std::string pathLine = tr("Pasta  ", "Folder  ") + proj.path;
+        dl->AddText(ImVec2(tx, cardMin.y + 42.0f),
+                    ImGui::ColorConvertFloat4ToU32(UI::Colors::TextMuted), pathLine.c_str());
+        std::string modified = std::string(tr("Modificado  ", "Modified  ")) + proj.lastModified;
+        dl->AddText(ImVec2(tx, cardMin.y + 65.0f),
+                    ImGui::ColorConvertFloat4ToU32(UI::Colors::TextMuted), modified.c_str());
+
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
         ImGui::PopID();
-        ImGui::Separator();
     }
-
     ImGui::EndChild();
 
-    // Launcher Action Buttons
-    ImGui::SetCursorPosY(viewport->WorkSize.y - 75.0f);
-    ImGui::SetCursorPosX((viewport->WorkSize.x - 720.0f) * 0.5f);
-
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.39f, 0.40f, 0.95f, 1.00f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.49f, 0.50f, 1.00f, 1.00f));
-    if (ImGui::Button(tr("ABRIR NO EDITOR", "LAUNCH ENGINE STUDIO"), ImVec2(250, 44))) {
-        m_inLauncherMode = false;
-        glfwSetWindowTitle(m_window, ("VulkanCraft Engine - [" + m_currentProjectName + "]").c_str());
+    ImGui::Dummy(ImVec2(0.0f, 12.0f));
+    const float gap = 10.0f;
+    const float available = ImGui::GetContentRegionAvail().x;
+    const float primaryW = std::max(180.0f, available * 0.38f);
+    const float secondaryW = (available - primaryW - gap * 2.0f) * 0.5f;
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
+    ImGui::PushStyleColor(ImGuiCol_Button, UI::Colors::Accent);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UI::Colors::AccentHover);
+    if (ImGui::Button(tr(ICON_FA_ARROW_RIGHT "  Abrir no editor", ICON_FA_ARROW_RIGHT "  Open in editor"),
+                      ImVec2(primaryW, 44.0f))) {
+        begin_project_transition(m_currentProjectName);
     }
     ImGui::PopStyleColor(2);
 
-    ImGui::SameLine();
-    if (ImGui::Button(tr("+ Criar Novo Jogo", "+ Create New Game"), ImVec2(220, 44))) {
-        m_inLauncherMode = false;
-        glfwSetWindowTitle(m_window, "VulkanCraft Engine - [Novo Jogo]");
+    ImGui::SameLine(0.0f, gap);
+    if (ImGui::Button(tr(ICON_FA_PLUS "  Novo projeto", ICON_FA_PLUS "  New project"),
+                      ImVec2(secondaryW, 44.0f))) {
+        begin_project_transition(tr("Novo Jogo", "New Game"));
     }
-    ImGui::SameLine();
-    if (ImGui::Button(tr("Procurar Pasta...", "Browse Folder..."), ImVec2(220, 44))) {
+    ImGui::SameLine(0.0f, gap);
+    if (ImGui::Button(tr(ICON_FA_FOLDER_OPEN "  Procurar...", ICON_FA_FOLDER_OPEN "  Browse..."),
+                      ImVec2(secondaryW, 44.0f))) {
         std::string folder;
         if (pick_folder_dialog(folder, L"Escolher pasta do projeto")) {
-            // Enter the editor scoped to the chosen project folder.
             m_currentProjectName = std::filesystem::path(folder).filename().string();
             if (m_currentProjectName.empty()) m_currentProjectName = "Projeto";
-            m_inLauncherMode = false;
-            glfwSetWindowTitle(m_window, ("VulkanCraft Engine - [" + m_currentProjectName + "]").c_str());
+            begin_project_transition(m_currentProjectName);
         }
     }
+    ImGui::PopStyleVar();
+
+    ImGui::EndChild();
 
     ImGui::End();
 }
@@ -265,6 +416,8 @@ void EditorApplication::draw_menu_bar() {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu(tr("Arquivo", "File"))) {
             if (ImGui::MenuItem(tr("Gerenciador de Jogos", "Game Launcher Hub"))) {
+                m_projectTransitionActive = false;
+                m_projectTransitionStage = 0;
                 m_inLauncherMode = true;
                 glfwSetWindowTitle(m_window, tr("VulkanCraft Engine - Gerenciador de Jogos", "VulkanCraft Engine - Game Launcher"));
             }
@@ -361,6 +514,10 @@ void EditorApplication::draw_menu_bar() {
                 if (m_editorScene) {
                     Entity light = m_editorScene->create_entity(tr("Luz Spot", "Spot Light"));
                     m_editorScene->lightComponents[light.get_id()] = LightComponent{ glm::vec3(0.2f, 0.5f, 1.0f), 4000.0f, 18.0f, true, LightType::Spot };
+                    // A new local directional light should illuminate the
+                    // ground immediately.  In our yaw/pitch convention -90° X
+                    // is straight down; zero rotation points horizontally +Z.
+                    m_editorScene->transformComponents[light.get_id()].rotation.x = -90.0f;
                     m_selectedEntity = light;
                     mark_scene_dirty();
                 }
@@ -369,6 +526,7 @@ void EditorApplication::draw_menu_bar() {
                 if (m_editorScene) {
                     Entity light = m_editorScene->create_entity(tr("Luz de Área", "Area Light"));
                     m_editorScene->lightComponents[light.get_id()] = LightComponent{ glm::vec3(1.0f, 0.4f, 0.9f), 1500.0f, 20.0f, true, LightType::Area };
+                    m_editorScene->transformComponents[light.get_id()].rotation.x = -90.0f;
                     m_selectedEntity = light;
                     mark_scene_dirty();
                 }
@@ -824,11 +982,17 @@ void EditorApplication::draw_hierarchy_panel() {
         }
         if (ImGui::MenuItem(tr("Luz Spot", "Spot Light"))) {
             Entity e = createSel(tr("Luz Spot", "Spot Light"));
-            if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(0.2f, 0.5f, 1.0f), 4000.0f, 18.0f, true, LightType::Spot };
+            if (e.is_valid()) {
+                m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(0.2f, 0.5f, 1.0f), 4000.0f, 18.0f, true, LightType::Spot };
+                m_editorScene->transformComponents[e.get_id()].rotation.x = -90.0f;
+            }
         }
         if (ImGui::MenuItem(tr("Luz de Área", "Area Light"))) {
             Entity e = createSel(tr("Luz de Área", "Area Light"));
-            if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(1.0f, 0.4f, 0.9f), 1500.0f, 20.0f, true, LightType::Area };
+            if (e.is_valid()) {
+                m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(1.0f, 0.4f, 0.9f), 1500.0f, 20.0f, true, LightType::Area };
+                m_editorScene->transformComponents[e.get_id()].rotation.x = -90.0f;
+            }
         }
         ImGui::Separator();
         ImGui::TextDisabled("%s", tr("EFEITOS", "EFFECTS"));
@@ -1308,7 +1472,22 @@ void EditorApplication::draw_inspector_panel() {
         int lightType = static_cast<int>(l.type);
         if (ImGui::Combo(tr("Tipo", "Type"), &lightType,
                          (m_currentLanguage == EngineLanguage::PT_BR) ? lightTypesPt : lightTypesEn, 4)) {
+            const LightType oldType = l.type;
             l.type = static_cast<LightType>(lightType);
+            // When a point/directional light is converted to Spot/Area, an
+            // untouched zero rotation would aim it horizontally and make the
+            // new type appear completely dead for the usual light-above-scene
+            // workflow. Initialize only an untouched transform; once authored,
+            // the user's rotation is preserved exactly.
+            if ((l.type == LightType::Spot || l.type == LightType::Area) &&
+                oldType != LightType::Spot && oldType != LightType::Area) {
+                auto tit = scene->transformComponents.find(id);
+                if (tit != scene->transformComponents.end() &&
+                    glm::length(tit->second.rotation) < 1.0e-4f) {
+                    tit->second.rotation.x = -90.0f;
+                }
+            }
+            mark_scene_dirty();
         }
         ImGui::ColorEdit3(tr("Cor da Luz", "Light Color"), &l.color.r);
         ImGui::DragFloat(tr("Brilho (Intensidade)", "Intensity"), &l.intensity, 100.0f, 0.0f, 100000.0f);

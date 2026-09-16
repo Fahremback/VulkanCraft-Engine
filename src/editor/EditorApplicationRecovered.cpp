@@ -322,7 +322,9 @@ void EditorApplication::render_frame() {
         vkCmdResetQueryPool(cmd, m_gpuTimestampPools[m_currentFrame], 0, kEditorGpuTimestampSlots);
     }
 
-    if (!m_inLauncherMode) {
+    const bool projectWarmupFrame =
+        m_projectTransitionActive && m_projectTransitionStage >= 1u;
+    if (!m_inLauncherMode || projectWarmupFrame) {
         // Size the offscreen to the panel (not the fitted image) so its aspect
         // ratio tracks the panel instead of locking onto its own previous size.
         recreate_offscreen_if_needed(
@@ -350,7 +352,26 @@ void EditorApplication::render_frame() {
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
-    if (m_inLauncherMode) {
+    if (m_projectTransitionActive) {
+        // Stage 0 is intentionally just the loading surface. Once that frame
+        // has reached the screen, stage 1 constructs the real dock/windows
+        // behind the loading surface. This primes ImGui's first-frame dock
+        // state without ever exposing the transient menu/app-bar-only shell.
+        if (m_projectTransitionStage >= 1u) {
+            ImGui::BeginDisabled();
+            draw_dockspace();
+            if (m_showHierarchy) draw_hierarchy_panel();
+            if (m_showInspector) draw_inspector_panel();
+            if (m_showViewport) draw_viewport_panel();
+            if (m_showContentBrowser) draw_content_browser_panel();
+#if VC_ENABLE_VOXEL_PLUGIN
+            if (m_showVoxelTools) draw_voxel_tool_panel();
+#endif
+            if (m_showConsole) draw_console_panel();
+            ImGui::EndDisabled();
+        }
+        draw_project_loading_screen();
+    } else if (m_inLauncherMode) {
         draw_project_launcher();
     } else {
         // Ctrl+K: focus the global search box (the command palette).
@@ -506,6 +527,23 @@ void EditorApplication::render_frame() {
     const VkResult presentResult = vkQueuePresentKHR(m_graphicsQueue, &presentInfo);
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) {
         recreate_swapchain();
+    }
+
+    // Advance only after a frame was actually presented. Stage 0 guarantees
+    // the loading screen is visible before expensive first-use work starts;
+    // stage 1 guarantees the dockspace and core panels have existed for one
+    // complete frame before the editor shell is revealed.
+    if (m_projectTransitionActive && presentResult == VK_SUCCESS) {
+        if (m_projectTransitionStage == 0u) {
+            m_projectTransitionStage = 1u;
+        } else {
+            m_projectTransitionActive = false;
+            m_projectTransitionStage = 0u;
+            m_inLauncherMode = false;
+            glfwSetWindowTitle(
+                m_window,
+                ("VulkanCraft Engine - [" + m_currentProjectName + "]").c_str());
+        }
     }
     m_currentFrame = (m_currentFrame + 1) % 2;
 }

@@ -802,8 +802,12 @@ void main() {
         if (dist <= range) {
             vec3 lightDirP = toL / max(dist, 0.001);
             float cosAng = dot(-lightDirP, normalize(push.spotLightDir.xyz));
-            float cosInner = max(push.spotLightParam.x, 0.0);
-            float cosOuter = max(push.spotLightParam.y, cosInner + 0.001);
+            float cosInner = clamp(push.spotLightParam.x, -1.0, 1.0);
+            // For a cone half-angle inner < outer, cos(inner) > cos(outer).
+            // The old max(..., cosInner + eps) inverted this ordering and made
+            // the denominator negative, effectively flipping/collapsing the
+            // authored spot cone. Preserve the physically valid ordering.
+            float cosOuter = min(clamp(push.spotLightParam.y, -1.0, 1.0), cosInner - 0.001);
             float cone = clamp((cosAng - cosOuter) / (cosInner - cosOuter), 0.0, 1.0);
             float att = max(1.0 - (dist * dist) / (range * range), 0.0);
             float ndlP = max(dot(normal, lightDirP), 0.0);

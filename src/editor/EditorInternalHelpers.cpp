@@ -307,10 +307,10 @@ Rendering::MaterialGraph material_graph_from_asset(const MaterialAsset& mat) {
         (void)graph.connect(albedo, baseOut, 0);
     }
     // Normal output (agente 4 — B.2): the asset's real normal map feeds the
-    // graph's Normal semantic. The generated fragment shader consumes it as a
-    // WORLD-SPACE normal override (the viewport mesh pipeline carries no
-    // tangents, so tangent-space TBN is not available); graphs without a
-    // Normal output keep the interpolated world normal — zero visual change.
+    // graph's Normal semantic. The generated fragment shader decodes the
+    // conventional tangent-space RGB and reconstructs TBN from position/UV
+    // derivatives, so the EditorVertex format does not need an explicit
+    // tangent attribute. Graphs without Normal keep the interpolated normal.
     if (mat.normalMapID.is_valid()) {
         const auto normalOut = graph.add_output("Normal", Rendering::MaterialValueType::Vec3);
         const auto tex = graph.add_texture_sample("Normal Map");
