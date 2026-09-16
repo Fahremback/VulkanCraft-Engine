@@ -37,11 +37,18 @@ if (!existsSync(CI)) {
     }
   });
 
-  // 4. Every referenced *.mjs gate must exist on disk.
-  const refs = [...text.matchAll(/([a-zA-Z0-9_-]+\.mjs)/g)].map((mm) => mm[1]);
+  // 4. Every referenced *.mjs gate must exist on disk. Preserve an explicit
+  // relative path (for example tests/GridShaderSourceGate.mjs) instead of
+  // stripping it to the basename; otherwise valid CI steps outside
+  // tools/portability are reported as missing.
+  const refs = [...text.matchAll(/(?:node\s+)?([a-zA-Z0-9_./\\-]+\.mjs)/g)]
+    .map((mm) => mm[1].replaceAll('\\', '/'));
   const uniq = [...new Set(refs)];
   uniq.forEach((f) => {
-    if (!existsSync(join(ROOT, 'tools', 'portability', f)) && !existsSync(join(ROOT, f))) {
+    const candidates = f.includes('/')
+      ? [join(ROOT, ...f.split('/'))]
+      : [join(ROOT, 'tools', 'portability', f), join(ROOT, f)];
+    if (!candidates.some((candidate) => existsSync(candidate))) {
       problems.push(`referenced gate missing: ${f}`);
     }
   });

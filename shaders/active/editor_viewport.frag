@@ -10,7 +10,7 @@
 //
 // BUG-EDITOR-SHADOWS-001/002: the basic path now also samples the three real
 // shadow targets the editor records every frame — the sun map (binding 1),
-// the spot atlas (binding 2, one 90° tile per spot slot) and the point slot-0
+// the spot atlas (binding 2, one authored-cone tile per spot slot) and the point slot-0
 // face atlas (binding 3, six tiles with LINEAR depth = distance/range).
 //
 // BUG-EDITOR-GI-001 / CONTA2-GI-EDITOR-005: indirect ambient comes from the
@@ -45,7 +45,7 @@ layout (set = 0, binding = 0) uniform SceneLights {
     vec4 spotLightColor[4];           // rgb = color * intensity
     vec4 areaLightPos[4];             // xyz = center, w = enabled
     vec4 areaLightNormal[4];          // xyz = facing normal
-    vec4 areaLightHalf[4];            // x = halfWidth, y = halfHeight
+    vec4 areaLightHalf[4];            // x/y = half size, z = attenuation range
     vec4 areaLightColor[4];           // rgb = color * intensity
     mat4 sunCascadeVP[4];             // unused on this path
     vec4 sunCascadeSplits;            // unused on this path
@@ -238,8 +238,8 @@ void main() {
         if (lights.areaLightPos[i].w <= 0.5) continue;
         vec3 toLight = lights.areaLightPos[i].xyz - fragWorldPos;
         float dist = max(length(toLight), 0.0001);
-        float reach = max(lights.areaLightHalf[i].x + lights.areaLightHalf[i].y, 0.01);
-        float att = clamp(1.0 - dist / reach, 0.0, 1.0);
+        float range = max(lights.areaLightHalf[i].z, 0.01);
+        float att = clamp(1.0 - dist / range, 0.0, 1.0);
         att *= att;
         vec3 L = toLight / dist;
         float facing = max(dot(lights.areaLightNormal[i].xyz, -L), 0.0);
@@ -252,9 +252,10 @@ void main() {
     vec3 ambient = gi_irradiance(fragWorldPos);
     vec3 baseColor = fragColor * (ambient + 0.78 * lightAccum);
 
-    // Rim light: brightens edges at grazing angles (kept from the previous
-    // look so silhouettes stay readable against the grid).
-    vec3 viewDir = normalize(-fragWorldPos);
+    // Rim light must be camera-relative. The previous -fragWorldPos treated
+    // world origin as the camera, so translating an object changed its rim
+    // even while camera/object orientation stayed identical.
+    vec3 viewDir = normalize(lights.cameraPosition.xyz - fragWorldPos);
     float rim = 1.0 - max(dot(n, viewDir), 0.0);
     rim = pow(rim, 3.0) * 0.15;
     baseColor += fragColor * rim;
@@ -268,7 +269,10 @@ void main() {
     float fogStart = push.fogParams.y;
     bool useHeightFog = push.fogParams.z > 0.5;
 
-    float dist = length(fragWorldPos);
+    // Fog distance is camera -> fragment, never world-origin -> fragment.
+    // Using length(fragWorldPos) made identical objects fog differently merely
+    // because the whole scene was translated away from (0,0,0).
+    float dist = length(fragWorldPos - lights.cameraPosition.xyz);
     float fogFactor = 1.0 - exp(-density * max(dist - fogStart, 0.0));
     fogFactor = clamp(fogFactor, 0.0, 1.0);
 

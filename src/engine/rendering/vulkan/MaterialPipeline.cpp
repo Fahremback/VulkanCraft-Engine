@@ -410,8 +410,8 @@ GlslGenerationResult material_graph_to_glsl(const MaterialGraph& graph) {
     out << "        if (lights.areaLightPos[i].w <= 0.5) continue;\n";
     out << "        vec3 toLight = lights.areaLightPos[i].xyz - vWorldPos;\n";
     out << "        float dist = max(length(toLight), 0.0001);\n";
-    out << "        float reach = max(lights.areaLightHalf[i].x + lights.areaLightHalf[i].y, 0.01);\n";
-    out << "        float att = clamp(1.0 - dist / reach, 0.0, 1.0);\n";
+    out << "        float range = max(lights.areaLightHalf[i].z, 0.01);\n";
+    out << "        float att = clamp(1.0 - dist / range, 0.0, 1.0);\n";
     out << "        att *= att;\n";
     out << "        vec3 L = toLight / dist;\n";
     out << "        float facing = max(dot(lights.areaLightNormal[i].xyz, -L), 0.0);\n";

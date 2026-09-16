@@ -334,6 +334,7 @@ struct EditorShadowLightSlots {
         glm::vec3 position{ 0.0f };
         glm::vec3 direction{ 0.0f, -1.0f, 0.0f };
         float range{ 50.0f };
+        float coneAngle{ 0.78539816339f };
     } spots[kEditorSpotShadowSlots]{};
     struct Point {
         bool enabled{ false };
@@ -352,6 +353,11 @@ void collect_editor_shadow_lights(const Scene* scene, EditorShadowLightSlots& ou
 // the shadow pass, collect_editor_shadow_lights, fill_scene_light_entries and
 // the sky so diffuse light, shadow map and sky never disagree.
 glm::vec3 editor_sun_direction(const TransformComponent& t);
+
+// Direction of a finite/local light (spot/area) from its authored rotation.
+// Unlike the sun helper above, position must NEVER steer a local light: moving
+// a spot/area changes only its origin; rotation changes where it points.
+glm::vec3 editor_local_light_direction(const TransformComponent& t);
 
 // -----------------------------------------------------------------------
 // GPU buffer for procedural geometry

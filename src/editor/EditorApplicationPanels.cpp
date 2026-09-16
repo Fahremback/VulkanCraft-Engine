@@ -343,7 +343,8 @@ void EditorApplication::draw_menu_bar() {
             if (ImGui::MenuItem(tr("Iluminação > Luz do Sol", "Light > Directional Light"))) {
                 if (m_editorScene) {
                     Entity light = m_editorScene->create_entity(tr("Luz do Sol", "Directional Light"));
-                    m_editorScene->lightComponents[light.get_id()] = LightComponent{};
+                    m_editorScene->lightComponents[light.get_id()] =
+                        LightComponent{ glm::vec3(1.0f, 0.95f, 0.85f), 10000.0f, 1000.0f, true };
                     m_selectedEntity = light;
                     mark_scene_dirty();
                 }
@@ -351,7 +352,7 @@ void EditorApplication::draw_menu_bar() {
             if (ImGui::MenuItem(tr("Iluminação > Luz de Lâmpada", "Light > Point Light"))) {
                 if (m_editorScene) {
                     Entity light = m_editorScene->create_entity(tr("Luz de Lâmpada", "Point Light"));
-                    m_editorScene->lightComponents[light.get_id()] = LightComponent{ glm::vec3(1.0f, 0.8f, 0.4f), 5000.0f, 15.0f, true };
+                    m_editorScene->lightComponents[light.get_id()] = LightComponent{ glm::vec3(1.0f, 0.8f, 0.4f), 5000.0f, 15.0f, true, LightType::Point };
                     m_selectedEntity = light;
                     mark_scene_dirty();
                 }
@@ -709,7 +710,8 @@ void EditorApplication::draw_app_bar() {
             { tr("Adicionar Luz do Sol", "Add Directional Light"), [this]() {
                 if (m_editorScene) {
                     Entity e = m_editorScene->create_entity(tr("Luz do Sol", "Directional Light"));
-                    m_editorScene->lightComponents[e.get_id()] = LightComponent{};
+                    m_editorScene->lightComponents[e.get_id()] =
+                        LightComponent{ glm::vec3(1.0f, 0.95f, 0.85f), 10000.0f, 1000.0f, true };
                     m_selectedEntity = e;
                 }
             } },
@@ -811,11 +813,14 @@ void EditorApplication::draw_hierarchy_panel() {
         ImGui::TextDisabled("%s", tr("ILUMINAÇÃO", "LIGHTING"));
         if (ImGui::MenuItem(tr("Luz do Sol", "Directional Light"))) {
             Entity e = createSel(tr("Luz do Sol", "Directional Light"));
-            if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{};
+            if (e.is_valid()) {
+                m_editorScene->lightComponents[e.get_id()] =
+                    LightComponent{ glm::vec3(1.0f, 0.95f, 0.85f), 10000.0f, 1000.0f, true };
+            }
         }
         if (ImGui::MenuItem(tr("Luz de Lâmpada", "Point Light"))) {
             Entity e = createSel(tr("Luz de Lâmpada", "Point Light"));
-            if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(1.0f, 0.8f, 0.4f), 5000.0f, 15.0f, true };
+            if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(1.0f, 0.8f, 0.4f), 5000.0f, 15.0f, true, LightType::Point };
         }
         if (ImGui::MenuItem(tr("Luz Spot", "Spot Light"))) {
             Entity e = createSel(tr("Luz Spot", "Spot Light"));
@@ -1298,14 +1303,21 @@ void EditorApplication::draw_inspector_panel() {
         beginInspectorGroup(3, tr("EFEITOS & MUNDO", "EFFECTS & WORLD"));
         UI::sectionHeader(ICON_FA_SUN, tr("Luz", "Light"));
         auto& l = scene->lightComponents[id];
+        const char* lightTypesPt[] = { "Direcional", "Pontual", "Spot", "Área" };
+        const char* lightTypesEn[] = { "Directional", "Point", "Spot", "Area" };
+        int lightType = static_cast<int>(l.type);
+        if (ImGui::Combo(tr("Tipo", "Type"), &lightType,
+                         (m_currentLanguage == EngineLanguage::PT_BR) ? lightTypesPt : lightTypesEn, 4)) {
+            l.type = static_cast<LightType>(lightType);
+        }
         ImGui::ColorEdit3(tr("Cor da Luz", "Light Color"), &l.color.r);
         ImGui::DragFloat(tr("Brilho (Intensidade)", "Intensity"), &l.intensity, 100.0f, 0.0f, 100000.0f);
         ImGui::DragFloat(tr("Alcance da Luz", "Range"), &l.range, 0.5f, 0.1f, 1000.0f);
         ImGui::Checkbox(tr("Projetar Sombras", "Cast Shadows"), &l.castShadows);
         if (l.type == LightType::Spot) {
             // Real spot cone (agente 4 — B.3): authored here, fed into the
-            // shared LightUboData spotLightParams each frame. 1.45 rad keeps
-            // the outer cone inside the 90° spot shadow-map frustum.
+            // shared LightUboData spotLightParams each frame; the shadow pass
+            // derives its projection FOV from the same authored half-angle.
             ImGui::SliderFloat(tr("Cone (rad)", "Spot Cone (rad)"), &l.coneAngle, 0.05f, 1.45f);
         }
         ImGui::Spacing();
@@ -1395,7 +1407,7 @@ void EditorApplication::draw_inspector_panel() {
         };
 
         section(tr("COMUM", "COMMON"));
-        if (match(tr("Iluminação e Luz", "Light"))) { if (ImGui::MenuItem(tr("Iluminação e Luz", "Light Component"))) scene->lightComponents[id] = LightComponent{}; }
+        if (match(tr("Iluminação e Luz", "Light"))) { if (ImGui::MenuItem(tr("Iluminação e Luz", "Light Component"))) scene->lightComponents[id] = LightComponent{ glm::vec3(1.0f), 5000.0f, 15.0f, true, LightType::Point }; }
         if (match(tr("Câmera de Visão", "Camera"))) { if (ImGui::MenuItem(tr("Câmera de Visão", "Camera Component"))) scene->cameraComponents[id] = CameraComponent{}; }
         if (match(tr("Modelo 3D (Mesh)", "Mesh Renderer"))) { if (ImGui::MenuItem(tr("Modelo 3D (Mesh)", "Mesh Renderer"))) scene->meshRendererComponents[id] = MeshRendererComponent{}; }
         if (match(tr("Material", "Material"))) { if (ImGui::MenuItem(tr("Material", "Material Component"))) scene->materialComponents[id] = MaterialComponent{}; }

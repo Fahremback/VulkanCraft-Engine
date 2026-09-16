@@ -69,6 +69,7 @@ $vcSccacheExe = Join-Path $engineRoot 'tools/portability/sccache.exe'
 Remove-Item Env:SCCACHE_NO_DAEMON -ErrorAction SilentlyContinue
 $mutex = [System.Threading.Mutex]::new($false, 'Global\VulkanCraft.SharedBuild')
 $locked = $false
+$cacheServerStarted = $false
 
 function Invoke-VcCmake {
     param([Parameter(Mandatory)][string[]]$Arguments)
@@ -88,7 +89,14 @@ function Invoke-VcCmake {
         # compiler environment at startup; doing it before vcvars causes C1083
         # on standard headers, while no-daemon mode is unstable under parallel
         # load in sccache 0.10 on Windows.
-        $cacheStart = if (Test-Path -LiteralPath $vcSccacheExe) { " && `"$vcSccacheExe`" --start-server >nul 2>&1" } else { '' }
+        # A single script invocation may run configure and build back-to-back.
+        # sccache --start-server returns exit 2 when the server is already
+        # running; chaining that command with && therefore used to make the
+        # second CMake invocation fail silently after a successful configure.
+        # Start it once per serialized build invocation instead.
+        $shouldStartCache = (Test-Path -LiteralPath $vcSccacheExe) -and -not $script:cacheServerStarted
+        $cacheStart = if ($shouldStartCache) { " && `"$vcSccacheExe`" --start-server >nul 2>&1" } else { '' }
+        if ($shouldStartCache) { $script:cacheServerStarted = $true }
         $command = "call `"$vcvars`" >nul 2>&1 && set `"VSLANG=1033`" && set `"PreferredUILang=en-US`"$cacheStart && cmake.exe $argumentText"
         if ($resolvedLogPath) {
             # Redirect inside cmd.exe.  Windows PowerShell 5 otherwise turns
@@ -125,7 +133,11 @@ try {
     # cada build compartilhada.
     if (Test-Path -LiteralPath $vcSccacheExe) {
         Write-BuildMessage '--- sccache (hit/miss desta maquina) ---'
-        & $vcSccacheExe --show-stats | Select-Object -First 8
+        # Do not close sccache's stdout early with Select-Object -First.  The
+        # Rust CLI treats the resulting Windows ERROR_NO_DATA/broken pipe as a
+        # panic, which polluted otherwise successful builds with a false crash.
+        $sccacheStats = @(& $vcSccacheExe --show-stats)
+        $sccacheStats | Select-Object -First 8
     }
 } finally {
     if ($locked) { $mutex.ReleaseMutex() | Out-Null }

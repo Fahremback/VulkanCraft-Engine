@@ -1386,15 +1386,20 @@ namespace {
 // these formulas EXACTLY — keep the two in sync (guarded by
 // EditorViewportRegressionTests).
 // ---------------------------------------------------------------------------
-glm::mat4 editor_spot_view_proj(const glm::vec3& position, const glm::vec3& direction, float range) {
-    const glm::vec3 lightDir = glm::normalize(-direction); // from the light toward the scene
+glm::mat4 editor_spot_view_proj(const glm::vec3& position, const glm::vec3& direction,
+                                float range, float coneAngle) {
+    // spotLightDir is the light->surface direction consumed by the lighting
+    // shader (dot(-L, spotDir)). The shadow camera must look in that SAME
+    // direction; negating it made the shadow atlas render behind the cone.
+    const glm::vec3 lightDir = glm::normalize(direction);
     const glm::vec3 up =
         std::abs(lightDir.y) > 0.98f ? glm::vec3(0.0f, 0.0f, 1.0f) : glm::vec3(0.0f, 1.0f, 0.0f);
     const glm::mat4 view = glm::lookAt(position, position + lightDir, up);
-    // 90° fov covers the hardcoded 45° outer spot cone with margin. GL-
-    // convention perspective + the [0,1] depth remap matches the sun map, so
-    // one sampling formula serves both.
-    const glm::mat4 proj = glm::perspective(glm::radians(90.0f), 1.0f, 0.05f, std::max(range, 1.0f));
+    // coneAngle is the authored OUTER half-angle. Shadow projection therefore
+    // needs a full FOV of 2*coneAngle; the previous fixed 90° projection broke
+    // shadows for cones wider than 45° and wasted resolution for narrow cones.
+    const float outer = glm::clamp(coneAngle, 0.05f, 1.45f);
+    const glm::mat4 proj = glm::perspective(2.0f * outer, 1.0f, 0.05f, std::max(range, 1.0f));
     glm::mat4 remap(1.0f);
     remap[2][2] = 0.5f;
     remap[2][3] = 0.5f;
@@ -1439,16 +1444,21 @@ glm::mat4 editor_face_view_proj(int face, const glm::vec3& position, float range
 
 } // namespace
 
-// Direction the scene light points TOWARD (sun->scene), derived from the
-// editor-sensible convention that MOVING the directional light must visibly
-// change the illumination (it used to be rotation-only, so dragging the sun
-// icon had zero effect). The light looks from its world position back toward
-// the scene origin, so picking the sun up and placing it somewhere changes the
-// angle of the light. When the object sits at (or near) the origin there is no
-// meaningful look direction, so the classic yaw/pitch from rotation.y/x is
-// used as a fallback (keeps authored scenes that never moved the sun intact).
-// Declared in EditorApplication.hpp so the diffuse-light entry filler in
-// EditorApplicationAssets.cpp shares the exact same formula.
+// Local finite-light direction from authored yaw/pitch. Position never enters
+// this calculation: translating a spot/area light must not silently re-aim it.
+glm::vec3 editor_local_light_direction(const TransformComponent& t) {
+    const float yaw = glm::radians(t.rotation.y);
+    const float pitch = glm::radians(t.rotation.x);
+    return glm::normalize(glm::vec3(
+        std::cos(pitch) * std::sin(yaw), std::sin(pitch),
+        std::cos(pitch) * std::cos(yaw)));
+}
+
+// Direction the scene's directional sun points TOWARD (sun->scene), derived
+// from the editor-sensible convention that MOVING the directional light must
+// visibly change the illumination. The light looks from its world position
+// back toward the scene origin. At the origin, identity means noon; otherwise
+// authored yaw/pitch supplies the direction. Shared by diffuse, shadow and sky.
 glm::vec3 editor_sun_direction(const TransformComponent& t) {
     const glm::vec3 p = t.position;
     if (glm::length(p) > 1e-3f) {
@@ -1456,11 +1466,15 @@ glm::vec3 editor_sun_direction(const TransformComponent& t) {
         // (object position acts as the sun's world location).
         return glm::normalize(-p);
     }
-    const float yaw = glm::radians(t.rotation.y);
-    const float pitch = glm::radians(t.rotation.x);
-    return glm::normalize(glm::vec3(
-        std::cos(pitch) * std::sin(yaw), std::sin(pitch),
-        std::cos(pitch) * std::cos(yaw)));
+
+    // A freshly-created directional light has the identity transform. Treat
+    // that as a noon sun instead of a horizontal ray: the sky already starts
+    // in daytime, and the old identity->+Z mapping immediately flipped that
+    // same viewport to night as soon as the user added a Sun entity.
+    if (std::abs(t.rotation.x) < 1e-4f && std::abs(t.rotation.y) < 1e-4f) {
+        return glm::vec3(0.0f, -1.0f, 0.0f);
+    }
+    return editor_local_light_direction(t);
 }
 
 // Depth-only render pass + comparison sampler, mirroring the sun map exactly
@@ -1686,7 +1700,9 @@ void collect_editor_shadow_lights(const Scene* scene, EditorShadowLightSlots& ou
         const auto tit = scene->transformComponents.find(id);
         if (tit != scene->transformComponents.end()) {
             position = tit->second.position;
-            dir = editor_sun_direction(tit->second);
+            dir = is_directional_sun(light)
+                ? editor_sun_direction(tit->second)
+                : editor_local_light_direction(tit->second);
         }
         if (is_directional_sun(light)) {
             if (!out.sun) {
@@ -1701,6 +1717,7 @@ void collect_editor_shadow_lights(const Scene* scene, EditorShadowLightSlots& ou
                     out.spots[i].position = position;
                     out.spots[i].direction = dir;
                     out.spots[i].range = std::max(light.range, 1.0f);
+                    out.spots[i].coneAngle = glm::clamp(light.coneAngle, 0.05f, 1.45f);
                     break;
                 }
             }
@@ -1742,7 +1759,7 @@ void EditorApplication::record_spot_shadow_pass(VkCommandBuffer cmd, const Scene
         set_viewport_scissor_offset(cmd, static_cast<float>(i * m_spotShadow.size), 0.0f,
                                     m_spotShadow.size, m_spotShadow.size);
         const glm::mat4 vp = editor_spot_view_proj(slots.spots[i].position, slots.spots[i].direction,
-                                                   slots.spots[i].range);
+                                                   slots.spots[i].range, slots.spots[i].coneAngle);
         draw_shadow_casters(cmd, m_shadowMap.pipelineLayout, m_shadowMap.pipeline,
                             VK_SHADER_STAGE_VERTEX_BIT, sizeof(glm::mat4), vp, nullptr, scene);
     }
@@ -2006,7 +2023,7 @@ void EditorApplication::update_shadow_ubo(const Scene* scene) {
         m_shadowUboData.spotEnabled[i] = on ? 1.0f : 0.0f;
         m_shadowUboData.spotViewProj[i] =
             on ? editor_spot_view_proj(slots.spots[i].position, slots.spots[i].direction,
-                                       slots.spots[i].range)
+                                       slots.spots[i].range, slots.spots[i].coneAngle)
                : glm::mat4(1.0f);
     }
     const bool pointOn = slots.point0.enabled && slots.point0.castShadows && m_pointShadow.enabled;

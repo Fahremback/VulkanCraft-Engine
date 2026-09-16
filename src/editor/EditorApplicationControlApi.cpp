@@ -240,8 +240,14 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
         if (type == "empty") e = create("Novo Objeto");
         else if (type == "cube") { e = create("Cubo 3D"); if (e.is_valid()) m_editorScene->meshRendererComponents[e.get_id()] = MeshRendererComponent{}; }
         else if (type == "camera") { e = create("Câmera"); if (e.is_valid()) m_editorScene->cameraComponents[e.get_id()] = CameraComponent{}; }
-        else if (type == "sun") { e = create("Luz do Sol"); if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{}; }
-        else if (type == "point") { e = create("Luz de Lâmpada"); if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(1.0f, 0.8f, 0.4f), 5000.0f, 15.0f, true }; }
+        else if (type == "sun") {
+            e = create("Luz do Sol");
+            if (e.is_valid()) {
+                m_editorScene->lightComponents[e.get_id()] =
+                    LightComponent{ glm::vec3(1.0f, 0.95f, 0.85f), 10000.0f, 1000.0f, true };
+            }
+        }
+        else if (type == "point") { e = create("Luz de Lâmpada"); if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(1.0f, 0.8f, 0.4f), 5000.0f, 15.0f, true, LightType::Point }; }
         else if (type == "spot") { e = create("Luz Spot"); if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(0.2f, 0.5f, 1.0f), 4000.0f, 18.0f, true, LightType::Spot }; }
         else if (type == "area") { e = create("Luz de Área"); if (e.is_valid()) m_editorScene->lightComponents[e.get_id()] = LightComponent{ glm::vec3(1.0f, 0.4f, 0.9f), 1500.0f, 20.0f, true, LightType::Area }; }
         else if (type == "particles") { e = create("Emissor de Partículas"); if (e.is_valid()) m_editorScene->particleEmitterComponents[e.get_id()] = ParticleEmitterComponent{}; }
@@ -268,7 +274,7 @@ void EditorApplication::handle_control_command(const std::string& cmd) {
             return;
         }
         Scene* scene = m_editorScene.get();
-        if (type == "light") scene->lightComponents[id] = LightComponent{};
+        if (type == "light") scene->lightComponents[id] = LightComponent{ glm::vec3(1.0f), 5000.0f, 15.0f, true, LightType::Point };
         else if (type == "camera") scene->cameraComponents[id] = CameraComponent{};
         else if (type == "mesh") scene->meshRendererComponents[id] = MeshRendererComponent{};
         else if (type == "material") scene->materialComponents[id] = MaterialComponent{};

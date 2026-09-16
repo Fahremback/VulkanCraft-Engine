@@ -14,6 +14,8 @@ const assetsImplEarly = read("../src/editor/EditorApplicationAssets.cpp");
 const header = read("../src/editor/EditorApplication.hpp");
 const gridVertex = read("../shaders/active/editor_grid.vert");
 const gridFragment = read("../shaders/active/editor_grid.frag");
+const viewportVertex = read("../shaders/active/editor_viewport.vert");
+const materialVertex = read("../shaders/active/editor_material.vert");
 const viewportFragment = read("../shaders/active/editor_viewport.frag");
 const pickFragment = read("../shaders/active/editor_pick.frag");
 
@@ -97,6 +99,26 @@ assert.match(
   vulkanImplEarly,
   /update_scene_light_ubo\s*\(\s*renderScene\s*\)/,
   "the viewport pass must refresh the scene light UBO every frame"
+);
+assert.match(
+  viewportVertex,
+  /transpose\s*\(\s*inverse\s*\(\s*mat3\s*\(\s*push\.model\s*\)\s*\)\s*\)\s*\*\s*inNormal/,
+  "basic viewport normals must be transformed to world space with inverse-transpose"
+);
+assert.match(
+  materialVertex,
+  /transpose\s*\(\s*inverse\s*\(\s*mat3\s*\(\s*push\.model\s*\)\s*\)\s*\)\s*\*\s*inNormal/,
+  "material-graph normals must remain correct under non-uniform entity scale"
+);
+assert.match(
+  viewportFragment,
+  /viewDir\s*=\s*normalize\s*\(\s*lights\.cameraPosition\.xyz\s*-\s*fragWorldPos\s*\)/,
+  "rim lighting must be relative to the real editor camera, not world origin"
+);
+assert.match(
+  viewportFragment,
+  /float\s+dist\s*=\s*length\s*\(\s*fragWorldPos\s*-\s*lights\.cameraPosition\.xyz\s*\)/,
+  "viewport fog must use camera-to-fragment distance, not distance from world origin"
 );
 
 // BUG-EDITOR-CUBE-WINDING: the scene pipeline's effective front-face rule
@@ -192,6 +214,16 @@ assert.match(vulkanImpl,
   "the editor frame must update canonical DDGI from the real editor camera");
 assert.match(vulkanImpl, /m_shadowUboData\.probeIrradiance\[idx\]\s*=\s*probe\.radianceVisibility/,
   "canonical DDGI probe output must feed the UBO consumed by the viewport shader");
+assert.match(vulkanImpl,
+  /const\s+glm::vec3\s+lightDir\s*=\s*glm::normalize\(direction\)/,
+  "spot shadow camera must point in the same light->surface direction used by the lighting cone");
+assert.match(vulkanImpl,
+  /glm::perspective\(2\.0f\s*\s*outer,\s*1\.0f/,
+  "spot shadow FOV must follow the authored outer half-angle instead of a fixed 90 degrees");
+assert.match(assetsImpl,
+  /data\.areaLightHalf\[areaCount\]\s*=\s*glm::vec4\([\s\S]{0,120}?std::max\(light\.range,\s*0\.01f\)/,
+  "area-light attenuation range must reach the shared light UBO"
+);
 assert.match(assetsImpl, /data\.shadowParams = glm::vec4\(m_shadowMap\.enabled \? 1\.0f : 0\.0f/,
   "the basic path's sun shadow flag must follow the shadow map state");
 assert.match(header, /static_assert\(sizeof\(EditorShadowUbo\) == 64 \* kEditorSpotShadowSlots \+ 16 \* 5 \+ 16 \* kEditorProbeCount/,

@@ -229,7 +229,8 @@ void WickedToolsPanel::draw_light_window() {
     const UUID id = m_selectedEntity;
     if (!m_scene->lightComponents.contains(id)) {
         if (ImGui::Button(tr("Adicionar Luz ao Objeto", "Add Light to Object"))) {
-            m_scene->lightComponents[id] = LightComponent{};
+            m_scene->lightComponents[id] =
+                LightComponent{ glm::vec3(1.0f), 5000.0f, 15.0f, true, LightType::Point };
         }
         ImGui::End();
         return;
@@ -243,6 +244,9 @@ void WickedToolsPanel::draw_light_window() {
     const char* types[] = { "Directional", "Point", "Spot", "Area" };
     int typeIdx = static_cast<int>(l.type);
     if (ImGui::Combo(tr("Tipo", "Type"), &typeIdx, types, 4)) l.type = static_cast<LightType>(typeIdx);
+    if (l.type == LightType::Spot) {
+        ImGui::SliderFloat(tr("Cone (rad)", "Spot Cone (rad)"), &l.coneAngle, 0.05f, 1.45f);
+    }
     if (ImGui::Button(tr("Remover Luz", "Remove Light"))) m_scene->lightComponents.erase(id);
     component_panel_end();
     ImGui::End();

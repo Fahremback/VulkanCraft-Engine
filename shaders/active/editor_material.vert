@@ -24,6 +24,7 @@ void main() {
     gl_Position = push.mvp * vec4(inPosition, 1.0);
     vUv = inUv;
     vWorldPos = world.xyz;
-    // Note: mat3(model) assumes uniform scale — acceptable for authored meshes.
-    vNormal = mat3(push.model) * inNormal;
+    // Correct normal transform for rotation + non-uniform authored scale.
+    // mat3(model) alone skews normals and visibly rotates the lighting lobe.
+    vNormal = normalize(transpose(inverse(mat3(push.model))) * inNormal);
 }

@@ -3351,17 +3351,24 @@ void EditorApplication::destroy_graph_material_pipelines() {
 // ---------------------------------------------------------------------------
 static void fill_scene_light_entries(Rendering::LightUboData& data, const Scene* scene) {
     uint32_t pointCount = 0, spotCount = 0, areaCount = 0;
+    bool hasDirectionalSun = false;
     if (scene) {
         for (const auto& [id, light] : scene->lightComponents) {
             glm::vec3 dir(0.0f, -1.0f, 0.0f);
             glm::vec3 position(0.0f);
+            glm::vec2 areaHalf(2.0f, 1.0f);
             const auto tit = scene->transformComponents.find(id);
             if (tit != scene->transformComponents.end()) {
                 position = tit->second.position;
-                // Sun direction derives from the light's world POSITION so
-                // moving the directional sun in the editor changes the
-                // illumination (falls back to yaw/pitch at the origin).
-                dir = editor_sun_direction(tit->second);
+                // Sun position is intentionally meaningful (it points back at
+                // the scene origin), but local lights MUST use authored
+                // rotation. Reusing editor_sun_direction here made moving a
+                // spot/area silently re-aim it at the origin.
+                dir = is_directional_sun(light)
+                    ? editor_sun_direction(tit->second)
+                    : editor_local_light_direction(tit->second);
+                areaHalf.x *= std::max(std::abs(tit->second.scale.x), 0.01f);
+                areaHalf.y *= std::max(std::abs(tit->second.scale.y), 0.01f);
             }
             // Editor lights use lux-like intensity (default sun = 10000) but the
             // MaterialPipeline Lambert term adds lightColor.rgb straight into
@@ -3373,14 +3380,13 @@ static void fill_scene_light_entries(Rendering::LightUboData& data, const Scene*
             if (is_directional_sun(light)) {
                 data.sunDirection = glm::vec4(dir, 1.0f);
                 data.sunColor = glm::vec4(colorIntensity, 1.0f);
+                hasDirectionalSun = true;
             } else if (light.type == LightType::Spot && spotCount < Rendering::kMaxSpotLights) {
                 data.spotLightPos[spotCount] = glm::vec4(position, light.range);
                 data.spotLightDir[spotCount] = glm::vec4(dir, 1.0f);
                 // Real cone (agente 4 — B.3): the editable LightComponent
                 // coneAngle drives cos(inner/outer); inner = 55% of the outer
-                // cone (the same ratio the previous hardcoded 25°/45° pair
-                // used). Clamped to 1.45 rad so the outer cone always fits
-                // the 90° spot shadow-map frustum with margin.
+                // cone. The shadow pass uses this same outer angle for its FOV.
                 const float outerCone = glm::clamp(light.coneAngle, 0.05f, 1.45f);
                 const float innerCone = outerCone * 0.55f;
                 data.spotLightParams[spotCount] = glm::vec4(
@@ -3390,7 +3396,11 @@ static void fill_scene_light_entries(Rendering::LightUboData& data, const Scene*
             } else if (light.type == LightType::Area && areaCount < Rendering::kMaxAreaLights) {
                 data.areaLightPos[areaCount] = glm::vec4(position, 1.0f);
                 data.areaLightNormal[areaCount] = glm::vec4(dir, 1.0f);
-                data.areaLightHalf[areaCount] = glm::vec4(2.0f, 1.0f, 0.0f, 0.0f);
+                // xy = authored emitter half-size (Transform scale), z = real
+                // attenuation range. Previously range was ignored completely
+                // for area lights despite being editable in the inspector.
+                data.areaLightHalf[areaCount] = glm::vec4(
+                    areaHalf.x, areaHalf.y, std::max(light.range, 0.01f), 0.0f);
                 data.areaLightColor[areaCount] = glm::vec4(colorIntensity, 1.0f);
                 ++areaCount;
             } else if (pointCount < Rendering::kMaxPointLights) {
@@ -3399,6 +3409,16 @@ static void fill_scene_light_entries(Rendering::LightUboData& data, const Scene*
                 ++pointCount;
             }
         }
+    }
+
+    // The editor viewport has a procedural daytime sky even before a Sun
+    // entity exists. Give material-graph objects (notably spawned blocks) the
+    // same environment daylight instead of leaving them at the 0.22 ambient
+    // floor while the rest of the viewport visibly looks like noon. An
+    // authored directional Sun replaces this fallback and keeps real shadows.
+    if (!hasDirectionalSun) {
+        data.sunDirection = glm::vec4(0.0f, -1.0f, 0.0f, 1.0f);
+        data.sunColor = glm::vec4(1.0f, 0.95f, 0.85f, 1.0f);
     }
 }
 

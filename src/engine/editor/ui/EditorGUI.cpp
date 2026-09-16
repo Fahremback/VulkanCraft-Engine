@@ -176,7 +176,10 @@ void EditorGUI::draw_inspector() {
         if (m_undoSystem) {
             m_undoSystem->execute_command(std::make_unique<AddComponentCommand>(
                 "Add LightComponent",
-                [scene = m_activeScene, id] { scene->lightComponents[id] = LightComponent{}; },
+                [scene = m_activeScene, id] {
+                    scene->lightComponents[id] =
+                        LightComponent{ glm::vec3(1.0f), 5000.0f, 15.0f, true, LightType::Point };
+                },
                 [scene = m_activeScene, id] { scene->lightComponents.erase(id); }));
         }
     }

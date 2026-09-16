@@ -57,11 +57,11 @@ struct LightUboData {
     glm::vec4 pointLightColor[kMaxPointLights];  // rgb = color * intensity, w = enabled
     glm::vec4 spotLightPos[kMaxSpotLights];      // xyz = position, w = range
     glm::vec4 spotLightDir[kMaxSpotLights];      // xyz = direction, w = enabled
-    glm::vec4 spotLightParams[kMaxSpotLights];   // x = cos(inner/2), y = cos(outer/2)
+    glm::vec4 spotLightParams[kMaxSpotLights];   // x/y = cos(inner/outer half-angle)
     glm::vec4 spotLightColor[kMaxSpotLights];    // rgb = color * intensity
     glm::vec4 areaLightPos[kMaxAreaLights];      // xyz = center, w = enabled
     glm::vec4 areaLightNormal[kMaxAreaLights];   // xyz = facing normal
-    glm::vec4 areaLightHalf[kMaxAreaLights];     // x = halfWidth, y = halfHeight
+    glm::vec4 areaLightHalf[kMaxAreaLights];     // x/y = half size, z = attenuation range
     glm::vec4 areaLightColor[kMaxAreaLights];    // rgb = color * intensity
     glm::mat4 sunCascadeVP[kShadowCascadeCount]; // per-cascade light view-projection (atlas 2x2)
     glm::vec4 sunCascadeSplits;            // xyz = view-depth split points, w = cascade count

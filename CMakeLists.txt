@@ -666,7 +666,12 @@ set(VC_SOURCE_DIRS
 
 add_library(vc_build_options INTERFACE)
 if(MSVC)
-    target_compile_options(vc_build_options INTERFACE /FS /fp:fast /arch:AVX2)
+    # The engine uses C++ exceptions throughout its public/runtime code (for
+    # example Vulkan setup and window creation).  Without /EHsc MSVC still
+    # accepts throw/catch but does not enable standard C++ stack-unwind
+    # semantics and emits C4530 from STL headers.  Keep exception behaviour
+    # correct for every first-party target consuming vc_build_options.
+    target_compile_options(vc_build_options INTERFACE /FS /EHsc /fp:fast /arch:AVX2)
 endif()
 # MSVC parallel compilation (/MP) — uses all available cores
 if(MSVC)

@@ -18,5 +18,5 @@ void main() {
     vec4 world = push.model * vec4(inPosition, 1.0);
     gl_Position = push.mvp * vec4(inPosition, 1.0);
     vWorldPos = world.xyz;
-    vNormal = mat3(push.model) * inNormal;
+    vNormal = normalize(transpose(inverse(mat3(push.model))) * inNormal);
 }

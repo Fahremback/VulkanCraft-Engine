@@ -19,7 +19,10 @@ layout (location = 2) out vec3 fragWorldPos;
 void main() {
     gl_Position = push.mvp * vec4(inPosition, 1.0);
     fragColor = inColor * push.color.rgb;
-    fragNormal = inNormal;
+    // Normals live in object space just like positions. Transform them with
+    // the inverse-transpose so rotated and non-uniformly scaled entities keep
+    // correct Lambert/specular response in world space.
+    fragNormal = normalize(transpose(inverse(mat3(push.model))) * inNormal);
     // World position (not local): fog distance and rim lighting in the
     // fragment stage use real world coordinates, correct for transformed
     // entities (blocks, characters, meshes placed in the scene).
