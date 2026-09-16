@@ -27,6 +27,15 @@ bool EditorApplication::wait_for_inflight_gpu(const char* reason) {
             continue;
         }
 
+        // Interactive viewport resizes can happen continuously while the dock
+        // is being dragged. Do not block the editor thread for seconds waiting
+        // for a GPU fence in that case: the next frame will retry once the GPU
+        // has retired the old offscreen resources. The previous behavior turned
+        // a stalled resize into a multi-second render loop.
+        if (reason && std::string(reason) == "offscreen resize") {
+            return false;
+        }
+
         const auto begin = std::chrono::steady_clock::now();
         const VkResult waited = vkWaitForFences(
             m_device, 1, &fence, VK_TRUE, kFenceTimeoutNs);
@@ -820,22 +829,36 @@ void EditorApplication::main_loop() {
             m_fileDebounceTick += 1;
             const auto settled = m_fileDebounce->advance(m_fileDebounceTick);
             if (!settled.empty() && m_assetHotReload) {
-                // Rate-limit: a burst of raw events coalesces into a few
-                // settled changes; each trigger re-walks every registered
-                // asset (last_write_time) — once per second is plenty for
-                // hot reload and keeps the loop cheap.
+                // The native watcher already tells us exactly which files
+                // changed. Reload only those paths; rebuilding the timestamp
+                // baseline immediately before poll() both scanned every asset
+                // twice and could erase the very change that triggered this
+                // branch.
                 const auto now = std::chrono::steady_clock::now();
                 if (m_lastWatcherReload.time_since_epoch().count() == 0 ||
                     now - m_lastWatcherReload >= std::chrono::seconds(1)) {
                     m_lastWatcherReload = now;
-                    m_assetHotReload->watch_registered_assets();
-                    m_assetHotReload->poll();
+                    std::vector<std::filesystem::path> changedPaths;
+                    changedPaths.reserve(settled.size());
+                    for (const auto& change : settled) changedPaths.emplace_back(change.path);
+                    const auto reloaded = m_assetHotReload->reload_paths(changedPaths);
+                    if (!reloaded.empty()) m_contentBrowserDirty = true;
                 }
             }
         }
 
         if (!m_inLauncherMode) {
-            {
+            // The loopback control API does not need a 60/120+ Hz document.
+            // Most fields below are serialized JSON snapshots, so rebuilding
+            // and copying the whole state every render frame wastes CPU while
+            // providing no useful extra observability. Publish at 10 Hz; live
+            // gameplay/camera/rendering continue at full frame rate below.
+            const auto apiNow = std::chrono::steady_clock::now();
+            const bool publishApi =
+                m_lastControlApiPublish.time_since_epoch().count() == 0 ||
+                apiNow - m_lastControlApiPublish >= std::chrono::milliseconds(100);
+            if (publishApi) {
+                m_lastControlApiPublish = apiNow;
                 EditorApiState api;
                 switch (m_playMode.get_state()) {
                     case PlayState::Play: api.state = "play"; break;
@@ -993,8 +1016,10 @@ void EditorApplication::main_loop() {
         // mutations made before the launcher hub is left still get saved.
         autosave_scene();
 
-        // 3D asset thumbnails (mesh + block cubes): a few renders per frame.
-        pump_asset_thumbnails(4);
+        // 3D asset thumbnails are deliberately limited to one render per
+        // frame. They use a submit-local synchronization path and are purely
+        // cosmetic, so a burst must never monopolize an interactive frame.
+        pump_asset_thumbnails(1);
 
         // One revision-gated registry snapshot feeds every texture name/picker
         // lookup. No material/decal/video path scans the full registry in the

@@ -719,6 +719,7 @@ float terrain_surface_height(uint32_t seed, float scale, int octaves,
 void EditorApplication::mark_scene_dirty() {
     m_sceneDirty = true;
     m_sceneLastChange = glfwGetTime();
+    ++m_sceneMutationRevision;
 }
 
 

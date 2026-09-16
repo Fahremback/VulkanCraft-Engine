@@ -1580,6 +1580,53 @@ std::vector<AssetMetadata> AssetHotReloadService::poll() {
     return reloaded;
 }
 
+std::vector<AssetMetadata> AssetHotReloadService::reload_paths(
+    const std::vector<std::filesystem::path>& sourcePaths) {
+    std::vector<AssetMetadata> reloaded;
+    std::vector<UUID> dirtyAssets;
+    std::unordered_set<std::string> visited;
+
+    for (const std::filesystem::path& sourcePath : sourcePaths) {
+        const std::string key = AssetRegistry::normalized_key(sourcePath);
+        if (!visited.insert(key).second) continue;
+
+        const auto id = registry_.find_id(sourcePath);
+        if (!id) continue; // watcher may also report directories/unregistered files
+        const auto metadata = registry_.find(*id);
+        if (!metadata) continue;
+
+        std::error_code error;
+        const auto currentTime = std::filesystem::last_write_time(metadata->sourcePath, error);
+        if (error) continue;
+
+        ImportResult result = pipeline_.import({metadata->sourcePath,
+                                                cookedDirectory_,
+                                                metadata->importerVersion,
+                                                metadata->importSettings,
+                                                "generic"});
+        if (!result) continue;
+
+        writeTimes_[AssetRegistry::normalized_key(metadata->sourcePath)] = currentTime;
+        dirtyAssets.push_back(metadata->id);
+        reloaded.push_back(result.asset);
+        if (callback_) callback_(result.asset);
+    }
+
+    for (const UUID dirty : dirtyAssets) {
+        for (const UUID referencer : registry_.referencers_of(dirty)) {
+            const auto metadata = registry_.find(referencer);
+            if (!metadata) continue;
+            ImportResult rebuilt = pipeline_.import({metadata->sourcePath,
+                                                     cookedDirectory_,
+                                                     metadata->importerVersion,
+                                                     metadata->importSettings,
+                                                     "generic"});
+            if (rebuilt) reloaded.push_back(rebuilt.asset);
+        }
+    }
+    return reloaded;
+}
+
 static std::string make_ddc_key(const DerivedDataKey& key) {
     return AssetRegistry::normalized_key(key.source) + "|" +
            std::to_string(key.sourceHash) + "|" + std::to_string(key.settingsHash) + "|" +

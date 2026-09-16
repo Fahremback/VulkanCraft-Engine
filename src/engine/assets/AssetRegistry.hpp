@@ -213,6 +213,11 @@ public:
     void set_reload_callback(ReloadCallback callback) { callback_ = std::move(callback); }
     void watch_registered_assets();
     [[nodiscard]] std::vector<AssetMetadata> poll();
+    // Event-driven hot reload path. Unlike poll(), this only touches the
+    // source paths reported by the native file watcher and therefore avoids a
+    // full registry snapshot + last_write_time() walk on interactive frames.
+    [[nodiscard]] std::vector<AssetMetadata> reload_paths(
+        const std::vector<std::filesystem::path>& sourcePaths);
 
 private:
     AssetPipeline& pipeline_;

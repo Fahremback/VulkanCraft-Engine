@@ -210,6 +210,74 @@ void EditorApplication::end_single_time_commands(VkCommandBuffer cmd) {
     vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
 }
 
+void EditorApplication::submit_thumbnail_commands(VkCommandBuffer cmd) {
+    if (cmd == VK_NULL_HANDLE || m_device == VK_NULL_HANDLE ||
+        m_graphicsQueue == VK_NULL_HANDLE) {
+        return;
+    }
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
+        return;
+    }
+
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if (vkCreateFence(m_device, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
+        vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
+        std::cerr << "[Vulkan] failed to create thumbnail submission fence\n";
+        return;
+    }
+
+    VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+    const VkResult submitted = vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, fence);
+    if (submitted != VK_SUCCESS) {
+        vkDestroyFence(m_device, fence, nullptr);
+        vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
+        std::cerr << "[Vulkan] thumbnail queue submit failed: "
+                  << static_cast<int>(submitted) << "\n";
+        return;
+    }
+
+    // Queue ordering guarantees that the regular viewport submission that
+    // samples this thumbnail runs after the copy/layout transition recorded
+    // above. Keep only the command buffer/fence alive until the GPU retires it;
+    // the editor thread never blocks here.
+    m_pendingThumbnailSubmissions.push_back({ cmd, fence });
+}
+
+void EditorApplication::reap_thumbnail_commands(bool waitAll) {
+    if (m_device == VK_NULL_HANDLE) {
+        m_pendingThumbnailSubmissions.clear();
+        return;
+    }
+    for (auto it = m_pendingThumbnailSubmissions.begin();
+         it != m_pendingThumbnailSubmissions.end();) {
+        VkResult status = VK_NOT_READY;
+        if (waitAll) {
+            status = vkWaitForFences(m_device, 1, &it->fence, VK_TRUE, UINT64_MAX);
+        } else {
+            status = vkGetFenceStatus(m_device, it->fence);
+        }
+        if (status == VK_NOT_READY) {
+            ++it;
+            continue;
+        }
+        if (status != VK_SUCCESS) {
+            std::cerr << "[Vulkan] thumbnail fence status failed: "
+                      << static_cast<int>(status) << "\n";
+        }
+        if (it->fence != VK_NULL_HANDLE) {
+            vkDestroyFence(m_device, it->fence, nullptr);
+        }
+        if (it->commandBuffer != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(m_device, m_commandPool, 1, &it->commandBuffer);
+        }
+        it = m_pendingThumbnailSubmissions.erase(it);
+    }
+}
+
 // ===========================================================================
 // Viewport initialization
 // ===========================================================================
@@ -821,7 +889,17 @@ void EditorApplication::recreate_offscreen_if_needed(uint32_t w, uint32_t h) {
     if (m_offscreen.framebuffer != VK_NULL_HANDLE && m_offscreen.width == w && m_offscreen.height == h) {
         return;
     }
-    if (m_device != VK_NULL_HANDLE && !wait_for_inflight_gpu("offscreen resize")) return;
+    // These resources are owned directly by the viewport and are destroyed
+    // immediately below. They cannot be retired asynchronously because the
+    // descriptor/framebuffer may still be referenced by an in-flight command
+    // buffer. Synchronize before destroying them.
+    if (m_device != VK_NULL_HANDLE) {
+        VkResult waitResult = vkDeviceWaitIdle(m_device);
+        if (waitResult != VK_SUCCESS) {
+            std::cerr << "[Vulkan] device wait idle failed during offscreen resize: "
+                      << static_cast<int>(waitResult) << "\n";
+        }
+    }
     cleanup_offscreen_target();
     create_offscreen_buffers(w, h);
     // The offscreen cleanup also destroys the shadow map (size-independent

@@ -59,11 +59,20 @@ void EditorApplication::refresh_hierarchy() {
     if (!scene) scene = m_editorScene.get();
     if (!m_sceneHierarchy || !scene) {
         m_hierarchyJson.clear();
+        m_hierarchyCachedScene = nullptr;
+        return;
+    }
+    const std::size_t entityCount = scene->get_entities().size();
+    const std::size_t linkCount = scene->hierarchyComponents.size();
+    if (m_hierarchyCachedScene == scene &&
+        m_hierarchyCachedRevision == m_sceneMutationRevision &&
+        m_hierarchyCachedEntityCount == entityCount &&
+        m_hierarchyCachedLinkCount == linkCount) {
         return;
     }
     std::vector<engine::editor::HierarchyEntity> entities;
     std::vector<engine::editor::HierarchyLink> links;
-    entities.reserve(scene->get_entities().size());
+    entities.reserve(entityCount);
     for (const auto& [id, ent] : scene->get_entities()) {
         entities.push_back(engine::editor::HierarchyEntity{
             id.to_string(), ent.get_name() });
@@ -76,6 +85,10 @@ void EditorApplication::refresh_hierarchy() {
     }
     const auto rows = m_sceneHierarchy->build(entities, links, "");
     m_hierarchyJson = m_sceneHierarchy->to_json(rows);
+    m_hierarchyCachedScene = scene;
+    m_hierarchyCachedRevision = m_sceneMutationRevision;
+    m_hierarchyCachedEntityCount = entityCount;
+    m_hierarchyCachedLinkCount = linkCount;
 }
 
 
@@ -1179,6 +1192,10 @@ void EditorApplication::run_luau_sandbox() {
     // instruction ceiling is enforced) and an io source (proves the io
     // lockdown), publishing the observed counters.
     if (!m_luauSandbox) return;
+    // These are capability/security probes, not gameplay simulation. Once both
+    // the successful execution and the I/O denial have been observed, rerunning
+    // the same scripts every API refresh only burns CPU.
+    if (m_luauSandboxExecutions > 0 && m_luauSandboxIoLocked) return;
     std::string sbErr;
     // 1) compliant run — the boxed result is JSON-shaped, deterministic.
     {
@@ -1212,6 +1229,12 @@ void EditorApplication::cook_showcase_assets() {
     // result (source, content hash, cache hit, artifact size) is published for
     // observability.
     if (!m_assetCooker) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (m_lastShowcaseCookCheck.time_since_epoch().count() != 0 &&
+        now - m_lastShowcaseCookCheck < std::chrono::seconds(2)) {
+        return;
+    }
+    m_lastShowcaseCookCheck = now;
     const char* assets[] = {
         "/Projects/ShowcaseGame/Content/Config/showcase_ocean.json",
         "/Projects/ShowcaseGame/Content/Config/showcase_particles.json",

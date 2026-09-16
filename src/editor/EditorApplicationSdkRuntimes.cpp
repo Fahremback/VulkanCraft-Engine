@@ -37,7 +37,6 @@
 #include <fstream>
 #include <iterator>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace Engine {
@@ -82,26 +81,6 @@ public:
     std::string script_id() const override { return "project:chest_loot"; }
 };
 
-// Bounded world boot for the editor consumer: pump update() until the center
-// chunk loads (mirrors the SDK tests' boot_world, bounded so it can never
-// stall the editor frame).
-bool sdk_boot_world(engine::voxel::IVoxelWorld& world, const glm::vec3& player,
-                    int budget, double maxMs) {
-    world.set_chunk_budget(budget);
-    using Clock = std::chrono::steady_clock;
-    const auto start = Clock::now();
-    for (int step = 0; step < 6000; ++step) {
-        if (world.is_chunk_loaded(0, 0)) return true;
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(
-                Clock::now() - start).count() > maxMs) {
-            return false;
-        }
-        world.update(player, 1.0f / 60.0f);
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-    return world.is_chunk_loaded(0, 0);
-}
-
 }  // namespace
 
 void EditorApplication::refresh_sdk_contract_runtimes() {
@@ -112,7 +91,14 @@ void EditorApplication::refresh_sdk_contract_runtimes() {
     // methods each frame exactly as before; only the final serialization path
     // changed, so a failing factory or a hostile string can no longer emit
     // invalid JSON (no leading comma, no unescaped quote/backslash/newline).
-    SdkContractStats stats;
+    SdkContractStats& stats = m_sdkContractStats;
+    const auto now = std::chrono::steady_clock::now();
+    const bool heavyRefresh =
+        m_lastSdkHeavyRefresh.time_since_epoch().count() == 0 ||
+        now - m_lastSdkHeavyRefresh >= std::chrono::seconds(5);
+    const bool spatialRefresh =
+        m_lastSdkSpatialRefresh.time_since_epoch().count() == 0 ||
+        now - m_lastSdkSpatialRefresh >= std::chrono::milliseconds(250);
 
     // ---- canonical plugin runtime -----------------------------------------
     // These are references to the SAME instances used by EnginePlugin::on_load
@@ -158,6 +144,10 @@ void EditorApplication::refresh_sdk_contract_runtimes() {
         }
     }
 
+    // Heavy capability probes are diagnostic evidence, not frame simulation.
+    // Run them at low frequency and keep the last truthful observable between
+    // refreshes instead of doing erosion/cooking/job drains at render rate.
+    if (heavyRefresh) {
     // ---- 1. create_job_system (engine::jobs::IJobSystem) ------------------
     // Real job dispatch: each frame the editor submits a genuine unit of work
     // through the public job system, reads its queued state and drains it
@@ -283,12 +273,15 @@ void EditorApplication::refresh_sdk_contract_runtimes() {
         stats.farmSignature = m_farmCookedSignature;
         stats.farmVerified = m_farmCookVerified;
     }
+    m_lastSdkHeavyRefresh = now;
+    }
 
     // ---- 6+7. create_hilbert_cell_index + create_hilbert_cell_index_json --
     // Real hierarchical spatial cell index over the editor's world focus. Two
     // instances: one configured programmatically and one loaded from JSON (so
     // BOTH factories are consumed), both queried with cell_id / parent_cell /
     // cover / contains on the live editor camera position.
+    if (spatialRefresh) {
     if (!m_hilbertIndex) {
         std::string hErr;
         m_hilbertIndex = engine::world::create_hilbert_cell_index(hErr);
@@ -340,14 +333,17 @@ void EditorApplication::refresh_sdk_contract_runtimes() {
         stats.hilJsonVariant = m_hilbertIndexJson != nullptr;
         stats.hilContains = hil->contains(m_hilbertCellId, dx, dy, posErr);
     }
+    m_lastSdkSpatialRefresh = now;
+    }
 
     // ---- 8. create_block_entity_scripting (engine::voxel::IBlockEntityScripting)
     // Real block-entity runtime: the editor owns a real IVoxelWorld (SDK's
     // VoxelWorldFacade) and a script bridge bound to it (takes over its
     // block-entity listener). On first use it boots a flat world once, then
-    // registers a chest script and runs it every frame — the script actually
-    // runs inside the world's runtime loop, with observability.
-    if (!m_blockScripting) {
+    // registers a chest script and runs it from the editor update. World boot
+    // is incremental: the previous helper could sleep/pump synchronously for
+    // up to 8 seconds on the main thread during the first observable refresh.
+    if (!m_blockWorld && !m_blockScripting) {
         m_blockWorld = engine::voxel::create_default_voxel_world();
         if (m_blockWorld) {
             m_blockWorld->register_generator(std::make_shared<SdkFlatGenerator>(96));
@@ -356,13 +352,19 @@ void EditorApplication::refresh_sdk_contract_runtimes() {
                 []() -> std::shared_ptr<engine::voxel::IVoxelBlockEntity> {
                     return std::make_shared<SdkChestCounter>();
                 });
-            m_blockEntityBooted =
-                sdk_boot_world(*m_blockWorld, glm::vec3(8.0f, 200.0f, 8.0f), 8, 8000.0);
         }
-        if (m_blockEntityBooted && m_blockWorld) {
-            m_blockScripting =
-                engine::voxel::create_block_entity_scripting(*m_blockWorld);
+    }
+    if (m_blockWorld && !m_blockEntityBooted) {
+        m_blockWorld->set_chunk_budget(8);
+        // A few non-blocking pumps per observable refresh are enough to make
+        // progress while keeping the UI responsive even on a cold world.
+        for (int i = 0; i < 4 && !m_blockWorld->is_chunk_loaded(0, 0); ++i) {
+            m_blockWorld->update(glm::vec3(8.0f, 200.0f, 8.0f), 1.0f / 60.0f);
         }
+        m_blockEntityBooted = m_blockWorld->is_chunk_loaded(0, 0);
+    }
+    if (m_blockEntityBooted && m_blockWorld && !m_blockScripting) {
+        m_blockScripting = engine::voxel::create_block_entity_scripting(*m_blockWorld);
         if (m_blockScripting) {
             engine::voxel::BlockEntityScriptSpec spec;
             spec.scriptId = "project:chest_loot";

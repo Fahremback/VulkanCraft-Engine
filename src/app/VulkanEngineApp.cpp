@@ -3408,13 +3408,12 @@ bool VulkanEngineApp::recreate_swapchain() {
     for (int i = 0; i < FRAME_OVERLAP; ++i) {
         VK_CHECK(vkWaitForFences(device, 1, &frames[i].renderFence, VK_TRUE, UINT64_MAX));
     }
-    VkFence resizeFence = VK_NULL_HANDLE;
-    VkFenceCreateInfo resizeFenceInfo{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    VK_CHECK(vkCreateFence(device, &resizeFenceInfo, nullptr, &resizeFence));
-    VkSubmitInfo2 resizeCheckpoint{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-    VK_CHECK(vkQueueSubmit2(graphicsQueue, 1, &resizeCheckpoint, resizeFence));
-    VK_CHECK(vkWaitForFences(device, 1, &resizeFence, VK_TRUE, UINT64_MAX));
-    vkDestroyFence(device, resizeFence, nullptr);
+    // Do not submit an empty VkSubmitInfo2 here. Some Vulkan drivers reject
+    // zero-work submits during swapchain recreation and leave the resize path
+    // waiting forever. The frame fences above already cover this engine's
+    // graphics work; drain the device before destroying resize-dependent
+    // resources.
+    VK_CHECK(vkDeviceWaitIdle(device));
 
     const VkSwapchainKHR oldSwapchain = swapchain;
     auto oldImageViews = std::move(swapchainImageViews);

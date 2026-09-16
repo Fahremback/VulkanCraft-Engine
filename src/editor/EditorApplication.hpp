@@ -43,6 +43,7 @@
 #include "../engine/gameplay/DialogueSystem.hpp"
 #include "../engine/gameplay/DestructionRuntime.hpp"
 #include "../engine/audio/AudioRuntime.hpp"
+#include "EditorSdkContractJson.hpp"
 #include "engine/navigation/INavigationProvider.hpp"
 #include "engine/navigation/INavigationSchedulerBridge.hpp"
 #include "engine/navigation/INavInvalidation.hpp"
@@ -516,6 +517,8 @@ private:
                                  uint32_t baseMipLevel = 0, uint32_t levelCount = 1);
     VkCommandBuffer begin_single_time_commands();
     void end_single_time_commands(VkCommandBuffer cmd);
+    void submit_thumbnail_commands(VkCommandBuffer cmd);
+    void reap_thumbnail_commands(bool waitAll = false);
 
     void main_loop();
     void render_frame();
@@ -901,6 +904,11 @@ private:
     // m_thumbView makes all thumbnails change to the most recently rendered asset.
     std::unordered_map<UUID, AssetThumbnail> m_asset3dThumbnailImages;
     std::unordered_map<UUID, std::uint64_t> m_asset3dThumbnailHashes; // content hash per 3D thumbnail
+    struct PendingThumbnailSubmission {
+        VkCommandBuffer commandBuffer{ VK_NULL_HANDLE };
+        VkFence fence{ VK_NULL_HANDLE };
+    };
+    std::deque<PendingThumbnailSubmission> m_pendingThumbnailSubmissions;
     void init_thumbnail_target();
     void destroy_thumbnail_target();
     void request_3d_thumbnail(const UUID& assetId);
@@ -1419,6 +1427,9 @@ private:
     std::unique_ptr<Engine::Farm::IFarmCooker> m_farmCooker;
     std::uint64_t m_farmCookedSignature{ 0 };  // last cooked asset signature
     bool m_farmCookVerified{ false };          // verify() of that asset
+    SdkContractStats m_sdkContractStats{};
+    std::chrono::steady_clock::time_point m_lastSdkHeavyRefresh{};
+    std::chrono::steady_clock::time_point m_lastSdkSpatialRefresh{};
     std::unique_ptr<engine::world::IHilbertCellIndex> m_hilbertIndex;
     std::unique_ptr<engine::world::IHilbertCellIndex> m_hilbertIndexJson;
     std::uint64_t m_hilbertCellId{ 0 };        // cell_id for the editor focus
@@ -1512,6 +1523,11 @@ private:
     // the real entities — exposed via GET /hierarchy.
     std::unique_ptr<engine::editor::ISceneHierarchy> m_sceneHierarchy;
     std::string m_hierarchyJson;
+    const Scene* m_hierarchyCachedScene{ nullptr };
+    std::uint64_t m_sceneMutationRevision{ 0 };
+    std::uint64_t m_hierarchyCachedRevision{ static_cast<std::uint64_t>(-1) };
+    std::size_t m_hierarchyCachedEntityCount{ static_cast<std::size_t>(-1) };
+    std::size_t m_hierarchyCachedLinkCount{ static_cast<std::size_t>(-1) };
     void refresh_hierarchy();
 
     // Play-mode frame stepping (PASSO button): advance the play world one
@@ -1579,6 +1595,8 @@ private:
     bool m_sceneDirty{ false };
     double m_sceneLastChange{ 0.0 };   // glfwGetTime() of the last mutation
     std::string m_autosavePath;        // stable fallback target for untitled scenes
+    std::chrono::steady_clock::time_point m_lastControlApiPublish{};
+    std::chrono::steady_clock::time_point m_lastShowcaseCookCheck{};
     void mark_scene_dirty();
     void autosave_scene(bool force = false);
 

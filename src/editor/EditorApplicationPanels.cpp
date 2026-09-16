@@ -99,9 +99,18 @@ void EditorApplication::draw_project_launcher() {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // Scan Projects/ for real project folders (no hardcoded list).
-    std::vector<LauncherProject> projects;
-    scan_projects(projects);
+    // Filesystem discovery is intentionally cached. The launcher is rendered
+    // every frame, but walking every project tree recursively at frame rate is
+    // pure metadata I/O and scales very badly with project size.
+    static std::vector<LauncherProject> projects;
+    static std::chrono::steady_clock::time_point lastProjectScan{};
+    const auto launcherNow = std::chrono::steady_clock::now();
+    if (lastProjectScan.time_since_epoch().count() == 0 ||
+        launcherNow - lastProjectScan >= std::chrono::seconds(2)) {
+        projects.clear();
+        scan_projects(projects);
+        lastProjectScan = launcherNow;
+    }
 
     if (projects.empty()) {
         ImGui::TextDisabled("%s", tr("Nenhum projeto encontrado em Projects/ — crie um novo acima.",
@@ -1899,8 +1908,26 @@ void EditorApplication::draw_content_browser_panel() {
                        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
         m_contentBrowserQueryCache.clear();
         m_contentBrowserQueryCache.reserve(m_assetRegistrySnapshotCache.size());
+        std::unordered_set<UUID> unusedSet;
+        if (typeFilter == 8) {
+            std::vector<UUID> roots;
+            for (const AssetMetadata& candidate : m_assetRegistrySnapshotCache) {
+                if (candidate.type == AssetType::Scene) roots.push_back(candidate.id);
+            }
+            const std::vector<UUID> unused = m_assetRegistry.unused_assets(roots);
+            unusedSet.insert(unused.begin(), unused.end());
+        }
         for (const AssetMetadata& asset : m_assetRegistrySnapshotCache) {
             if (selectedType && asset.type != *selectedType) continue;
+            // .vblock sidecars are hidden plumbing: the PNG IS the block.
+            if (asset.type == AssetType::Block) continue;
+            if (typeFilter == 3 &&
+                asset.type != AssetType::Mesh && asset.type != AssetType::VoxelStructure &&
+                !(asset.type == AssetType::Texture &&
+                  (is_block_texture(asset) || is_character_texture(asset)))) {
+                continue;
+            }
+            if (typeFilter == 8 && !unusedSet.contains(asset.id)) continue;
             std::string searchable = asset.sourcePath.generic_string();
             std::transform(searchable.begin(), searchable.end(), searchable.begin(),
                            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
@@ -1916,31 +1943,7 @@ void EditorApplication::draw_content_browser_panel() {
         m_contentBrowserQueryFilter = typeFilter;
         m_contentBrowserDirty = false;
     }
-    std::vector<AssetMetadata> assets = m_contentBrowserQueryCache;
-    // .vblock sidecars are hidden plumbing: the PNG IS the block, so Block
-    // assets never appear as cards (that would duplicate the texture).
-    assets.erase(std::remove_if(assets.begin(), assets.end(), [](const AssetMetadata& candidate) {
-        return candidate.type == AssetType::Block;
-    }), assets.end());
-    if (typeFilter == 3) {
-        // Modelos: industry meshes + voxel structures + block-capable textures
-        // (the PNG itself is the Minecraft-style block) + character/mob skins.
-        assets.erase(std::remove_if(assets.begin(), assets.end(), [&](const AssetMetadata& candidate) {
-            return candidate.type != AssetType::Mesh && candidate.type != AssetType::VoxelStructure &&
-                   !(candidate.type == AssetType::Texture &&
-                     (is_block_texture(candidate) || is_character_texture(candidate)));
-        }), assets.end());
-    }
-    if (typeFilter == 8) {
-        std::vector<UUID> roots;
-        for (const AssetMetadata& candidate : m_assetRegistrySnapshotCache)
-            if (candidate.type == AssetType::Scene) roots.push_back(candidate.id);
-        const std::vector<UUID> unused = m_assetRegistry.unused_assets(roots);
-        const std::unordered_set<UUID> unusedSet(unused.begin(), unused.end());
-        assets.erase(std::remove_if(assets.begin(), assets.end(), [&](const AssetMetadata& candidate) {
-            return !unusedSet.contains(candidate.id);
-        }), assets.end());
-    }
+    const std::vector<AssetMetadata>& assets = m_contentBrowserQueryCache;
     const auto assetIcon = [](AssetType t) -> const char* {
         switch (t) {
             case AssetType::Texture: return ICON_FA_IMAGE;
@@ -2266,10 +2269,6 @@ void EditorApplication::draw_content_browser_panel() {
         }
     }
 
-    if (m_assetHotReload) {
-        const auto reloaded = m_assetHotReload->poll();
-        if (!reloaded.empty()) ImGui::Text("%zu asset(s) reimported", reloaded.size());
-    }
     ImGui::End();
 }
 

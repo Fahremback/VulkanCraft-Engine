@@ -1221,6 +1221,7 @@ void EditorApplication::init_thumbnail_target() {
 
 void EditorApplication::destroy_thumbnail_target() {
     if (m_device == VK_NULL_HANDLE) return;
+    reap_thumbnail_commands(true);
     if (m_thumbFramebuffer != VK_NULL_HANDLE) { vkDestroyFramebuffer(m_device, m_thumbFramebuffer, nullptr); m_thumbFramebuffer = VK_NULL_HANDLE; }
     if (m_thumbMsaaView != VK_NULL_HANDLE) { vkDestroyImageView(m_device, m_thumbMsaaView, nullptr); m_thumbMsaaView = VK_NULL_HANDLE; }
     if (m_thumbMsaaImage != VK_NULL_HANDLE) { vkDestroyImage(m_device, m_thumbMsaaImage, nullptr); m_thumbMsaaImage = VK_NULL_HANDLE; }
@@ -1514,6 +1515,7 @@ void EditorApplication::request_3d_thumbnail(const UUID& assetId) {
 // submit + wait, so the budget keeps the editor responsive).
 void EditorApplication::pump_asset_thumbnails(int budget) {
     if (m_thumbFramebuffer == VK_NULL_HANDLE || m_device == VK_NULL_HANDLE) return;
+    reap_thumbnail_commands(false);
     while (budget-- > 0 && !m_thumbnailQueue.empty()) {
         const UUID id = m_thumbnailQueue.front();
         m_thumbnailQueue.pop_front();
@@ -1598,7 +1600,7 @@ void EditorApplication::render_mesh_thumbnail(const UUID& assetId, const EditorM
     draw_mesh_resource(cmd, proj * view, glm::vec4(0.62f, 0.66f, 0.75f, 1.0f), mesh);
     vkCmdEndRenderPass(cmd);
     snapshot_rendered_thumbnail(cmd, assetId);
-    end_single_time_commands(cmd);
+    submit_thumbnail_commands(cmd);
     if (const auto meta = m_assetRegistry.find(assetId))
         m_asset3dThumbnailHashes[assetId] = meta->contentHash;
 }
@@ -1642,7 +1644,7 @@ void EditorApplication::render_block_thumbnail(const UUID& assetId, VkDescriptor
     vkCmdDrawIndexed(cmd, m_blockCubeIndexCount, 1, 0, 0, 0);
     vkCmdEndRenderPass(cmd);
     snapshot_rendered_thumbnail(cmd, assetId);
-    end_single_time_commands(cmd);
+    submit_thumbnail_commands(cmd);
     if (const auto meta = m_assetRegistry.find(assetId))
         m_asset3dThumbnailHashes[assetId] = meta->contentHash;
 }
@@ -1695,7 +1697,7 @@ void EditorApplication::render_character_thumbnail(const UUID& assetId, const Ed
     }
     vkCmdEndRenderPass(cmd);
     snapshot_rendered_thumbnail(cmd, assetId);
-    end_single_time_commands(cmd);
+    submit_thumbnail_commands(cmd);
     if (const auto meta = m_assetRegistry.find(assetId))
         m_asset3dThumbnailHashes[assetId] = meta->contentHash;
 }
